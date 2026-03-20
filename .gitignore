@@ -1,0 +1,13 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.log
+.env
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.png
+*.jpg
+*.jpeg
