@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.dicom import router as dicom_router
 from app.api.routes.health import router as health_router
+from app.api.routes.view import router as view_router
 from app.core.config import get_settings
 from app.sockets.handlers import register_socket_handlers
 
@@ -26,6 +27,7 @@ fastapi_app.add_middleware(
 
 fastapi_app.include_router(health_router)
 fastapi_app.include_router(dicom_router, prefix="/api/v1")
+fastapi_app.include_router(view_router, prefix="/api/v1")
 
 sio = socketio.AsyncServer(
     async_mode="asgi",

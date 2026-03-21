@@ -1,24 +1,29 @@
 from pydantic import BaseModel, Field
 
 
-class DicomRenderRequest(BaseModel):
-    dicom_dir: str = Field(..., description="Directory containing DICOM files")
-    file_name: str | None = Field(default=None, description="Specific DICOM file name")
-    index: int = Field(default=0, ge=0, description="File index when file_name is not set")
-    image_format: str = Field(default="png", pattern="^(png|jpeg)$")
-    window_center: float | None = Field(default=None)
-    window_width: float | None = Field(default=None, gt=0)
-    invert: bool = Field(default=False)
+class SeriesSummary(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")
+    study_instance_uid: str | None = Field(default=None, alias="studyInstanceUid")
+    patient_id: str | None = Field(default=None, alias="patientId")
+    modality: str | None = None
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+    instance_count: int = Field(alias="instanceCount")
+    width: int | None = None
+    height: int | None = None
+    folder_path: str = Field(alias="folderPath")
+
+    model_config = {"populate_by_name": True}
 
 
-class DicomRenderResponse(BaseModel):
-    file_path: str
-    image_format: str
-    image_base64: str
-    content_type: str
-    width: int
-    height: int
-    patient_id: str | None = None
-    study_instance_uid: str | None = None
-    series_instance_uid: str | None = None
-    sop_instance_uid: str | None = None
+class LoadFolderRequest(BaseModel):
+    folder_path: str = Field(alias="folderPath")
+
+    model_config = {"populate_by_name": True}
+
+
+class LoadFolderResponse(BaseModel):
+    series_id: str | None = Field(default=None, alias="seriesId")
+    series_list: list[SeriesSummary] = Field(default_factory=list, alias="seriesList")
+
+    model_config = {"populate_by_name": True}

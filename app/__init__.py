@@ -1,1 +1,0 @@
-"""DicomVision application package."""
