@@ -1,1 +1,24 @@
-"""Core helpers."""
+from typing import Final
+
+
+VIEW_OP_TYPE_SET_SIZE: Final = "setSize"
+VIEW_OP_TYPE_SCROLL: Final = "scroll"
+VIEW_OP_TYPE_PAN: Final = "pan"
+VIEW_OP_TYPE_ZOOM: Final = "zoom"
+VIEW_OP_TYPE_WINDOW: Final = "window"
+
+DRAG_ACTION_START: Final = "start"
+DRAG_ACTION_MOVE: Final = "move"
+DRAG_ACTION_END: Final = "end"
+DRAG_ACTION_TYPES: Final = {
+    DRAG_ACTION_START,
+    DRAG_ACTION_MOVE,
+    DRAG_ACTION_END,
+}
+
+ZOOM_MIN: Final = 0.5
+ZOOM_MAX: Final = 3.0
+ZOOM_DRAG_SENSITIVITY: Final = 0.01
+ZOOM_DRAG_FACTOR_MIN: Final = 0.05
+WINDOW_WIDTH_MIN: Final = 1.0
+WINDOW_DRAG_SENSITIVITY: Final = 2.0

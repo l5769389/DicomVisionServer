@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 
 ViewType = Literal["Stack", "MPR", "3D"]
+ImageFormat = Literal["png", "jpeg"]
 
 
 class ViewCreateRequest(BaseModel):
@@ -14,6 +15,14 @@ class ViewCreateRequest(BaseModel):
 
 
 class ViewCreateResponse(BaseModel):
+    view_id: str = Field(alias="viewId")
+
+    model_config = {"populate_by_name": True}
+
+
+class OperationAcceptedResponse(BaseModel):
+    success: bool = True
+    message: str
     view_id: str = Field(alias="viewId")
 
     model_config = {"populate_by_name": True}
@@ -45,7 +54,7 @@ class WindowInfo(BaseModel):
 class ViewImageResponse(BaseModel):
     slice_info: SliceInfo = Field(alias="slice_info")
     window_info: WindowInfo = Field(alias="window_info")
-    image: str
+    image_format: ImageFormat = Field(alias="imageFormat")
     view_id: str = Field(alias="viewId")
 
     model_config = {"populate_by_name": True}

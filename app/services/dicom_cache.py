@@ -8,13 +8,20 @@ from fastapi import HTTPException
 from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
 
+from app.core.logging import get_logger
+
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class CachedDicom:
     dataset: Dataset
-    image_array: np.ndarray
+    source_pixels: np.ndarray
     window_width: float | None
     window_center: float | None
+    pixel_min: float
+    pixel_max: float
 
 
 class DicomCache:
@@ -22,24 +29,29 @@ class DicomCache:
         self.max_entries = max_entries
         self._cache: OrderedDict[str, CachedDicom] = OrderedDict()
 
-    def get(self, path: Path) -> CachedDicom:
-        cache_key = str(path.resolve())
+    def get(self, instance_uid: str, path: Path) -> CachedDicom:
+        cache_key = instance_uid
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._cache.move_to_end(cache_key)
+            logger.debug("dicom cache hit instance_uid=%s", instance_uid)
             return cached
 
+        logger.info("dicom cache miss instance_uid=%s path=%s", instance_uid, path)
         dataset = pydicom.dcmread(str(path), force=True)
-        image_array = self._extract_image_array(dataset)
+        source_pixels = self._extract_source_pixels(dataset)
         cached = CachedDicom(
             dataset=dataset,
-            image_array=image_array,
+            source_pixels=source_pixels,
             window_width=self._get_first_number(getattr(dataset, "WindowWidth", None)),
             window_center=self._get_first_number(getattr(dataset, "WindowCenter", None)),
+            pixel_min=float(np.min(source_pixels)),
+            pixel_max=float(np.max(source_pixels)),
         )
         self._cache[cache_key] = cached
         if len(self._cache) > self.max_entries:
-            self._cache.popitem(last=False)
+            evicted_key, _ = self._cache.popitem(last=False)
+            logger.debug("dicom cache evict instance_uid=%s", evicted_key)
         return cached
 
     def stats(self) -> dict[str, int]:
@@ -50,8 +62,9 @@ class DicomCache:
 
     def clear(self) -> None:
         self._cache.clear()
+        logger.info("dicom cache cleared")
 
-    def _extract_image_array(self, dataset: Dataset) -> np.ndarray:
+    def _extract_source_pixels(self, dataset: Dataset) -> np.ndarray:
         if "PixelData" not in dataset:
             raise HTTPException(status_code=400, detail="DICOM file does not contain pixel data")
 
@@ -67,21 +80,17 @@ class DicomCache:
         intercept = float(getattr(dataset, "RescaleIntercept", 0.0))
         pixels = pixels * slope + intercept
 
-        ww = self._get_first_number(getattr(dataset, "WindowWidth", None))
-        wl = self._get_first_number(getattr(dataset, "WindowCenter", None))
-        if ww and wl:
-            lower = wl - ww / 2.0
-            upper = wl + ww / 2.0
-            pixels = np.clip(pixels, lower, upper)
-
-        pixels = pixels - float(np.min(pixels))
-        scale = float(np.max(pixels))
-        if scale > 0:
-            pixels = pixels / scale
-        pixels = (pixels * 255.0).astype(np.uint8)
-
         if getattr(dataset, "PhotometricInterpretation", "") == "MONOCHROME1":
-            pixels = 255 - pixels
+            pixels = -pixels
+        logger.debug(
+            "source pixels extracted rows=%s cols=%s slope=%s intercept=%s min=%.3f max=%.3f",
+            pixels.shape[0],
+            pixels.shape[1],
+            slope,
+            intercept,
+            float(np.min(pixels)),
+            float(np.max(pixels)),
+        )
         return pixels
 
     @staticmethod

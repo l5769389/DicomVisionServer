@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
     app_port: int = Field(default=8000, alias="APP_PORT")
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -36,3 +36,11 @@ class ViewRecord:
     offset_y: float = 0.0
     hor_flip: bool = False
     ver_flip: bool = False
+    window_width: float | None = None
+    window_center: float | None = None
+    drag_origin_zoom: float | None = None
+    drag_origin_offset_x: float | None = None
+    drag_origin_offset_y: float | None = None
+    drag_origin_window_width: float | None = None
+    drag_origin_window_center: float | None = None
+    is_initialized: bool = False
