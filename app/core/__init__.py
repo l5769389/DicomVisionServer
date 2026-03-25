@@ -1,6 +1,5 @@
 from typing import Final
 
-
 VIEW_OP_TYPE_SET_SIZE: Final = "setSize"
 VIEW_OP_TYPE_SCROLL: Final = "scroll"
 VIEW_OP_TYPE_PAN: Final = "pan"
@@ -22,3 +21,12 @@ ZOOM_DRAG_SENSITIVITY: Final = 0.01
 ZOOM_DRAG_FACTOR_MIN: Final = 0.05
 WINDOW_WIDTH_MIN: Final = 1.0
 WINDOW_DRAG_SENSITIVITY: Final = 2.0
+
+MPR_VIEWPORT_AXIAL: Final = "mpr-ax"
+MPR_VIEWPORT_CORONAL: Final = "mpr-cor"
+MPR_VIEWPORT_SAGITTAL: Final = "mpr-sag"
+MPR_VIEWPORT_TYPES: Final = {
+    MPR_VIEWPORT_AXIAL,
+    MPR_VIEWPORT_CORONAL,
+    MPR_VIEWPORT_SAGITTAL,
+}

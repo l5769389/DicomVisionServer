@@ -38,6 +38,11 @@ class ViewRecord:
     ver_flip: bool = False
     window_width: float | None = None
     window_center: float | None = None
+    mpr_active_viewport: str = "mpr-ax"
+    mpr_viewport: str = "mpr-ax"
+    mpr_axial_index: int = 0
+    mpr_coronal_index: int = 0
+    mpr_sagittal_index: int = 0
     drag_origin_zoom: float | None = None
     drag_origin_offset_x: float | None = None
     drag_origin_offset_y: float | None = None
