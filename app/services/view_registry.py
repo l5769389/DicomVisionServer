@@ -1,4 +1,4 @@
-from uuid import uuid4
+﻿from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -6,9 +6,10 @@ from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGI
 from app.models.viewer import ViewRecord
 from app.schemas.view import ViewCreateRequest, ViewCreateResponse
 from app.services.series_registry import series_registry
+from app.services.view_group_registry import view_group_registry
 
 
-def _resolve_mpr_viewport(view_type: str) -> str:
+def _resolve_mpr_active_viewport(view_type: str) -> str:
     if view_type == "COR":
         return MPR_VIEWPORT_CORONAL
     if view_type == "SAG":
@@ -22,15 +23,17 @@ class ViewRegistry:
 
     def create(self, payload: ViewCreateRequest) -> ViewCreateResponse:
         series_registry.get(payload.series_id)
-        mpr_viewport = _resolve_mpr_viewport(payload.view_type)
 
         view = ViewRecord(
             view_id=str(uuid4()),
             series_id=payload.series_id,
             view_type=payload.view_type,
-            mpr_active_viewport=mpr_viewport,
-            mpr_viewport=mpr_viewport,
         )
+        if payload.view_type in {"MPR", "AX", "COR", "SAG"}:
+            view.view_group = view_group_registry.get_or_create_mpr_group_for_series(
+                payload.series_id,
+                active_viewport=_resolve_mpr_active_viewport(payload.view_type),
+            )
         self._view_by_id[view.view_id] = view
         return ViewCreateResponse(viewId=view.view_id)
 
@@ -42,6 +45,9 @@ class ViewRegistry:
 
     def list_all(self) -> list[ViewRecord]:
         return list(self._view_by_id.values())
+
+    def list_view_group(self, group_id: str) -> list[ViewRecord]:
+        return [view for view in self._view_by_id.values() if view.view_group is not None and view.view_group.group_id == group_id]
 
 
 view_registry = ViewRegistry()

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -24,6 +24,45 @@ class SeriesRecord:
 
 
 @dataclass
+class ViewTransformState:
+    zoom: float = 1.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    hor_flip: bool = False
+    ver_flip: bool = False
+
+
+@dataclass
+class WindowState:
+    window_width: float | None = None
+    window_center: float | None = None
+
+
+@dataclass
+class DragState:
+    drag_origin_zoom: float | None = None
+    drag_origin_offset_x: float | None = None
+    drag_origin_offset_y: float | None = None
+    drag_origin_window_width: float | None = None
+    drag_origin_window_center: float | None = None
+
+
+@dataclass
+class ViewGroupRecord:
+    group_id: str
+    group_type: str
+    series_id: str
+    active_viewport: str = "mpr-ax"
+    axial_index: int = 0
+    coronal_index: int = 0
+    sagittal_index: int = 0
+    window: WindowState = field(default_factory=WindowState)
+    drag_origin_window_width: float | None = None
+    drag_origin_window_center: float | None = None
+    crosshair_drag_active: bool = False
+
+
+@dataclass
 class ViewRecord:
     view_id: str
     series_id: str
@@ -31,21 +70,169 @@ class ViewRecord:
     width: int | None = None
     height: int | None = None
     current_index: int = 0
-    zoom: float = 1.0
-    offset_x: float = 0.0
-    offset_y: float = 0.0
-    hor_flip: bool = False
-    ver_flip: bool = False
-    window_width: float | None = None
-    window_center: float | None = None
-    mpr_active_viewport: str = "mpr-ax"
-    mpr_viewport: str = "mpr-ax"
-    mpr_axial_index: int = 0
-    mpr_coronal_index: int = 0
-    mpr_sagittal_index: int = 0
-    drag_origin_zoom: float | None = None
-    drag_origin_offset_x: float | None = None
-    drag_origin_offset_y: float | None = None
-    drag_origin_window_width: float | None = None
-    drag_origin_window_center: float | None = None
+    transform: ViewTransformState = field(default_factory=ViewTransformState)
+    window: WindowState = field(default_factory=WindowState)
+    drag: DragState = field(default_factory=DragState)
+    view_group: ViewGroupRecord | None = None
     is_initialized: bool = False
+
+    @property
+    def zoom(self) -> float:
+        return self.transform.zoom
+
+    @zoom.setter
+    def zoom(self, value: float) -> None:
+        self.transform.zoom = value
+
+    @property
+    def offset_x(self) -> float:
+        return self.transform.offset_x
+
+    @offset_x.setter
+    def offset_x(self, value: float) -> None:
+        self.transform.offset_x = value
+
+    @property
+    def offset_y(self) -> float:
+        return self.transform.offset_y
+
+    @offset_y.setter
+    def offset_y(self, value: float) -> None:
+        self.transform.offset_y = value
+
+    @property
+    def hor_flip(self) -> bool:
+        return self.transform.hor_flip
+
+    @hor_flip.setter
+    def hor_flip(self, value: bool) -> None:
+        self.transform.hor_flip = value
+
+    @property
+    def ver_flip(self) -> bool:
+        return self.transform.ver_flip
+
+    @ver_flip.setter
+    def ver_flip(self, value: bool) -> None:
+        self.transform.ver_flip = value
+
+    @property
+    def window_width(self) -> float | None:
+        if self.view_group is not None:
+            return self.view_group.window.window_width
+        return self.window.window_width
+
+    @window_width.setter
+    def window_width(self, value: float | None) -> None:
+        if self.view_group is not None:
+            self.view_group.window.window_width = value
+            return
+        self.window.window_width = value
+
+    @property
+    def window_center(self) -> float | None:
+        if self.view_group is not None:
+            return self.view_group.window.window_center
+        return self.window.window_center
+
+    @window_center.setter
+    def window_center(self, value: float | None) -> None:
+        if self.view_group is not None:
+            self.view_group.window.window_center = value
+            return
+        self.window.window_center = value
+
+    @property
+    def drag_origin_zoom(self) -> float | None:
+        return self.drag.drag_origin_zoom
+
+    @drag_origin_zoom.setter
+    def drag_origin_zoom(self, value: float | None) -> None:
+        self.drag.drag_origin_zoom = value
+
+    @property
+    def drag_origin_offset_x(self) -> float | None:
+        return self.drag.drag_origin_offset_x
+
+    @drag_origin_offset_x.setter
+    def drag_origin_offset_x(self, value: float | None) -> None:
+        self.drag.drag_origin_offset_x = value
+
+    @property
+    def drag_origin_offset_y(self) -> float | None:
+        return self.drag.drag_origin_offset_y
+
+    @drag_origin_offset_y.setter
+    def drag_origin_offset_y(self, value: float | None) -> None:
+        self.drag.drag_origin_offset_y = value
+
+    @property
+    def drag_origin_window_width(self) -> float | None:
+        if self.view_group is not None:
+            return self.view_group.drag_origin_window_width
+        return self.drag.drag_origin_window_width
+
+    @drag_origin_window_width.setter
+    def drag_origin_window_width(self, value: float | None) -> None:
+        if self.view_group is not None:
+            self.view_group.drag_origin_window_width = value
+            return
+        self.drag.drag_origin_window_width = value
+
+    @property
+    def drag_origin_window_center(self) -> float | None:
+        if self.view_group is not None:
+            return self.view_group.drag_origin_window_center
+        return self.drag.drag_origin_window_center
+
+    @drag_origin_window_center.setter
+    def drag_origin_window_center(self, value: float | None) -> None:
+        if self.view_group is not None:
+            self.view_group.drag_origin_window_center = value
+            return
+        self.drag.drag_origin_window_center = value
+
+    @property
+    def mpr_active_viewport(self) -> str:
+        return self.view_group.active_viewport if self.view_group is not None else "mpr-ax"
+
+    @mpr_active_viewport.setter
+    def mpr_active_viewport(self, value: str) -> None:
+        if self.view_group is not None:
+            self.view_group.active_viewport = value
+
+    @property
+    def mpr_axial_index(self) -> int:
+        return self.view_group.axial_index if self.view_group is not None else 0
+
+    @mpr_axial_index.setter
+    def mpr_axial_index(self, value: int) -> None:
+        if self.view_group is not None:
+            self.view_group.axial_index = value
+
+    @property
+    def mpr_coronal_index(self) -> int:
+        return self.view_group.coronal_index if self.view_group is not None else 0
+
+    @mpr_coronal_index.setter
+    def mpr_coronal_index(self, value: int) -> None:
+        if self.view_group is not None:
+            self.view_group.coronal_index = value
+
+    @property
+    def mpr_sagittal_index(self) -> int:
+        return self.view_group.sagittal_index if self.view_group is not None else 0
+
+    @mpr_sagittal_index.setter
+    def mpr_sagittal_index(self, value: int) -> None:
+        if self.view_group is not None:
+            self.view_group.sagittal_index = value
+
+    @property
+    def mpr_crosshair_drag_active(self) -> bool:
+        return self.view_group.crosshair_drag_active if self.view_group is not None else False
+
+    @mpr_crosshair_drag_active.setter
+    def mpr_crosshair_drag_active(self, value: bool) -> None:
+        if self.view_group is not None:
+            self.view_group.crosshair_drag_active = value

@@ -27,3 +27,24 @@ class LoadFolderResponse(BaseModel):
     series_list: list[SeriesSummary] = Field(default_factory=list, alias="seriesList")
 
     model_config = {"populate_by_name": True}
+
+
+class CornerInfoPayload(BaseModel):
+    top_left: list[str] = Field(default_factory=list, alias="topLeft")
+    top_right: list[str] = Field(default_factory=list, alias="topRight")
+    bottom_left: list[str] = Field(default_factory=list, alias="bottomLeft")
+    bottom_right: list[str] = Field(default_factory=list, alias="bottomRight")
+
+    model_config = {"populate_by_name": True}
+
+
+class CornerInfoRequest(BaseModel):
+    series_id: str = Field(alias="seriesId")
+
+    model_config = {"populate_by_name": True}
+
+
+class CornerInfoResponse(BaseModel):
+    corner_info: CornerInfoPayload = Field(alias="cornerInfo")
+
+    model_config = {"populate_by_name": True}

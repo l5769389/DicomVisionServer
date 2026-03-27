@@ -2,6 +2,7 @@ from typing import Final
 
 VIEW_OP_TYPE_SET_SIZE: Final = "setSize"
 VIEW_OP_TYPE_SCROLL: Final = "scroll"
+VIEW_OP_TYPE_CROSSHAIR: Final = "crosshair"
 VIEW_OP_TYPE_PAN: Final = "pan"
 VIEW_OP_TYPE_ZOOM: Final = "zoom"
 VIEW_OP_TYPE_WINDOW: Final = "window"

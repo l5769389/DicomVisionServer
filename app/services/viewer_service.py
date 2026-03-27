@@ -1,9 +1,10 @@
-import io
+﻿import io
 from dataclasses import dataclass, replace
 
 import numpy as np
 from fastapi import HTTPException
 from PIL import Image
+from pydicom.dataset import Dataset
 
 from app.core import (
     DRAG_ACTION_END,
@@ -12,6 +13,7 @@ from app.core import (
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
+    VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_SET_SIZE,
     VIEW_OP_TYPE_WINDOW,
@@ -20,13 +22,17 @@ from app.core import (
     WINDOW_WIDTH_MIN,
     ZOOM_DRAG_FACTOR_MIN,
     ZOOM_DRAG_SENSITIVITY,
+    VIEW_OP_TYPE_SCROLL,
 )
 from app.core.logging import get_logger
-from app.models.viewer import SeriesRecord, ViewRecord
+from app.models.viewer import InstanceRecord, SeriesRecord, ViewRecord
+from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
     ImageFormat,
     OperationAcceptedResponse,
+    OrientationInfo,
     SliceInfo,
+    MprCrosshairInfo,
     ViewImageResponse,
     ViewOperationRequest,
     ViewSetSizeRequest,
@@ -34,12 +40,16 @@ from app.schemas.view import (
 )
 from app.services.dicom_cache import CachedDicom, dicom_cache
 from app.services.layered_renderer import RenderContext, layered_renderer
+from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
 from app.services.view_registry import view_registry
+from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
 
 
 logger = get_logger(__name__)
+
+CROSSHAIR_HIT_RADIUS = 12.0
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,7 @@ class RenderPlan:
 class ViewerService:
     def __init__(self) -> None:
         self._volume_cache: dict[str, np.ndarray] = {}
+        self._logger = logger
 
     @staticmethod
     def _is_mpr_view_type(view_type: str) -> bool:
@@ -85,73 +96,38 @@ class ViewerService:
 
         return OperationAcceptedResponse(message="View size updated", viewId=view.view_id)
 
-    def render_view_by_id(self, view_id: str) -> RenderedImageResult:
+    def render_view_by_id(
+        self,
+        view_id: str,
+        *,
+        image_format: ImageFormat = "png",
+        fast_preview: bool = False,
+    ) -> RenderedImageResult:
         view = view_registry.get(view_id)
-        return self._render_by_view_type(view, image_format="png")
+        return self._render_by_view_type(view, image_format=image_format, fast_preview=fast_preview)
 
-    def handle_view_operation(self, payload: ViewOperationRequest) -> RenderedImageResult | None:
-        view = view_registry.get(payload.view_id)
-        series = series_registry.get(view.series_id)
+    def handle_view_operation(self, payload: ViewOperationRequest) -> OperationRenderOutcome:
+        return handle_view_operation(self, payload)
 
-        if payload.scroll is not None:
-            self._handle_scroll(view, series, int(payload.scroll))
-
-        if payload.op_type == VIEW_OP_TYPE_ZOOM and payload.action_type is not None:
-            self._handle_drag_zoom(view, payload)
-        elif payload.op_type == VIEW_OP_TYPE_WINDOW and payload.action_type is not None:
-            self._handle_drag_window(view, payload)
-        elif payload.op_type == VIEW_OP_TYPE_PAN and payload.action_type is not None:
-            self._handle_drag_pan(view, payload)
-        elif payload.zoom is not None and payload.zoom > 0:
-            view.zoom = viewport_transformer.clamp_zoom(payload.zoom)
-            view.is_initialized = True
-
-        if payload.x is not None and payload.op_type not in {VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN}:
-            view.offset_x += float(payload.x)
-            view.is_initialized = True
-        if payload.y is not None and payload.op_type not in {VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN}:
-            view.offset_y += float(payload.y)
-            view.is_initialized = True
-        if payload.hor_flip is not None:
-            view.hor_flip = payload.hor_flip
-            view.is_initialized = True
-        if payload.ver_flip is not None:
-            view.ver_flip = payload.ver_flip
-            view.is_initialized = True
-
-        logger.info(
-            "view operation view_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f ww=%s wl=%s",
-            view.view_id,
-            view.view_type,
-            payload.op_type,
-            payload.action_type,
-            payload.sub_op_type,
-            view.current_index,
-            view.zoom,
-            view.offset_x,
-            view.offset_y,
-            view.window_width,
-            view.window_center,
+    def get_series_corner_info(self, payload: CornerInfoRequest) -> CornerInfoResponse:
+        series = series_registry.get(payload.series_id)
+        _, reference_cached = self._get_reference_instance_and_cache(series)
+        overlay = self._build_series_corner_info_overlay(
+            series,
+            reference_cached.dataset if reference_cached is not None else None,
         )
-
-        if payload.op_type in {VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_PAN} and payload.action_type == DRAG_ACTION_START:
-            return None
-
-        if payload.op_type == VIEW_OP_TYPE_WINDOW and payload.action_type == DRAG_ACTION_MOVE:
-            return self._render_by_view_type(view, image_format="jpeg", fast_window=True)
-
-        return self._render_by_view_type(view, image_format="png")
+        return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(overlay))
 
     def _render_by_view_type(
         self,
         view: ViewRecord,
         image_format: ImageFormat = "png",
         *,
-        fast_window: bool = False,
+        fast_preview: bool = False,
     ) -> RenderedImageResult:
         if self._is_mpr_view_type(view.view_type):
-            return self._render_mpr_view(view, image_format=image_format)
-        return self._render_view(view, image_format=image_format, fast_window=fast_window)
+            return self._render_mpr_view(view, image_format=image_format, fast_preview=fast_preview)
+        return self._render_view(view, image_format=image_format, fast_preview=fast_preview)
 
     def _handle_scroll(self, view: ViewRecord, series: SeriesRecord, scroll: int) -> None:
         if not self._is_mpr_view_type(view.view_type):
@@ -161,7 +137,7 @@ class ViewerService:
 
         volume = self._get_series_volume(series)
         depth, height, width = volume.shape
-        target_viewport = view.mpr_viewport
+        target_viewport = self._resolve_mpr_viewport(view)
         if target_viewport == MPR_VIEWPORT_CORONAL:
             view.mpr_coronal_index = max(0, min(view.mpr_coronal_index + scroll, height - 1))
         elif target_viewport == MPR_VIEWPORT_SAGITTAL:
@@ -250,7 +226,7 @@ class ViewerService:
         view: ViewRecord,
         image_format: ImageFormat = "png",
         *,
-        fast_window: bool = False,
+        fast_preview: bool = False,
     ) -> RenderedImageResult:
         if not view.width or not view.height:
             raise HTTPException(status_code=400, detail="View size has not been set")
@@ -269,18 +245,30 @@ class ViewerService:
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
         )
+        slice_corner_info = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            cached.dataset,
+            current_index=view.current_index,
+            total_slices=len(series.instances),
+            viewport_label="Stack",
+        )
+        context = RenderContext(
+            view=render_plan.render_view,
+            source_pixels=cached.source_pixels,
+            pixel_min=cached.pixel_min,
+            pixel_max=cached.pixel_max,
+            instance=instance,
+            cached=cached,
+            image_transform=image_transform,
+            corner_info=None,
+            orientation=None,
+        )
 
-        if fast_window:
-            image = self._render_fast_window_image(render_plan, cached, image_transform)
+        if fast_preview:
+            image = self._render_fast_preview(context)
         else:
-            image = layered_renderer.render(
-                RenderContext(
-                    view=render_plan.render_view,
-                    instance=instance,
-                    cached=cached,
-                    image_transform=image_transform,
-                )
-            )
+            image = layered_renderer.render(context)
 
         logger.debug(
             "render completed view_id=%s index=%s viewport=%sx%s render=%sx%s ratio=%.4f zoom=%.4f ww=%s wl=%s image_format=%s fast_window=%s",
@@ -295,7 +283,7 @@ class ViewerService:
             view.window_width,
             view.window_center,
             image_format,
-            fast_window,
+            fast_preview,
         )
 
         return RenderedImageResult(
@@ -304,11 +292,21 @@ class ViewerService:
                 window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
                 imageFormat=image_format,
                 viewId=view.view_id,
+                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
+                orientation=self._serialize_orientation_overlay(
+                    self._build_stack_orientation_overlay(render_plan.render_view, cached.dataset)
+                ),
             ),
             image_bytes=self._encode_image(image, image_format),
         )
 
-    def _render_mpr_view(self, view: ViewRecord, image_format: ImageFormat = "png") -> RenderedImageResult:
+    def _render_mpr_view(
+        self,
+        view: ViewRecord,
+        image_format: ImageFormat = "png",
+        *,
+        fast_preview: bool = False,
+    ) -> RenderedImageResult:
         if not view.width or not view.height:
             raise HTTPException(status_code=400, detail="View size has not been set")
 
@@ -318,7 +316,8 @@ class ViewerService:
             self._initialize_mpr_viewport(view)
             view.is_initialized = True
 
-        plane_pixels, current, total = self._extract_mpr_plane(view, volume, view.mpr_viewport)
+        target_viewport = self._resolve_mpr_viewport(view)
+        plane_pixels, current, total = self._extract_mpr_plane(view, volume, target_viewport)
         render_plan = self._build_render_plan_for_shape(view, *plane_pixels.shape[:2])
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_pixels.shape[1],
@@ -327,16 +326,35 @@ class ViewerService:
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
         )
-        windowed = self._window_array(plane_pixels, view.window_width, view.window_center)
-        transformed = viewport_transformer.apply_affine_array(
-            windowed,
-            render_plan.render_view.width or 0,
-            render_plan.render_view.height or 0,
-            image_transform,
-            order=1,
-            cval=0.0,
+        plane_min = float(np.min(plane_pixels))
+        plane_max = float(np.max(plane_pixels))
+        mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(view, volume.shape, plane_pixels.shape, image_transform)
+        reference_instance, reference_cached = self._get_reference_instance_and_cache(series)
+        slice_corner_info = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            reference_cached.dataset if reference_cached is not None else None,
+            current_index=current,
+            total_slices=total,
+            viewport_label=self._build_mpr_viewport_label(target_viewport),
         )
-        image = Image.fromarray(transformed, mode="L")
+        context = RenderContext(
+            view=render_plan.render_view,
+            source_pixels=plane_pixels,
+            pixel_min=plane_min,
+            pixel_max=plane_max,
+            image_transform=image_transform,
+            instance=reference_instance,
+            cached=reference_cached,
+            mpr_viewport=target_viewport,
+            mpr_crosshair=mpr_crosshair_overlay,
+            corner_info=None,
+            orientation=None,
+        )
+        if fast_preview:
+            image = self._render_fast_mpr_preview(context)
+        else:
+            image = layered_renderer.render(context)
 
         return RenderedImageResult(
             meta=ViewImageResponse(
@@ -344,25 +362,50 @@ class ViewerService:
                 window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
                 imageFormat=image_format,
                 viewId=view.view_id,
+                mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
+                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
+                orientation=self._serialize_orientation_overlay(
+                    self._build_mpr_orientation_overlay(render_plan.render_view, target_viewport)
+                ),
             ),
             image_bytes=self._encode_image(image, image_format),
         )
 
     @staticmethod
-    def _render_fast_window_image(
-        render_plan: RenderPlan,
-        cached: CachedDicom,
+    def _render_fast_mpr_preview(context: RenderContext) -> Image.Image:
+        return ViewerService._render_fast_preview(context)
+
+    @staticmethod
+    def _render_fast_preview(context: RenderContext) -> Image.Image:
+        image = ViewerService._render_fast_grayscale_image(
+            source_pixels=context.source_pixels,
+            pixel_min=context.pixel_min,
+            pixel_max=context.pixel_max,
+            render_view=context.view,
+            image_transform=context.image_transform,
+        ).convert("RGBA")
+        return layered_renderer.composite_overlays(image, context)
+
+    @staticmethod
+    @staticmethod
+    def _render_fast_grayscale_image(
+        source_pixels: np.ndarray,
+        pixel_min: float,
+        pixel_max: float,
+        render_view: ViewRecord,
         image_transform,
     ) -> Image.Image:
-        base_pixels = ViewerService._window_pixels(
-            cached,
-            render_plan.render_view.window_width,
-            render_plan.render_view.window_center,
+        base_pixels = ViewerService._window_array(
+            source_pixels,
+            render_view.window_width,
+            render_view.window_center,
+            pixel_min=pixel_min,
+            pixel_max=pixel_max,
         )
         transformed = viewport_transformer.apply_affine_array(
             base_pixels,
-            render_plan.render_view.width or 0,
-            render_plan.render_view.height or 0,
+            render_view.width or 0,
+            render_view.height or 0,
             image_transform,
             order=1,
             cval=0.0,
@@ -376,13 +419,17 @@ class ViewerService:
 
         render_width = max(1, int(round((view.width or 1) * render_ratio)))
         render_height = max(1, int(round((view.height or 1) * render_ratio)))
+        scaled_transform = replace(
+            view.transform,
+            zoom=view.zoom * render_ratio,
+            offset_x=view.offset_x * render_ratio,
+            offset_y=view.offset_y * render_ratio,
+        )
         render_view = replace(
             view,
             width=render_width,
             height=render_height,
-            zoom=view.zoom * render_ratio,
-            offset_x=view.offset_x * render_ratio,
-            offset_y=view.offset_y * render_ratio,
+            transform=scaled_transform,
         )
         return RenderPlan(render_view=render_view, render_ratio=render_ratio)
 
@@ -407,6 +454,15 @@ class ViewerService:
         height_ratio = image_height / view.height
         return max(width_ratio, height_ratio)
 
+    @staticmethod
+    def _get_mpr_plane_shape(volume_shape: tuple[int, int, int], viewport_key: str) -> tuple[int, int]:
+        depth, height, width = volume_shape
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            return depth, width
+        if viewport_key == MPR_VIEWPORT_SAGITTAL:
+            return depth, height
+        return height, width
+
     def _extract_mpr_plane(
         self,
         view: ViewRecord,
@@ -414,9 +470,11 @@ class ViewerService:
         viewport_key: str | None = None,
     ) -> tuple[np.ndarray, int, int]:
         depth, height, width = volume.shape
-        target_viewport = viewport_key or view.mpr_viewport
+        target_viewport = viewport_key or self._resolve_mpr_viewport(view)
         if target_viewport == MPR_VIEWPORT_CORONAL:
             index = max(0, min(view.mpr_coronal_index, height - 1))
+            # 从 3D volume 切出来的一张 2D 切面
+            # np.flipud(...)：把这张切面上下翻过来
             plane = np.flipud(volume[:, index, :])
             return plane.astype(np.float32), index, height
         if target_viewport == MPR_VIEWPORT_SAGITTAL:
@@ -601,15 +659,620 @@ class ViewerService:
             view.drag_origin_window_width = None
             view.drag_origin_window_center = None
 
-    @staticmethod
-    def _window_pixels(cached: CachedDicom, window_width: float | None, window_center: float | None) -> np.ndarray:
-        return ViewerService._window_array(
-            cached.source_pixels,
-            window_width or cached.window_width,
-            window_center or cached.window_center,
-            pixel_min=cached.pixel_min,
-            pixel_max=cached.pixel_max,
+    def _get_mpr_group_views(self, view: ViewRecord) -> list[ViewRecord]:
+        if view.view_group is None:
+            return [view]
+        group_views = view_registry.list_view_group(view.view_group.group_id)
+        return group_views or [view]
+
+    def _handle_mpr_crosshair(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if payload.x is None or payload.y is None:
+            return False
+        if not self._is_mpr_view_type(view.view_type):
+            return False
+        if not view.width or not view.height:
+            raise HTTPException(status_code=400, detail="View size has not been set")
+
+        volume = self._get_series_volume(series_registry.get(view.series_id))
+        target_viewport = self._resolve_mpr_viewport(view)
+        plane_shape = self._get_mpr_plane_shape(volume.shape, target_viewport)
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=plane_shape[1],
+            image_height=plane_shape[0],
+            canvas_width=view.width,
+            canvas_height=view.height,
+            view=view,
         )
+        crosshair_info = self._build_mpr_crosshair_info(
+            self._build_mpr_crosshair_overlay(view, volume.shape, plane_shape, image_transform)
+        )
+
+        if payload.action_type == DRAG_ACTION_START:
+            view.mpr_crosshair_drag_active = self._is_point_near_mpr_crosshair_center(
+                crosshair_info,
+                float(payload.x),
+                float(payload.y),
+            )
+            return False
+
+        if payload.action_type == DRAG_ACTION_END:
+            was_dragging = view.mpr_crosshair_drag_active
+            view.mpr_crosshair_drag_active = False
+            return was_dragging
+
+        if payload.action_type != DRAG_ACTION_MOVE or not view.mpr_crosshair_drag_active:
+            return False
+
+        image_x, image_y = self._canvas_to_image_coordinates(image_transform, float(payload.x), float(payload.y))
+        depth, height, width = volume.shape
+        previous_indices = (view.mpr_axial_index, view.mpr_coronal_index, view.mpr_sagittal_index)
+
+        if target_viewport == MPR_VIEWPORT_CORONAL:
+            view.mpr_sagittal_index = max(0, min(int(round(image_x)), width - 1))
+            view.mpr_axial_index = max(0, min(depth - 1 - int(round(image_y)), depth - 1))
+        elif target_viewport == MPR_VIEWPORT_SAGITTAL:
+            view.mpr_coronal_index = max(0, min(int(round(image_x)), height - 1))
+            view.mpr_axial_index = max(0, min(depth - 1 - int(round(image_y)), depth - 1))
+        else:
+            view.mpr_sagittal_index = max(0, min(int(round(image_x)), width - 1))
+            view.mpr_coronal_index = max(0, min(int(round(image_y)), height - 1))
+
+        current_indices = (view.mpr_axial_index, view.mpr_coronal_index, view.mpr_sagittal_index)
+        if current_indices == previous_indices:
+            return False
+
+        view.current_index = view.mpr_axial_index
+        view.is_initialized = True
+        return True
+
+    @staticmethod
+    def _build_mpr_crosshair_info(overlay: MprCrosshairOverlay) -> MprCrosshairInfo | None:
+        if overlay.center_x is None or overlay.center_y is None:
+            return None
+
+        return MprCrosshairInfo(
+            centerX=float(overlay.center_x),
+            centerY=float(overlay.center_y),
+            hitRadius=CROSSHAIR_HIT_RADIUS,
+        )
+
+    @staticmethod
+    def _is_point_near_mpr_crosshair_center(
+        crosshair_info: MprCrosshairInfo | None,
+        canvas_x: float,
+        canvas_y: float,
+    ) -> bool:
+        if crosshair_info is None:
+            return False
+
+        delta_x = canvas_x - crosshair_info.center_x
+        delta_y = canvas_y - crosshair_info.center_y
+        return delta_x * delta_x + delta_y * delta_y <= crosshair_info.hit_radius * crosshair_info.hit_radius
+
+    @staticmethod
+    def _canvas_to_image_coordinates(image_transform, canvas_x: float, canvas_y: float) -> tuple[float, float]:
+        inverse = np.linalg.inv(image_transform.matrix)
+        point = inverse @ np.array([canvas_x, canvas_y, 1.0], dtype=np.float64)
+        return float(point[0]), float(point[1])
+
+    @staticmethod
+    def _build_mpr_crosshair_overlay(
+        view: ViewRecord,
+        volume_shape: tuple[int, int, int],
+        plane_shape: tuple[int, int],
+        image_transform,
+    ) -> MprCrosshairOverlay:
+        depth, _, _ = volume_shape
+        plane_height, plane_width = plane_shape
+        canvas_width = view.width or plane_width
+        canvas_height = view.height or plane_height
+        target_viewport = ViewerService._resolve_mpr_viewport(view)
+        is_active = view.mpr_active_viewport == target_viewport
+        line_alpha = 255
+
+        def with_alpha(rgb: tuple[int, int, int], alpha: int) -> tuple[int, int, int, int]:
+            return rgb[0], rgb[1], rgb[2], alpha
+
+        axial_color = with_alpha((255, 0, 0), line_alpha)
+        coronal_color = with_alpha((0, 255, 0), line_alpha)
+        sagittal_color = with_alpha((0, 102, 255), line_alpha)
+
+        def image_to_canvas(image_x: float, image_y: float) -> tuple[float, float]:
+            point = image_transform.matrix @ np.array([image_x, image_y, 1.0], dtype=np.float64)
+            return float(point[0]), float(point[1])
+
+        if target_viewport == MPR_VIEWPORT_CORONAL:
+            center_x, center_y = image_to_canvas(float(view.mpr_sagittal_index), float(depth - 1 - view.mpr_axial_index))
+            _, horizontal_position = image_to_canvas(0.0, float(depth - 1 - view.mpr_axial_index))
+            vertical_position, _ = image_to_canvas(float(view.mpr_sagittal_index), 0.0)
+            return MprCrosshairOverlay(
+                width=canvas_width,
+                height=canvas_height,
+                horizontal_position=horizontal_position,
+                horizontal_color=axial_color,
+                vertical_position=vertical_position,
+                vertical_color=sagittal_color,
+                center_x=center_x,
+                center_y=center_y,
+                is_active=is_active,
+            )
+        if target_viewport == MPR_VIEWPORT_SAGITTAL:
+            center_x, center_y = image_to_canvas(float(view.mpr_coronal_index), float(depth - 1 - view.mpr_axial_index))
+            _, horizontal_position = image_to_canvas(0.0, float(depth - 1 - view.mpr_axial_index))
+            vertical_position, _ = image_to_canvas(float(view.mpr_coronal_index), 0.0)
+            return MprCrosshairOverlay(
+                width=canvas_width,
+                height=canvas_height,
+                horizontal_position=horizontal_position,
+                horizontal_color=axial_color,
+                vertical_position=vertical_position,
+                vertical_color=coronal_color,
+                center_x=center_x,
+                center_y=center_y,
+                is_active=is_active,
+            )
+        center_x, center_y = image_to_canvas(float(view.mpr_sagittal_index), float(view.mpr_coronal_index))
+        _, horizontal_position = image_to_canvas(0.0, float(view.mpr_coronal_index))
+        vertical_position, _ = image_to_canvas(float(view.mpr_sagittal_index), 0.0)
+        return MprCrosshairOverlay(
+            width=canvas_width,
+            height=canvas_height,
+            horizontal_position=horizontal_position,
+            horizontal_color=coronal_color,
+            vertical_position=vertical_position,
+            vertical_color=sagittal_color,
+            center_x=center_x,
+            center_y=center_y,
+            is_active=is_active,
+        )
+
+    @staticmethod
+    def _get_reference_instance_and_cache(series: SeriesRecord) -> tuple[InstanceRecord | None, CachedDicom | None]:
+        for instance in series.instances:
+            if not instance.sop_instance_uid:
+                continue
+            return instance, dicom_cache.get(instance.sop_instance_uid, instance.path)
+        return None, None
+
+    def _build_series_corner_info_overlay(
+        self,
+        series: SeriesRecord,
+        dataset: Dataset | None,
+    ) -> CornerInfoOverlay:
+        manufacturer = self._safe_text(getattr(dataset, "Manufacturer", None))
+        manufacturer_model = self._safe_text(getattr(dataset, "ManufacturerModelName", None))
+        station_name = self._safe_text(getattr(dataset, "StationName", None))
+        institution_name = self._safe_text(getattr(dataset, "InstitutionName", None))
+        study_description = self._safe_text(getattr(dataset, "StudyDescription", None))
+        exam_text = self._first_non_empty(
+            study_description,
+            self._safe_text(getattr(dataset, "StudyID", None)),
+            self._safe_text(series.series_description),
+        )
+        series_number = self._safe_text(getattr(dataset, "SeriesNumber", None))
+        patient_name = self._safe_text(getattr(dataset, "PatientName", None))
+        patient_id = self._first_non_empty(self._safe_text(getattr(dataset, "PatientID", None)), self._safe_text(series.patient_id))
+        patient_sex = self._safe_text(getattr(dataset, "PatientSex", None))
+        patient_age = self._safe_text(getattr(dataset, "PatientAge", None))
+        acquisition_date = self._first_non_empty(
+            self._format_dicom_date(getattr(dataset, "AcquisitionDate", None)),
+            self._format_dicom_date(getattr(dataset, "ContentDate", None)),
+            self._format_dicom_date(getattr(dataset, "StudyDate", None)),
+        )
+        acquisition_time = self._first_non_empty(
+            self._format_dicom_time(getattr(dataset, "AcquisitionTime", None)),
+            self._format_dicom_time(getattr(dataset, "ContentTime", None)),
+            self._format_dicom_time(getattr(dataset, "StudyTime", None)),
+        )
+        kv = self._format_number(getattr(dataset, "KVP", None), suffix="kV")
+        ma = self._format_number(getattr(dataset, "XRayTubeCurrent", None), suffix="mA")
+        thickness = self._format_number(getattr(dataset, "SliceThickness", None), suffix="mm")
+
+        vendor_line = self._join_non_empty(" / ", manufacturer, manufacturer_model)
+        patient_meta = self._join_non_empty(" ", patient_id, self._join_non_empty(" / ", patient_sex, patient_age))
+        technique_parts = [part for part in (kv, ma) if part]
+
+        top_left = tuple(
+            line
+            for line in (
+                vendor_line,
+                station_name,
+                institution_name,
+                exam_text,
+                f"Se: {series_number}" if series_number else None,
+            )
+            if line
+        )
+        top_right = tuple(
+            line
+            for line in (
+                patient_name,
+                patient_meta,
+            )
+            if line
+        )
+        bottom_left = tuple(
+            line
+            for line in (
+                " ".join(technique_parts) if technique_parts else None,
+                thickness,
+                self._join_non_empty(" ", acquisition_date, acquisition_time),
+            )
+            if line
+        )
+        return CornerInfoOverlay(
+            top_left=top_left,
+            top_right=top_right,
+            bottom_left=bottom_left,
+            bottom_right=tuple(),
+        )
+
+    def _build_slice_corner_info_overlay(
+        self,
+        view: ViewRecord,
+        series: SeriesRecord,
+        dataset: Dataset | None,
+        *,
+        current_index: int,
+        total_slices: int,
+        viewport_label: str,
+    ) -> CornerInfoOverlay:
+        zoom = self._format_number(view.zoom, precision=2, suffix="x")
+        physical_location = self._build_physical_location_label(view, series, dataset, current_index, viewport_label)
+        top_left = tuple(
+            line
+            for line in (
+                self._join_non_empty("  ", viewport_label, physical_location),
+                f"Im: {current_index + 1}/{total_slices}" if total_slices > 0 else None,
+            )
+            if line
+        )
+        top_right = tuple()
+        bottom_left = tuple(
+            line
+            for line in (
+                self._build_window_label(view.window_width, view.window_center),
+            )
+            if line
+        )
+        bottom_right = tuple(
+            line
+            for line in (
+                f"Zoom:{zoom}" if zoom else None,
+                f"X:{int(round(view.offset_x))} Y:{int(round(view.offset_y))}",
+            )
+            if line
+        )
+        return CornerInfoOverlay(
+            top_left=top_left,
+            top_right=top_right,
+            bottom_left=bottom_left,
+            bottom_right=bottom_right,
+        )
+
+    @staticmethod
+    def _serialize_corner_info_overlay(overlay: CornerInfoOverlay) -> CornerInfoPayload:
+        return CornerInfoPayload(
+            topLeft=list(overlay.top_left),
+            topRight=list(overlay.top_right),
+            bottomLeft=list(overlay.bottom_left),
+            bottomRight=list(overlay.bottom_right),
+        )
+
+    @staticmethod
+    def _serialize_orientation_overlay(overlay: OrientationOverlay | None) -> OrientationInfo:
+        return OrientationInfo(
+            top=overlay.top if overlay is not None else None,
+            right=overlay.right if overlay is not None else None,
+            bottom=overlay.bottom if overlay is not None else None,
+            left=overlay.left if overlay is not None else None,
+        )
+
+    def _build_physical_location_label(
+        self,
+        view: ViewRecord,
+        series: SeriesRecord,
+        dataset: Dataset | None,
+        current_index: int,
+        viewport_label: str,
+    ) -> str | None:
+        label = viewport_label.lower()
+        if self._is_mpr_view_type(view.view_type):
+            transform = self._get_series_patient_transform(series)
+            if transform is not None:
+                shape = transform["shape"]
+                x_index = max(0, min(view.mpr_sagittal_index, int(shape[2]) - 1))
+                y_index = max(0, min(view.mpr_coronal_index, int(shape[1]) - 1))
+                z_index = max(0, min(view.mpr_axial_index, int(shape[0]) - 1))
+                patient_point = (
+                    transform["origin"]
+                    + transform["axis_vectors"][0] * float(z_index)
+                    + transform["axis_vectors"][1] * float(y_index)
+                    + transform["axis_vectors"][2] * float(x_index)
+                )
+                if label.startswith("cor"):
+                    return self._format_oriented_mm(float(patient_point[1]), positive="P", negative="A")
+                if label.startswith("sag"):
+                    return self._format_oriented_mm(float(patient_point[0]), positive="L", negative="R")
+                if label.startswith("ax"):
+                    return self._format_oriented_mm(float(patient_point[2]), positive="S", negative="I")
+                return self._join_non_empty(
+                    " ",
+                    self._format_oriented_mm(float(patient_point[0]), positive="L", negative="R"),
+                    self._format_oriented_mm(float(patient_point[1]), positive="P", negative="A"),
+                    self._format_oriented_mm(float(patient_point[2]), positive="S", negative="I"),
+                )
+
+        position = self._get_dataset_position(dataset)
+        if position is None:
+            return None
+        if label.startswith("stack") or label.startswith("ax"):
+            return self._format_oriented_mm(float(position[2]), positive="S", negative="I")
+        if label.startswith("cor"):
+            return self._format_oriented_mm(float(position[1]), positive="P", negative="A")
+        if label.startswith("sag"):
+            return self._format_oriented_mm(float(position[0]), positive="L", negative="R")
+        return self._join_non_empty(
+            " ",
+            self._format_oriented_mm(float(position[0]), positive="L", negative="R"),
+            self._format_oriented_mm(float(position[1]), positive="P", negative="A"),
+            self._format_oriented_mm(float(position[2]), positive="S", negative="I"),
+        )
+
+    def _get_series_patient_transform(self, series: SeriesRecord) -> dict[str, object] | None:
+        slice_entries: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, Dataset]] = []
+        for instance in series.instances:
+            if not instance.sop_instance_uid:
+                continue
+            cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
+            dataset = cached.dataset
+            slice_entries.append((
+                cached.source_pixels,
+                self._get_dataset_orientation(dataset),
+                self._get_dataset_position(dataset),
+                dataset,
+            ))
+
+        if not slice_entries:
+            return None
+
+        orientation = next((item[1] for item in slice_entries if item[1] is not None), None)
+        if orientation is None:
+            return None
+
+        row_direction = self._normalize_vector(orientation[:3])
+        column_direction = self._normalize_vector(orientation[3:6])
+        if row_direction is None or column_direction is None:
+            return None
+
+        slice_direction = self._normalize_vector(np.cross(row_direction, column_direction))
+        if slice_direction is None:
+            return None
+
+        positions = [item[2] for item in slice_entries]
+        if any(position is None for position in positions):
+            ordered_entries = slice_entries
+        else:
+            ordered_entries = sorted(
+                slice_entries,
+                key=lambda item: float(np.dot(item[2], slice_direction)) if item[2] is not None else 0.0,
+            )
+
+        first_dataset = ordered_entries[0][3]
+        pixel_spacing = getattr(first_dataset, "PixelSpacing", None)
+        if pixel_spacing is None or len(pixel_spacing) < 2:
+            return None
+
+        try:
+            row_spacing = abs(float(pixel_spacing[0]))
+            col_spacing = abs(float(pixel_spacing[1]))
+        except (TypeError, ValueError):
+            return None
+
+        ordered_positions = [item[2] for item in ordered_entries if item[2] is not None]
+        slice_spacing = self._estimate_slice_spacing(ordered_positions, slice_direction, first_dataset)
+
+        raw_axis_vectors = (slice_direction, column_direction, row_direction)
+        raw_axis_steps = (slice_spacing, row_spacing, col_spacing)
+        raw_lengths = (
+            len(ordered_entries),
+            int(getattr(first_dataset, "Rows", 0) or 0),
+            int(getattr(first_dataset, "Columns", 0) or 0),
+        )
+        if any(length <= 0 for length in raw_lengths):
+            return None
+
+        patient_axes: list[int] = []
+        axis_signs: list[int] = []
+        for vector in raw_axis_vectors:
+            patient_axis = int(np.argmax(np.abs(vector)))
+            if patient_axis in patient_axes:
+                return None
+            patient_axes.append(patient_axis)
+            axis_signs.append(1 if vector[patient_axis] >= 0 else -1)
+
+        transpose_order = [patient_axes.index(2), patient_axes.index(1), patient_axes.index(0)]
+        canonical_signs = [
+            axis_signs[patient_axes.index(2)],
+            axis_signs[patient_axes.index(1)],
+            axis_signs[patient_axes.index(0)],
+        ]
+
+        origin = np.asarray(ordered_entries[0][2], dtype=np.float64)
+        for canonical_axis, raw_axis in enumerate(transpose_order):
+            if canonical_signs[canonical_axis] < 0:
+                origin = origin + raw_axis_vectors[raw_axis] * raw_axis_steps[raw_axis] * float(raw_lengths[raw_axis] - 1)
+
+        axis_vectors = tuple(
+            raw_axis_vectors[raw_axis] * raw_axis_steps[raw_axis] * float(canonical_signs[canonical_axis])
+            for canonical_axis, raw_axis in enumerate(transpose_order)
+        )
+        shape = tuple(raw_lengths[raw_axis] for raw_axis in transpose_order)
+        return {
+            "origin": origin,
+            "axis_vectors": axis_vectors,
+            "shape": shape,
+        }
+
+    @staticmethod
+    def _estimate_slice_spacing(
+        positions: list[np.ndarray],
+        slice_direction: np.ndarray,
+        dataset: Dataset | None,
+    ) -> float:
+        if len(positions) >= 2:
+            projected = sorted(float(np.dot(position, slice_direction)) for position in positions)
+            diffs = [abs(projected[index] - projected[index - 1]) for index in range(1, len(projected))]
+            diffs = [diff for diff in diffs if diff > 1e-6]
+            if diffs:
+                return float(np.median(diffs))
+        slice_thickness = getattr(dataset, "SliceThickness", None) if dataset is not None else None
+        try:
+            thickness = abs(float(slice_thickness))
+            if thickness > 0:
+                return thickness
+        except (TypeError, ValueError):
+            pass
+        return 1.0
+
+    @staticmethod
+    def _format_oriented_mm(value: float, *, positive: str, negative: str) -> str:
+        orientation = positive if float(value) >= 0 else negative
+        magnitude = abs(float(value))
+        return f"{orientation} {magnitude:.2f}mm"
+
+    def _build_stack_orientation_overlay(self, view: ViewRecord, dataset: Dataset | None) -> OrientationOverlay | None:
+        orientation = self._get_dataset_orientation(dataset)
+        if orientation is None:
+            return None
+
+        row_direction = self._normalize_vector(orientation[:3])
+        column_direction = self._normalize_vector(orientation[3:6])
+        if row_direction is None or column_direction is None:
+            return None
+
+        x_vector = row_direction * (-1.0 if view.hor_flip else 1.0)
+        y_vector = column_direction * (-1.0 if view.ver_flip else 1.0)
+        return OrientationOverlay(
+            top=self._orientation_text_for_vector(-y_vector),
+            right=self._orientation_text_for_vector(x_vector),
+            bottom=self._orientation_text_for_vector(y_vector),
+            left=self._orientation_text_for_vector(-x_vector),
+        )
+
+    def _build_mpr_orientation_overlay(self, view: ViewRecord, viewport_key: str) -> OrientationOverlay:
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            x_vector = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+            y_vector = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
+        elif viewport_key == MPR_VIEWPORT_SAGITTAL:
+            x_vector = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+            y_vector = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
+        else:
+            x_vector = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+            y_vector = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+
+        if view.hor_flip:
+            x_vector = -x_vector
+        if view.ver_flip:
+            y_vector = -y_vector
+
+        return OrientationOverlay(
+            top=self._orientation_text_for_vector(-y_vector),
+            right=self._orientation_text_for_vector(x_vector),
+            bottom=self._orientation_text_for_vector(y_vector),
+            left=self._orientation_text_for_vector(-x_vector),
+        )
+
+    @staticmethod
+    def _build_mpr_viewport_label(viewport_key: str) -> str:
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            return "CORONAL"
+        if viewport_key == MPR_VIEWPORT_SAGITTAL:
+            return "SAGITTAL"
+        return "AXIAL"
+
+    @staticmethod
+    def _build_window_label(window_width: float | None, window_center: float | None) -> str | None:
+        ww = ViewerService._format_number(window_width, precision=0)
+        wl = ViewerService._format_number(window_center, precision=0)
+        if ww is None and wl is None:
+            return None
+        return f"W: {ww or '-'} L: {wl or '-'}"
+
+    @staticmethod
+    def _safe_text(value) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _first_non_empty(*values: str | None) -> str | None:
+        for value in values:
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _join_non_empty(separator: str, *values: str | None) -> str | None:
+        parts = [value for value in values if value]
+        if not parts:
+            return None
+        return separator.join(parts)
+
+    @staticmethod
+    def _format_number(value, *, precision: int = 1, suffix: str = "") -> str | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            text = str(value).strip()
+            return f"{text}{suffix}" if text else None
+        if precision <= 0:
+            rendered = str(int(round(numeric)))
+        else:
+            rendered = f"{numeric:.{precision}f}".rstrip("0").rstrip(".")
+        return f"{rendered}{suffix}"
+
+    @staticmethod
+    def _format_dicom_date(value) -> str | None:
+        text = ViewerService._safe_text(value)
+        if not text or len(text) != 8 or not text.isdigit():
+            return text
+        return f"{text[:4]}.{text[4:6]}.{text[6:8]}"
+
+    @staticmethod
+    def _format_dicom_time(value) -> str | None:
+        text = ViewerService._safe_text(value)
+        if not text:
+            return None
+        digits = ''.join(ch for ch in text if ch.isdigit())
+        if len(digits) < 6:
+            return text
+        return f"{digits[:2]}:{digits[2:4]}:{digits[4:6]}"
+
+    @staticmethod
+    def _orientation_text_for_vector(vector: np.ndarray | None) -> str | None:
+        if vector is None:
+            return None
+        axis_map = (
+            (0, "L", "R"),
+            (1, "P", "A"),
+            (2, "S", "I"),
+        )
+        components: list[tuple[float, str]] = []
+        for axis_index, positive_label, negative_label in axis_map:
+            component = float(vector[axis_index])
+            magnitude = abs(component)
+            if magnitude < 0.2:
+                continue
+            label = positive_label if component >= 0 else negative_label
+            components.append((magnitude, label))
+        if not components:
+            return None
+        components.sort(key=lambda item: item[0], reverse=True)
+        return ''.join(label for _, label in components[:3])
 
     @staticmethod
     def _window_array(
@@ -634,13 +1297,24 @@ class ViewerService:
         if scale <= 0:
             return np.zeros(pixels.shape, dtype=np.uint8)
 
-        normalized = (pixels - lower) * (255.0 / scale)
-        clipped = np.clip(normalized, 0.0, 255.0)
-        return clipped.astype(np.uint8)
+        normalized = np.asarray(pixels, dtype=np.float32).copy()
+        np.clip(normalized, lower, upper, out=normalized)
+        normalized -= lower
+        normalized *= 255.0 / scale
+        return normalized.astype(np.uint8, copy=False)
+
+    @staticmethod
+    def _resolve_mpr_viewport(view: ViewRecord) -> str:
+        if view.view_type == "COR":
+            return MPR_VIEWPORT_CORONAL
+        if view.view_type == "SAG":
+            return MPR_VIEWPORT_SAGITTAL
+        return MPR_VIEWPORT_AXIAL
 
     @staticmethod
     def _derive_default_window_width(cached: CachedDicom) -> float:
         return max(WINDOW_WIDTH_MIN, cached.pixel_max - cached.pixel_min)
+
 
     @staticmethod
     def _derive_default_window_center(cached: CachedDicom) -> float:
@@ -665,3 +1339,5 @@ class ViewerService:
 
 
 viewer_service = ViewerService()
+
+
