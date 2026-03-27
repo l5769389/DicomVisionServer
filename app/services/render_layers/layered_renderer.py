@@ -3,7 +3,6 @@ from PIL import Image
 from app.services.render_layers.base_image_layer import BaseImageLayer
 from app.services.render_layers.corner_info_layer import CornerInfoLayer
 from app.services.render_layers.measurement_layer import MeasurementLayer
-from app.services.render_layers.mpr_crosshair_layer import MprCrosshairLayer
 from app.services.render_layers.render_context import RenderContext, RenderLayer
 from app.services.viewport_transformer import viewport_transformer
 from app.utils.utils import timer
@@ -15,7 +14,6 @@ class LayeredRenderer:
         self._overlay_layers: tuple[RenderLayer, ...] = (
             CornerInfoLayer(),
             MeasurementLayer(),
-            MprCrosshairLayer(),
         )
 
     def render(self, context: RenderContext) -> Image.Image:
@@ -64,7 +62,6 @@ class LayeredRenderer:
         return any(
             (
                 context.corner_info is not None,
-                context.mpr_crosshair is not None,
             )
         )
 

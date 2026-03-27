@@ -60,6 +60,8 @@ class MprCrosshairInfo(BaseModel):
     center_x: float = Field(alias="centerX")
     center_y: float = Field(alias="centerY")
     hit_radius: float = Field(alias="hitRadius")
+    horizontal_position: float | None = Field(default=None, alias="horizontalPosition")
+    vertical_position: float | None = Field(default=None, alias="verticalPosition")
 
     model_config = {"populate_by_name": True}
 

@@ -347,7 +347,7 @@ class ViewerService:
             instance=reference_instance,
             cached=reference_cached,
             mpr_viewport=target_viewport,
-            mpr_crosshair=mpr_crosshair_overlay,
+            mpr_crosshair=None,
             corner_info=None,
             orientation=None,
         )
@@ -386,7 +386,6 @@ class ViewerService:
         ).convert("RGBA")
         return layered_renderer.composite_overlays(image, context)
 
-    @staticmethod
     @staticmethod
     def _render_fast_grayscale_image(
         source_pixels: np.ndarray,
@@ -688,11 +687,7 @@ class ViewerService:
         )
 
         if payload.action_type == DRAG_ACTION_START:
-            view.mpr_crosshair_drag_active = self._is_point_near_mpr_crosshair_center(
-                crosshair_info,
-                float(payload.x),
-                float(payload.y),
-            )
+            view.mpr_crosshair_drag_active = True
             return False
 
         if payload.action_type == DRAG_ACTION_END:
@@ -703,19 +698,25 @@ class ViewerService:
         if payload.action_type != DRAG_ACTION_MOVE or not view.mpr_crosshair_drag_active:
             return False
 
-        image_x, image_y = self._canvas_to_image_coordinates(image_transform, float(payload.x), float(payload.y))
+        overlay = self._build_mpr_crosshair_overlay(view, volume.shape, plane_shape, image_transform)
+        if overlay.image_width <= 0 or overlay.image_height <= 0:
+            return False
+
+        canvas_x = overlay.image_left + float(payload.x) * float(overlay.image_width)
+        canvas_y = overlay.image_top + float(payload.y) * float(overlay.image_height)
+        image_x, image_y = self._canvas_to_image_coordinates(image_transform, canvas_x, canvas_y)
         depth, height, width = volume.shape
         previous_indices = (view.mpr_axial_index, view.mpr_coronal_index, view.mpr_sagittal_index)
 
         if target_viewport == MPR_VIEWPORT_CORONAL:
-            view.mpr_sagittal_index = max(0, min(int(round(image_x)), width - 1))
-            view.mpr_axial_index = max(0, min(depth - 1 - int(round(image_y)), depth - 1))
+            view.mpr_sagittal_index = max(0, min(int(np.floor(image_x)), width - 1))
+            view.mpr_axial_index = max(0, min(depth - 1 - int(np.floor(image_y)), depth - 1))
         elif target_viewport == MPR_VIEWPORT_SAGITTAL:
-            view.mpr_coronal_index = max(0, min(int(round(image_x)), height - 1))
-            view.mpr_axial_index = max(0, min(depth - 1 - int(round(image_y)), depth - 1))
+            view.mpr_coronal_index = max(0, min(int(np.floor(image_x)), height - 1))
+            view.mpr_axial_index = max(0, min(depth - 1 - int(np.floor(image_y)), depth - 1))
         else:
-            view.mpr_sagittal_index = max(0, min(int(round(image_x)), width - 1))
-            view.mpr_coronal_index = max(0, min(int(round(image_y)), height - 1))
+            view.mpr_sagittal_index = max(0, min(int(np.floor(image_x)), width - 1))
+            view.mpr_coronal_index = max(0, min(int(np.floor(image_y)), height - 1))
 
         current_indices = (view.mpr_axial_index, view.mpr_coronal_index, view.mpr_sagittal_index)
         if current_indices == previous_indices:
@@ -730,10 +731,33 @@ class ViewerService:
         if overlay.center_x is None or overlay.center_y is None:
             return None
 
+        normalized_radius = (
+            CROSSHAIR_HIT_RADIUS / float(min(overlay.image_width, overlay.image_height))
+            if min(overlay.image_width, overlay.image_height) > 0
+            else 0.0
+        )
         return MprCrosshairInfo(
-            centerX=float(overlay.center_x),
-            centerY=float(overlay.center_y),
-            hitRadius=CROSSHAIR_HIT_RADIUS,
+            centerX=(
+                (float(overlay.center_x) - float(overlay.image_left)) / float(overlay.image_width)
+                if overlay.image_width > 0
+                else 0.0
+            ),
+            centerY=(
+                (float(overlay.center_y) - float(overlay.image_top)) / float(overlay.image_height)
+                if overlay.image_height > 0
+                else 0.0
+            ),
+            hitRadius=normalized_radius,
+            horizontalPosition=(
+                (float(overlay.horizontal_position) - float(overlay.image_top)) / float(overlay.image_height)
+                if overlay.horizontal_position is not None and overlay.image_height > 0
+                else None
+            ),
+            verticalPosition=(
+                (float(overlay.vertical_position) - float(overlay.image_left)) / float(overlay.image_width)
+                if overlay.vertical_position is not None and overlay.image_width > 0
+                else None
+            ),
         )
 
     @staticmethod
@@ -781,13 +805,28 @@ class ViewerService:
             point = image_transform.matrix @ np.array([image_x, image_y, 1.0], dtype=np.float64)
             return float(point[0]), float(point[1])
 
+        top_left_x, top_left_y = image_to_canvas(0.0, 0.0)
+        top_right_x, top_right_y = image_to_canvas(float(plane_width), 0.0)
+        bottom_left_x, bottom_left_y = image_to_canvas(0.0, float(plane_height))
+        bottom_right_x, bottom_right_y = image_to_canvas(float(plane_width), float(plane_height))
+        image_left = min(top_left_x, top_right_x, bottom_left_x, bottom_right_x)
+        image_top = min(top_left_y, top_right_y, bottom_left_y, bottom_right_y)
+        image_right = max(top_left_x, top_right_x, bottom_left_x, bottom_right_x)
+        image_bottom = max(top_left_y, top_right_y, bottom_left_y, bottom_right_y)
+        image_width = image_right - image_left
+        image_height = image_bottom - image_top
+
         if target_viewport == MPR_VIEWPORT_CORONAL:
-            center_x, center_y = image_to_canvas(float(view.mpr_sagittal_index), float(depth - 1 - view.mpr_axial_index))
-            _, horizontal_position = image_to_canvas(0.0, float(depth - 1 - view.mpr_axial_index))
-            vertical_position, _ = image_to_canvas(float(view.mpr_sagittal_index), 0.0)
+            center_x, center_y = image_to_canvas(float(view.mpr_sagittal_index) + 0.5, float(depth - 1 - view.mpr_axial_index) + 0.5)
+            _, horizontal_position = image_to_canvas(0.0, float(depth - 1 - view.mpr_axial_index) + 0.5)
+            vertical_position, _ = image_to_canvas(float(view.mpr_sagittal_index) + 0.5, 0.0)
             return MprCrosshairOverlay(
                 width=canvas_width,
                 height=canvas_height,
+                image_left=image_left,
+                image_top=image_top,
+                image_width=image_width,
+                image_height=image_height,
                 horizontal_position=horizontal_position,
                 horizontal_color=axial_color,
                 vertical_position=vertical_position,
@@ -797,12 +836,16 @@ class ViewerService:
                 is_active=is_active,
             )
         if target_viewport == MPR_VIEWPORT_SAGITTAL:
-            center_x, center_y = image_to_canvas(float(view.mpr_coronal_index), float(depth - 1 - view.mpr_axial_index))
-            _, horizontal_position = image_to_canvas(0.0, float(depth - 1 - view.mpr_axial_index))
-            vertical_position, _ = image_to_canvas(float(view.mpr_coronal_index), 0.0)
+            center_x, center_y = image_to_canvas(float(view.mpr_coronal_index) + 0.5, float(depth - 1 - view.mpr_axial_index) + 0.5)
+            _, horizontal_position = image_to_canvas(0.0, float(depth - 1 - view.mpr_axial_index) + 0.5)
+            vertical_position, _ = image_to_canvas(float(view.mpr_coronal_index) + 0.5, 0.0)
             return MprCrosshairOverlay(
                 width=canvas_width,
                 height=canvas_height,
+                image_left=image_left,
+                image_top=image_top,
+                image_width=image_width,
+                image_height=image_height,
                 horizontal_position=horizontal_position,
                 horizontal_color=axial_color,
                 vertical_position=vertical_position,
@@ -811,12 +854,16 @@ class ViewerService:
                 center_y=center_y,
                 is_active=is_active,
             )
-        center_x, center_y = image_to_canvas(float(view.mpr_sagittal_index), float(view.mpr_coronal_index))
-        _, horizontal_position = image_to_canvas(0.0, float(view.mpr_coronal_index))
-        vertical_position, _ = image_to_canvas(float(view.mpr_sagittal_index), 0.0)
+        center_x, center_y = image_to_canvas(float(view.mpr_sagittal_index) + 0.5, float(view.mpr_coronal_index) + 0.5)
+        _, horizontal_position = image_to_canvas(0.0, float(view.mpr_coronal_index) + 0.5)
+        vertical_position, _ = image_to_canvas(float(view.mpr_sagittal_index) + 0.5, 0.0)
         return MprCrosshairOverlay(
             width=canvas_width,
             height=canvas_height,
+            image_left=image_left,
+            image_top=image_top,
+            image_width=image_width,
+            image_height=image_height,
             horizontal_position=horizontal_position,
             horizontal_color=coronal_color,
             vertical_position=vertical_position,
@@ -1339,5 +1386,7 @@ class ViewerService:
 
 
 viewer_service = ViewerService()
+
+
 
 

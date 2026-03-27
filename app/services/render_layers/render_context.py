@@ -16,6 +16,10 @@ ColorRGBA = tuple[int, int, int, int]
 class MprCrosshairOverlay:
     width: int
     height: int
+    image_left: float
+    image_top: float
+    image_width: float
+    image_height: float
     horizontal_position: float | None
     horizontal_color: ColorRGBA | None
     vertical_position: float | None

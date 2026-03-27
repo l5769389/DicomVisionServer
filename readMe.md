@@ -40,6 +40,11 @@ req : {
 res : {
     seriesId: ''
 }
+ b. /dicom/cornerInfo
+ req : {
+     seriesId: ""   
+}
+res: {}
 
 2. view
   a. /view/create
