@@ -18,10 +18,14 @@ from app.core import (
     VIEW_OP_TYPE_SET_SIZE,
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
+    VIEW_OP_TYPE_ROTATE_3D,
     WINDOW_DRAG_SENSITIVITY,
     WINDOW_WIDTH_MIN,
     ZOOM_DRAG_FACTOR_MIN,
     ZOOM_DRAG_SENSITIVITY,
+    ZOOM_DRAG_SENSITIVITY_3D,
+    ZOOM_MAX_3D,
+    ZOOM_MIN_3D,
     VIEW_OP_TYPE_SCROLL,
 )
 from app.core.logging import get_logger
@@ -45,6 +49,7 @@ from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
 from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
+from app.services.volume_rendering import VolumeRenderRequest, vtk_volume_renderer
 
 
 logger = get_logger(__name__)
@@ -67,11 +72,16 @@ class RenderPlan:
 class ViewerService:
     def __init__(self) -> None:
         self._volume_cache: dict[str, np.ndarray] = {}
+        self._series_patient_transform_cache: dict[str, dict[str, object] | None] = {}
         self._logger = logger
 
     @staticmethod
     def _is_mpr_view_type(view_type: str) -> bool:
         return view_type in {"MPR", "AX", "COR", "SAG"}
+
+    @staticmethod
+    def _is_3d_view_type(view_type: str) -> bool:
+        return view_type == "3D"
 
     def set_view_size(self, payload: ViewSetSizeRequest) -> OperationAcceptedResponse:
         if payload.op_type != VIEW_OP_TYPE_SET_SIZE:
@@ -90,6 +100,8 @@ class ViewerService:
         if not view.is_initialized:
             if self._is_mpr_view_type(view.view_type):
                 self._initialize_mpr_viewport(view)
+            elif self._is_3d_view_type(view.view_type):
+                self._initialize_3d_viewport(view)
             else:
                 self._initialize_viewport(view)
             view.is_initialized = True
@@ -127,6 +139,8 @@ class ViewerService:
     ) -> RenderedImageResult:
         if self._is_mpr_view_type(view.view_type):
             return self._render_mpr_view(view, image_format=image_format, fast_preview=fast_preview)
+        if self._is_3d_view_type(view.view_type):
+            return self._render_3d_view(view, image_format=image_format, fast_preview=fast_preview)
         return self._render_view(view, image_format=image_format, fast_preview=fast_preview)
 
     def _handle_scroll(self, view: ViewRecord, series: SeriesRecord, scroll: int) -> None:
@@ -219,6 +233,95 @@ class ViewerService:
             view.mpr_coronal_index,
             view.mpr_sagittal_index,
             view.zoom,
+        )
+
+
+    def _initialize_3d_viewport(self, view: ViewRecord) -> None:
+        if not view.width or not view.height:
+            raise HTTPException(status_code=400, detail="View size has not been set")
+
+        series = series_registry.get(view.series_id)
+        volume = self._get_series_volume(series)
+        view.current_index = max(0, min(volume.shape[0] // 2, len(series.instances) - 1)) if series.instances else 0
+
+        first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
+        if first_instance is not None and first_instance.sop_instance_uid:
+            cached = dicom_cache.get(first_instance.sop_instance_uid, first_instance.path)
+            view.window_width = cached.window_width or self._derive_default_window_width(cached)
+            view.window_center = cached.window_center or self._derive_default_window_center(cached)
+        else:
+            pixel_min = float(np.min(volume))
+            pixel_max = float(np.max(volume))
+            view.window_width = max(WINDOW_WIDTH_MIN, pixel_max - pixel_min)
+            view.window_center = (pixel_max + pixel_min) / 2.0
+
+        view.zoom = 1.0
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        view.rotation_quaternion = (0.0, 0.0, 0.0, 1.0)
+        self._reset_drag_state(view)
+        logger.info(
+            "3d viewport initialized view_id=%s volume=%s zoom=%.4f ww=%s wl=%s",
+            view.view_id,
+            volume.shape,
+            view.zoom,
+            view.window_width,
+            view.window_center,
+        )
+
+    def _render_3d_view(
+        self,
+        view: ViewRecord,
+        image_format: ImageFormat = "png",
+        *,
+        fast_preview: bool = False,
+    ) -> RenderedImageResult:
+        if not view.width or not view.height:
+            raise HTTPException(status_code=400, detail="View size has not been set")
+
+        series = series_registry.get(view.series_id)
+        volume = self._get_series_volume(series)
+        if not view.is_initialized:
+            self._initialize_3d_viewport(view)
+            view.is_initialized = True
+
+        spacing_xyz = self._get_3d_spacing_xyz(series)
+        image = vtk_volume_renderer.render(
+            VolumeRenderRequest(
+                view_id=view.view_id,
+                volume=volume,
+                spacing_xyz=spacing_xyz,
+                canvas_width=view.width,
+                canvas_height=view.height,
+                window_width=float(view.window_width or WINDOW_WIDTH_MIN),
+                window_center=float(view.window_center or 0.0),
+                zoom=float(view.zoom),
+                offset_x=float(view.offset_x),
+                offset_y=float(view.offset_y),
+                rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
+                fast_preview=fast_preview,
+            )
+        )
+
+        corner_info = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            None,
+            current_index=view.current_index,
+            total_slices=max(1, volume.shape[0]),
+            viewport_label="3D VR",
+        )
+
+        return RenderedImageResult(
+            meta=ViewImageResponse(
+                slice_info=SliceInfo(current=view.current_index, total=max(1, volume.shape[0])),
+                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
+                imageFormat=image_format,
+                viewId=view.view_id,
+                cornerInfo=self._serialize_corner_info_overlay(corner_info),
+                orientation=self._build_3d_orientation_overlay(view),
+            ),
+            image_bytes=self._encode_image(image, image_format),
         )
 
     def _render_view(
@@ -485,6 +588,31 @@ class ViewerService:
         plane = volume[index, :, :]
         return plane.astype(np.float32), index, depth
 
+    @staticmethod
+    def _clamp_3d_zoom(zoom: float) -> float:
+        return min(max(float(zoom), ZOOM_MIN_3D), ZOOM_MAX_3D)
+
+    def _get_3d_spacing_xyz(self, series: SeriesRecord) -> tuple[float, float, float]:
+        transform = self._get_series_patient_transform(series)
+        if transform is not None:
+            axis_vectors = transform.get("axis_vectors")
+            if isinstance(axis_vectors, tuple) and len(axis_vectors) == 3:
+                spacing = tuple(max(float(np.linalg.norm(axis_vectors[index])), 1e-3) for index in (2, 1, 0))
+                return spacing
+
+        reference_instance, reference_cached = self._get_reference_instance_and_cache(series)
+        dataset = reference_cached.dataset if reference_cached is not None else None
+        pixel_spacing = getattr(dataset, "PixelSpacing", None) if dataset is not None else None
+        slice_spacing = self._estimate_slice_spacing([], np.array([1.0, 0.0, 0.0], dtype=np.float64), dataset)
+        if pixel_spacing is not None and len(pixel_spacing) >= 2:
+            try:
+                row_spacing = max(abs(float(pixel_spacing[0])), 1e-3)
+                col_spacing = max(abs(float(pixel_spacing[1])), 1e-3)
+                return (col_spacing, row_spacing, max(slice_spacing, 1e-3))
+            except (TypeError, ValueError):
+                pass
+        return (1.0, 1.0, 1.0)
+
     def _get_series_volume(self, series: SeriesRecord) -> np.ndarray:
         cached_volume = self._volume_cache.get(series.series_id)
         if cached_volume is not None:
@@ -519,6 +647,7 @@ class ViewerService:
         try:
             orientation = np.asarray([float(item) for item in value[:6]], dtype=np.float64)
         except (TypeError, ValueError):
+            self._series_patient_transform_cache[series.series_id] = None
             return None
         return orientation if np.all(np.isfinite(orientation)) else None
 
@@ -530,6 +659,7 @@ class ViewerService:
         try:
             position = np.asarray([float(item) for item in value[:3]], dtype=np.float64)
         except (TypeError, ValueError):
+            self._series_patient_transform_cache[series.series_id] = None
             return None
         return position if np.all(np.isfinite(position)) else None
 
@@ -619,6 +749,59 @@ class ViewerService:
             view.drag_origin_offset_x = None
             view.drag_origin_offset_y = None
 
+    def _handle_drag_rotate_3d(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        if payload.action_type not in {DRAG_ACTION_START, DRAG_ACTION_MOVE, DRAG_ACTION_END}:
+            return
+        if payload.x is None or payload.y is None or not view.width or not view.height:
+            return
+
+        if payload.action_type == DRAG_ACTION_START:
+            view.drag_origin_arcball_x = float(payload.x)
+            view.drag_origin_arcball_y = float(payload.y)
+            return
+
+        if payload.action_type == DRAG_ACTION_END:
+            view.drag_origin_arcball_x = None
+            view.drag_origin_arcball_y = None
+            return
+
+        previous_x = view.drag_origin_arcball_x
+        previous_y = view.drag_origin_arcball_y
+        current_x = float(payload.x)
+        current_y = float(payload.y)
+        view.drag_origin_arcball_x = current_x
+        view.drag_origin_arcball_y = current_y
+        if previous_x is None or previous_y is None:
+            return
+
+        delta_x_pixels = (current_x - previous_x) * float(view.width)
+        delta_y_pixels = (current_y - previous_y) * float(view.height)
+        if abs(delta_x_pixels) < 0.01 and abs(delta_y_pixels) < 0.01:
+            return
+
+        series = series_registry.get(view.series_id)
+        volume = self._get_series_volume(series)
+        spacing_xyz = self._get_3d_spacing_xyz(series)
+        view.rotation_quaternion = vtk_volume_renderer.apply_trackball_camera_delta(
+            VolumeRenderRequest(
+                view_id=view.view_id,
+                volume=volume,
+                spacing_xyz=spacing_xyz,
+                canvas_width=view.width,
+                canvas_height=view.height,
+                window_width=float(view.window_width or WINDOW_WIDTH_MIN),
+                window_center=float(view.window_center or 0.0),
+                zoom=float(view.zoom),
+                offset_x=float(view.offset_x),
+                offset_y=float(view.offset_y),
+                rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
+                fast_preview=True,
+            ),
+            delta_x_pixels=delta_x_pixels,
+            delta_y_pixels=delta_y_pixels,
+        )
+        view.is_initialized = True
+
     def _handle_drag_zoom(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if payload.action_type == DRAG_ACTION_START:
             view.drag_origin_zoom = view.zoom
@@ -627,9 +810,13 @@ class ViewerService:
         if payload.action_type == DRAG_ACTION_MOVE:
             base_zoom = view.drag_origin_zoom if view.drag_origin_zoom is not None else view.zoom
             delta_y = float(payload.y or 0.0)
-            zoom_factor = 1.0 - delta_y * ZOOM_DRAG_SENSITIVITY
+            zoom_sensitivity = ZOOM_DRAG_SENSITIVITY_3D if self._is_3d_view_type(view.view_type) else ZOOM_DRAG_SENSITIVITY
+            zoom_factor = 1.0 - delta_y * zoom_sensitivity
             zoom_factor = max(ZOOM_DRAG_FACTOR_MIN, zoom_factor)
-            view.zoom = viewport_transformer.clamp_zoom(float(base_zoom) * zoom_factor)
+            next_zoom = viewport_transformer.clamp_zoom(float(base_zoom) * zoom_factor)
+            if self._is_3d_view_type(view.view_type):
+                next_zoom = self._clamp_3d_zoom(next_zoom)
+            view.zoom = next_zoom
             view.is_initialized = True
             return
 
@@ -1013,7 +1200,27 @@ class ViewerService:
             right=overlay.right if overlay is not None else None,
             bottom=overlay.bottom if overlay is not None else None,
             left=overlay.left if overlay is not None else None,
+            volumeQuaternion=getattr(overlay, "volume_quaternion", None) if overlay is not None else None,
         )
+
+    def _build_3d_orientation_overlay(self, view: ViewRecord) -> OrientationInfo:
+        quaternion = self._normalize_quaternion(tuple(float(value) for value in view.rotation_quaternion))
+        return OrientationInfo(
+            top=None,
+            right=None,
+            bottom=None,
+            left=None,
+            volumeQuaternion=quaternion,
+        )
+
+    @staticmethod
+    def _normalize_quaternion(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        vector = np.asarray(quaternion, dtype=np.float64)
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-12:
+            return (0.0, 0.0, 0.0, 1.0)
+        vector /= norm
+        return tuple(float(value) for value in vector)
 
     def _build_physical_location_label(
         self,
@@ -1067,6 +1274,10 @@ class ViewerService:
         )
 
     def _get_series_patient_transform(self, series: SeriesRecord) -> dict[str, object] | None:
+        cached_transform = self._series_patient_transform_cache.get(series.series_id, Ellipsis)
+        if cached_transform is not Ellipsis:
+            return cached_transform
+
         slice_entries: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, Dataset]] = []
         for instance in series.instances:
             if not instance.sop_instance_uid:
@@ -1081,19 +1292,23 @@ class ViewerService:
             ))
 
         if not slice_entries:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         orientation = next((item[1] for item in slice_entries if item[1] is not None), None)
         if orientation is None:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         row_direction = self._normalize_vector(orientation[:3])
         column_direction = self._normalize_vector(orientation[3:6])
         if row_direction is None or column_direction is None:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         slice_direction = self._normalize_vector(np.cross(row_direction, column_direction))
         if slice_direction is None:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         positions = [item[2] for item in slice_entries]
@@ -1108,12 +1323,14 @@ class ViewerService:
         first_dataset = ordered_entries[0][3]
         pixel_spacing = getattr(first_dataset, "PixelSpacing", None)
         if pixel_spacing is None or len(pixel_spacing) < 2:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         try:
             row_spacing = abs(float(pixel_spacing[0]))
             col_spacing = abs(float(pixel_spacing[1]))
         except (TypeError, ValueError):
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         ordered_positions = [item[2] for item in ordered_entries if item[2] is not None]
@@ -1134,6 +1351,7 @@ class ViewerService:
         for vector in raw_axis_vectors:
             patient_axis = int(np.argmax(np.abs(vector)))
             if patient_axis in patient_axes:
+                self._series_patient_transform_cache[series.series_id] = None
                 return None
             patient_axes.append(patient_axis)
             axis_signs.append(1 if vector[patient_axis] >= 0 else -1)
@@ -1155,11 +1373,13 @@ class ViewerService:
             for canonical_axis, raw_axis in enumerate(transpose_order)
         )
         shape = tuple(raw_lengths[raw_axis] for raw_axis in transpose_order)
-        return {
+        result = {
             "origin": origin,
             "axis_vectors": axis_vectors,
             "shape": shape,
         }
+        self._series_patient_transform_cache[series.series_id] = result
+        return result
 
     @staticmethod
     def _estimate_slice_spacing(
@@ -1191,11 +1411,13 @@ class ViewerService:
     def _build_stack_orientation_overlay(self, view: ViewRecord, dataset: Dataset | None) -> OrientationOverlay | None:
         orientation = self._get_dataset_orientation(dataset)
         if orientation is None:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         row_direction = self._normalize_vector(orientation[:3])
         column_direction = self._normalize_vector(orientation[3:6])
         if row_direction is None or column_direction is None:
+            self._series_patient_transform_cache[series.series_id] = None
             return None
 
         x_vector = row_direction * (-1.0 if view.hor_flip else 1.0)
@@ -1374,6 +1596,9 @@ class ViewerService:
         view.drag_origin_offset_y = None
         view.drag_origin_window_width = None
         view.drag_origin_window_center = None
+        view.drag_origin_rotation_quaternion = None
+        view.drag_origin_arcball_x = None
+        view.drag_origin_arcball_y = None
 
     @staticmethod
     def _encode_image(image: Image.Image, image_format: ImageFormat) -> bytes:
@@ -1386,6 +1611,7 @@ class ViewerService:
 
 
 viewer_service = ViewerService()
+
 
 
 

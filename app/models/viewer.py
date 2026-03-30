@@ -1,5 +1,8 @@
-﻿from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+Quaternion = tuple[float, float, float, float]
 
 
 @dataclass
@@ -28,6 +31,7 @@ class ViewTransformState:
     zoom: float = 1.0
     offset_x: float = 0.0
     offset_y: float = 0.0
+    rotation_quaternion: Quaternion = (0.0, 0.0, 0.0, 1.0)
     hor_flip: bool = False
     ver_flip: bool = False
 
@@ -43,6 +47,9 @@ class DragState:
     drag_origin_zoom: float | None = None
     drag_origin_offset_x: float | None = None
     drag_origin_offset_y: float | None = None
+    drag_origin_rotation_quaternion: Quaternion | None = None
+    drag_origin_arcball_x: float | None = None
+    drag_origin_arcball_y: float | None = None
     drag_origin_window_width: float | None = None
     drag_origin_window_center: float | None = None
 
@@ -99,6 +106,14 @@ class ViewRecord:
     @offset_y.setter
     def offset_y(self, value: float) -> None:
         self.transform.offset_y = value
+
+    @property
+    def rotation_quaternion(self) -> Quaternion:
+        return self.transform.rotation_quaternion
+
+    @rotation_quaternion.setter
+    def rotation_quaternion(self, value: Quaternion) -> None:
+        self.transform.rotation_quaternion = value
 
     @property
     def hor_flip(self) -> bool:
@@ -165,6 +180,30 @@ class ViewRecord:
     @drag_origin_offset_y.setter
     def drag_origin_offset_y(self, value: float | None) -> None:
         self.drag.drag_origin_offset_y = value
+
+    @property
+    def drag_origin_rotation_quaternion(self) -> Quaternion | None:
+        return self.drag.drag_origin_rotation_quaternion
+
+    @drag_origin_rotation_quaternion.setter
+    def drag_origin_rotation_quaternion(self, value: Quaternion | None) -> None:
+        self.drag.drag_origin_rotation_quaternion = value
+
+    @property
+    def drag_origin_arcball_x(self) -> float | None:
+        return self.drag.drag_origin_arcball_x
+
+    @drag_origin_arcball_x.setter
+    def drag_origin_arcball_x(self, value: float | None) -> None:
+        self.drag.drag_origin_arcball_x = value
+
+    @property
+    def drag_origin_arcball_y(self) -> float | None:
+        return self.drag.drag_origin_arcball_y
+
+    @drag_origin_arcball_y.setter
+    def drag_origin_arcball_y(self, value: float | None) -> None:
+        self.drag.drag_origin_arcball_y = value
 
     @property
     def drag_origin_window_width(self) -> float | None:

@@ -10,6 +10,7 @@ from app.core import (
     VIEW_OP_TYPE_SCROLL,
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
+    VIEW_OP_TYPE_ROTATE_3D,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ImageFormat, ViewOperationRequest
@@ -30,6 +31,9 @@ class OperationRenderOutcome:
     broadcast_view_ids: tuple[str, ...] = ()
     broadcast_image_format: ImageFormat = "png"
     broadcast_fast_preview: bool = False
+    deferred_view_ids: tuple[str, ...] = ()
+    deferred_image_format: ImageFormat = "png"
+    deferred_fast_preview: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,8 @@ def _get_operation_handler(payload: ViewOperationRequest):
         return _handle_window_operation
     if payload.op_type == VIEW_OP_TYPE_PAN:
         return _handle_pan_operation
+    if payload.op_type == VIEW_OP_TYPE_ROTATE_3D:
+        return _handle_rotate_3d_operation
     return _handle_generic_operation
 
 
@@ -146,7 +152,7 @@ def _handle_zoom_operation(
     if payload.action_type == "start":
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg")
+        return _render_single("jpeg", fast_preview=service._is_3d_view_type(view.view_type))
     return _render_single()
 
 
@@ -167,7 +173,7 @@ def _handle_window_operation(
     if payload.action_type == "start":
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg")
+        return _render_single("jpeg", fast_preview=service._is_3d_view_type(view.view_type))
     return _render_single()
 
 
@@ -184,7 +190,23 @@ def _handle_pan_operation(
     if payload.action_type == "start":
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg")
+        return _render_single("jpeg", fast_preview=service._is_3d_view_type(view.view_type))
+    return _render_single()
+
+
+def _handle_rotate_3d_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    service._handle_drag_rotate_3d(view, payload)
+    if payload.action_type == "start":
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_single("jpeg", fast_preview=True)
     return _render_single()
 
 
@@ -197,14 +219,17 @@ def _handle_generic_operation(
 ) -> RenderDecision:
     del series, is_mpr_view
     if payload.zoom is not None and payload.zoom > 0:
-        view.zoom = viewport_transformer.clamp_zoom(payload.zoom)
+        next_zoom = viewport_transformer.clamp_zoom(payload.zoom)
+        if service._is_3d_view_type(view.view_type):
+            next_zoom = service._clamp_3d_zoom(next_zoom)
+        view.zoom = next_zoom
         view.is_initialized = True
         return _render_single()
     return _render_none()
 
 
 def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest) -> None:
-    handled_drag_ops = {VIEW_OP_TYPE_CROSSHAIR, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN}
+    handled_drag_ops = {VIEW_OP_TYPE_CROSSHAIR, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN, VIEW_OP_TYPE_ROTATE_3D}
     if payload.x is not None and payload.op_type not in handled_drag_ops:
         view.offset_x += float(payload.x)
         view.is_initialized = True
@@ -252,6 +277,13 @@ def _build_operation_render_outcome(
             broadcast_view_ids=tuple(group_view.view_id for group_view in service._get_mpr_group_views(view)),
             broadcast_image_format=render_decision.image_format,
             broadcast_fast_preview=render_decision.fast_preview,
+        )
+
+    if service._is_3d_view_type(view.view_type) and render_decision.fast_preview:
+        return OperationRenderOutcome(
+            deferred_view_ids=(view.view_id,),
+            deferred_image_format=render_decision.image_format,
+            deferred_fast_preview=True,
         )
 
     return OperationRenderOutcome(

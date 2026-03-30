@@ -8,7 +8,7 @@ from app.schemas.dicom import CornerInfoPayload
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d"]
 ViewActionType = Literal["start", "move", "end"]
 
 
@@ -71,6 +71,7 @@ class OrientationInfo(BaseModel):
     right: str | None = None
     bottom: str | None = None
     left: str | None = None
+    volume_quaternion: tuple[float, float, float, float] | None = Field(default=None, alias="volumeQuaternion")
 
     model_config = {"populate_by_name": True}
 

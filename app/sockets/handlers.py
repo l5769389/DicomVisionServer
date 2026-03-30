@@ -39,6 +39,16 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
                 for view_id in result.broadcast_view_ids
             ]
             await asyncio.gather(*tasks)
+        if result.deferred_view_ids:
+            for view_id in result.deferred_view_ids:
+                asyncio.create_task(
+                    view_socket_hub.emit_render_for_view(
+                        view_id,
+                        image_format=result.deferred_image_format,
+                        fast_preview=result.deferred_fast_preview,
+                        target_sids=(sid,),
+                    )
+                )
         logger.info("socket view_operation sid=%s view_id=%s op_type=%s", sid, payload.view_id, payload.op_type)
     except Exception as exc:
         error = {"message": getattr(exc, "detail", str(exc))}
