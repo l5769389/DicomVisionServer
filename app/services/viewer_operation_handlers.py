@@ -11,6 +11,7 @@ from app.core import (
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
     VIEW_OP_TYPE_ROTATE_3D,
+    VIEW_OP_TYPE_RESET,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ImageFormat, ViewOperationRequest
@@ -98,6 +99,8 @@ def _get_operation_handler(payload: ViewOperationRequest):
         return _handle_pan_operation
     if payload.op_type == VIEW_OP_TYPE_ROTATE_3D:
         return _handle_rotate_3d_operation
+    if payload.op_type == VIEW_OP_TYPE_RESET:
+        return _handle_reset_operation
     return _handle_generic_operation
 
 
@@ -208,6 +211,18 @@ def _handle_rotate_3d_operation(
     if payload.action_type == DRAG_ACTION_MOVE:
         return _render_single("jpeg", fast_preview=True)
     return _render_single()
+
+
+def _handle_reset_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, payload
+    service._reset_view(view)
+    return _render_broadcast() if is_mpr_view else _render_single()
 
 
 def _handle_generic_operation(

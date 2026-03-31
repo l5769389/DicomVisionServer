@@ -22,8 +22,6 @@ from vtk import (
 from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
 
-DEFAULT_AZIMUTH = 38.0
-DEFAULT_ELEVATION = 26.0
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
 
 
@@ -195,9 +193,7 @@ class VtkVolumeRenderer:
 
         renderer.ResetCamera()
         camera = renderer.GetActiveCamera()
-        camera.Azimuth(DEFAULT_AZIMUTH)
-        camera.Elevation(DEFAULT_ELEVATION)
-        camera.OrthogonalizeViewUp()
+        self._set_base_camera_orientation(camera)
         renderer.ResetCameraClippingRange()
 
         window_to_image = vtkWindowToImageFilter()
@@ -233,6 +229,22 @@ class VtkVolumeRenderer:
         self._update_transfer_functions(session, request.window_width, request.window_center)
         self._update_sampling(session, request.fast_preview)
         self._update_camera(session, request)
+
+    @staticmethod
+    def get_default_rotation_quaternion() -> tuple[float, float, float, float]:
+        return (0.0, 0.0, 0.0, 1.0)
+
+    @staticmethod
+    def _set_base_camera_orientation(camera) -> None:
+        focal_point = np.array(camera.GetFocalPoint(), dtype=np.float64)
+        distance = max(float(camera.GetDistance()), 1e-3)
+        forward = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        position = focal_point - forward * distance
+        camera.SetPosition(*position.tolist())
+        camera.SetFocalPoint(*focal_point.tolist())
+        camera.SetViewUp(*up.tolist())
+        camera.OrthogonalizeViewUp()
 
     @staticmethod
     def _build_volume_token(

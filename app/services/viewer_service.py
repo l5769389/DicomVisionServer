@@ -258,7 +258,7 @@ class ViewerService:
         view.zoom = 1.0
         view.offset_x = 0.0
         view.offset_y = 0.0
-        view.rotation_quaternion = (0.0, 0.0, 0.0, 1.0)
+        view.rotation_quaternion = vtk_volume_renderer.get_default_rotation_quaternion()
         self._reset_drag_state(view)
         logger.info(
             "3d viewport initialized view_id=%s volume=%s zoom=%.4f ww=%s wl=%s",
@@ -268,6 +268,19 @@ class ViewerService:
             view.window_width,
             view.window_center,
         )
+
+    def _reset_view(self, view: ViewRecord) -> None:
+        view.hor_flip = False
+        view.ver_flip = False
+
+        if self._is_mpr_view_type(view.view_type):
+            self._initialize_mpr_viewport(view)
+        elif self._is_3d_view_type(view.view_type):
+            self._initialize_3d_viewport(view)
+        else:
+            self._initialize_viewport(view)
+
+        view.is_initialized = True
 
     def _render_3d_view(
         self,

@@ -8,7 +8,7 @@ from app.schemas.dicom import CornerInfoPayload
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d", "reset"]
 ViewActionType = Literal["start", "move", "end"]
 
 

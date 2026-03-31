@@ -7,6 +7,7 @@ VIEW_OP_TYPE_PAN: Final = "pan"
 VIEW_OP_TYPE_ZOOM: Final = "zoom"
 VIEW_OP_TYPE_WINDOW: Final = "window"
 VIEW_OP_TYPE_ROTATE_3D: Final = "rotate3d"
+VIEW_OP_TYPE_RESET: Final = "reset"
 
 DRAG_ACTION_START: Final = "start"
 DRAG_ACTION_MOVE: Final = "move"
