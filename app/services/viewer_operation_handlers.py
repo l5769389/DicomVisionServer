@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -12,6 +12,8 @@ from app.core import (
     VIEW_OP_TYPE_ZOOM,
     VIEW_OP_TYPE_ROTATE_3D,
     VIEW_OP_TYPE_RESET,
+    VIEW_OP_TYPE_VOLUME_PRESET,
+    VIEW_OP_TYPE_VOLUME_CONFIG,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ImageFormat, ViewOperationRequest
@@ -101,6 +103,10 @@ def _get_operation_handler(payload: ViewOperationRequest):
         return _handle_rotate_3d_operation
     if payload.op_type == VIEW_OP_TYPE_RESET:
         return _handle_reset_operation
+    if payload.op_type == VIEW_OP_TYPE_VOLUME_PRESET:
+        return _handle_volume_preset_operation
+    if payload.op_type == VIEW_OP_TYPE_VOLUME_CONFIG:
+        return _handle_volume_config_operation
     return _handle_generic_operation
 
 
@@ -225,6 +231,30 @@ def _handle_reset_operation(
     return _render_broadcast() if is_mpr_view else _render_single()
 
 
+def _handle_volume_preset_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    service._handle_volume_preset(view, payload)
+    return _render_single()
+
+
+def _handle_volume_config_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    service._handle_volume_config(view, payload)
+    return _render_single()
+
+
 def _handle_generic_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -308,3 +338,7 @@ def _build_operation_render_outcome(
             fast_preview=render_decision.fast_preview,
         )
     )
+
+
+
+

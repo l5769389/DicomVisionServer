@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -34,6 +34,8 @@ class ViewTransformState:
     rotation_quaternion: Quaternion = (0.0, 0.0, 0.0, 1.0)
     hor_flip: bool = False
     ver_flip: bool = False
+    volume_preset: str = "aaa"
+    volume_render_config: dict[str, object] | None = None
 
 
 @dataclass
@@ -52,6 +54,7 @@ class DragState:
     drag_origin_arcball_y: float | None = None
     drag_origin_window_width: float | None = None
     drag_origin_window_center: float | None = None
+    drag_origin_volume_render_config: dict[str, object] | None = None
 
 
 @dataclass
@@ -66,6 +69,7 @@ class ViewGroupRecord:
     window: WindowState = field(default_factory=WindowState)
     drag_origin_window_width: float | None = None
     drag_origin_window_center: float | None = None
+    drag_origin_volume_render_config: dict[str, object] | None = None
     crosshair_drag_active: bool = False
 
 
@@ -114,6 +118,22 @@ class ViewRecord:
     @rotation_quaternion.setter
     def rotation_quaternion(self, value: Quaternion) -> None:
         self.transform.rotation_quaternion = value
+
+    @property
+    def volume_preset(self) -> str:
+        return self.transform.volume_preset
+
+    @volume_preset.setter
+    def volume_preset(self, value: str) -> None:
+        self.transform.volume_preset = value
+
+    @property
+    def volume_render_config(self) -> dict[str, object] | None:
+        return self.transform.volume_render_config
+
+    @volume_render_config.setter
+    def volume_render_config(self, value: dict[str, object] | None) -> None:
+        self.transform.volume_render_config = value
 
     @property
     def hor_flip(self) -> bool:
@@ -232,6 +252,14 @@ class ViewRecord:
         self.drag.drag_origin_window_center = value
 
     @property
+    def drag_origin_volume_render_config(self) -> dict[str, object] | None:
+        return self.drag.drag_origin_volume_render_config
+
+    @drag_origin_volume_render_config.setter
+    def drag_origin_volume_render_config(self, value: dict[str, object] | None) -> None:
+        self.drag.drag_origin_volume_render_config = value
+
+    @property
     def mpr_active_viewport(self) -> str:
         return self.view_group.active_viewport if self.view_group is not None else "mpr-ax"
 
@@ -275,3 +303,4 @@ class ViewRecord:
     def mpr_crosshair_drag_active(self, value: bool) -> None:
         if self.view_group is not None:
             self.view_group.crosshair_drag_active = value
+

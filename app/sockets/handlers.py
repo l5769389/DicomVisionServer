@@ -2,7 +2,7 @@ import asyncio
 import socketio
 
 from app.core.logging import get_logger
-from app.schemas.view import ViewOperationRequest, ViewSetSizeRequest
+from app.schemas.view import ViewHoverRequest, ViewOperationRequest, ViewSetSizeRequest
 from app.sockets.runtime import view_socket_hub
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
@@ -57,6 +57,18 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
         await server.emit("render_error", error, to=sid)
 
 
+async def _handle_hover(server: socketio.AsyncServer, sid: str, data: dict) -> None:
+    try:
+        payload = ViewHoverRequest.model_validate(data)
+        view_socket_hub.bind_view(sid, payload.view_id)
+        result = await asyncio.to_thread(viewer_service.handle_view_hover, payload)
+        await server.emit("hover_info", result.model_dump(by_alias=True), to=sid)
+    except Exception as exc:
+        error = {"message": getattr(exc, "detail", str(exc))}
+        logger.exception("socket view_hover failed sid=%s", sid)
+        await server.emit("image_error", error, to=sid)
+
+
 async def _handle_set_size(server: socketio.AsyncServer, sid: str, data: dict) -> None:
     try:
         payload = ViewSetSizeRequest.model_validate(data)
@@ -106,6 +118,10 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
     @server.on("set_view_size")
     async def set_view_size(sid: str, data: dict) -> None:
         await _handle_set_size(server, sid, data)
+
+    @server.on("view_hover")
+    async def view_hover(sid: str, data: dict) -> None:
+        await _handle_hover(server, sid, data)
 
     @server.on("view_operation")
     async def view_operation(sid: str, data: dict) -> None:
