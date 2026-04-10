@@ -2,6 +2,9 @@
 from pathlib import Path
 
 
+from app.models.measurement import MeasurementRecord
+
+
 Quaternion = tuple[float, float, float, float]
 
 
@@ -85,6 +88,7 @@ class ViewRecord:
     window: WindowState = field(default_factory=WindowState)
     drag: DragState = field(default_factory=DragState)
     view_group: ViewGroupRecord | None = None
+    measurements: list[MeasurementRecord] = field(default_factory=list)
     is_initialized: bool = False
 
     @property

@@ -4,6 +4,7 @@ from typing import Literal, Protocol
 import numpy as np
 from PIL import Image
 
+from app.models.measurement import MeasurementRecord
 from app.models.viewer import InstanceRecord, ViewRecord
 from app.services.dicom_cache import CachedDicom
 from app.services.viewport_transformer import AffineTransform
@@ -55,6 +56,7 @@ class RenderContext:
     instance: InstanceRecord | None = None
     cached: CachedDicom | None = None
     mpr_viewport: str | None = None
+    measurements: tuple[MeasurementRecord, ...] = ()
     mpr_crosshair: MprCrosshairOverlay | None = None
     corner_info: CornerInfoOverlay | None = None
     orientation: OrientationOverlay | None = None

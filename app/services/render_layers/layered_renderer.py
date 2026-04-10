@@ -2,7 +2,6 @@ from PIL import Image
 
 from app.services.render_layers.base_image_layer import BaseImageLayer
 from app.services.render_layers.corner_info_layer import CornerInfoLayer
-from app.services.render_layers.measurement_layer import MeasurementLayer
 from app.services.render_layers.render_context import RenderContext, RenderLayer
 from app.services.viewport_transformer import viewport_transformer
 from app.utils.utils import timer
@@ -13,7 +12,6 @@ class LayeredRenderer:
         self._base_layer = BaseImageLayer()
         self._overlay_layers: tuple[RenderLayer, ...] = (
             CornerInfoLayer(),
-            MeasurementLayer(),
         )
 
     def render(self, context: RenderContext) -> Image.Image:

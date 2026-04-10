@@ -14,6 +14,7 @@ from app.core import (
     VIEW_OP_TYPE_RESET,
     VIEW_OP_TYPE_VOLUME_PRESET,
     VIEW_OP_TYPE_VOLUME_CONFIG,
+    VIEW_OP_TYPE_MEASUREMENT,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ImageFormat, ViewOperationRequest
@@ -30,6 +31,7 @@ RenderMode = Literal["none", "single", "broadcast"]
 @dataclass(frozen=True)
 class OperationRenderOutcome:
     primary_result: RenderedImageResult | None = None
+    draft_measurement: dict[str, object] | None = None
     broadcast_view_ids: tuple[str, ...] = ()
     broadcast_image_format: ImageFormat = "png"
     broadcast_fast_preview: bool = False
@@ -43,6 +45,7 @@ class RenderDecision:
     mode: RenderMode
     image_format: ImageFormat = "png"
     fast_preview: bool = False
+    draft_measurement: dict[str, object] | None = None
 
 
 OperationHandler = Callable[
@@ -64,8 +67,8 @@ def handle_view_operation(service: ViewerService, payload: ViewOperationRequest)
     if is_mpr_view and active_viewport_changed:
         render_decision = _promote_render_decision_to_broadcast(render_decision)
 
-    if payload.op_type == VIEW_OP_TYPE_CROSSHAIR and render_decision.mode == "none":
-        return OperationRenderOutcome()
+    if render_decision.mode == "none":
+        return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     _log_view_operation_state(service, view, payload)
     return _build_operation_render_outcome(service, view, render_decision)
@@ -104,6 +107,7 @@ def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
         VIEW_OP_TYPE_RESET: _handle_reset_operation,
         VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
         VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
+        VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
     }
     return operation_handlers.get(payload.op_type, _handle_generic_operation)
 
@@ -254,6 +258,23 @@ def _handle_volume_config_operation(
     return _render_single()
 
 
+def _handle_measurement_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if payload.action_type in {"start", "move"}:
+        return RenderDecision(mode="none", draft_measurement=service._build_measurement_preview(view, payload))
+    if payload.action_type == "end":
+        if service._handle_measurement(view, payload):
+            return _render_single()
+        return _render_none()
+    return _render_none()
+
+
 def _handle_generic_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -314,7 +335,7 @@ def _build_operation_render_outcome(
     render_decision: RenderDecision,
 ) -> OperationRenderOutcome:
     if render_decision.mode == "none":
-        return OperationRenderOutcome()
+        return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     if render_decision.mode == "broadcast":
         return OperationRenderOutcome(
@@ -333,6 +354,7 @@ def _build_operation_render_outcome(
         )
 
     return OperationRenderOutcome(
+        draft_measurement=render_decision.draft_measurement,
         primary_result=service._render_by_view_type(
             view,
             image_format=render_decision.image_format,

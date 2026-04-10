@@ -8,7 +8,7 @@ from app.schemas.dicom import CornerInfoPayload
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d", "reset", "volumePreset", "volumeConfig"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d", "reset", "volumePreset", "volumeConfig", "measurement"]
 ViewActionType = Literal["start", "move", "end"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -118,6 +118,7 @@ class ViewImageResponse(BaseModel):
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
+    measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)
     orientation: OrientationInfo | None = None
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
@@ -141,13 +142,29 @@ class ViewHoverResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MeasurementPointPayload(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
+class MeasurementOverlayPayload(BaseModel):
+    measurement_id: str = Field(alias="measurementId")
+    tool_type: str = Field(alias="toolType")
+    points: list[MeasurementPointPayload]
+    label_lines: list[str] = Field(alias="labelLines", default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId")
     op_type: ViewOperationType = Field(alias="opType")
+    viewport_key: str | None = Field(default=None, alias="viewportKey")
     sub_op_type: str | None = Field(default=None, alias="subOpType")
     action_type: ViewActionType | None = Field(default=None, alias="actionType")
     x: float | None = None
     y: float | None = None
+    points: list[MeasurementPointPayload] | None = None
     zoom: float | None = None
     delta: int | None = None
     hor_flip: bool | None = Field(default=None, alias="hor_flip")

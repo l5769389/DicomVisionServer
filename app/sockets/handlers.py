@@ -23,6 +23,8 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
         payload = ViewOperationRequest.model_validate(data)
         view_socket_hub.bind_view(sid, payload.view_id)
         result = await asyncio.to_thread(viewer_service.handle_view_operation, payload)
+        if result.draft_measurement is not None:
+            await server.emit("measurement_draft", result.draft_measurement, to=sid)
         if result.primary_result is not None:
             await server.emit(
                 "image_update",

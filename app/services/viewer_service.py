@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
@@ -32,6 +33,7 @@ from app.core import (
     VIEW_OP_TYPE_SCROLL,
 )
 from app.core.logging import get_logger
+from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import InstanceRecord, SeriesRecord, ViewRecord
 from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
@@ -40,6 +42,7 @@ from app.schemas.view import (
     OrientationInfo,
     SliceInfo,
     MprCrosshairInfo,
+    MeasurementOverlayPayload,
     ViewHoverRequest,
     ViewHoverResponse,
     ViewImageResponse,
@@ -50,6 +53,7 @@ from app.schemas.view import (
 from app.services.dicom_cache import CachedDicom, dicom_cache
 from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
+from app.services.measurement_utils import build_measurement_metrics, clamp_point_to_image
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
@@ -66,6 +70,7 @@ from app.services.volume_rendering import VolumeRenderRequest, vtk_volume_render
 logger = get_logger(__name__)
 
 CROSSHAIR_HIT_RADIUS = 12.0
+MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle"}
 
 
 @dataclass(frozen=True)
@@ -198,6 +203,271 @@ class ViewerService:
             return (0, 0)
         cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
         return (int(cached.source_pixels.shape[1]), int(cached.source_pixels.shape[0]))
+
+    def _resolve_normalized_point_to_image_point(
+        self,
+        view: ViewRecord,
+        normalized_x: float,
+        normalized_y: float,
+    ) -> MeasurementPoint:
+        image_width, image_height, image_transform, canvas_width, canvas_height = self._build_hover_mapping_context(view)
+        if image_width <= 0 or image_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
+            raise HTTPException(status_code=400, detail="View is not ready for measurement")
+
+        x = max(0.0, min(1.0, float(normalized_x)))
+        y = max(0.0, min(1.0, float(normalized_y)))
+        max_canvas_x = max(float(canvas_width) - 1e-6, 0.0)
+        max_canvas_y = max(float(canvas_height) - 1e-6, 0.0)
+        canvas_x = min(max(x * float(canvas_width), 0.0), max_canvas_x)
+        canvas_y = min(max(y * float(canvas_height), 0.0), max_canvas_y)
+
+        affine_matrix, offset = image_transform.inverse_components()
+        source_point = affine_matrix @ np.asarray([canvas_x, canvas_y], dtype=np.float64) + offset
+        clamped = clamp_point_to_image(
+            MeasurementPoint(x=float(source_point[0]), y=float(source_point[1])),
+            image_width=image_width,
+            image_height=image_height,
+        )
+        return clamped
+
+    def _resolve_measurement_source_context(
+        self,
+        view: ViewRecord,
+    ) -> tuple[np.ndarray, tuple[float, float] | None, MeasurementSliceContext]:
+        if self._is_mpr_view_type(view.view_type):
+            series = series_registry.get(view.series_id)
+            volume = self._get_series_volume(series)
+            target_viewport = self._resolve_mpr_viewport(view)
+            plane_pixels, current_index, _ = self._extract_mpr_plane(view, volume, target_viewport)
+            return (
+                plane_pixels,
+                self._get_mpr_spacing_xy(series, target_viewport),
+                MeasurementSliceContext(kind="mpr", slice_index=current_index),
+            )
+
+        series = series_registry.get(view.series_id)
+        instance = series.instances[view.current_index]
+        if not instance.sop_instance_uid:
+            raise HTTPException(status_code=400, detail="DICOM instance does not contain SOPInstanceUID")
+        cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
+        return (
+            cached.source_pixels,
+            self._get_stack_spacing_xy(cached.dataset),
+            MeasurementSliceContext(kind="stack", slice_index=view.current_index, sop_instance_uid=instance.sop_instance_uid),
+        )
+
+    @staticmethod
+    def _resolve_measurement_tool_type(payload: ViewOperationRequest) -> str | None:
+        tool_type = str(payload.sub_op_type or "").strip().lower()
+        return tool_type if tool_type in MEASUREMENT_TOOL_TYPES else None
+
+    def _resolve_measurement_image_points(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+    ) -> tuple[MeasurementPoint, ...]:
+        return tuple(
+            self._resolve_normalized_point_to_image_point(view, point.x, point.y)
+            for point in (payload.points or [])
+        )
+
+    @staticmethod
+    def _is_empty_measurement(tool_type: str, points: tuple[MeasurementPoint, ...]) -> bool:
+        if tool_type == "angle" or len(points) < 2:
+            return False
+        start, end = points[:2]
+        return abs(end.x - start.x) < 1e-3 and abs(end.y - start.y) < 1e-3
+
+    @staticmethod
+    def _serialize_measurement_metrics(metrics) -> dict[str, float | str | None]:
+        return {
+            "length": metrics.length,
+            "width": metrics.width,
+            "height": metrics.height,
+            "area": metrics.area,
+            "angleDegrees": metrics.angle_degrees,
+            "mean": metrics.mean,
+            "min": metrics.minimum,
+            "max": metrics.maximum,
+            "unit": metrics.unit,
+            "areaUnit": metrics.area_unit,
+        }
+
+    def _build_measurement_preview_payload(
+        self,
+        *,
+        view: ViewRecord,
+        viewport_key: str,
+        tool_type: str,
+        slice_index: int,
+        label_lines: tuple[str, ...] | list[str] = (),
+        metrics=None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "viewId": view.view_id,
+            "viewportKey": viewport_key,
+            "toolType": tool_type,
+            "labelLines": list(label_lines),
+            "sliceIndex": slice_index,
+        }
+        if metrics is not None:
+            payload["metrics"] = self._serialize_measurement_metrics(metrics)
+        return payload
+
+    def _build_measurement_preview(self, view: ViewRecord, payload: ViewOperationRequest) -> dict[str, object] | None:
+        tool_type = self._resolve_measurement_tool_type(payload)
+        if tool_type is None or not payload.points:
+            return None
+
+        image_points = self._resolve_measurement_image_points(view, payload)
+        source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
+        viewport_key = payload.viewport_key or self._resolve_measurement_viewport_key(view)
+
+        if tool_type == "angle" and len(image_points) < 3:
+            return self._build_measurement_preview_payload(
+                view=view,
+                viewport_key=viewport_key,
+                tool_type=tool_type,
+                slice_index=slice_context.slice_index,
+            )
+
+        expected_points = 3 if tool_type == "angle" else 2
+        if len(image_points) != expected_points:
+            return None
+
+        if self._is_empty_measurement(tool_type, image_points):
+            return self._build_measurement_preview_payload(
+                view=view,
+                viewport_key=viewport_key,
+                tool_type=tool_type,
+                slice_index=slice_context.slice_index,
+            )
+
+        metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
+        return self._build_measurement_preview_payload(
+            view=view,
+            viewport_key=viewport_key,
+            tool_type=tool_type,
+            slice_index=slice_context.slice_index,
+            label_lines=label_lines,
+            metrics=metrics,
+        )
+
+    def _handle_measurement(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        tool_type = self._resolve_measurement_tool_type(payload)
+        if tool_type is None:
+            raise HTTPException(status_code=400, detail="Unsupported measurement tool type")
+        if not payload.points:
+            raise HTTPException(status_code=400, detail="Measurement points are required")
+
+        expected_points = 3 if tool_type == "angle" else 2
+        if len(payload.points) != expected_points:
+            return False
+
+        image_points = self._resolve_measurement_image_points(view, payload)
+
+        if self._is_empty_measurement(tool_type, image_points):
+            return False
+
+        source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
+        metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
+
+        label_anchor = image_points[1] if tool_type != "angle" else image_points[1]
+        view.measurements.append(
+            MeasurementRecord(
+                measurement_id=str(uuid4()),
+                tool_type=tool_type,
+                points=image_points,
+                slice_context=slice_context,
+                metrics=metrics,
+                label_anchor=label_anchor,
+                label_lines=label_lines,
+            )
+        )
+        view.is_initialized = True
+        return True
+
+    def _build_visible_measurements(self, view: ViewRecord) -> tuple[MeasurementRecord, ...]:
+        if not view.measurements:
+            return ()
+
+        current_slice = self._resolve_current_measurement_slice_index(view)
+        visible: list[MeasurementRecord] = []
+        for measurement in view.measurements:
+            if measurement.slice_context.kind == "stack":
+                if not self._is_mpr_view_type(view.view_type) and measurement.slice_context.slice_index == current_slice:
+                    visible.append(measurement)
+                continue
+            if self._is_mpr_view_type(view.view_type) and measurement.slice_context.slice_index == current_slice:
+                visible.append(measurement)
+        return tuple(visible)
+
+    @staticmethod
+    def _serialize_measurements(
+        measurements: tuple[MeasurementRecord, ...],
+        *,
+        image_transform: Any,
+        canvas_width: int,
+        canvas_height: int,
+    ) -> list[MeasurementOverlayPayload]:
+        if canvas_width <= 0 or canvas_height <= 0:
+            return []
+
+        matrix = image_transform.matrix
+        width = max(float(canvas_width), 1.0)
+        height = max(float(canvas_height), 1.0)
+
+        def serialize_point(point: MeasurementPoint) -> dict[str, float]:
+            projected = matrix @ np.asarray([point.x, point.y, 1.0], dtype=np.float64)
+            return {
+                "x": max(0.0, min(1.0, float(projected[0]) / width)),
+                "y": max(0.0, min(1.0, float(projected[1]) / height)),
+            }
+
+        return [
+            MeasurementOverlayPayload(
+                measurementId=measurement.measurement_id,
+                toolType=measurement.tool_type,
+                points=[serialize_point(point) for point in measurement.points],
+                labelLines=list(measurement.label_lines),
+            )
+            for measurement in measurements
+        ]
+
+    def _resolve_current_measurement_slice_index(self, view: ViewRecord) -> int:
+        if not self._is_mpr_view_type(view.view_type):
+            return int(view.current_index)
+        target_viewport = self._resolve_mpr_viewport(view)
+        if target_viewport == MPR_VIEWPORT_CORONAL:
+            return int(view.mpr_coronal_index)
+        if target_viewport == MPR_VIEWPORT_SAGITTAL:
+            return int(view.mpr_sagittal_index)
+        return int(view.mpr_axial_index)
+
+    def _resolve_measurement_viewport_key(self, view: ViewRecord) -> str:
+        if not self._is_mpr_view_type(view.view_type):
+            return "single"
+        return self._resolve_mpr_viewport(view)
+
+    @staticmethod
+    def _get_stack_spacing_xy(dataset: Dataset | None) -> tuple[float, float] | None:
+        pixel_spacing = getattr(dataset, "PixelSpacing", None) if dataset is not None else None
+        if pixel_spacing is None or len(pixel_spacing) < 2:
+            return None
+        try:
+            row_spacing = max(abs(float(pixel_spacing[0])), 1e-6)
+            col_spacing = max(abs(float(pixel_spacing[1])), 1e-6)
+        except (TypeError, ValueError):
+            return None
+        return (col_spacing, row_spacing)
+
+    def _get_mpr_spacing_xy(self, series: SeriesRecord, viewport_key: str) -> tuple[float, float] | None:
+        spacing_x, spacing_y, spacing_z = self._get_3d_spacing_xyz(series)
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            return (spacing_x, spacing_z)
+        if viewport_key == MPR_VIEWPORT_SAGITTAL:
+            return (spacing_y, spacing_z)
+        return (spacing_x, spacing_y)
 
     def _render_by_view_type(
         self,
@@ -468,9 +738,11 @@ class ViewerService:
             instance=instance,
             cached=cached,
             image_transform=image_transform,
+            measurements=self._build_visible_measurements(view),
             corner_info=None,
             orientation=None,
         )
+        visible_measurements = self._build_visible_measurements(view)
 
         if fast_preview:
             image = self._render_fast_preview(context)
@@ -500,6 +772,12 @@ class ViewerService:
                 imageFormat=image_format,
                 viewId=view.view_id,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
+                measurements=self._serialize_measurements(
+                    visible_measurements,
+                    image_transform=image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
                 orientation=self._serialize_orientation_overlay(
                     self._build_stack_orientation_overlay(render_plan.render_view, cached.dataset)
                 ),
@@ -554,10 +832,12 @@ class ViewerService:
             instance=reference_instance,
             cached=reference_cached,
             mpr_viewport=target_viewport,
+            measurements=self._build_visible_measurements(view),
             mpr_crosshair=None,
             corner_info=None,
             orientation=None,
         )
+        visible_measurements = self._build_visible_measurements(view)
         if fast_preview:
             image = self._render_fast_mpr_preview(context)
         else:
@@ -571,6 +851,12 @@ class ViewerService:
                 viewId=view.view_id,
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
+                measurements=self._serialize_measurements(
+                    visible_measurements,
+                    image_transform=image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
                 orientation=self._serialize_orientation_overlay(
                     self._build_mpr_orientation_overlay(render_plan.render_view, target_viewport)
                 ),
