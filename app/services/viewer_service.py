@@ -1,6 +1,7 @@
 ﻿import io
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 from fastapi import HTTPException
@@ -45,15 +46,20 @@ from app.schemas.view import (
     ViewOperationRequest,
     ViewSetSizeRequest,
     WindowInfo,
-    VolumeRenderConfig,
 )
 from app.services.dicom_cache import CachedDicom, dicom_cache
+from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
 from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
+from app.services.volume_render_config import (
+    create_default_volume_render_config,
+    normalize_volume_preset_name,
+    normalize_volume_render_config,
+)
 from app.services.volume_rendering import VolumeRenderRequest, vtk_volume_renderer
 
 
@@ -144,6 +150,38 @@ class ViewerService:
         if not view.width or not view.height or self._is_3d_view_type(view.view_type):
             return (0, 0)
 
+        image_width, image_height, image_transform, canvas_width, canvas_height = self._build_hover_mapping_context(view)
+        return map_normalized_canvas_to_image_row_col(
+            normalized_x,
+            normalized_y,
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            image_transform=image_transform,
+        )
+
+    def _build_hover_mapping_context(self, view: ViewRecord) -> tuple[int, int, Any, int, int]:
+        """Prepare the source-image dimensions and inverse transform used for hover lookup."""
+
+        image_width, image_height = self._get_hover_source_dimensions(view)
+        render_plan = self._build_render_plan_for_shape(view, image_height, image_width)
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=render_plan.render_view.width or 0,
+            canvas_height=render_plan.render_view.height or 0,
+            view=render_plan.render_view,
+        )
+        return (
+            image_width,
+            image_height,
+            image_transform,
+            render_plan.render_view.width or 0,
+            render_plan.render_view.height or 0,
+        )
+
+    def _get_hover_source_dimensions(self, view: ViewRecord) -> tuple[int, int]:
         if self._is_mpr_view_type(view.view_type):
             series = series_registry.get(view.series_id)
             volume = self._get_series_volume(series)
@@ -152,79 +190,14 @@ class ViewerService:
                 view.is_initialized = True
             target_viewport = self._resolve_mpr_viewport(view)
             plane_pixels, _, _ = self._extract_mpr_plane(view, volume, target_viewport)
-            render_plan = self._build_render_plan_for_shape(view, *plane_pixels.shape[:2])
-            image_transform = viewport_transformer.build_image_to_canvas_transform(
-                image_width=plane_pixels.shape[1],
-                image_height=plane_pixels.shape[0],
-                canvas_width=render_plan.render_view.width or 0,
-                canvas_height=render_plan.render_view.height or 0,
-                view=render_plan.render_view,
-            )
-            return self._map_normalized_canvas_to_image_row_col(
-                normalized_x,
-                normalized_y,
-                image_width=plane_pixels.shape[1],
-                image_height=plane_pixels.shape[0],
-                canvas_width=render_plan.render_view.width or 0,
-                canvas_height=render_plan.render_view.height or 0,
-                image_transform=image_transform,
-            )
+            return (int(plane_pixels.shape[1]), int(plane_pixels.shape[0]))
 
         series = series_registry.get(view.series_id)
         instance = series.instances[view.current_index]
         if not instance.sop_instance_uid:
             return (0, 0)
         cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
-        render_plan = self._build_render_plan_for_shape(view, *cached.source_pixels.shape[:2])
-        image_transform = viewport_transformer.build_image_to_canvas_transform(
-            image_width=cached.source_pixels.shape[1],
-            image_height=cached.source_pixels.shape[0],
-            canvas_width=render_plan.render_view.width or 0,
-            canvas_height=render_plan.render_view.height or 0,
-            view=render_plan.render_view,
-        )
-        return self._map_normalized_canvas_to_image_row_col(
-            normalized_x,
-            normalized_y,
-            image_width=cached.source_pixels.shape[1],
-            image_height=cached.source_pixels.shape[0],
-            canvas_width=render_plan.render_view.width or 0,
-            canvas_height=render_plan.render_view.height or 0,
-            image_transform=image_transform,
-        )
-
-    def _map_normalized_canvas_to_image_row_col(
-        self,
-        normalized_x: float,
-        normalized_y: float,
-        *,
-        image_width: int,
-        image_height: int,
-        canvas_width: int,
-        canvas_height: int,
-        image_transform,
-    ) -> tuple[int, int]:
-        if image_width <= 0 or image_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
-            return (0, 0)
-
-        x = max(0.0, min(1.0, float(normalized_x)))
-        y = max(0.0, min(1.0, float(normalized_y)))
-        max_canvas_x = max(float(canvas_width) - 1e-6, 0.0)
-        max_canvas_y = max(float(canvas_height) - 1e-6, 0.0)
-        canvas_x = min(max(x * float(canvas_width), 0.0), max_canvas_x)
-        canvas_y = min(max(y * float(canvas_height), 0.0), max_canvas_y)
-
-        affine_matrix, offset = image_transform.inverse_components()
-        source_point = affine_matrix @ np.asarray([canvas_x, canvas_y], dtype=np.float64) + offset
-        source_x = float(source_point[0])
-        source_y = float(source_point[1])
-
-        if source_x < 0.0 or source_x >= float(image_width) or source_y < 0.0 or source_y >= float(image_height):
-            return (0, 0)
-
-        row = int(np.floor(source_y)) + 1
-        col = int(np.floor(source_x)) + 1
-        return (row, col)
+        return (int(cached.source_pixels.shape[1]), int(cached.source_pixels.shape[0]))
 
     def _render_by_view_type(
         self,
@@ -355,7 +328,7 @@ class ViewerService:
         view.offset_y = 0.0
         view.rotation_quaternion = vtk_volume_renderer.get_default_rotation_quaternion()
         view.volume_preset = "aaa"
-        view.volume_render_config = self._create_default_volume_render_config("aaa")
+        view.volume_render_config = create_default_volume_render_config("aaa")
         self._reset_drag_state(view)
         logger.info(
             "3d viewport initialized view_id=%s volume=%s zoom=%.4f ww=%s wl=%s",
@@ -365,193 +338,6 @@ class ViewerService:
             view.window_width,
             view.window_center,
         )
-
-    @staticmethod
-    def _hex_to_rgb(color: str, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
-        text = str(color or '').strip()
-        if len(text) == 7 and text.startswith('#'):
-            try:
-                return tuple(int(text[index:index + 2], 16) / 255.0 for index in (1, 3, 5))
-            except ValueError:
-                return fallback
-        return fallback
-
-    def _create_default_volume_render_config(self, preset_value: str) -> dict[str, object]:
-        preset = str(preset_value or 'aaa').strip().lower()
-        if ':' in preset:
-            preset = preset.split(':', 1)[1]
-
-        layers = {
-            'bone': {
-                'key': 'bone',
-                'label': '\u9aa8\u9abc',
-                'enabled': False,
-                'ww': 500.0,
-                'wl': 400.0,
-                'opacity': 1.0,
-                'colorStart': '#ffffff',
-                'colorEnd': '#ffffff',
-            },
-            'blood': {
-                'key': 'blood',
-                'label': '\u8840\u6db2',
-                'enabled': False,
-                'ww': 200.0,
-                'wl': 220.0,
-                'opacity': 0.2,
-                'colorStart': '#d31b1b',
-                'colorEnd': '#ffd54a',
-            },
-            'muscle': {
-                'key': 'muscle',
-                'label': '\u808c\u8089',
-                'enabled': False,
-                'ww': 320.0,
-                'wl': 45.0,
-                'opacity': 0.55,
-                'colorStart': '#f2c7b8',
-                'colorEnd': '#8a3426',
-            },
-            'softTissue': {
-                'key': 'softTissue',
-                'label': '\u8f6f\u7ec4\u7ec7',
-                'enabled': False,
-                'ww': 380.0,
-                'wl': 55.0,
-                'opacity': 0.32,
-                'colorStart': '#f1d8c8',
-                'colorEnd': '#b06b56',
-            },
-            'lung': {
-                'key': 'lung',
-                'label': '\u80ba',
-                'enabled': False,
-                'ww': 1500.0,
-                'wl': -550.0,
-                'opacity': 0.22,
-                'colorStart': '#9fd8ff',
-                'colorEnd': '#e5f6ff',
-            },
-            'custom': {
-                'key': 'custom',
-                'label': '\u81ea\u5b9a\u4e49',
-                'enabled': False,
-                'ww': 400.0,
-                'wl': 40.0,
-                'opacity': 0.3,
-                'colorStart': '#7dd3fc',
-                'colorEnd': '#f8fafc',
-            },
-        }
-        blend_mode = 'composite'
-        lighting = {
-            'shading': True,
-            'interpolation': 'linear',
-            'ambient': 0.16,
-            'diffuse': 0.86,
-            'specular': 0.18,
-            'roughness': 0.78,
-        }
-
-        if preset == 'aaa':
-            layers['bone'].update({'enabled': True, 'ww': 500.0, 'wl': 400.0, 'opacity': 1.0, 'colorStart': '#ffffff', 'colorEnd': '#ffffff'})
-            layers['blood'].update({'enabled': True, 'ww': 200.0, 'wl': 220.0, 'opacity': 0.2, 'colorStart': '#d31b1b', 'colorEnd': '#ffd54a'})
-            lighting.update({'shading': True, 'interpolation': 'linear', 'ambient': 0.12, 'diffuse': 0.9, 'specular': 0.2, 'roughness': 0.74})
-        elif preset == 'red':
-            layers['bone'].update({'enabled': True, 'ww': 442.0, 'wl': 115.0, 'opacity': 1.0, 'colorStart': '#c31616', 'colorEnd': '#ff6666'})
-            lighting.update({'shading': True, 'interpolation': 'linear', 'ambient': 0.14, 'diffuse': 0.88, 'specular': 0.16, 'roughness': 0.8})
-        elif preset == 'cardiac':
-            layers['bone'].update({'enabled': True, 'ww': 170.0, 'wl': 176.0, 'opacity': 0.9, 'colorStart': '#fff9f2', 'colorEnd': '#7f1720'})
-            layers['blood'].update({'enabled': True, 'ww': 170.0, 'wl': 7.0, 'opacity': 0.3, 'colorStart': '#ffe082', 'colorEnd': '#ffb300'})
-            lighting.update({'shading': True, 'interpolation': 'linear', 'ambient': 0.1, 'diffuse': 0.88, 'specular': 0.22, 'roughness': 0.72})
-        elif preset == 'muscle':
-            layers['muscle'].update({'enabled': True, 'ww': 280.0, 'wl': 40.0, 'opacity': 0.58, 'colorStart': '#f4cfbf', 'colorEnd': '#8c3d2e'})
-            layers['softTissue'].update({'enabled': True, 'ww': 360.0, 'wl': 50.0, 'opacity': 0.28, 'colorStart': '#f3ddd1', 'colorEnd': '#9e6a5a'})
-            lighting.update({'shading': True, 'interpolation': 'linear', 'ambient': 0.18, 'diffuse': 0.82, 'specular': 0.08, 'roughness': 0.9})
-        elif preset == 'mip':
-            blend_mode = 'mip'
-            layers['bone'].update({'enabled': True, 'ww': 900.0, 'wl': 350.0, 'opacity': 0.35, 'colorStart': '#9a9a9a', 'colorEnd': '#ffffff'})
-            layers['blood'].update({'enabled': True, 'ww': 260.0, 'wl': 200.0, 'opacity': 0.85, 'colorStart': '#f7f1b6', 'colorEnd': '#ffffff'})
-            lighting.update({'shading': False, 'interpolation': 'linear', 'ambient': 1.0, 'diffuse': 0.0, 'specular': 0.0, 'roughness': 1.0})
-        else:
-            preset = 'aaa'
-            layers['bone'].update({'enabled': True, 'ww': 500.0, 'wl': 400.0, 'opacity': 1.0, 'colorStart': '#ffffff', 'colorEnd': '#ffffff'})
-            layers['blood'].update({'enabled': True, 'ww': 200.0, 'wl': 220.0, 'opacity': 0.2, 'colorStart': '#d31b1b', 'colorEnd': '#ffd54a'})
-            lighting.update({'shading': True, 'interpolation': 'linear', 'ambient': 0.12, 'diffuse': 0.9, 'specular': 0.2, 'roughness': 0.74})
-
-        return {
-            'preset': preset,
-            'blendMode': blend_mode,
-            'layers': list(layers.values()),
-            'lighting': lighting,
-        }
-
-    def _normalize_volume_render_config(self, value: VolumeRenderConfig | dict[str, object] | None, fallback_preset: str) -> dict[str, object]:
-        fallback = self._create_default_volume_render_config(fallback_preset)
-        if value is None:
-            return fallback
-
-        if isinstance(value, VolumeRenderConfig):
-            payload = value.model_dump(by_alias=True)
-        else:
-            payload = dict(value)
-
-        preset = str(payload.get('preset') or fallback['preset']).strip().lower()
-        normalized = self._create_default_volume_render_config(preset)
-        normalized['blendMode'] = 'mip' if payload.get('blendMode') == 'mip' else 'composite'
-
-        incoming_layers = payload.get('layers') if isinstance(payload.get('layers'), list) else []
-        layer_map = {str(layer['key']): layer for layer in normalized['layers'] if isinstance(layer, dict)}
-
-        for entry in incoming_layers:
-            if not isinstance(entry, dict):
-                continue
-            layer = layer_map.get(str(entry.get('key') or ''))
-            if layer is None:
-                continue
-            layer['label'] = str(entry.get('label') or layer['label'])
-            layer['enabled'] = bool(entry.get('enabled', layer['enabled']))
-            layer['ww'] = max(1.0, float(entry.get('ww', layer['ww'])))
-            layer['wl'] = float(entry.get('wl', layer['wl']))
-            layer['opacity'] = self._normalize_unit_interval(entry.get('opacity'), float(layer['opacity']))
-            layer['colorStart'] = self._normalize_hex_color(str(entry.get('colorStart') or layer['colorStart']), str(layer['colorStart']))
-            layer['colorEnd'] = self._normalize_hex_color(str(entry.get('colorEnd') or layer['colorEnd']), str(layer['colorEnd']))
-
-        lighting_payload = payload.get('lighting') if isinstance(payload.get('lighting'), dict) else {}
-        lighting = normalized.get('lighting') if isinstance(normalized.get('lighting'), dict) else {}
-        lighting['shading'] = bool(lighting_payload.get('shading', lighting.get('shading', True)))
-        lighting['interpolation'] = self._normalize_volume_interpolation(
-            str(lighting_payload.get('interpolation') or lighting.get('interpolation') or 'linear')
-        )
-        lighting['ambient'] = self._normalize_unit_interval(lighting_payload.get('ambient'), float(lighting.get('ambient', 0.18)))
-        lighting['diffuse'] = self._normalize_unit_interval(lighting_payload.get('diffuse'), float(lighting.get('diffuse', 0.82)))
-        lighting['specular'] = self._normalize_unit_interval(lighting_payload.get('specular'), float(lighting.get('specular', 0.12)))
-        lighting['roughness'] = self._normalize_unit_interval(lighting_payload.get('roughness'), float(lighting.get('roughness', 0.85)))
-        normalized['lighting'] = lighting
-
-        return normalized
-
-    @staticmethod
-    def _normalize_hex_color(value: str, fallback: str) -> str:
-        text = str(value or '').strip().lower()
-        if len(text) == 7 and text.startswith('#') and all(ch in '0123456789abcdef' for ch in text[1:]):
-            return text
-        return fallback
-
-    @staticmethod
-    def _normalize_unit_interval(value: object, fallback: float) -> float:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return fallback
-        return max(0.0, min(1.0, numeric))
-
-    @staticmethod
-    def _normalize_volume_interpolation(value: str) -> str:
-        normalized = str(value or 'linear').strip().lower()
-        if normalized in {'nearest', 'linear', 'cubic'}:
-            return normalized
-        return 'linear'
 
     def _reset_view(self, view: ViewRecord) -> None:
         view.hor_flip = False
@@ -565,6 +351,33 @@ class ViewerService:
             self._initialize_viewport(view)
 
         view.is_initialized = True
+
+    def _build_volume_render_request(
+        self,
+        view: ViewRecord,
+        *,
+        volume: np.ndarray,
+        spacing_xyz: tuple[float, float, float],
+        fast_preview: bool,
+    ) -> VolumeRenderRequest:
+        """Build the shared VTK request payload used by 3D render and drag paths."""
+
+        return VolumeRenderRequest(
+            view_id=view.view_id,
+            volume=volume,
+            spacing_xyz=spacing_xyz,
+            canvas_width=view.width or 0,
+            canvas_height=view.height or 0,
+            window_width=float(view.window_width or WINDOW_WIDTH_MIN),
+            window_center=float(view.window_center or 0.0),
+            zoom=float(view.zoom),
+            offset_x=float(view.offset_x),
+            offset_y=float(view.offset_y),
+            rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
+            volume_preset=str(view.volume_preset or "aaa"),
+            volume_config=view.volume_render_config,
+            fast_preview=fast_preview,
+        )
 
     def _render_3d_view(
         self,
@@ -584,20 +397,10 @@ class ViewerService:
 
         spacing_xyz = self._get_3d_spacing_xyz(series)
         image = vtk_volume_renderer.render(
-            VolumeRenderRequest(
-                view_id=view.view_id,
+            self._build_volume_render_request(
+                view,
                 volume=volume,
                 spacing_xyz=spacing_xyz,
-                canvas_width=view.width,
-                canvas_height=view.height,
-                window_width=float(view.window_width or WINDOW_WIDTH_MIN),
-                window_center=float(view.window_center or 0.0),
-                zoom=float(view.zoom),
-                offset_x=float(view.offset_x),
-                offset_y=float(view.offset_y),
-                rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
-                volume_preset=str(view.volume_preset or "aaa"),
-                volume_config=view.volume_render_config,
                 fast_preview=fast_preview,
             )
         )
@@ -1084,20 +887,10 @@ class ViewerService:
         volume = self._get_series_volume(series)
         spacing_xyz = self._get_3d_spacing_xyz(series)
         view.rotation_quaternion = vtk_volume_renderer.apply_trackball_camera_delta(
-            VolumeRenderRequest(
-                view_id=view.view_id,
+            self._build_volume_render_request(
+                view,
                 volume=volume,
                 spacing_xyz=spacing_xyz,
-                canvas_width=view.width,
-                canvas_height=view.height,
-                window_width=float(view.window_width or WINDOW_WIDTH_MIN),
-                window_center=float(view.window_center or 0.0),
-                zoom=float(view.zoom),
-                offset_x=float(view.offset_x),
-                offset_y=float(view.offset_y),
-                rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
-                volume_preset=str(view.volume_preset or "aaa"),
-                volume_config=view.volume_render_config,
                 fast_preview=True,
             ),
             delta_x_pixels=delta_x_pixels,
@@ -1108,30 +901,16 @@ class ViewerService:
     def _handle_volume_config(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
             return
-        view.volume_render_config = self._normalize_volume_render_config(payload.volume_config, view.volume_preset)
-        view.volume_preset = str(view.volume_render_config.get('preset', view.volume_preset or 'aaa'))
+        view.volume_render_config = normalize_volume_render_config(payload.volume_config, view.volume_preset)
+        view.volume_preset = str(view.volume_render_config.get("preset", view.volume_preset or "aaa"))
         view.is_initialized = True
 
     def _handle_volume_preset(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
             return
 
-        preset_value = (payload.sub_op_type or "aaa").strip().lower()
-        if ":" in preset_value:
-            preset_value = preset_value.split(":", 1)[1]
-
-        preset_aliases = {
-            "aaa": "aaa",
-            "red": "red",
-            "cardiac": "cardiac",
-            "cardiac-muscle": "cardiac",
-            "cardiac_muscle": "cardiac",
-            "cardiac muscle": "cardiac",
-            "muscle": "muscle",
-            "mip": "mip",
-        }
-        view.volume_preset = preset_aliases.get(preset_value, "aaa")
-        view.volume_render_config = self._create_default_volume_render_config(view.volume_preset)
+        view.volume_preset = normalize_volume_preset_name(payload.sub_op_type or "aaa")
+        view.volume_render_config = create_default_volume_render_config(view.volume_preset)
         view.is_initialized = True
 
     def _handle_drag_zoom(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
@@ -1253,30 +1032,30 @@ class ViewerService:
             return None
 
         normalized_radius = (
-            CROSSHAIR_HIT_RADIUS / float(min(overlay.width, overlay.height))
-            if min(overlay.width, overlay.height) > 0
+            CROSSHAIR_HIT_RADIUS / float(min(overlay.image_width, overlay.image_height))
+            if min(overlay.image_width, overlay.image_height) > 0
             else 0.0
         )
         return MprCrosshairInfo(
             centerX=(
-                float(overlay.center_x) / float(overlay.width)
-                if overlay.width > 0
+                (float(overlay.center_x) - float(overlay.image_left)) / float(overlay.image_width)
+                if overlay.image_width > 0
                 else 0.0
             ),
             centerY=(
-                float(overlay.center_y) / float(overlay.height)
-                if overlay.height > 0
+                (float(overlay.center_y) - float(overlay.image_top)) / float(overlay.image_height)
+                if overlay.image_height > 0
                 else 0.0
             ),
             hitRadius=normalized_radius,
             horizontalPosition=(
-                float(overlay.horizontal_position) / float(overlay.height)
-                if overlay.horizontal_position is not None and overlay.height > 0
+                (float(overlay.horizontal_position) - float(overlay.image_top)) / float(overlay.image_height)
+                if overlay.horizontal_position is not None and overlay.image_height > 0
                 else None
             ),
             verticalPosition=(
-                float(overlay.vertical_position) / float(overlay.width)
-                if overlay.vertical_position is not None and overlay.width > 0
+                (float(overlay.vertical_position) - float(overlay.image_left)) / float(overlay.image_width)
+                if overlay.vertical_position is not None and overlay.image_width > 0
                 else None
             ),
         )

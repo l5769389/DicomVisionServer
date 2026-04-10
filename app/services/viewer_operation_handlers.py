@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from app.core import (
     DRAG_ACTION_MOVE,
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 RenderMode = Literal["none", "single", "broadcast"]
 
-
 @dataclass(frozen=True)
 class OperationRenderOutcome:
     primary_result: RenderedImageResult | None = None
@@ -44,6 +43,12 @@ class RenderDecision:
     mode: RenderMode
     image_format: ImageFormat = "png"
     fast_preview: bool = False
+
+
+OperationHandler = Callable[
+    ["ViewerService", ViewRecord, SeriesRecord, ViewOperationRequest, bool],
+    RenderDecision,
+]
 
 
 def handle_view_operation(service: ViewerService, payload: ViewOperationRequest) -> OperationRenderOutcome:
@@ -88,26 +93,19 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
     )
 
 
-def _get_operation_handler(payload: ViewOperationRequest):
-    if payload.op_type == VIEW_OP_TYPE_SCROLL:
-        return _handle_scroll_operation
-    if payload.op_type == VIEW_OP_TYPE_CROSSHAIR:
-        return _handle_crosshair_operation
-    if payload.op_type == VIEW_OP_TYPE_ZOOM:
-        return _handle_zoom_operation
-    if payload.op_type == VIEW_OP_TYPE_WINDOW:
-        return _handle_window_operation
-    if payload.op_type == VIEW_OP_TYPE_PAN:
-        return _handle_pan_operation
-    if payload.op_type == VIEW_OP_TYPE_ROTATE_3D:
-        return _handle_rotate_3d_operation
-    if payload.op_type == VIEW_OP_TYPE_RESET:
-        return _handle_reset_operation
-    if payload.op_type == VIEW_OP_TYPE_VOLUME_PRESET:
-        return _handle_volume_preset_operation
-    if payload.op_type == VIEW_OP_TYPE_VOLUME_CONFIG:
-        return _handle_volume_config_operation
-    return _handle_generic_operation
+def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
+    operation_handlers: dict[str, OperationHandler] = {
+        VIEW_OP_TYPE_SCROLL: _handle_scroll_operation,
+        VIEW_OP_TYPE_CROSSHAIR: _handle_crosshair_operation,
+        VIEW_OP_TYPE_ZOOM: _handle_zoom_operation,
+        VIEW_OP_TYPE_WINDOW: _handle_window_operation,
+        VIEW_OP_TYPE_PAN: _handle_pan_operation,
+        VIEW_OP_TYPE_ROTATE_3D: _handle_rotate_3d_operation,
+        VIEW_OP_TYPE_RESET: _handle_reset_operation,
+        VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
+        VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
+    }
+    return operation_handlers.get(payload.op_type, _handle_generic_operation)
 
 
 def _sync_mpr_active_viewport(service: ViewerService, view: ViewRecord) -> bool:
@@ -117,6 +115,23 @@ def _sync_mpr_active_viewport(service: ViewerService, view: ViewRecord) -> bool:
     if active_viewport_changed:
         view.is_initialized = True
     return active_viewport_changed
+
+
+def _resolve_drag_single_render_decision(
+    service: ViewerService,
+    view: ViewRecord,
+    payload: ViewOperationRequest,
+    *,
+    fast_preview_on_move: bool | None = None,
+) -> RenderDecision:
+    if payload.action_type == "start":
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_single(
+            "jpeg",
+            fast_preview=service._is_3d_view_type(view.view_type) if fast_preview_on_move is None else fast_preview_on_move,
+        )
+    return _render_single()
 
 
 def _handle_scroll_operation(
@@ -158,11 +173,7 @@ def _handle_zoom_operation(
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
     service._handle_drag_zoom(view, payload)
-    if payload.action_type == "start":
-        return _render_none()
-    if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg", fast_preview=service._is_3d_view_type(view.view_type))
-    return _render_single()
+    return _resolve_drag_single_render_decision(service, view, payload)
 
 
 def _handle_window_operation(
@@ -179,11 +190,7 @@ def _handle_window_operation(
         if payload.action_type == DRAG_ACTION_MOVE:
             return _render_broadcast("jpeg", fast_preview=True)
         return _render_broadcast()
-    if payload.action_type == "start":
-        return _render_none()
-    if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg", fast_preview=service._is_3d_view_type(view.view_type))
-    return _render_single()
+    return _resolve_drag_single_render_decision(service, view, payload)
 
 
 def _handle_pan_operation(
@@ -196,11 +203,7 @@ def _handle_pan_operation(
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
     service._handle_drag_pan(view, payload)
-    if payload.action_type == "start":
-        return _render_none()
-    if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg", fast_preview=service._is_3d_view_type(view.view_type))
-    return _render_single()
+    return _resolve_drag_single_render_decision(service, view, payload)
 
 
 def _handle_rotate_3d_operation(
@@ -212,11 +215,7 @@ def _handle_rotate_3d_operation(
 ) -> RenderDecision:
     del series, is_mpr_view
     service._handle_drag_rotate_3d(view, payload)
-    if payload.action_type == "start":
-        return _render_none()
-    if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("jpeg", fast_preview=True)
-    return _render_single()
+    return _resolve_drag_single_render_decision(service, view, payload, fast_preview_on_move=True)
 
 
 def _handle_reset_operation(
@@ -325,6 +324,8 @@ def _build_operation_render_outcome(
         )
 
     if service._is_3d_view_type(view.view_type) and render_decision.fast_preview:
+        # 3D drag interactions first schedule a quick preview frame and let the
+        # socket runtime follow up with the heavier render path asynchronously.
         return OperationRenderOutcome(
             deferred_view_ids=(view.view_id,),
             deferred_image_format=render_decision.image_format,
