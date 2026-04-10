@@ -159,6 +159,7 @@ class MeasurementOverlayPayload(BaseModel):
 class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId")
     op_type: ViewOperationType = Field(alias="opType")
+    measurement_id: str | None = Field(default=None, alias="measurementId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")
     sub_op_type: str | None = Field(default=None, alias="subOpType")
     action_type: ViewActionType | None = Field(default=None, alias="actionType")

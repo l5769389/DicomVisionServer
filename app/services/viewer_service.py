@@ -373,17 +373,24 @@ class ViewerService:
         metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
 
         label_anchor = image_points[1] if tool_type != "angle" else image_points[1]
-        view.measurements.append(
-            MeasurementRecord(
-                measurement_id=str(uuid4()),
-                tool_type=tool_type,
-                points=image_points,
-                slice_context=slice_context,
-                metrics=metrics,
-                label_anchor=label_anchor,
-                label_lines=label_lines,
-            )
+        measurement_id = str(payload.measurement_id or "").strip() or str(uuid4())
+        next_measurement = MeasurementRecord(
+            measurement_id=measurement_id,
+            tool_type=tool_type,
+            points=image_points,
+            slice_context=slice_context,
+            metrics=metrics,
+            label_anchor=label_anchor,
+            label_lines=label_lines,
         )
+        existing_index = next(
+            (index for index, measurement in enumerate(view.measurements) if measurement.measurement_id == measurement_id),
+            None,
+        )
+        if existing_index is None:
+            view.measurements.append(next_measurement)
+        else:
+            view.measurements[existing_index] = next_measurement
         view.is_initialized = True
         return True
 
