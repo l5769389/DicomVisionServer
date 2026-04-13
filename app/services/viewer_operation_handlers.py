@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Literal
@@ -266,6 +266,10 @@ def _handle_measurement_operation(
     is_mpr_view: bool,
 ) -> RenderDecision:
     del series, is_mpr_view
+    if payload.action_type == "delete":
+        if service._delete_measurement(view, payload.measurement_id):
+            return _render_single()
+        return _render_none()
     if payload.action_type in {"start", "move"}:
         return RenderDecision(mode="none", draft_measurement=service._build_measurement_preview(view, payload))
     if payload.action_type == "end":
@@ -361,6 +365,7 @@ def _build_operation_render_outcome(
             fast_preview=render_decision.fast_preview,
         )
     )
+
 
 
 

@@ -1,4 +1,4 @@
-﻿from typing import Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -9,7 +9,7 @@ ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ViewSetSizeOperationType = Literal["setSize"]
 ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d", "reset", "volumePreset", "volumeConfig", "measurement"]
-ViewActionType = Literal["start", "move", "end"]
+ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
 
@@ -173,4 +173,5 @@ class ViewOperationRequest(BaseModel):
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
 
     model_config = {"populate_by_name": True}
+
 

@@ -1,4 +1,4 @@
-﻿import io
+import io
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
@@ -391,6 +391,25 @@ class ViewerService:
             view.measurements.append(next_measurement)
         else:
             view.measurements[existing_index] = next_measurement
+        view.is_initialized = True
+        return True
+
+    @staticmethod
+    def _delete_measurement(view: ViewRecord, measurement_id: str | None) -> bool:
+        target_measurement_id = str(measurement_id or "").strip()
+        if not target_measurement_id:
+            return False
+
+        existing_count = len(view.measurements)
+        if not existing_count:
+            return False
+
+        view.measurements = [
+            measurement for measurement in view.measurements if measurement.measurement_id != target_measurement_id
+        ]
+        if len(view.measurements) == existing_count:
+            return False
+
         view.is_initialized = True
         return True
 
@@ -972,8 +991,8 @@ class ViewerService:
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
         if target_viewport == MPR_VIEWPORT_CORONAL:
             index = max(0, min(view.mpr_coronal_index, height - 1))
-            # 浠?3D volume 鍒囧嚭鏉ョ殑涓€寮?2D 鍒囬潰
-            # np.flipud(...)锛氭妸杩欏紶鍒囬潰涓婁笅缈昏繃鏉?
+            # �?3D volume 切出来的一�?2D 切面
+            # np.flipud(...)：把这张切面上下翻过�?
             plane = np.flipud(volume[:, index, :])
             return plane.astype(np.float32), index, height
         if target_viewport == MPR_VIEWPORT_SAGITTAL:
@@ -2017,6 +2036,7 @@ class ViewerService:
 
 
 viewer_service = ViewerService()
+
 
 
 
