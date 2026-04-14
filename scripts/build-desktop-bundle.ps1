@@ -46,10 +46,22 @@ try {
     --distpath $outputRootPath `
     --workpath $workRoot `
     --specpath $workRoot `
-    --collect-submodules vtk `
+    --hidden-import scipy `
+    --hidden-import scipy.ndimage `
+    --hidden-import scipy.ndimage._nd_image `
+    --exclude-module matplotlib `
+    --exclude-module pytest `
+    --exclude-module scipy.conftest `
+    --exclude-module scipy.tests `
+    --hidden-import vtkmodules.util.numpy_support `
+    --hidden-import vtkmodules.util.vtkConstants `
+    --hidden-import vtkmodules.vtkCommonCore `
+    --hidden-import vtkmodules.vtkCommonDataModel `
+    --hidden-import vtkmodules.vtkRenderingCore `
+    --hidden-import vtkmodules.vtkRenderingOpenGL2 `
+    --hidden-import vtkmodules.vtkRenderingVolumeOpenGL2 `
     --collect-binaries vtk `
     --collect-data vtk `
-    --collect-submodules scipy `
     $entryPath
 
   if ($LASTEXITCODE -ne 0) {

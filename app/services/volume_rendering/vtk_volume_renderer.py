@@ -8,20 +8,19 @@ from threading import RLock
 
 import numpy as np
 from PIL import Image
-from vtk import (
-    VTK_FLOAT,
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+from vtkmodules.util.vtkConstants import VTK_FLOAT
+from vtkmodules.vtkCommonCore import vtkObject
+from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
+from vtkmodules.vtkRenderingCore import (
     vtkColorTransferFunction,
-    vtkImageData,
-    vtkObject,
-    vtkPiecewiseFunction,
     vtkRenderer,
     vtkRenderWindow,
-    vtkSmartVolumeMapper,
     vtkVolume,
     vtkVolumeProperty,
     vtkWindowToImageFilter,
 )
-from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 
 
 vtkObject.GlobalWarningDisplayOff()
