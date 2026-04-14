@@ -19,6 +19,7 @@ It is built with FastAPI and Python, and is designed to work with the Electron/V
 - [3D Volume Rendering](#3d-volume-rendering)
 - [Development Notes](#development-notes)
 - [Testing](#testing)
+- [Desktop Packaging](#desktop-packaging)
 - [Frontend Integration](#frontend-integration)
 
 ## Overview
@@ -214,6 +215,41 @@ If tests are added or expanded:
 ```bash
 uv run pytest
 ```
+
+## Desktop Packaging
+
+This repository is responsible for producing its own desktop backend bundle. The Electron client repository consumes that bundle and assembles the final installer.
+
+Install `PyInstaller` into the local virtual environment when needed:
+
+```bash
+uv run python -m pip install pyinstaller
+```
+
+Build the Windows desktop bundle:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
+```
+
+Default output:
+
+```text
+dist/
+  DicomVisionServer/
+    DicomVisionServer.exe
+    ...
+```
+
+You can override the output root if your release pipeline needs a different staging location:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1 -OutputRoot .\artifacts
+```
+
+The companion Electron client can then stage this directory through `DICOM_VISION_SERVER_BUNDLE_PATH` and package it into the final desktop installer.
+
+If the companion repository is located next to this one, you can also trigger the full release chain from `DicomVisionClient` with `npm run release:win`.
 
 ## Frontend Integration
 

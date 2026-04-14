@@ -19,6 +19,7 @@ DicomVision Server 是 DicomVision 桌面阅片系统的后端服务，负责 DI
 - [3D 体渲染](#3d-体渲染)
 - [开发说明](#开发说明)
 - [测试](#测试)
+- [桌面打包](#桌面打包)
 - [前后端联调](#前后端联调)
 
 ## 项目概览
@@ -214,6 +215,41 @@ HTTP 基础路径：`/api/v1`
 ```bash
 uv run pytest
 ```
+
+## 桌面打包
+
+当前仓库负责产出自己的桌面后端 bundle，Electron 客户端仓库只消费该 bundle 并组装最终安装包。
+
+如需构建 Windows 桌面 bundle，先在本地虚拟环境安装 `PyInstaller`：
+
+```bash
+uv run python -m pip install pyinstaller
+```
+
+执行构建脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
+```
+
+默认输出目录：
+
+```text
+dist/
+  DicomVisionServer/
+    DicomVisionServer.exe
+    ...
+```
+
+如果发布链路需要不同的产物目录，可覆盖输出根目录：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1 -OutputRoot .\artifacts
+```
+
+随后可将该目录作为 `DICOM_VISION_SERVER_BUNDLE_PATH` 提供给 `DicomVisionClient`，由客户端仓库完成最终安装包组装。
+
+如果两个仓库位于相邻目录，也可以直接在 `DicomVisionClient` 中执行 `npm run release:win`，一次完成服务端构建与客户端安装包组装。
 
 ## 前后端联调
 
