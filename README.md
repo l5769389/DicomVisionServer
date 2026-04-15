@@ -1,6 +1,6 @@
 # DicomVision Server
 
-[ä¸­æ–‡æ–‡æ¡£](./README.zh-CN.md)
+[ÖÐÎÄÎÄµµ](./README.zh-CN.md)
 
 DicomVision Server is the backend service for the DicomVision desktop viewer. It provides DICOM series loading, viewport lifecycle management, 2D image rendering, MPR reconstruction, 3D volume rendering, and real-time image updates over Socket.IO.
 
@@ -15,6 +15,7 @@ It is built with FastAPI and Python, and is designed to work with the Electron/V
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [Render Deployment](#render-deployment)
 - [API and Realtime Events](#api-and-realtime-events)
 - [3D Volume Rendering](#3d-volume-rendering)
 - [Development Notes](#development-notes)
@@ -47,6 +48,7 @@ Typical lifecycle:
 - DICOM pixel caching to reduce repeated file reads
 - Corner overlays, orientation overlays, crosshair synchronization, and hover coordinate mapping
 - 3D preset and transfer-function configuration support
+- Dedicated sample-loading endpoint for the web deployment path
 
 ## Technology Stack
 
@@ -71,7 +73,9 @@ app/
   services/                rendering, registries, DICOM processing
   sockets/                 Socket.IO handlers and runtime hub
   utils/                   shared helpers
+sample-data/               optional sample DICOM directory for web deployment
 run.py                     local startup entry
+render.yaml                Render deployment manifest
 pyproject.toml             dependencies and project metadata
 .env.example               environment variable example
 ```
@@ -138,6 +142,7 @@ APP_ENV=development
 APP_HOST=0.0.0.0
 APP_PORT=8000
 CORS_ORIGINS=["*"]
+WEB_SAMPLE_DICOM_PATH=
 ```
 
 Key settings:
@@ -146,6 +151,28 @@ Key settings:
 - `APP_HOST`: bind address for Uvicorn
 - `APP_PORT`: service port, default `8000`
 - `CORS_ORIGINS`: allowed HTTP and Socket.IO origins
+- `WEB_SAMPLE_DICOM_PATH`: sample DICOM folder used by `POST /api/v1/dicom/loadSample`
+
+## Render Deployment
+
+This repository now includes a ready-to-edit `render.yaml` for deploying the backend to Render.
+
+Recommended Render environment variables:
+
+```env
+APP_ENV=production
+APP_HOST=0.0.0.0
+APP_PORT=10000
+CORS_ORIGINS=["https://your-vercel-app.vercel.app"]
+WEB_SAMPLE_DICOM_PATH=/opt/render/project/src/sample-data
+```
+
+Notes:
+
+- `CORS_ORIGINS` is reused by both FastAPI CORS and Socket.IO `cors_allowed_origins`
+- `WEB_SAMPLE_DICOM_PATH` should point to a readable directory on the Render instance
+- You can store the sample series in `sample-data/` or point the variable elsewhere
+- The web frontend can use `POST /api/v1/dicom/loadSample` to load this server-side sample folder without exposing filesystem paths to the browser
 
 ## API and Realtime Events
 
@@ -156,6 +183,8 @@ Base HTTP path: `/api/v1`
 - `GET /health`
 - `POST /dicom/loadFolder`
   - Purpose: load a local folder and register readable DICOM series
+- `POST /dicom/loadSample`
+  - Purpose: load the configured server-side sample DICOM folder for the web deployment
 - `POST /dicom/cornerInfo`
   - Purpose: resolve series-level corner overlay information
 - `POST /view/create`

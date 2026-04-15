@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: dicomvision-server
+    runtime: python
+    plan: starter
+    rootDir: .
+    buildCommand: |
+      pip install uv && uv sync
+    startCommand: |
+      uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_HOST
+        value: 0.0.0.0
+      - key: APP_PORT
+        value: 10000
+      - key: CORS_ORIGINS
+        sync: false
+      - key: WEB_SAMPLE_DICOM_PATH
+        sync: false
