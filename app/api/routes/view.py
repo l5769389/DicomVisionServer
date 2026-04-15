@@ -1,6 +1,13 @@
-from fastapi import APIRouter, BackgroundTasks
+﻿from fastapi import APIRouter, BackgroundTasks
 
-from app.schemas.view import OperationAcceptedResponse, ViewCreateRequest, ViewCreateResponse, ViewSetSizeRequest
+from app.schemas.view import (
+    OperationAcceptedResponse,
+    ViewCreateRequest,
+    ViewCreateResponse,
+    ViewMtfAnalyzeRequest,
+    ViewMtfAnalyzeResponse,
+    ViewSetSizeRequest,
+)
 from app.sockets.runtime import view_socket_hub
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
@@ -25,3 +32,8 @@ async def set_view_size(payload: ViewSetSizeRequest, background_tasks: Backgroun
     result = viewer_service.set_view_size(payload)
     background_tasks.add_task(_emit_render_after_resize, payload.view_id)
     return result
+
+
+@router.post("/mtf/analyze", response_model=ViewMtfAnalyzeResponse)
+async def analyze_mtf(payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
+    return viewer_service.analyze_mtf(payload)

@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, alias="APP_PORT")
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    web_sample_dicom_path: str | None = Field(default=None, alias="WEB_SAMPLE_DICOM_PATH")
 
     model_config = SettingsConfigDict(
         env_file=".env",

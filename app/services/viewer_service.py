@@ -1,4 +1,4 @@
-import io
+﻿import io
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
@@ -38,14 +38,18 @@ from app.models.viewer import InstanceRecord, SeriesRecord, ViewRecord
 from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
     ImageFormat,
+    MtfCurvePointPayload,
+    MtfMetricsPayload,
+    MprCrosshairInfo,
+    MeasurementOverlayPayload,
     OperationAcceptedResponse,
     OrientationInfo,
     SliceInfo,
-    MprCrosshairInfo,
-    MeasurementOverlayPayload,
     ViewHoverRequest,
     ViewHoverResponse,
     ViewImageResponse,
+    ViewMtfAnalyzeRequest,
+    ViewMtfAnalyzeResponse,
     ViewOperationRequest,
     ViewSetSizeRequest,
     WindowInfo,
@@ -150,6 +154,74 @@ class ViewerService:
             reference_cached.dataset if reference_cached is not None else None,
         )
         return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(overlay))
+
+    def analyze_mtf(self, payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
+        view = view_registry.get(payload.view_id)
+        if view.view_type not in {"Stack", "MPR", "AX", "COR", "SAG"}:
+            raise HTTPException(status_code=400, detail="MTF analysis is only available for 2D views")
+        if len(payload.points) < 2:
+            raise HTTPException(status_code=400, detail="MTF analysis requires two ROI points")
+
+        image_points = tuple(
+            self._resolve_normalized_point_to_image_point(view, point.x, point.y)
+            for point in payload.points[:2]
+        )
+        source_pixels, spacing_xy, _ = self._resolve_measurement_source_context(view)
+        image_height = int(source_pixels.shape[0])
+        image_width = int(source_pixels.shape[1])
+        left = max(0, min(int(round(image_points[0].x)), int(round(image_points[1].x))))
+        right = min(image_width - 1, max(int(round(image_points[0].x)), int(round(image_points[1].x))))
+        top = max(0, min(int(round(image_points[0].y)), int(round(image_points[1].y))))
+        bottom = min(image_height - 1, max(int(round(image_points[0].y)), int(round(image_points[1].y))))
+        if right <= left or bottom <= top:
+            raise HTTPException(status_code=400, detail="MTF ROI is too small")
+
+        roi = np.asarray(source_pixels[top : bottom + 1, left : right + 1], dtype=np.float64)
+        if roi.size == 0:
+            raise HTTPException(status_code=400, detail="MTF ROI is empty")
+
+        sample_count = int(roi.size)
+        roi_width = max(right - left, 1)
+        roi_height = max(bottom - top, 1)
+        diagonal_ratio = min(
+            max(float(np.hypot(roi_width, roi_height)) / max(float(np.hypot(image_width, image_height)), 1.0), 0.12),
+            0.95,
+        )
+        curve_length = 32
+        if spacing_xy is not None:
+            pixel_scale = max((float(spacing_xy[0]) + float(spacing_xy[1])) / 2.0, 1e-6)
+            max_frequency = 1.2 / pixel_scale
+            unit = "lp/mm"
+        else:
+            max_frequency = 1.2
+            unit = "lp/pixel"
+
+        frequencies = np.linspace(0.0, max_frequency, curve_length)
+        decay = max(max_frequency * diagonal_ratio, max_frequency * 0.18)
+        values = np.exp(-(frequencies / max(decay, 1e-6)) ** 1.3)
+        values[0] = 1.0
+
+        mtf50 = next((float(freq) for freq, value in zip(frequencies, values) if value <= 0.5), float(frequencies[-1]))
+        mtf10 = next((float(freq) for freq, value in zip(frequencies, values) if value <= 0.1), float(frequencies[-1]))
+        curve = [
+            MtfCurvePointPayload(frequency=float(freq), value=float(value))
+            for freq, value in zip(frequencies, values)
+        ]
+
+        return ViewMtfAnalyzeResponse(
+            viewId=view.view_id,
+            viewportKey=payload.viewport_key,
+            points=payload.points[:2],
+            metrics=MtfMetricsPayload(
+                mtf50=round(mtf50, 4),
+                mtf10=round(mtf10, 4),
+                peakValue=round(float(np.max(values)), 4),
+                sampleCount=sample_count,
+                unit=unit,
+            ),
+            curve=curve,
+            isPlaceholder=True,
+        )
 
     def _resolve_hover_row_col(self, view: ViewRecord, normalized_x: float, normalized_y: float) -> tuple[int, int]:
         if not view.width or not view.height or self._is_3d_view_type(view.view_type):
@@ -991,8 +1063,8 @@ class ViewerService:
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
         if target_viewport == MPR_VIEWPORT_CORONAL:
             index = max(0, min(view.mpr_coronal_index, height - 1))
-            # �?3D volume 切出来的一�?2D 切面
-            # np.flipud(...)：把这张切面上下翻过�?
+            # 浠?3D volume 鍒囧嚭鏉ョ殑涓€寮?2D 鍒囬潰
+            # np.flipud(...)锛氭妸杩欏紶鍒囬潰涓婁笅缈昏繃鏉?
             plane = np.flipud(volume[:, index, :])
             return plane.astype(np.float32), index, height
         if target_viewport == MPR_VIEWPORT_SAGITTAL:
@@ -2036,6 +2108,9 @@ class ViewerService:
 
 
 viewer_service = ViewerService()
+
+
+
 
 
 

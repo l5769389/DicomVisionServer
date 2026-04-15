@@ -29,6 +29,12 @@ class LoadFolderResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class LoadSampleResponse(LoadFolderResponse):
+    sample_path: str = Field(alias="samplePath")
+
+    model_config = {"populate_by_name": True}
+
+
 class CornerInfoPayload(BaseModel):
     top_left: list[str] = Field(default_factory=list, alias="topLeft")
     top_right: list[str] = Field(default_factory=list, alias="topRight")
