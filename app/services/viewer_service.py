@@ -359,6 +359,7 @@ class ViewerService:
             "area": metrics.area,
             "angleDegrees": metrics.angle_degrees,
             "mean": metrics.mean,
+            "sd": metrics.standard_deviation,
             "min": metrics.minimum,
             "max": metrics.maximum,
             "unit": metrics.unit,
@@ -1328,11 +1329,11 @@ class ViewerService:
         if payload.action_type == DRAG_ACTION_MOVE:
             base_ww = view.drag_origin_window_width if view.drag_origin_window_width is not None else view.window_width
             base_wl = view.drag_origin_window_center if view.drag_origin_window_center is not None else view.window_center
-            base_ww = max(WINDOW_WIDTH_MIN, float(base_ww or WINDOW_WIDTH_MIN))
+            base_ww = float(base_ww or 0.0)
             base_wl = float(base_wl or 0.0)
             delta_x = float(payload.x or 0.0)
             delta_y = float(payload.y or 0.0)
-            view.window_width = max(WINDOW_WIDTH_MIN, base_ww + delta_x * WINDOW_DRAG_SENSITIVITY)
+            view.window_width = base_ww + delta_x * WINDOW_DRAG_SENSITIVITY
             view.window_center = base_wl - delta_y * WINDOW_DRAG_SENSITIVITY
             view.is_initialized = True
             return

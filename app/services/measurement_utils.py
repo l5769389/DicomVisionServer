@@ -63,6 +63,7 @@ def _build_rect_metrics(
     left, top, right, bottom = _resolve_bounds(points)
     roi = source_pixels[top : bottom + 1, left : right + 1]
     mean = float(np.mean(roi)) if roi.size else None
+    standard_deviation = float(np.std(roi)) if roi.size else None
     minimum = float(np.min(roi)) if roi.size else None
     maximum = float(np.max(roi)) if roi.size else None
     pixel_width = max(0, right - left)
@@ -78,10 +79,24 @@ def _build_rect_metrics(
             height=height,
             area=area,
             mean=mean,
+            standard_deviation=standard_deviation,
             minimum=minimum,
             maximum=maximum,
         )
-        return (metrics, (f"{width:.1f} x {height:.1f} mm", f"{area:.1f} mm2", f"Mean {mean:.1f}" if mean is not None else "Mean -"))
+        return (
+            metrics,
+            _build_roi_label_lines(
+                width=width,
+                height=height,
+                area=area,
+                length_unit="mm",
+                area_unit="mm2",
+                mean=mean,
+                minimum=minimum,
+                maximum=maximum,
+                standard_deviation=standard_deviation,
+            ),
+        )
 
     area = float(pixel_width * pixel_height)
     metrics = MeasurementMetrics(
@@ -91,10 +106,24 @@ def _build_rect_metrics(
         height=float(pixel_height),
         area=area,
         mean=mean,
+        standard_deviation=standard_deviation,
         minimum=minimum,
         maximum=maximum,
     )
-    return (metrics, (f"{pixel_width} x {pixel_height} px", f"{area:.1f} px2", f"Mean {mean:.1f}" if mean is not None else "Mean -"))
+    return (
+        metrics,
+        _build_roi_label_lines(
+            width=float(pixel_width),
+            height=float(pixel_height),
+            area=area,
+            length_unit="px",
+            area_unit="px2",
+            mean=mean,
+            minimum=minimum,
+            maximum=maximum,
+            standard_deviation=standard_deviation,
+        ),
+    )
 
 
 def _build_ellipse_metrics(
@@ -116,6 +145,7 @@ def _build_ellipse_metrics(
         masked = np.asarray([], dtype=np.float32)
 
     mean = float(np.mean(masked)) if masked.size else None
+    standard_deviation = float(np.std(masked)) if masked.size else None
     minimum = float(np.min(masked)) if masked.size else None
     maximum = float(np.max(masked)) if masked.size else None
     pixel_width = max(0.0, float(right - left))
@@ -131,10 +161,24 @@ def _build_ellipse_metrics(
             height=height,
             area=area,
             mean=mean,
+            standard_deviation=standard_deviation,
             minimum=minimum,
             maximum=maximum,
         )
-        return (metrics, (f"{width:.1f} x {height:.1f} mm", f"{area:.1f} mm2", f"Mean {mean:.1f}" if mean is not None else "Mean -"))
+        return (
+            metrics,
+            _build_roi_label_lines(
+                width=width,
+                height=height,
+                area=area,
+                length_unit="mm",
+                area_unit="mm2",
+                mean=mean,
+                minimum=minimum,
+                maximum=maximum,
+                standard_deviation=standard_deviation,
+            ),
+        )
 
     area = math.pi * (pixel_width / 2.0) * (pixel_height / 2.0)
     metrics = MeasurementMetrics(
@@ -144,10 +188,24 @@ def _build_ellipse_metrics(
         height=pixel_height,
         area=area,
         mean=mean,
+        standard_deviation=standard_deviation,
         minimum=minimum,
         maximum=maximum,
     )
-    return (metrics, (f"{pixel_width:.1f} x {pixel_height:.1f} px", f"{area:.1f} px2", f"Mean {mean:.1f}" if mean is not None else "Mean -"))
+    return (
+        metrics,
+        _build_roi_label_lines(
+            width=pixel_width,
+            height=pixel_height,
+            area=area,
+            length_unit="px",
+            area_unit="px2",
+            mean=mean,
+            minimum=minimum,
+            maximum=maximum,
+            standard_deviation=standard_deviation,
+        ),
+    )
 
 
 def _build_angle_metrics(points: tuple[MeasurementPoint, ...]) -> tuple[MeasurementMetrics, tuple[str, ...]]:
@@ -162,7 +220,7 @@ def _build_angle_metrics(points: tuple[MeasurementPoint, ...]) -> tuple[Measurem
         cosine = float(np.dot(vector_a, vector_b) / (length_a * length_b))
         angle = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
     metrics = MeasurementMetrics(unit="px", area_unit="px2", angle_degrees=angle)
-    return (metrics, (f"{angle:.1f}°",))
+    return (metrics, (f"{angle:.1f}\u00b0",))
 
 
 def _resolve_bounds(points: tuple[MeasurementPoint, ...]) -> tuple[int, int, int, int]:
@@ -175,3 +233,29 @@ def _resolve_bounds(points: tuple[MeasurementPoint, ...]) -> tuple[int, int, int
     top = min(y0, y1)
     bottom = max(y0, y1)
     return (left, top, right, bottom)
+
+
+def _build_roi_label_lines(
+    *,
+    width: float,
+    height: float,
+    area: float,
+    length_unit: str,
+    area_unit: str,
+    mean: float | None,
+    minimum: float | None,
+    maximum: float | None,
+    standard_deviation: float | None,
+) -> tuple[str, ...]:
+    return (
+        f"Size {width:.1f} * {height:.1f} {length_unit}",
+        f"Area {area:.1f} {area_unit}",
+        _format_stat_label("Mean", mean),
+        _format_stat_label("Min", minimum),
+        _format_stat_label("Max", maximum),
+        _format_stat_label("SD", standard_deviation),
+    )
+
+
+def _format_stat_label(name: str, value: float | None) -> str:
+    return f"{name} {value:.1f}" if value is not None else f"{name} -"

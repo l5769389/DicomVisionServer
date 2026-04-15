@@ -425,7 +425,7 @@ class VtkVolumeRenderer:
         layer: dict[str, Any],
     ) -> tuple[list[tuple[float, float, float, float]], list[tuple[float, float]]]:
         key = str(layer.get('key') or '').strip()
-        width = max(float(layer.get('ww', 1.0)), 1.0)
+        width = float(layer.get('ww', 1.0))
         center = float(layer.get('wl', 0.0))
         opacity = max(0.0, min(1.0, float(layer.get('opacity', 0.0))))
         low = center - width / 2.0

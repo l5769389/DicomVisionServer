@@ -32,6 +32,7 @@ class MeasurementMetrics:
     area: float | None = None
     angle_degrees: float | None = None
     mean: float | None = None
+    standard_deviation: float | None = None
     minimum: float | None = None
     maximum: float | None = None
 

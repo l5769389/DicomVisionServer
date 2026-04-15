@@ -143,7 +143,7 @@ def normalize_volume_render_config(
             continue
         layer["label"] = str(entry.get("label") or layer["label"])
         layer["enabled"] = bool(entry.get("enabled", layer["enabled"]))
-        layer["ww"] = max(1.0, float(entry.get("ww", layer["ww"])))
+        layer["ww"] = float(entry.get("ww", layer["ww"]))
         layer["wl"] = float(entry.get("wl", layer["wl"]))
         layer["opacity"] = _normalize_unit_interval(entry.get("opacity"), float(layer["opacity"]))
         layer["colorStart"] = _normalize_hex_color(str(entry.get("colorStart") or layer["colorStart"]), str(layer["colorStart"]))
