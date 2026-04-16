@@ -119,15 +119,32 @@ class ViewportTransformer:
         # so convert the inverse transform from x/y into array coordinates.
         array_matrix = affine_matrix[[1, 0]][:, [1, 0]]
         array_offset = offset[[1, 0]]
-        transformed = affine_transform(
-            image_array,
-            array_matrix,
-            offset=array_offset,
-            output_shape=(canvas_height, canvas_width),
-            order=order,
-            mode="constant",
-            cval=cval,
-        )
+        if image_array.ndim == 3:
+            transformed = np.stack(
+                [
+                    affine_transform(
+                        image_array[..., channel_index],
+                        array_matrix,
+                        offset=array_offset,
+                        output_shape=(canvas_height, canvas_width),
+                        order=order,
+                        mode="constant",
+                        cval=cval,
+                    )
+                    for channel_index in range(image_array.shape[-1])
+                ],
+                axis=-1,
+            )
+        else:
+            transformed = affine_transform(
+                image_array,
+                array_matrix,
+                offset=array_offset,
+                output_shape=(canvas_height, canvas_width),
+                order=order,
+                mode="constant",
+                cval=cval,
+            )
         if transformed.dtype != np.uint8:
             transformed = np.clip(transformed, 0, 255).astype(np.uint8)
         return transformed

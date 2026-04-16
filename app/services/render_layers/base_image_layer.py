@@ -1,5 +1,6 @@
 import numpy as np
 
+from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor
 from app.services.render_layers.render_context import RenderContext
 
 
@@ -24,4 +25,7 @@ class BaseImageLayer:
             return np.zeros_like(clipped, dtype=np.uint8)
 
         normalized = (clipped - lower) / scale
-        return (normalized * 255.0).astype(np.uint8)
+        grayscale = (normalized * 255.0).astype(np.uint8)
+        if context.view.pseudocolor_preset == DEFAULT_PSEUDOCOLOR_PRESET:
+            return grayscale
+        return apply_pseudocolor(grayscale, context.view.pseudocolor_preset)

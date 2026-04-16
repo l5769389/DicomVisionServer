@@ -82,6 +82,7 @@ class ViewRecord:
     view_id: str
     series_id: str
     view_type: str
+    pseudocolor_preset: str = "bw"
     width: int | None = None
     height: int | None = None
     current_index: int = 0

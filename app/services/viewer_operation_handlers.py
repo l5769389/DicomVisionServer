@@ -7,6 +7,7 @@ from app.core import (
     DRAG_ACTION_MOVE,
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_PSEUDOCOLOR,
     VIEW_OP_TYPE_SCROLL,
     VIEW_OP_TYPE_TRANSFORM_2D,
     VIEW_OP_TYPE_WINDOW,
@@ -103,6 +104,7 @@ def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
         VIEW_OP_TYPE_CROSSHAIR: _handle_crosshair_operation,
         VIEW_OP_TYPE_ZOOM: _handle_zoom_operation,
         VIEW_OP_TYPE_WINDOW: _handle_window_operation,
+        VIEW_OP_TYPE_PSEUDOCOLOR: _handle_pseudocolor_operation,
         VIEW_OP_TYPE_PAN: _handle_pan_operation,
         VIEW_OP_TYPE_TRANSFORM_2D: _handle_transform_2d_operation,
         VIEW_OP_TYPE_ROTATE_3D: _handle_rotate_3d_operation,
@@ -210,6 +212,19 @@ def _handle_pan_operation(
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
     service._handle_drag_pan(view, payload)
     return _resolve_drag_single_render_decision(service, view, payload)
+
+
+def _handle_pseudocolor_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if not service._handle_pseudocolor(view, payload):
+        return _render_none()
+    return _render_single()
 
 
 def _handle_rotate_3d_operation(

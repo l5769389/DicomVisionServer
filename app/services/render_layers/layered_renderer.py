@@ -28,10 +28,11 @@ class LayeredRenderer:
             cval=0.0,
         )
 
+        base_image = self._build_base_image(transformed_base)
         if not self._has_overlay_content(context):
-            return Image.fromarray(transformed_base, mode="L")
+            return base_image
 
-        canvas = Image.fromarray(transformed_base, mode="L").convert("RGBA")
+        canvas = base_image.convert("RGBA")
         return self.composite_overlays(canvas, context)
 
     def composite_overlays(self, canvas: Image.Image, context: RenderContext) -> Image.Image:
@@ -62,6 +63,12 @@ class LayeredRenderer:
                 context.corner_info is not None,
             )
         )
+
+    @staticmethod
+    def _build_base_image(base_pixels):
+        if getattr(base_pixels, "ndim", 0) == 3 and base_pixels.shape[-1] == 3:
+            return Image.fromarray(base_pixels, mode="RGB")
+        return Image.fromarray(base_pixels, mode="L")
 
 
 layered_renderer = LayeredRenderer()

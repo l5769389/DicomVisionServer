@@ -45,6 +45,7 @@ from app.schemas.view import (
     OperationAcceptedResponse,
     OrientationInfo,
     SliceInfo,
+    ViewColorInfo,
     ViewHoverRequest,
     ViewHoverResponse,
     ViewImageResponse,
@@ -60,6 +61,7 @@ from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
 from app.services.measurement_utils import build_measurement_metrics, clamp_point_to_image
 from app.services.mtf import MtfAnalyzer
+from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor, normalize_pseudocolor_preset
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
@@ -606,6 +608,7 @@ class ViewerService:
         view.offset_x = 0.0
         view.offset_y = 0.0
         view.rotation_degrees = 0
+        view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
         view.window_width = cached.window_width or self._derive_default_window_width(cached)
         view.window_center = cached.window_center or self._derive_default_window_center(cached)
         self._reset_drag_state(view)
@@ -633,6 +636,7 @@ class ViewerService:
         view.offset_x = 0.0
         view.offset_y = 0.0
         view.rotation_degrees = 0
+        view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
 
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
@@ -686,6 +690,7 @@ class ViewerService:
         view.offset_x = 0.0
         view.offset_y = 0.0
         view.rotation_quaternion = vtk_volume_renderer.get_default_rotation_quaternion()
+        view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
         view.volume_preset = "aaa"
         view.volume_render_config = create_default_volume_render_config("aaa")
         self._reset_drag_state(view)
@@ -780,6 +785,7 @@ class ViewerService:
                 window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
                 imageFormat=image_format,
                 viewId=view.view_id,
+                color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 cornerInfo=self._serialize_corner_info_overlay(corner_info),
                 orientation=self._build_3d_orientation_overlay(view),
                 transform=self._build_view_transform_payload(view),
@@ -862,6 +868,7 @@ class ViewerService:
                 window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
                 imageFormat=image_format,
                 viewId=view.view_id,
+                color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
                     visible_measurements,
@@ -941,6 +948,7 @@ class ViewerService:
                 window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
                 imageFormat=image_format,
                 viewId=view.view_id,
+                color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
@@ -963,7 +971,7 @@ class ViewerService:
 
     @staticmethod
     def _render_fast_preview(context: RenderContext) -> Image.Image:
-        image = ViewerService._render_fast_grayscale_image(
+        image = ViewerService._render_fast_base_image(
             source_pixels=context.source_pixels,
             pixel_min=context.pixel_min,
             pixel_max=context.pixel_max,
@@ -973,7 +981,7 @@ class ViewerService:
         return layered_renderer.composite_overlays(image, context)
 
     @staticmethod
-    def _render_fast_grayscale_image(
+    def _render_fast_base_image(
         source_pixels: np.ndarray,
         pixel_min: float,
         pixel_max: float,
@@ -995,6 +1003,9 @@ class ViewerService:
             order=1,
             cval=0.0,
         )
+        if render_view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
+            transformed = apply_pseudocolor(transformed, render_view.pseudocolor_preset)
+            return Image.fromarray(transformed, mode="RGB")
         return Image.fromarray(transformed, mode="L")
 
     def _build_render_plan_for_shape(self, view: ViewRecord, image_height: int, image_width: int) -> RenderPlan:
@@ -1334,6 +1345,15 @@ class ViewerService:
             view.drag_origin_window_width = None
             view.drag_origin_window_center = None
             view.drag_origin_volume_render_config = None
+
+    @staticmethod
+    def _handle_pseudocolor(view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+        if view.pseudocolor_preset == next_preset:
+            return False
+        view.pseudocolor_preset = next_preset
+        view.is_initialized = True
+        return True
 
     def _get_mpr_group_views(self, view: ViewRecord) -> list[ViewRecord]:
         if view.view_group is None:
