@@ -1,4 +1,4 @@
-﻿from typing import Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -178,6 +178,8 @@ class ViewOperationRequest(BaseModel):
 class MtfMetricsPayload(BaseModel):
     mtf50: float | None = None
     mtf10: float | None = None
+    fwhm_w: float | None = Field(default=None, alias="fwhmW")
+    fwhm_h: float | None = Field(default=None, alias="fwhmH")
     peak_value: float | None = Field(default=None, alias="peakValue")
     sample_count: int | None = Field(default=None, alias="sampleCount")
     unit: str | None = None
@@ -207,3 +209,4 @@ class ViewMtfAnalyzeResponse(BaseModel):
     is_placeholder: bool = Field(default=True, alias="isPlaceholder")
 
     model_config = {"populate_by_name": True}
+

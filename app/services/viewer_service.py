@@ -1,4 +1,4 @@
-﻿import io
+import io
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
@@ -58,6 +58,7 @@ from app.services.dicom_cache import CachedDicom, dicom_cache
 from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
 from app.services.measurement_utils import build_measurement_metrics, clamp_point_to_image
+from app.services.mtf import MtfAnalyzer
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
@@ -181,31 +182,15 @@ class ViewerService:
             raise HTTPException(status_code=400, detail="MTF ROI is empty")
 
         sample_count = int(roi.size)
-        roi_width = max(right - left, 1)
-        roi_height = max(bottom - top, 1)
-        diagonal_ratio = min(
-            max(float(np.hypot(roi_width, roi_height)) / max(float(np.hypot(image_width, image_height)), 1.0), 0.12),
-            0.95,
-        )
-        curve_length = 32
-        if spacing_xy is not None:
-            pixel_scale = max((float(spacing_xy[0]) + float(spacing_xy[1])) / 2.0, 1e-6)
-            max_frequency = 1.2 / pixel_scale
-            unit = "lp/mm"
-        else:
-            max_frequency = 1.2
-            unit = "lp/pixel"
+        try:
+            analysis = MtfAnalyzer.analyze_roi(roi, spacing_xy=spacing_xy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        frequencies = np.linspace(0.0, max_frequency, curve_length)
-        decay = max(max_frequency * diagonal_ratio, max_frequency * 0.18)
-        values = np.exp(-(frequencies / max(decay, 1e-6)) ** 1.3)
-        values[0] = 1.0
-
-        mtf50 = next((float(freq) for freq, value in zip(frequencies, values) if value <= 0.5), float(frequencies[-1]))
-        mtf10 = next((float(freq) for freq, value in zip(frequencies, values) if value <= 0.1), float(frequencies[-1]))
+        unit = "lp/mm" if spacing_xy is not None else "lp/pixel"
         curve = [
-            MtfCurvePointPayload(frequency=float(freq), value=float(value))
-            for freq, value in zip(frequencies, values)
+            MtfCurvePointPayload(frequency=round(float(freq), 6), value=round(float(value), 6))
+            for freq, value in zip(analysis.frequencies, analysis.values)
         ]
 
         return ViewMtfAnalyzeResponse(
@@ -213,14 +198,16 @@ class ViewerService:
             viewportKey=payload.viewport_key,
             points=payload.points[:2],
             metrics=MtfMetricsPayload(
-                mtf50=round(mtf50, 4),
-                mtf10=round(mtf10, 4),
-                peakValue=round(float(np.max(values)), 4),
+                mtf50=round(float(analysis.mtf50), 4),
+                mtf10=round(float(analysis.mtf10), 4),
+                fwhmW=round(float(analysis.fwhm_w), 4),
+                fwhmH=round(float(analysis.fwhm_h), 4),
+                peakValue=round(float(analysis.peak_value), 4),
                 sampleCount=sample_count,
                 unit=unit,
             ),
             curve=curve,
-            isPlaceholder=True,
+            isPlaceholder=False,
         )
 
     def _resolve_hover_row_col(self, view: ViewRecord, normalized_x: float, normalized_y: float) -> tuple[int, int]:
@@ -1064,8 +1051,6 @@ class ViewerService:
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
         if target_viewport == MPR_VIEWPORT_CORONAL:
             index = max(0, min(view.mpr_coronal_index, height - 1))
-            # 浠?3D volume 鍒囧嚭鏉ョ殑涓€寮?2D 鍒囬潰
-            # np.flipud(...)锛氭妸杩欏紶鍒囬潰涓婁笅缈昏繃鏉?
             plane = np.flipud(volume[:, index, :])
             return plane.astype(np.float32), index, height
         if target_viewport == MPR_VIEWPORT_SAGITTAL:
@@ -2109,26 +2094,4 @@ class ViewerService:
 
 
 viewer_service = ViewerService()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
