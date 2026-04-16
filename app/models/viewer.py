@@ -34,6 +34,7 @@ class ViewTransformState:
     zoom: float = 1.0
     offset_x: float = 0.0
     offset_y: float = 0.0
+    rotation_degrees: int = 0
     rotation_quaternion: Quaternion = (0.0, 0.0, 0.0, 1.0)
     hor_flip: bool = False
     ver_flip: bool = False
@@ -122,6 +123,14 @@ class ViewRecord:
     @rotation_quaternion.setter
     def rotation_quaternion(self, value: Quaternion) -> None:
         self.transform.rotation_quaternion = value
+
+    @property
+    def rotation_degrees(self) -> int:
+        return self.transform.rotation_degrees
+
+    @rotation_degrees.setter
+    def rotation_degrees(self, value: int) -> None:
+        self.transform.rotation_degrees = value
 
     @property
     def volume_preset(self) -> str:

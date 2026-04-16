@@ -49,6 +49,7 @@ from app.schemas.view import (
     ViewHoverResponse,
     ViewImageResponse,
     ViewMtfAnalyzeRequest,
+    ViewTransformPayload,
     ViewMtfAnalyzeResponse,
     ViewOperationRequest,
     ViewSetSizeRequest,
@@ -604,6 +605,7 @@ class ViewerService:
         )
         view.offset_x = 0.0
         view.offset_y = 0.0
+        view.rotation_degrees = 0
         view.window_width = cached.window_width or self._derive_default_window_width(cached)
         view.window_center = cached.window_center or self._derive_default_window_center(cached)
         self._reset_drag_state(view)
@@ -630,6 +632,7 @@ class ViewerService:
         view.current_index = view.mpr_axial_index
         view.offset_x = 0.0
         view.offset_y = 0.0
+        view.rotation_degrees = 0
 
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
@@ -696,6 +699,7 @@ class ViewerService:
         )
 
     def _reset_view(self, view: ViewRecord) -> None:
+        view.rotation_degrees = 0
         view.hor_flip = False
         view.ver_flip = False
 
@@ -778,6 +782,7 @@ class ViewerService:
                 viewId=view.view_id,
                 cornerInfo=self._serialize_corner_info_overlay(corner_info),
                 orientation=self._build_3d_orientation_overlay(view),
+                transform=self._build_view_transform_payload(view),
                 volumePreset=str(view.volume_preset or "aaa"),
                 volumeConfig=view.volume_render_config,
             ),
@@ -864,6 +869,7 @@ class ViewerService:
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
                 ),
+                transform=self._build_view_transform_payload(view),
                 orientation=self._serialize_orientation_overlay(
                     self._build_stack_orientation_overlay(render_plan.render_view, cached.dataset)
                 ),
@@ -943,6 +949,7 @@ class ViewerService:
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
                 ),
+                transform=self._build_view_transform_payload(view),
                 orientation=self._serialize_orientation_overlay(
                     self._build_mpr_orientation_overlay(render_plan.render_view, target_viewport)
                 ),
@@ -1891,6 +1898,29 @@ class ViewerService:
         magnitude = abs(float(value))
         return f"{orientation} {magnitude:.2f}mm"
 
+    @staticmethod
+    def _rotate_screen_axes(
+        x_vector: np.ndarray,
+        y_vector: np.ndarray,
+        rotation_degrees: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        normalized_rotation = viewport_transformer.normalize_rotation_degrees(rotation_degrees)
+        if normalized_rotation == 90:
+            return y_vector, -x_vector
+        if normalized_rotation == 180:
+            return -x_vector, -y_vector
+        if normalized_rotation == 270:
+            return -y_vector, x_vector
+        return x_vector, y_vector
+
+    @staticmethod
+    def _build_view_transform_payload(view: ViewRecord) -> ViewTransformPayload:
+        return ViewTransformPayload(
+            rotationDegrees=viewport_transformer.normalize_rotation_degrees(view.rotation_degrees),
+            horFlip=bool(view.hor_flip),
+            verFlip=bool(view.ver_flip),
+        )
+
     def _build_stack_orientation_overlay(self, view: ViewRecord, dataset: Dataset | None) -> OrientationOverlay | None:
         orientation = self._get_dataset_orientation(dataset)
         if orientation is None:
@@ -1905,6 +1935,7 @@ class ViewerService:
 
         x_vector = row_direction * (-1.0 if view.hor_flip else 1.0)
         y_vector = column_direction * (-1.0 if view.ver_flip else 1.0)
+        x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
         return OrientationOverlay(
             top=self._orientation_text_for_vector(-y_vector),
             right=self._orientation_text_for_vector(x_vector),
@@ -1927,6 +1958,7 @@ class ViewerService:
             x_vector = -x_vector
         if view.ver_flip:
             y_vector = -y_vector
+        x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
 
         return OrientationOverlay(
             top=self._orientation_text_for_vector(-y_vector),

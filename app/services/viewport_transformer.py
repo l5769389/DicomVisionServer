@@ -29,6 +29,13 @@ class AffineTransform:
 
 
 class ViewportTransformer:
+    @staticmethod
+    def normalize_rotation_degrees(rotation_degrees: int | float | None) -> int:
+        if rotation_degrees is None:
+            return 0
+        normalized = int(round(float(rotation_degrees) / 90.0) * 90) % 360
+        return normalized if normalized >= 0 else normalized + 360
+
     def build_image_to_canvas_transform(
         self,
         image_width: int,
@@ -40,17 +47,45 @@ class ViewportTransformer:
         zoom = self.clamp_zoom(view.zoom)
         scale_x = -zoom if view.hor_flip else zoom
         scale_y = -zoom if view.ver_flip else zoom
-        translate_x = canvas_width / 2.0 + view.offset_x - scale_x * image_width / 2.0
-        translate_y = canvas_height / 2.0 + view.offset_y - scale_y * image_height / 2.0
+        rotation_degrees = self.normalize_rotation_degrees(view.rotation_degrees)
+        radians = np.deg2rad(rotation_degrees)
+        cos_theta = float(np.cos(radians))
+        sin_theta = float(np.sin(radians))
 
-        matrix = np.array(
+        translate_to_origin = np.array(
             [
-                [scale_x, 0.0, translate_x],
-                [0.0, scale_y, translate_y],
+                [1.0, 0.0, -image_width / 2.0],
+                [0.0, 1.0, -image_height / 2.0],
                 [0.0, 0.0, 1.0],
             ],
             dtype=np.float64,
         )
+        scale = np.array(
+            [
+                [scale_x, 0.0, 0.0],
+                [0.0, scale_y, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        rotate = np.array(
+            [
+                [cos_theta, -sin_theta, 0.0],
+                [sin_theta, cos_theta, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        translate_to_canvas = np.array(
+            [
+                [1.0, 0.0, canvas_width / 2.0 + view.offset_x],
+                [0.0, 1.0, canvas_height / 2.0 + view.offset_y],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        matrix = translate_to_canvas @ rotate @ scale @ translate_to_origin
         return AffineTransform(matrix=matrix)
 
     @staticmethod

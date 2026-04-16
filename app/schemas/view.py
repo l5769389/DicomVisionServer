@@ -8,7 +8,7 @@ from app.schemas.dicom import CornerInfoPayload
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "rotate3d", "reset", "volumePreset", "volumeConfig", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -111,6 +111,14 @@ class VolumeRenderConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ViewTransformPayload(BaseModel):
+    rotation_degrees: int = Field(default=0, alias="rotationDegrees")
+    hor_flip: bool = Field(default=False, alias="horFlip")
+    ver_flip: bool = Field(default=False, alias="verFlip")
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewImageResponse(BaseModel):
     slice_info: SliceInfo = Field(alias="slice_info")
     window_info: WindowInfo = Field(alias="window_info")
@@ -120,6 +128,7 @@ class ViewImageResponse(BaseModel):
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
     measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)
     orientation: OrientationInfo | None = None
+    transform: ViewTransformPayload | None = None
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
 
@@ -168,6 +177,7 @@ class ViewOperationRequest(BaseModel):
     points: list[MeasurementPointPayload] | None = None
     zoom: float | None = None
     delta: int | None = None
+    rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
     ver_flip: bool | None = Field(default=None, alias="ver_flip")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")

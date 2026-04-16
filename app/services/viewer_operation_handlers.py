@@ -8,6 +8,7 @@ from app.core import (
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_SCROLL,
+    VIEW_OP_TYPE_TRANSFORM_2D,
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
     VIEW_OP_TYPE_ROTATE_3D,
@@ -103,6 +104,7 @@ def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
         VIEW_OP_TYPE_ZOOM: _handle_zoom_operation,
         VIEW_OP_TYPE_WINDOW: _handle_window_operation,
         VIEW_OP_TYPE_PAN: _handle_pan_operation,
+        VIEW_OP_TYPE_TRANSFORM_2D: _handle_transform_2d_operation,
         VIEW_OP_TYPE_ROTATE_3D: _handle_rotate_3d_operation,
         VIEW_OP_TYPE_RESET: _handle_reset_operation,
         VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
@@ -222,6 +224,19 @@ def _handle_rotate_3d_operation(
     return _resolve_drag_single_render_decision(service, view, payload, fast_preview_on_move=True)
 
 
+def _handle_transform_2d_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del service, view, series, is_mpr_view
+    if payload.rotation_degrees is None and payload.hor_flip is None and payload.ver_flip is None:
+        return _render_none()
+    return _render_single()
+
+
 def _handle_reset_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -311,11 +326,14 @@ def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest
     if payload.ver_flip is not None:
         view.ver_flip = payload.ver_flip
         view.is_initialized = True
+    if payload.rotation_degrees is not None:
+        view.rotation_degrees = viewport_transformer.normalize_rotation_degrees(payload.rotation_degrees)
+        view.is_initialized = True
 
 
 def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload: ViewOperationRequest) -> None:
     service._logger.info(
-        "view operation view_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
+        "view operation view_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f rotation=%s hor_flip=%s ver_flip=%s ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
         view.view_id,
         view.view_type,
         payload.op_type,
@@ -325,6 +343,9 @@ def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload:
         view.zoom,
         view.offset_x,
         view.offset_y,
+        view.rotation_degrees,
+        view.hor_flip,
+        view.ver_flip,
         view.window_width,
         view.window_center,
         view.mpr_axial_index,
