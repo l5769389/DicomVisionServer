@@ -54,3 +54,31 @@ class CornerInfoResponse(BaseModel):
     corner_info: CornerInfoPayload = Field(alias="cornerInfo")
 
     model_config = {"populate_by_name": True}
+
+
+class DicomTagsRequest(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    index: int = 0
+
+    model_config = {"populate_by_name": True}
+
+
+class DicomTagItem(BaseModel):
+    tag: str
+    keyword: str
+    name: str
+    vr: str
+    value: str
+    depth: int = 0
+
+
+class DicomTagsResponse(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    index: int
+    total: int
+    instance_number: int | None = Field(default=None, alias="instanceNumber")
+    sop_instance_uid: str | None = Field(default=None, alias="sopInstanceUid")
+    file_path: str | None = Field(default=None, alias="filePath")
+    items: list[DicomTagItem] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}

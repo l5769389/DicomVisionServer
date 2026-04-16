@@ -154,5 +154,9 @@ class SeriesRegistry:
     def list_all(self) -> list[SeriesRecord]:
         return list(self._series_by_id.values())
 
+    def clear(self) -> None:
+        self._series_by_id.clear()
+        self._series_id_by_key.clear()
+
 
 series_registry = SeriesRegistry()

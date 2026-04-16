@@ -1,7 +1,16 @@
 from fastapi import APIRouter, HTTPException
 
 from app.core.config import get_settings
-from app.schemas.dicom import CornerInfoRequest, CornerInfoResponse, LoadFolderRequest, LoadFolderResponse, LoadSampleResponse
+from app.schemas.dicom import (
+    CornerInfoRequest,
+    CornerInfoResponse,
+    DicomTagsRequest,
+    DicomTagsResponse,
+    LoadFolderRequest,
+    LoadFolderResponse,
+    LoadSampleResponse,
+)
+from app.services.dicom_tag_service import dicom_tag_service
 from app.services.series_registry import series_registry
 from app.services.viewer_service import viewer_service
 
@@ -31,3 +40,8 @@ async def load_sample_folder() -> LoadSampleResponse:
 @router.post("/cornerInfo", response_model=CornerInfoResponse)
 async def get_corner_info(payload: CornerInfoRequest) -> CornerInfoResponse:
     return viewer_service.get_series_corner_info(payload)
+
+
+@router.post("/tags", response_model=DicomTagsResponse)
+async def get_dicom_tags(payload: DicomTagsRequest) -> DicomTagsResponse:
+    return dicom_tag_service.get_series_tags(payload)
