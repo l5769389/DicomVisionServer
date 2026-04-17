@@ -184,6 +184,8 @@ class ViewOperationRequest(BaseModel):
     points: list[MeasurementPointPayload] | None = None
     zoom: float | None = None
     delta: int | None = None
+    ww: float | None = None
+    wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")

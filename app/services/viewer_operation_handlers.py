@@ -191,6 +191,14 @@ def _handle_window_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
+    if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
+        if payload.ww is not None:
+            view.window_width = float(payload.ww)
+        if payload.wl is not None:
+            view.window_center = float(payload.wl)
+        view.is_initialized = True
+        return _render_broadcast() if is_mpr_view else _render_single()
+
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
     service._handle_drag_window(view, payload)
