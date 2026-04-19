@@ -44,7 +44,11 @@ async def analyze_mtf(payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
 
 @router.post("/export")
 async def export_view(payload: ViewExportRequest) -> Response:
-    exported = viewer_service.export_view_by_id(payload.view_id, payload.export_format)
+    exported = viewer_service.export_view_by_id(
+        payload.view_id,
+        payload.export_format,
+        overlays=payload.overlays,
+    )
     return Response(
         content=exported.file_bytes,
         media_type=exported.media_type,

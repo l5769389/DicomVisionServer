@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pydicom import dcmwrite
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.uid import (
@@ -58,6 +58,7 @@ from app.schemas.view import (
     ScaleBarInfo,
     SliceInfo,
     ViewColorInfo,
+    ViewExportOverlaysPayload,
     ViewHoverRequest,
     ViewHoverResponse,
     ViewImageResponse,
@@ -161,14 +162,29 @@ class ViewerService:
         view = view_registry.get(view_id)
         return self._render_by_view_type(view, image_format=image_format, fast_preview=fast_preview)
 
-    def export_view_by_id(self, view_id: str, export_format: str) -> ExportedFileResult:
+    def export_view_by_id(
+        self,
+        view_id: str,
+        export_format: str,
+        *,
+        overlays: ViewExportOverlaysPayload | None = None,
+    ) -> ExportedFileResult:
         view = view_registry.get(view_id)
         safe_view_type = str(view.view_type or "view").lower()
 
         if export_format == "png":
             rendered = self._render_by_view_type(view, image_format="png", fast_preview=False)
+            if overlays and (overlays.annotations or overlays.measurements):
+                try:
+                    image = Image.open(io.BytesIO(rendered.image_bytes)).convert("RGB")
+                    image = self._apply_export_overlays(image, overlays)
+                    rendered_bytes = self._encode_image(image, "png")
+                except Exception as exc:  # pragma: no cover - defensive
+                    raise HTTPException(status_code=500, detail="Failed to render export overlays") from exc
+            else:
+                rendered_bytes = rendered.image_bytes
             return ExportedFileResult(
-                file_bytes=rendered.image_bytes,
+                file_bytes=rendered_bytes,
                 file_name=f"{view.view_id}-{safe_view_type}.png",
                 media_type="image/png",
             )
@@ -181,6 +197,9 @@ class ViewerService:
         except Exception as exc:  # pragma: no cover - defensive
             raise HTTPException(status_code=500, detail="Failed to decode rendered image for DICOM export") from exc
 
+        if overlays and (overlays.annotations or overlays.measurements):
+            image = self._apply_export_overlays(image, overlays)
+
         reference_dataset = self._get_export_reference_dataset(view)
         dicom_bytes = self._build_secondary_capture_dicom_bytes(view, image, reference_dataset)
         return ExportedFileResult(
@@ -188,6 +207,164 @@ class ViewerService:
             file_name=f"{view.view_id}-{safe_view_type}.dcm",
             media_type="application/dicom",
         )
+
+    def _apply_export_overlays(self, image: Image.Image, overlays: ViewExportOverlaysPayload) -> Image.Image:
+        canvas = image.convert("RGBA")
+        draw = ImageDraw.Draw(canvas)
+        font = ImageFont.load_default()
+        width, height = canvas.size
+
+        for measurement in overlays.measurements:
+            points = tuple((point.x * width, point.y * height) for point in measurement.points)
+            self._draw_export_measurement(draw, font, measurement.tool_type, points, measurement.label_lines, width, height)
+
+        for annotation in overlays.annotations:
+            points = tuple((point.x * width, point.y * height) for point in annotation.points)
+            self._draw_export_annotation(draw, font, points, annotation.text, annotation.color, annotation.size, width, height)
+
+        return canvas.convert("RGB")
+
+    def _draw_export_measurement(
+        self,
+        draw: ImageDraw.ImageDraw,
+        font: ImageFont.ImageFont,
+        tool_type: str,
+        points: tuple[tuple[float, float], ...],
+        label_lines: list[str],
+        width: int,
+        height: int,
+    ) -> None:
+        if not points:
+            return
+
+        if tool_type == "line" and len(points) >= 2:
+            self._draw_export_polyline(draw, points[:2])
+        elif tool_type == "rect" and len(points) >= 2:
+            left, right = sorted((points[0][0], points[1][0]))
+            top, bottom = sorted((points[0][1], points[1][1]))
+            draw.rectangle((left, top, right, bottom), outline=(3, 15, 24, 235), width=5)
+            draw.rectangle((left, top, right, bottom), outline=(85, 231, 255, 255), width=2)
+        elif tool_type == "ellipse" and len(points) >= 2:
+            left, right = sorted((points[0][0], points[1][0]))
+            top, bottom = sorted((points[0][1], points[1][1]))
+            draw.ellipse((left, top, right, bottom), outline=(3, 15, 24, 235), width=5)
+            draw.ellipse((left, top, right, bottom), outline=(85, 231, 255, 255), width=2)
+        elif tool_type == "angle" and len(points) >= 2:
+            self._draw_export_polyline(draw, points[:2])
+            if len(points) >= 3:
+                self._draw_export_polyline(draw, points[1:3])
+        else:
+            return
+
+        if label_lines:
+            anchor = points[1] if len(points) >= 2 else points[0]
+            self._draw_export_label(draw, font, label_lines, anchor[0] + 12, anchor[1] - 32, width, height)
+
+    @staticmethod
+    def _draw_export_polyline(draw: ImageDraw.ImageDraw, points: tuple[tuple[float, float], ...]) -> None:
+        draw.line(points, fill=(3, 15, 24, 235), width=5, joint="curve")
+        draw.line(points, fill=(85, 231, 255, 255), width=2, joint="curve")
+
+    def _draw_export_annotation(
+        self,
+        draw: ImageDraw.ImageDraw,
+        font: ImageFont.ImageFont,
+        points: tuple[tuple[float, float], ...],
+        text: str,
+        color: str,
+        size: str,
+        width: int,
+        height: int,
+    ) -> None:
+        if len(points) < 2:
+            return
+
+        stroke = self._parse_export_color(color)
+        stroke_width = 3 if size == "lg" else 2
+        draw.line(points[:2], fill=stroke, width=stroke_width)
+        self._draw_export_arrow_head(draw, points[0], points[1], stroke, stroke_width * 3)
+
+        visible_text = text.strip()
+        if visible_text:
+            self._draw_export_label(draw, font, [visible_text], points[0][0] + 12, points[0][1] - 30, width, height, text_fill=stroke)
+
+    @staticmethod
+    def _draw_export_arrow_head(
+        draw: ImageDraw.ImageDraw,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        fill: tuple[int, int, int, int],
+        size: int,
+    ) -> None:
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = float(np.hypot(dx, dy))
+        if length < 1e-6:
+            return
+
+        ux = dx / length
+        uy = dy / length
+        back_x = end[0] - ux * size * 2.8
+        back_y = end[1] - uy * size * 2.8
+        perp_x = -uy * size
+        perp_y = ux * size
+        draw.polygon(
+            (
+                end,
+                (back_x + perp_x, back_y + perp_y),
+                (back_x - perp_x, back_y - perp_y),
+            ),
+            fill=fill,
+        )
+
+    @staticmethod
+    def _draw_export_label(
+        draw: ImageDraw.ImageDraw,
+        font: ImageFont.ImageFont,
+        lines: list[str],
+        x: float,
+        y: float,
+        width: int,
+        height: int,
+        *,
+        text_fill: tuple[int, int, int, int] = (235, 245, 255, 255),
+    ) -> None:
+        visible_lines = [line.strip() for line in lines if line.strip()]
+        if not visible_lines:
+            return
+
+        padding_x = 8
+        padding_y = 6
+        line_gap = 3
+        line_sizes = [draw.textbbox((0, 0), line, font=font) for line in visible_lines]
+        text_width = max((bbox[2] - bbox[0]) for bbox in line_sizes)
+        text_height = sum((bbox[3] - bbox[1]) for bbox in line_sizes) + max(0, len(visible_lines) - 1) * line_gap
+        left = max(6, min(width - text_width - padding_x * 2 - 6, int(round(x))))
+        top = max(6, min(height - text_height - padding_y * 2 - 6, int(round(y))))
+        right = left + text_width + padding_x * 2
+        bottom = top + text_height + padding_y * 2
+
+        draw.rounded_rectangle((left, top, right, bottom), radius=7, fill=(7, 16, 28, 232), outline=(108, 201, 255, 188), width=1)
+        cursor_y = top + padding_y
+        for index, line in enumerate(visible_lines):
+            bbox = line_sizes[index]
+            draw.text((left + padding_x, cursor_y), line, fill=text_fill, font=font)
+            cursor_y += (bbox[3] - bbox[1]) + line_gap
+
+    @staticmethod
+    def _parse_export_color(value: str) -> tuple[int, int, int, int]:
+        hex_value = value.strip().lstrip("#")
+        if len(hex_value) == 3:
+            hex_value = "".join(char * 2 for char in hex_value)
+        if len(hex_value) != 6:
+            return (255, 209, 102, 255)
+        try:
+            red = int(hex_value[0:2], 16)
+            green = int(hex_value[2:4], 16)
+            blue = int(hex_value[4:6], 16)
+        except ValueError:
+            return (255, 209, 102, 255)
+        return (red, green, blue, 255)
 
     def handle_view_operation(self, payload: ViewOperationRequest) -> OperationRenderOutcome:
         return handle_view_operation(self, payload)

@@ -76,9 +76,44 @@ class MprCrosshairInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ViewExportPointPayload(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
+class ViewExportMeasurementOverlayPayload(BaseModel):
+    measurement_id: str = Field(alias="measurementId")
+    tool_type: str = Field(alias="toolType")
+    points: list[ViewExportPointPayload]
+    label_lines: list[str] = Field(alias="labelLines", default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewExportAnnotationOverlayPayload(BaseModel):
+    annotation_id: str = Field(alias="annotationId")
+    tool_type: str = Field(alias="toolType")
+    points: list[ViewExportPointPayload]
+    text: str = ""
+    color: str = "#ffd166"
+    size: str = "md"
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewExportOverlaysPayload(BaseModel):
+    annotations: list[ViewExportAnnotationOverlayPayload] = Field(default_factory=list)
+    measurements: list[ViewExportMeasurementOverlayPayload] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewExportRequest(BaseModel):
     view_id: str = Field(alias="viewId")
     export_format: ExportFormat = Field(alias="exportFormat")
+    overlays: ViewExportOverlaysPayload = Field(default_factory=ViewExportOverlaysPayload)
+    overlay_mode: str | None = Field(default=None, alias="overlayMode")
+    preserve_source_dicom: bool = Field(default=True, alias="preserveSourceDicom")
 
     model_config = {"populate_by_name": True}
 
