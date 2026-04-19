@@ -7,6 +7,7 @@ from app.schemas.dicom import CornerInfoPayload
 
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
+ExportFormat = Literal["png", "dicom"]
 ViewSetSizeOperationType = Literal["setSize"]
 ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
@@ -71,6 +72,13 @@ class MprCrosshairInfo(BaseModel):
     hit_radius: float = Field(alias="hitRadius")
     horizontal_position: float | None = Field(default=None, alias="horizontalPosition")
     vertical_position: float | None = Field(default=None, alias="verticalPosition")
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewExportRequest(BaseModel):
+    view_id: str = Field(alias="viewId")
+    export_format: ExportFormat = Field(alias="exportFormat")
 
     model_config = {"populate_by_name": True}
 

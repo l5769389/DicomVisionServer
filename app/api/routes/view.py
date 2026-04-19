@@ -1,9 +1,12 @@
 ﻿from fastapi import APIRouter, BackgroundTasks
 
+from fastapi.responses import Response
+
 from app.schemas.view import (
     OperationAcceptedResponse,
     ViewCreateRequest,
     ViewCreateResponse,
+    ViewExportRequest,
     ViewMtfAnalyzeRequest,
     ViewMtfAnalyzeResponse,
     ViewSetSizeRequest,
@@ -37,3 +40,13 @@ async def set_view_size(payload: ViewSetSizeRequest, background_tasks: Backgroun
 @router.post("/mtf/analyze", response_model=ViewMtfAnalyzeResponse)
 async def analyze_mtf(payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
     return viewer_service.analyze_mtf(payload)
+
+
+@router.post("/export")
+async def export_view(payload: ViewExportRequest) -> Response:
+    exported = viewer_service.export_view_by_id(payload.view_id, payload.export_format)
+    return Response(
+        content=exported.file_bytes,
+        media_type=exported.media_type,
+        headers={"Content-Disposition": f'attachment; filename="{exported.file_name}"'},
+    )

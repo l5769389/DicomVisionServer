@@ -1,4 +1,5 @@
 import io
+from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
@@ -7,7 +8,14 @@ from uuid import uuid4
 import numpy as np
 from fastapi import HTTPException
 from PIL import Image
-from pydicom.dataset import Dataset
+from pydicom import dcmwrite
+from pydicom.dataset import Dataset, FileMetaDataset
+from pydicom.uid import (
+    ExplicitVRLittleEndian,
+    PYDICOM_IMPLEMENTATION_UID,
+    SecondaryCaptureImageStorage,
+    generate_uid,
+)
 
 from app.core import (
     DRAG_ACTION_END,
@@ -92,6 +100,13 @@ class RenderedImageResult:
 
 
 @dataclass(frozen=True)
+class ExportedFileResult:
+    file_bytes: bytes
+    file_name: str
+    media_type: str
+
+
+@dataclass(frozen=True)
 class RenderPlan:
     render_view: ViewRecord
     render_ratio: float
@@ -145,6 +160,34 @@ class ViewerService:
     ) -> RenderedImageResult:
         view = view_registry.get(view_id)
         return self._render_by_view_type(view, image_format=image_format, fast_preview=fast_preview)
+
+    def export_view_by_id(self, view_id: str, export_format: str) -> ExportedFileResult:
+        view = view_registry.get(view_id)
+        safe_view_type = str(view.view_type or "view").lower()
+
+        if export_format == "png":
+            rendered = self._render_by_view_type(view, image_format="png", fast_preview=False)
+            return ExportedFileResult(
+                file_bytes=rendered.image_bytes,
+                file_name=f"{view.view_id}-{safe_view_type}.png",
+                media_type="image/png",
+            )
+        if export_format != "dicom":
+            raise HTTPException(status_code=400, detail="Unsupported export format")
+
+        rendered = self._render_by_view_type(view, image_format="png", fast_preview=False)
+        try:
+            image = Image.open(io.BytesIO(rendered.image_bytes)).convert("RGB")
+        except Exception as exc:  # pragma: no cover - defensive
+            raise HTTPException(status_code=500, detail="Failed to decode rendered image for DICOM export") from exc
+
+        reference_dataset = self._get_export_reference_dataset(view)
+        dicom_bytes = self._build_secondary_capture_dicom_bytes(view, image, reference_dataset)
+        return ExportedFileResult(
+            file_bytes=dicom_bytes,
+            file_name=f"{view.view_id}-{safe_view_type}.dcm",
+            media_type="application/dicom",
+        )
 
     def handle_view_operation(self, payload: ViewOperationRequest) -> OperationRenderOutcome:
         return handle_view_operation(self, payload)
@@ -1612,6 +1655,87 @@ class ViewerService:
             lengthNorm=float(selected_length_px) / canvas_width,
             label="10 cm",
         )
+
+    def _get_export_reference_dataset(self, view: ViewRecord) -> Dataset | None:
+        series = series_registry.get(view.series_id)
+        if self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type):
+            _, cached = self._get_reference_instance_and_cache(series)
+            return cached.dataset if cached is not None else None
+
+        if 0 <= view.current_index < len(series.instances):
+            instance = series.instances[view.current_index]
+            if instance.sop_instance_uid:
+                cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
+                return cached.dataset
+
+        _, cached = self._get_reference_instance_and_cache(series)
+        return cached.dataset if cached is not None else None
+
+    @staticmethod
+    def _build_secondary_capture_dicom_bytes(view: ViewRecord, image: Image.Image, reference_dataset: Dataset | None) -> bytes:
+        now = datetime.now()
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+        file_meta.MediaStorageSOPInstanceUID = generate_uid()
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        file_meta.ImplementationClassUID = PYDICOM_IMPLEMENTATION_UID
+
+        dataset = Dataset()
+        dataset.file_meta = file_meta
+        dataset.is_little_endian = True
+        dataset.is_implicit_VR = False
+
+        if reference_dataset is not None:
+            for attribute in (
+                "PatientName",
+                "PatientID",
+                "PatientBirthDate",
+                "PatientSex",
+                "StudyInstanceUID",
+                "StudyID",
+                "AccessionNumber",
+                "StudyDate",
+                "StudyTime",
+                "ReferringPhysicianName",
+                "InstitutionName",
+                "Manufacturer",
+            ):
+                value = getattr(reference_dataset, attribute, None)
+                if value not in (None, ""):
+                    setattr(dataset, attribute, value)
+
+        dataset.SOPClassUID = SecondaryCaptureImageStorage
+        dataset.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        dataset.SeriesInstanceUID = generate_uid()
+        dataset.Modality = "OT"
+        dataset.SeriesNumber = 999
+        dataset.InstanceNumber = 1
+        dataset.ImageType = ["DERIVED", "SECONDARY", "OTHER"]
+        dataset.ConversionType = "WSD"
+        dataset.SeriesDescription = f"Exported {view.view_type}"
+        dataset.ContentDate = now.strftime("%Y%m%d")
+        dataset.ContentTime = now.strftime("%H%M%S")
+        dataset.InstanceCreationDate = dataset.ContentDate
+        dataset.InstanceCreationTime = dataset.ContentTime
+        dataset.BurnedInAnnotation = "YES"
+        dataset.SpecificCharacterSet = "ISO_IR 192"
+
+        rgb_image = image.convert("RGB")
+        rows, cols = rgb_image.height, rgb_image.width
+        dataset.SamplesPerPixel = 3
+        dataset.PhotometricInterpretation = "RGB"
+        dataset.PlanarConfiguration = 0
+        dataset.Rows = rows
+        dataset.Columns = cols
+        dataset.BitsAllocated = 8
+        dataset.BitsStored = 8
+        dataset.HighBit = 7
+        dataset.PixelRepresentation = 0
+        dataset.PixelData = rgb_image.tobytes()
+
+        output = io.BytesIO()
+        dcmwrite(output, dataset, write_like_original=False)
+        return output.getvalue()
 
     @staticmethod
     def _build_mpr_crosshair_info(overlay: MprCrosshairOverlay) -> MprCrosshairInfo | None:
