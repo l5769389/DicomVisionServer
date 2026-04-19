@@ -23,6 +23,7 @@ from app.core import (
     VIEW_OP_TYPE_ZOOM,
     VIEW_OP_TYPE_ROTATE_3D,
     VIEW_OP_TYPE_VOLUME_CONFIG,
+    VIEW_OP_TYPE_MPR_MIP_CONFIG,
     WINDOW_DRAG_SENSITIVITY,
     WINDOW_WIDTH_MIN,
     ZOOM_DRAG_FACTOR_MIN,
@@ -34,13 +35,15 @@ from app.core import (
 )
 from app.core.logging import get_logger
 from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
-from app.models.viewer import InstanceRecord, SeriesRecord, ViewRecord
+from app.models.viewer import InstanceRecord, MprMipState, MprMipViewportState, SeriesRecord, ViewRecord
 from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
     ImageFormat,
     MtfCurvePointPayload,
     MtfMetricsPayload,
     MprCrosshairInfo,
+    MprMipConfig,
+    MprMipViewportConfig,
     MeasurementOverlayPayload,
     OperationAcceptedResponse,
     OrientationInfo,
@@ -232,13 +235,26 @@ class ViewerService:
         """Prepare the source-image dimensions and inverse transform used for hover lookup."""
 
         image_width, image_height = self._get_hover_source_dimensions(view)
-        render_plan = self._build_render_plan_for_shape(view, image_height, image_width)
+        pixel_aspect_x = 1.0
+        pixel_aspect_y = 1.0
+        if self._is_mpr_view_type(view.view_type):
+            series = series_registry.get(view.series_id)
+            pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, self._resolve_mpr_viewport(view))
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            image_height,
+            image_width,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=image_width,
             image_height=image_height,
             canvas_width=render_plan.render_view.width or 0,
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         return (
             image_width,
@@ -558,6 +574,15 @@ class ViewerService:
             return (spacing_y, spacing_z)
         return (spacing_x, spacing_y)
 
+    def _get_mpr_display_aspect_xy(self, series: SeriesRecord, viewport_key: str) -> tuple[float, float]:
+        spacing_xy = self._get_mpr_spacing_xy(series, viewport_key)
+        if spacing_xy is None:
+            return (1.0, 1.0)
+        return (
+            max(abs(float(spacing_xy[0])), 1e-6),
+            max(abs(float(spacing_xy[1])), 1e-6),
+        )
+
     def _render_by_view_type(
         self,
         view: ViewRecord,
@@ -637,6 +662,8 @@ class ViewerService:
         view.offset_y = 0.0
         view.rotation_degrees = 0
         view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
+        if view.view_group is not None:
+            view.view_group.mpr_mip = self._create_default_mpr_mip_state()
 
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
@@ -650,11 +677,14 @@ class ViewerService:
             view.window_center = (pixel_max + pixel_min) / 2.0
 
         plane_pixels, _, _ = self._extract_mpr_plane(view, volume)
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, self._resolve_mpr_viewport(view))
         view.zoom = viewport_transformer.calculate_contain_zoom(
             image_width=plane_pixels.shape[1],
             image_height=plane_pixels.shape[0],
             canvas_width=view.width,
             canvas_height=view.height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         self._reset_drag_state(view)
         logger.info(
@@ -902,17 +932,30 @@ class ViewerService:
 
         target_viewport = self._resolve_mpr_viewport(view)
         plane_pixels, current, total = self._extract_mpr_plane(view, volume, target_viewport)
-        render_plan = self._build_render_plan_for_shape(view, *plane_pixels.shape[:2])
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport)
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            *plane_pixels.shape[:2],
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_pixels.shape[1],
             image_height=plane_pixels.shape[0],
             canvas_width=render_plan.render_view.width or 0,
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
-        mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(view, volume.shape, plane_pixels.shape, image_transform)
+        mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(
+            render_plan.render_view,
+            volume.shape,
+            plane_pixels.shape,
+            image_transform,
+        )
         reference_instance, reference_cached = self._get_reference_instance_and_cache(series)
         slice_corner_info = self._build_slice_corner_info_overlay(
             view,
@@ -949,6 +992,7 @@ class ViewerService:
                 imageFormat=image_format,
                 viewId=view.view_id,
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
+                mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
@@ -1008,8 +1052,22 @@ class ViewerService:
             return Image.fromarray(transformed, mode="RGB")
         return Image.fromarray(transformed, mode="L")
 
-    def _build_render_plan_for_shape(self, view: ViewRecord, image_height: int, image_width: int) -> RenderPlan:
-        render_ratio = self._resolve_render_ratio_for_shape(view, image_height, image_width)
+    def _build_render_plan_for_shape(
+        self,
+        view: ViewRecord,
+        image_height: int,
+        image_width: int,
+        *,
+        pixel_aspect_x: float = 1.0,
+        pixel_aspect_y: float = 1.0,
+    ) -> RenderPlan:
+        render_ratio = self._resolve_render_ratio_for_shape(
+            view,
+            image_height,
+            image_width,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
         if render_ratio >= 0.999:
             return RenderPlan(render_view=view, render_ratio=1.0)
 
@@ -1030,11 +1088,20 @@ class ViewerService:
         return RenderPlan(render_view=render_view, render_ratio=render_ratio)
 
     @staticmethod
-    def _resolve_render_ratio_for_shape(view: ViewRecord, image_height: int, image_width: int) -> float:
+    def _resolve_render_ratio_for_shape(
+        view: ViewRecord,
+        image_height: int,
+        image_width: int,
+        *,
+        pixel_aspect_x: float = 1.0,
+        pixel_aspect_y: float = 1.0,
+    ) -> float:
         if not view.width or not view.height:
             return 1.0
 
-        if view.width <= image_width or view.height <= image_height:
+        physical_width = image_width * max(abs(float(pixel_aspect_x)), 1e-6)
+        physical_height = image_height * max(abs(float(pixel_aspect_y)), 1e-6)
+        if view.width <= physical_width or view.height <= physical_height:
             return 1.0
 
         contain_zoom = viewport_transformer.calculate_contain_zoom(
@@ -1042,12 +1109,14 @@ class ViewerService:
             image_height=image_height,
             canvas_width=view.width,
             canvas_height=view.height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         if view.zoom > contain_zoom:
             return 1.0
 
-        width_ratio = image_width / view.width
-        height_ratio = image_height / view.height
+        width_ratio = physical_width / view.width
+        height_ratio = physical_height / view.height
         return max(width_ratio, height_ratio)
 
     @staticmethod
@@ -1059,6 +1128,44 @@ class ViewerService:
             return depth, height
         return height, width
 
+    @staticmethod
+    def _create_default_mpr_mip_state() -> MprMipState:
+        return MprMipState()
+
+    @staticmethod
+    def _serialize_mpr_mip_config(state: MprMipState) -> MprMipConfig:
+        return MprMipConfig(
+            enabled=bool(state.enabled),
+            algorithm=str(state.algorithm or "maximum"),
+            viewports={
+                viewport_key: MprMipViewportConfig(thickness=max(1, int(viewport_state.thickness)))
+                for viewport_key, viewport_state in state.viewports.items()
+            },
+        )
+
+    def _handle_mpr_mip_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_mpr_view_type(view.view_type) or payload.mpr_mip_config is None:
+            return False
+
+        incoming = payload.mpr_mip_config
+        current_state = view.mpr_mip
+        next_viewports = dict(current_state.viewports)
+        for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL):
+            next_config = incoming.viewports.get(viewport_key)
+            if next_config is None:
+                next_viewports[viewport_key] = current_state.viewports.get(viewport_key, MprMipViewportState())
+                continue
+            next_viewports[viewport_key] = MprMipViewportState(thickness=max(1, int(next_config.thickness)))
+
+        next_state = MprMipState(
+            enabled=bool(incoming.enabled),
+            algorithm=str(incoming.algorithm or "maximum"),
+            viewports=next_viewports,
+        )
+        if view.view_group is not None:
+            view.view_group.mpr_mip = next_state
+        return True
+
     def _extract_mpr_plane(
         self,
         view: ViewRecord,
@@ -1067,17 +1174,46 @@ class ViewerService:
     ) -> tuple[np.ndarray, int, int]:
         depth, height, width = volume.shape
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
+        mip_state = view.mpr_mip
+
+        def reduce_slab(slab: np.ndarray, axis: int) -> np.ndarray:
+            if not mip_state.enabled:
+                center_index = slab.shape[axis] // 2
+                return np.take(slab, indices=center_index, axis=axis)
+            algorithm = str(mip_state.algorithm or "maximum")
+            if algorithm == "minimum":
+                return np.min(slab, axis=axis)
+            if algorithm == "average":
+                return np.mean(slab, axis=axis)
+            if algorithm == "sum":
+                return np.sum(slab, axis=axis)
+            return np.max(slab, axis=axis)
+
+        def slab_bounds(center_index: int, total_size: int) -> tuple[int, int]:
+            thickness = max(1, int(mip_state.viewports.get(target_viewport, MprMipViewportState()).thickness))
+            half_before = (thickness - 1) // 2
+            half_after = thickness // 2
+            start = max(0, center_index - half_before)
+            end = min(total_size, center_index + half_after + 1)
+            return start, end
+
         if target_viewport == MPR_VIEWPORT_CORONAL:
             index = max(0, min(view.mpr_coronal_index, height - 1))
-            plane = np.flipud(volume[:, index, :])
+            start, end = slab_bounds(index, height)
+            slab = volume[:, start:end, :]
+            plane = np.flipud(reduce_slab(slab, axis=1))
             return plane.astype(np.float32), index, height
         if target_viewport == MPR_VIEWPORT_SAGITTAL:
             index = max(0, min(view.mpr_sagittal_index, width - 1))
-            plane = np.flipud(volume[:, :, index])
+            start, end = slab_bounds(index, width)
+            slab = volume[:, :, start:end]
+            plane = np.flipud(reduce_slab(slab, axis=2))
             return plane.astype(np.float32), index, width
         index = max(0, min(view.mpr_axial_index, depth - 1))
         view.current_index = index
-        plane = volume[index, :, :]
+        start, end = slab_bounds(index, depth)
+        slab = volume[start:end, :, :]
+        plane = reduce_slab(slab, axis=0)
         return plane.astype(np.float32), index, depth
 
     @staticmethod
@@ -1352,7 +1488,6 @@ class ViewerService:
         if view.pseudocolor_preset == next_preset:
             return False
         view.pseudocolor_preset = next_preset
-        view.is_initialized = True
         return True
 
     def _get_mpr_group_views(self, view: ViewRecord) -> list[ViewRecord]:
@@ -1372,12 +1507,15 @@ class ViewerService:
         volume = self._get_series_volume(series_registry.get(view.series_id))
         target_viewport = self._resolve_mpr_viewport(view)
         plane_shape = self._get_mpr_plane_shape(volume.shape, target_viewport)
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series_registry.get(view.series_id), target_viewport)
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_shape[1],
             image_height=plane_shape[0],
             canvas_width=view.width,
             canvas_height=view.height,
             view=view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         crosshair_info = self._build_mpr_crosshair_info(
             self._build_mpr_crosshair_overlay(view, volume.shape, plane_shape, image_transform)
@@ -1395,25 +1533,31 @@ class ViewerService:
         if payload.action_type != DRAG_ACTION_MOVE or not view.mpr_crosshair_drag_active:
             return False
 
-        overlay = self._build_mpr_crosshair_overlay(view, volume.shape, plane_shape, image_transform)
-        if overlay.image_width <= 0 or overlay.image_height <= 0:
+        canvas_width = float(view.width or 0)
+        canvas_height = float(view.height or 0)
+        if canvas_width <= 0 or canvas_height <= 0:
             return False
 
-        canvas_x = overlay.image_left + float(payload.x) * float(overlay.image_width)
-        canvas_y = overlay.image_top + float(payload.y) * float(overlay.image_height)
+        max_canvas_x = max(canvas_width - 1e-6, 0.0)
+        max_canvas_y = max(canvas_height - 1e-6, 0.0)
+        canvas_x = min(max(float(payload.x) * canvas_width, 0.0), max_canvas_x)
+        canvas_y = min(max(float(payload.y) * canvas_height, 0.0), max_canvas_y)
         image_x, image_y = self._canvas_to_image_coordinates(image_transform, canvas_x, canvas_y)
         depth, height, width = volume.shape
         previous_indices = (view.mpr_axial_index, view.mpr_coronal_index, view.mpr_sagittal_index)
 
+        def nearest_index(value: float, size: int) -> int:
+            return max(0, min(int(np.round(value - 0.5)), size - 1))
+
         if target_viewport == MPR_VIEWPORT_CORONAL:
-            view.mpr_sagittal_index = max(0, min(int(np.floor(image_x)), width - 1))
-            view.mpr_axial_index = max(0, min(depth - 1 - int(np.floor(image_y)), depth - 1))
+            view.mpr_sagittal_index = nearest_index(image_x, width)
+            view.mpr_axial_index = max(0, min(depth - 1 - nearest_index(image_y, depth), depth - 1))
         elif target_viewport == MPR_VIEWPORT_SAGITTAL:
-            view.mpr_coronal_index = max(0, min(int(np.floor(image_x)), height - 1))
-            view.mpr_axial_index = max(0, min(depth - 1 - int(np.floor(image_y)), depth - 1))
+            view.mpr_coronal_index = nearest_index(image_x, height)
+            view.mpr_axial_index = max(0, min(depth - 1 - nearest_index(image_y, depth), depth - 1))
         else:
-            view.mpr_sagittal_index = max(0, min(int(np.floor(image_x)), width - 1))
-            view.mpr_coronal_index = max(0, min(int(np.floor(image_y)), height - 1))
+            view.mpr_sagittal_index = nearest_index(image_x, width)
+            view.mpr_coronal_index = nearest_index(image_y, height)
 
         current_indices = (view.mpr_axial_index, view.mpr_coronal_index, view.mpr_sagittal_index)
         if current_indices == previous_indices:
@@ -1429,30 +1573,30 @@ class ViewerService:
             return None
 
         normalized_radius = (
-            CROSSHAIR_HIT_RADIUS / float(min(overlay.image_width, overlay.image_height))
-            if min(overlay.image_width, overlay.image_height) > 0
+            CROSSHAIR_HIT_RADIUS / float(min(overlay.width, overlay.height))
+            if min(overlay.width, overlay.height) > 0
             else 0.0
         )
         return MprCrosshairInfo(
             centerX=(
-                (float(overlay.center_x) - float(overlay.image_left)) / float(overlay.image_width)
-                if overlay.image_width > 0
+                float(overlay.center_x) / float(overlay.width)
+                if overlay.width > 0
                 else 0.0
             ),
             centerY=(
-                (float(overlay.center_y) - float(overlay.image_top)) / float(overlay.image_height)
-                if overlay.image_height > 0
+                float(overlay.center_y) / float(overlay.height)
+                if overlay.height > 0
                 else 0.0
             ),
             hitRadius=normalized_radius,
             horizontalPosition=(
-                (float(overlay.horizontal_position) - float(overlay.image_top)) / float(overlay.image_height)
-                if overlay.horizontal_position is not None and overlay.image_height > 0
+                float(overlay.horizontal_position) / float(overlay.height)
+                if overlay.horizontal_position is not None and overlay.height > 0
                 else None
             ),
             verticalPosition=(
-                (float(overlay.vertical_position) - float(overlay.image_left)) / float(overlay.image_width)
-                if overlay.vertical_position is not None and overlay.image_width > 0
+                float(overlay.vertical_position) / float(overlay.width)
+                if overlay.vertical_position is not None and overlay.width > 0
                 else None
             ),
         )
