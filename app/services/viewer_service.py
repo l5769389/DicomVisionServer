@@ -47,6 +47,7 @@ from app.schemas.view import (
     MeasurementOverlayPayload,
     OperationAcceptedResponse,
     OrientationInfo,
+    ScaleBarInfo,
     SliceInfo,
     ViewColorInfo,
     ViewHoverRequest,
@@ -849,6 +850,11 @@ class ViewerService:
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
         )
+        scale_bar = self._build_scale_bar_info(
+            render_plan.render_view,
+            image_transform,
+            self._get_stack_spacing_xy(cached.dataset),
+        )
         slice_corner_info = self._build_slice_corner_info_overlay(
             view,
             series,
@@ -899,6 +905,7 @@ class ViewerService:
                 imageFormat=image_format,
                 viewId=view.view_id,
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
+                scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
                     visible_measurements,
@@ -948,6 +955,11 @@ class ViewerService:
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
+        scale_bar = self._build_scale_bar_info(
+            render_plan.render_view,
+            image_transform,
+            self._get_mpr_spacing_xy(series, target_viewport),
+        )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
         mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(
@@ -994,6 +1006,7 @@ class ViewerService:
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
+                scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
                     visible_measurements,
@@ -1568,6 +1581,39 @@ class ViewerService:
         return True
 
     @staticmethod
+    def _build_scale_bar_info(
+        render_view: ViewRecord,
+        image_transform,
+        spacing_xy: tuple[float, float] | None,
+    ) -> ScaleBarInfo | None:
+        if spacing_xy is None or not render_view.width or render_view.width <= 0:
+            return None
+
+        spacing_x = max(abs(float(spacing_xy[0])), 1e-6)
+        spacing_y = max(abs(float(spacing_xy[1])), 1e-6)
+        inverse = np.linalg.inv(image_transform.matrix)
+        image_dx = float(inverse[0, 0])
+        image_dy = float(inverse[1, 0])
+        mm_per_canvas_pixel = float(np.hypot(image_dx * spacing_x, image_dy * spacing_y))
+        if not np.isfinite(mm_per_canvas_pixel) or mm_per_canvas_pixel <= 0.0:
+            return None
+
+        canvas_width = float(render_view.width)
+        selected_length_mm = 100.0
+        selected_length_px = selected_length_mm / mm_per_canvas_pixel
+        if (
+            not np.isfinite(selected_length_px)
+            or selected_length_px <= 0.0
+            or selected_length_px > canvas_width * 0.8
+        ):
+            return None
+
+        return ScaleBarInfo(
+            lengthNorm=float(selected_length_px) / canvas_width,
+            label="10 cm",
+        )
+
+    @staticmethod
     def _build_mpr_crosshair_info(overlay: MprCrosshairOverlay) -> MprCrosshairInfo | None:
         if overlay.center_x is None or overlay.center_y is None:
             return None
@@ -1638,9 +1684,9 @@ class ViewerService:
         def with_alpha(rgb: tuple[int, int, int], alpha: int) -> tuple[int, int, int, int]:
             return rgb[0], rgb[1], rgb[2], alpha
 
-        axial_color = with_alpha((255, 0, 0), line_alpha)
-        coronal_color = with_alpha((0, 255, 0), line_alpha)
-        sagittal_color = with_alpha((0, 102, 255), line_alpha)
+        axial_color = with_alpha((34, 197, 94), line_alpha)
+        coronal_color = with_alpha((59, 130, 246), line_alpha)
+        sagittal_color = with_alpha((239, 68, 68), line_alpha)
 
         def image_to_canvas(image_x: float, image_y: float) -> tuple[float, float]:
             point = image_transform.matrix @ np.array([image_x, image_y, 1.0], dtype=np.float64)

@@ -75,6 +75,13 @@ class MprCrosshairInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ScaleBarInfo(BaseModel):
+    length_norm: float = Field(alias="lengthNorm")
+    label: str
+
+    model_config = {"populate_by_name": True}
+
+
 class OrientationInfo(BaseModel):
     top: str | None = None
     right: str | None = None
@@ -144,6 +151,7 @@ class ViewImageResponse(BaseModel):
     image_format: ImageFormat = Field(alias="imageFormat")
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
+    scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
     measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)
     orientation: OrientationInfo | None = None
