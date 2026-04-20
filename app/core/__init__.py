@@ -12,6 +12,7 @@ VIEW_OP_TYPE_ROTATE_3D: Final = "rotate3d"
 VIEW_OP_TYPE_RESET: Final = "reset"
 VIEW_OP_TYPE_VOLUME_PRESET: Final = "volumePreset"
 VIEW_OP_TYPE_VOLUME_CONFIG: Final = "volumeConfig"
+VIEW_OP_TYPE_MPR_MIP_CONFIG: Final = "mprMipConfig"
 VIEW_OP_TYPE_MEASUREMENT: Final = "measurement"
 
 DRAG_ACTION_START: Final = "start"

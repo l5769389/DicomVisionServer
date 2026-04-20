@@ -62,6 +62,24 @@ class DragState:
 
 
 @dataclass
+class MprMipViewportState:
+    thickness: int = 12
+
+
+@dataclass
+class MprMipState:
+    enabled: bool = False
+    algorithm: str = "maximum"
+    viewports: dict[str, MprMipViewportState] = field(
+        default_factory=lambda: {
+            "mpr-ax": MprMipViewportState(),
+            "mpr-cor": MprMipViewportState(),
+            "mpr-sag": MprMipViewportState(),
+        }
+    )
+
+
+@dataclass
 class ViewGroupRecord:
     group_id: str
     group_type: str
@@ -75,6 +93,7 @@ class ViewGroupRecord:
     drag_origin_window_center: float | None = None
     drag_origin_volume_render_config: dict[str, object] | None = None
     crosshair_drag_active: bool = False
+    mpr_mip: MprMipState = field(default_factory=MprMipState)
 
 
 @dataclass
@@ -317,4 +336,10 @@ class ViewRecord:
     def mpr_crosshair_drag_active(self, value: bool) -> None:
         if self.view_group is not None:
             self.view_group.crosshair_drag_active = value
+
+    @property
+    def mpr_mip(self) -> MprMipState:
+        if self.view_group is not None:
+            return self.view_group.mpr_mip
+        return MprMipState()
 

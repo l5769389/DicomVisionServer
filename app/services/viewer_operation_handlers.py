@@ -16,6 +16,7 @@ from app.core import (
     VIEW_OP_TYPE_RESET,
     VIEW_OP_TYPE_VOLUME_PRESET,
     VIEW_OP_TYPE_VOLUME_CONFIG,
+    VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_MEASUREMENT,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
@@ -111,6 +112,7 @@ def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
         VIEW_OP_TYPE_RESET: _handle_reset_operation,
         VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
         VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
+        VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
         VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
     }
     return operation_handlers.get(payload.op_type, _handle_generic_operation)
@@ -120,8 +122,6 @@ def _sync_mpr_active_viewport(service: ViewerService, view: ViewRecord) -> bool:
     target_viewport = service._resolve_mpr_viewport(view)
     active_viewport_changed = view.mpr_active_viewport != target_viewport
     view.mpr_active_viewport = target_viewport
-    if active_viewport_changed:
-        view.is_initialized = True
     return active_viewport_changed
 
 
@@ -315,6 +315,21 @@ def _handle_measurement_operation(
             return _render_single()
         return _render_none()
     return _render_none()
+
+
+def _handle_mpr_mip_config_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series
+    if not is_mpr_view:
+        return _render_none()
+    if not service._handle_mpr_mip_config(view, payload):
+        return _render_none()
+    return _render_broadcast()
 
 
 def _handle_generic_operation(

@@ -7,11 +7,13 @@ from app.schemas.dicom import CornerInfoPayload
 
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
+ExportFormat = Literal["png", "dicom"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
+MprMipAlgorithm = Literal["maximum", "minimum", "average", "sum"]
 
 
 class ViewCreateRequest(BaseModel):
@@ -74,6 +76,55 @@ class MprCrosshairInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ViewExportPointPayload(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
+class ViewExportMeasurementOverlayPayload(BaseModel):
+    measurement_id: str = Field(alias="measurementId")
+    tool_type: str = Field(alias="toolType")
+    points: list[ViewExportPointPayload]
+    label_lines: list[str] = Field(alias="labelLines", default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewExportAnnotationOverlayPayload(BaseModel):
+    annotation_id: str = Field(alias="annotationId")
+    tool_type: str = Field(alias="toolType")
+    points: list[ViewExportPointPayload]
+    text: str = ""
+    color: str = "#ffd166"
+    size: str = "md"
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewExportOverlaysPayload(BaseModel):
+    annotations: list[ViewExportAnnotationOverlayPayload] = Field(default_factory=list)
+    measurements: list[ViewExportMeasurementOverlayPayload] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewExportRequest(BaseModel):
+    view_id: str = Field(alias="viewId")
+    export_format: ExportFormat = Field(alias="exportFormat")
+    overlays: ViewExportOverlaysPayload = Field(default_factory=ViewExportOverlaysPayload)
+    overlay_mode: str | None = Field(default=None, alias="overlayMode")
+    preserve_source_dicom: bool = Field(default=True, alias="preserveSourceDicom")
+
+    model_config = {"populate_by_name": True}
+
+
+class ScaleBarInfo(BaseModel):
+    length_norm: float = Field(alias="lengthNorm")
+    label: str
+
+    model_config = {"populate_by_name": True}
+
+
 class OrientationInfo(BaseModel):
     top: str | None = None
     right: str | None = None
@@ -125,17 +176,31 @@ class ViewTransformPayload(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprMipViewportConfig(BaseModel):
+    thickness: int = Field(default=12, ge=1, le=512)
+
+
+class MprMipConfig(BaseModel):
+    enabled: bool = False
+    algorithm: MprMipAlgorithm = "maximum"
+    viewports: dict[str, MprMipViewportConfig] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewImageResponse(BaseModel):
     slice_info: SliceInfo = Field(alias="slice_info")
     window_info: WindowInfo = Field(alias="window_info")
     image_format: ImageFormat = Field(alias="imageFormat")
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
+    scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
     measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)
     orientation: OrientationInfo | None = None
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
+    mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
 
@@ -187,6 +252,7 @@ class ViewOperationRequest(BaseModel):
     ww: float | None = None
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
+    mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
     ver_flip: bool | None = Field(default=None, alias="ver_flip")
