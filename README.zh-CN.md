@@ -1,52 +1,71 @@
-# DicomVision Server
+﻿# DicomVision Server
 
 [English](./README.md)
 
-DicomVision Server 是 DicomVision 桌面阅片系统的后端服务，负责 DICOM 序列加载、视口生命周期管理、2D 图像渲染、MPR 重建、3D 体渲染，以及通过 Socket.IO 提供实时图像更新。
+DicomVision Server 是 DicomVision 阅片系统的后端仓库，负责 DICOM 序列加载、视口生命周期管理、2D 图像渲染、MPR 重建、3D 体渲染，以及通过 Socket.IO 向前端实时推送图像与交互结果。
 
-该服务基于 FastAPI 和 Python 构建，配套前端仓库位于 `D:\ct\git-repo\my\dicomVision\DicomVisionClient`。
+配套前端仓库 GitHub 地址：[DicomVisionClient](https://github.com/l5769389/DicomVisionClient)
 
-## 目录
+## 项目概述
 
-- [项目概览](#项目概览)
-- [核心亮点](#核心亮点)
-- [技术栈](#技术栈)
-- [目录结构](#目录结构)
-- [架构说明](#架构说明)
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [API 与实时事件](#api-与实时事件)
-- [3D 体渲染](#3d-体渲染)
-- [开发说明](#开发说明)
-- [测试](#测试)
-- [桌面打包](#桌面打包)
-- [前后端联调](#前后端联调)
+DicomVision 采用前后端分离的医学影像查看架构：
 
-## 项目概览
+- `DicomVisionServer`：基于 FastAPI + Socket.IO 的后端服务，负责数据加载、渲染和交互处理
+- `DicomVisionClient`：基于 Electron + Vue 的前端应用，负责工作流编排、视口交互和结果展示
 
-后端对外提供两类通信通道：
+后端是整个系统的渲染核心，承担图像计算、视图同步与实时事件分发；前端负责用户操作、工作区管理与渲染结果呈现。
 
-- HTTP：用于加载 DICOM 目录、创建视口等粗粒度资源操作
-- Socket.IO：用于平移、缩放、滚动、悬停、十字线更新和实时渲染推送等交互操作
+## 软件功能
 
-典型调用流程：
+### DICOM 数据服务
 
-1. 前端调用 `POST /api/v1/dicom/loadFolder` 注册目录并获取 `seriesId`。
-2. 前端调用 `POST /api/v1/view/create` 创建视口并获取 `viewId`。
-3. 前端通过 `POST /api/v1/view/setSize` 或 `set_view_size` socket 事件设置视口尺寸。
-4. 前端通过 `bind_view` 将 socket 连接绑定到视口。
-5. 前端通过 `view_operation` 或 `image_operation` 发送交互命令。
+- 加载本地 DICOM 文件夹并发现可读序列
+- 在内存中维护序列元数据与运行时注册表
+- 为 Web 部署场景提供示例数据加载入口
+
+### 视口与渲染能力
+
+- 创建并管理 `Stack`、`MPR`、`3D` 三类视口
+- 渲染 2D Stack 图像与叠加层
+- 提供正交重建能力以支持 MPR 工作流
+- 基于 VTK 在后端执行 3D 体渲染
+
+### 实时交互处理
+
+- 通过 Socket.IO 提供低延迟交互链路
+- 处理平移、缩放、滚动、悬停、重置、十字线与图像操作
+- 将图像帧、叠加信息和确认事件实时回推给前端
+
+### 3D 渲染配置
+
+- 提供 `aaa`、`red`、`cardiac`、`muscle`、`mip` 等内置预设
+- 支持传输函数归一化和应用
+- 支持混合模式、光照、插值、不透明度、颜色、图层等配置
+- 支持快速预览与完整质量渲染两条路径
+
+## 系统架构
+
+后端对外暴露两层通信能力：
+
+- HTTP API：处理加载目录、创建视口、设置尺寸等粗粒度操作
+- Socket.IO：处理交互命令和实时渲染更新
+
+典型请求流程如下：
+
+1. 前端调用 `POST /api/v1/dicom/loadFolder` 注册目录。
+2. 前端调用 `POST /api/v1/view/create` 创建视口。
+3. 通过 `POST /api/v1/view/setSize` 或 `set_view_size` 设置视口尺寸。
+4. 前端通过 `bind_view` 绑定 socket 会话。
+5. 交互事件通过 `view_operation`、`image_operation` 或 `view_hover` 发送到后端。
 6. 后端回推 `image_update`、`hover_info`、`view_ack` 或错误事件。
 
-## 核心亮点
+后端核心职责包括：
 
-- 基于 FastAPI 的 HTTP API，用于序列加载与视口创建
-- 基于 Socket.IO 的低延迟交互与图像刷新链路
-- 支持 2D Stack 渲染、MPR 重建和基于 VTK 的 3D 体渲染
-- 使用内存注册表管理序列与视图状态
-- 通过 DICOM 像素缓存减少重复文件读取
-- 支持角标信息、方向信息、十字线联动与 hover 坐标映射
-- 支持 3D 预设与传输函数配置
+- 注册并索引可读 DICOM 序列
+- 管理 `Stack`、`MPR`、`3D` 视口生命周期与状态
+- 渲染图像帧与叠加信息
+- 同步多视图交互状态
+- 归一化并应用 3D 渲染配置
 
 ## 技术栈
 
@@ -55,8 +74,8 @@ DicomVision Server 是 DicomVision 桌面阅片系统的后端服务，负责 DI
 - python-socketio
 - pydicom
 - NumPy
-- Pillow
 - SciPy
+- Pillow
 - VTK
 - uv
 
@@ -66,41 +85,34 @@ DicomVision Server 是 DicomVision 桌面阅片系统的后端服务，负责 DI
 app/
   api/routes/              HTTP 路由
   core/                    配置、常量、日志
-  models/                  内存领域模型
-  schemas/                 请求响应模型
-  services/                渲染、注册表与 DICOM 处理
-  sockets/                 Socket.IO 事件与运行时中心
+  models/                  内存运行时模型
+  schemas/                 请求与响应模型
+  services/                DICOM 处理、渲染与注册表
+  sockets/                 Socket.IO 事件与运行时中枢
   utils/                   通用工具
+sample-data/               Web 部署可用的示例数据
+tests/                     自动化测试
 run.py                     本地启动入口
-pyproject.toml             项目与依赖配置
-.env.example               环境变量示例
+render.yaml                Render 部署清单
+pyproject.toml             项目元数据与依赖
 ```
 
-## 架构说明
+## 核心模块
 
-后端核心职责：
-
-- 从本地目录注册并索引可读 DICOM 序列
-- 管理 `Stack`、`MPR`、`3D` 三类视口状态
-- 渲染图像帧和叠加信息供客户端消费
-- 维护多视图交互同步
-- 对 3D 预设和自定义配置进行归一化并应用到渲染流程
-
-核心模块：
-
-- `series_registry`：目录级序列发现和元数据管理
-- `view_registry`：视口实例与生命周期管理
+- `series_registry`：序列发现与元数据管理
+- `view_registry`：视口实例生命周期管理
 - `dicom_cache`：解码像素缓存
 - `viewer_service`：渲染与交互处理的核心编排层
-- `view_socket_hub`：定向 socket 绑定与渲染推送
+- `view_socket_hub`：按视口定向绑定与推送
+- `app/services/volume_rendering/`：基于 VTK 的体渲染管线
 
 ## 快速开始
 
 ### 环境要求
 
 - Python 3.13 或更高版本
-- 可运行 VTK 的本地环境
-- 后端所在机器需要具备对本地 DICOM 目录的访问权限
+- 可运行 VTK 的环境
+- 对待加载 DICOM 目录具备读取权限
 
 ### 安装依赖
 
@@ -108,7 +120,7 @@ pyproject.toml             项目与依赖配置
 uv sync
 ```
 
-如需安装开发依赖：
+如需开发依赖：
 
 ```bash
 uv sync --extra dev
@@ -120,17 +132,16 @@ uv sync --extra dev
 uv run python run.py
 ```
 
-默认启动地址为 `http://127.0.0.1:8000`。
+默认服务地址：
 
-启动后可访问：
-
-- OpenAPI 文档：`http://127.0.0.1:8000/docs`
-- ReDoc 文档：`http://127.0.0.1:8000/redoc`
-- Socket.IO 路径：`http://127.0.0.1:8000/socket.io`
+- HTTP：`http://127.0.0.1:8000`
+- OpenAPI：`http://127.0.0.1:8000/docs`
+- ReDoc：`http://127.0.0.1:8000/redoc`
+- Socket.IO：`http://127.0.0.1:8000/socket.io`
 
 ## 配置说明
 
-如有需要，可根据 `.env.example` 创建本地 `.env` 文件。
+按需创建本地 `.env` 文件，常用配置如下：
 
 ```env
 APP_NAME=DicomVision Server
@@ -138,14 +149,16 @@ APP_ENV=development
 APP_HOST=0.0.0.0
 APP_PORT=8000
 CORS_ORIGINS=["*"]
+WEB_SAMPLE_DICOM_PATH=
 ```
 
 关键配置项：
 
-- `APP_ENV`：设置为 `development` 时启用自动重载
-- `APP_HOST`：Uvicorn 监听地址
+- `APP_ENV`：控制开发态行为，例如自动重载
+- `APP_HOST`：服务监听地址
 - `APP_PORT`：服务端口，默认 `8000`
-- `CORS_ORIGINS`：允许的 HTTP 与 Socket.IO 来源
+- `CORS_ORIGINS`：HTTP 与 Socket.IO 允许的来源
+- `WEB_SAMPLE_DICOM_PATH`：`POST /api/v1/dicom/loadSample` 使用的示例目录
 
 ## API 与实时事件
 
@@ -155,19 +168,16 @@ HTTP 基础路径：`/api/v1`
 
 - `GET /health`
 - `POST /dicom/loadFolder`
-  - 作用：加载本地目录并注册可读 DICOM 序列
+- `POST /dicom/loadSample`
 - `POST /dicom/cornerInfo`
-  - 作用：获取序列级角标信息
 - `POST /view/create`
-  - 作用：创建 `Stack`、`MPR` 或 `3D` 视口
 - `POST /view/setSize`
-  - 作用：保存视口尺寸并触发渲染
 
-精确的请求响应结构请以 `/docs` 中自动生成的 OpenAPI 文档为准。
+准确的请求与响应结构以 `/docs` 中的 OpenAPI 文档为准。
 
 ### Socket.IO 事件
 
-客户端发往服务端：
+客户端发送：
 
 - `bind_view`
 - `set_view_size`
@@ -175,7 +185,7 @@ HTTP 基础路径：`/api/v1`
 - `image_operation`
 - `view_hover`
 
-服务端发往客户端：
+服务端回推：
 
 - `connected`
 - `view_bound`
@@ -185,32 +195,46 @@ HTTP 基础路径：`/api/v1`
 - `image_error`
 - `render_error`
 
-`image_update` 会返回渲染后的视口元数据及图像字节流。
+`image_update` 会返回渲染图像数据和视口元数据。
 
-## 3D 体渲染
+## 前端联调说明
 
-基于 VTK 的 3D 渲染器位于 `app/services/volume_rendering/`。
+配套前端仓库：
 
-当前 3D 能力包括：
+[https://github.com/l5769389/DicomVisionClient](https://github.com/l5769389/DicomVisionClient)
 
-- 基于四元数的相机旋转
-- 快速预览与完整渲染两条路径
-- 可配置的混合模式
-- 可配置的光照与插值策略
-- 多层传输函数配置
-- 内置 `aaa`、`red`、`cardiac`、`muscle`、`mip` 等预设
+推荐本地联调顺序：
 
-所有 3D 配置在应用到渲染会话前，都会先在后端完成归一化处理。
+1. 启动 `DicomVisionServer`。
+2. 启动 `DicomVisionClient`。
+3. 在客户端中加载 DICOM 文件夹。
+4. 创建 Stack、MPR 或 3D 视口并开始交互。
 
-## 开发说明
+当前前端桌面开发模式默认连接 `http://127.0.0.1:8000`，HTTP 与 Socket.IO 均使用该地址。
 
-- 当前实现以“后端负责渲染，前端负责驱动和展示”为主要设计思路。
-- 低延迟交互主要依赖 Socket 事件链路。
-- 当前前端默认连接 `http://127.0.0.1:8000`。
+## Render 部署
+
+仓库内已提供 `render.yaml`，可用于部署到 Render。
+
+建议环境变量：
+
+```env
+APP_ENV=production
+APP_HOST=0.0.0.0
+APP_PORT=10000
+CORS_ORIGINS=["https://your-vercel-app.vercel.app"]
+WEB_SAMPLE_DICOM_PATH=/opt/render/project/src/sample-data
+```
+
+说明：
+
+- `CORS_ORIGINS` 同时用于 FastAPI CORS 与 Socket.IO 允许来源
+- `WEB_SAMPLE_DICOM_PATH` 必须指向可读目录
+- Web 前端可通过 `POST /api/v1/dicom/loadSample` 加载服务端示例数据，而无需暴露本地路径
 
 ## 测试
 
-如果后续补充或扩展测试，可执行：
+运行测试：
 
 ```bash
 uv run pytest
@@ -218,15 +242,15 @@ uv run pytest
 
 ## 桌面打包
 
-当前仓库负责产出自己的桌面后端 bundle，Electron 客户端仓库只消费该 bundle 并组装最终安装包。
+当前仓库负责构建后端桌面 bundle，由 Electron 客户端安装包消费。
 
-如需构建 Windows 桌面 bundle，先在本地虚拟环境安装 `PyInstaller`：
+如需安装 PyInstaller：
 
 ```bash
 uv run python -m pip install pyinstaller
 ```
 
-执行构建脚本：
+构建 Windows 后端 bundle：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
@@ -241,20 +265,10 @@ dist/
     ...
 ```
 
-如果发布链路需要不同的产物目录，可覆盖输出根目录：
+如需覆盖输出路径：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1 -OutputRoot .\artifacts
 ```
 
-随后可将该目录作为 `DICOM_VISION_SERVER_BUNDLE_PATH` 提供给 `DicomVisionClient`，由客户端仓库完成最终安装包组装。
-
-如果两个仓库位于相邻目录，也可以直接在 `DicomVisionClient` 中执行 `npm run release:win`，一次完成服务端构建与客户端安装包组装。
-
-## 前后端联调
-
-配套前端项目位于：
-
-`D:\ct\git-repo\my\dicomVision\DicomVisionClient`
-
-启动 Electron 客户端前，请先启动本服务。
+随后可通过 `DICOM_VISION_SERVER_BUNDLE_PATH` 将该目录交给前端安装包流程使用。

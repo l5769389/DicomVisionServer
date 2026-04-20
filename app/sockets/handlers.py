@@ -11,6 +11,22 @@ from app.utils.utils import timer
 logger = get_logger(__name__)
 
 
+def _build_error_payload(exc: Exception) -> dict[str, str]:
+    return {"message": getattr(exc, "detail", str(exc))}
+
+
+async def _emit_errors(
+    server: socketio.AsyncServer,
+    sid: str,
+    *,
+    events: tuple[str, ...],
+    exc: Exception,
+) -> None:
+    error = _build_error_payload(exc)
+    for event_name in events:
+        await server.emit(event_name, error, to=sid)
+
+
 async def _emit_render(server: socketio.AsyncServer, sid: str, view_id: str) -> None:
     view_socket_hub.bind_view(sid, view_id)
     await view_socket_hub.emit_render_for_view(view_id, target_sids=(sid,))
@@ -53,10 +69,8 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
                 )
         logger.info("socket view_operation sid=%s view_id=%s op_type=%s", sid, payload.view_id, payload.op_type)
     except Exception as exc:
-        error = {"message": getattr(exc, "detail", str(exc))}
         logger.exception("socket view_operation failed sid=%s", sid)
-        await server.emit("image_error", error, to=sid)
-        await server.emit("render_error", error, to=sid)
+        await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
 
 
 async def _handle_hover(server: socketio.AsyncServer, sid: str, data: dict) -> None:
@@ -66,9 +80,8 @@ async def _handle_hover(server: socketio.AsyncServer, sid: str, data: dict) -> N
         result = await asyncio.to_thread(viewer_service.handle_view_hover, payload)
         await server.emit("hover_info", result.model_dump(by_alias=True), to=sid)
     except Exception as exc:
-        error = {"message": getattr(exc, "detail", str(exc))}
         logger.exception("socket view_hover failed sid=%s", sid)
-        await server.emit("image_error", error, to=sid)
+        await _emit_errors(server, sid, events=("image_error",), exc=exc)
 
 
 async def _handle_set_size(server: socketio.AsyncServer, sid: str, data: dict) -> None:
@@ -80,10 +93,8 @@ async def _handle_set_size(server: socketio.AsyncServer, sid: str, data: dict) -
         await _emit_render(server, sid, payload.view_id)
         logger.info("socket set_view_size sid=%s view_id=%s", sid, payload.view_id)
     except Exception as exc:
-        error = {"message": getattr(exc, "detail", str(exc))}
         logger.exception("socket set_view_size failed sid=%s", sid)
-        await server.emit("image_error", error, to=sid)
-        await server.emit("render_error", error, to=sid)
+        await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
 
 
 def register_socket_handlers(server: socketio.AsyncServer) -> None:
@@ -115,7 +126,7 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
                 await _emit_render(server, sid, view_id)
         except Exception as exc:
             logger.exception("socket bind_view initial render failed sid=%s view_id=%s", sid, view_id)
-            await server.emit("render_error", {"message": getattr(exc, "detail", str(exc))}, to=sid)
+            await _emit_errors(server, sid, events=("render_error",), exc=exc)
 
     @server.on("set_view_size")
     async def set_view_size(sid: str, data: dict) -> None:

@@ -78,6 +78,13 @@ from app.schemas.view import (
     WindowInfo,
 )
 from app.services.dicom_cache import CachedDicom, dicom_cache
+from app.services.dicom_geometry import (
+    build_standardized_volume,
+    get_dataset_orientation,
+    get_dataset_position,
+    get_standardized_axis_mapping,
+    normalize_vector,
+)
 from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
 from app.services.measurement_utils import build_measurement_metrics, clamp_point_to_image
@@ -1918,95 +1925,21 @@ class ViewerService:
 
     @staticmethod
     def _get_dataset_orientation(dataset) -> np.ndarray | None:
-        value = getattr(dataset, "ImageOrientationPatient", None)
-        if value is None or len(value) < 6:
-            return None
-        try:
-            orientation = np.asarray([float(item) for item in value[:6]], dtype=np.float64)
-        except (TypeError, ValueError):
-            self._series_patient_transform_cache[series.series_id] = None
-            return None
-        return orientation if np.all(np.isfinite(orientation)) else None
+        return get_dataset_orientation(dataset)
 
     @staticmethod
     def _get_dataset_position(dataset) -> np.ndarray | None:
-        value = getattr(dataset, "ImagePositionPatient", None)
-        if value is None or len(value) < 3:
-            return None
-        try:
-            position = np.asarray([float(item) for item in value[:3]], dtype=np.float64)
-        except (TypeError, ValueError):
-            self._series_patient_transform_cache[series.series_id] = None
-            return None
-        return position if np.all(np.isfinite(position)) else None
+        return get_dataset_position(dataset)
 
     @staticmethod
     def _normalize_vector(vector: np.ndarray) -> np.ndarray | None:
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-6:
-            return None
-        return vector / norm
+        return normalize_vector(vector)
 
     def _build_standardized_volume(
         self,
         slice_entries: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]],
     ) -> np.ndarray:
-        orientation = next((item[1] for item in slice_entries if item[1] is not None), None)
-        if orientation is None:
-            return np.stack([item[0] for item in slice_entries], axis=0).astype(np.float32)
-
-        row_direction = self._normalize_vector(orientation[:3])
-        column_direction = self._normalize_vector(orientation[3:6])
-        if row_direction is None or column_direction is None:
-            return np.stack([item[0] for item in slice_entries], axis=0).astype(np.float32)
-
-        slice_direction = self._normalize_vector(np.cross(row_direction, column_direction))
-        if slice_direction is None:
-            return np.stack([item[0] for item in slice_entries], axis=0).astype(np.float32)
-
-        positions = [item[2] for item in slice_entries]
-        if any(position is None for position in positions):
-            ordered_entries = slice_entries
-        else:
-            ordered_entries = sorted(
-                slice_entries,
-                key=lambda item: float(np.dot(item[2], slice_direction)) if item[2] is not None else 0.0,
-            )
-
-        raw_volume = np.stack([item[0] for item in ordered_entries], axis=0).astype(np.float32)
-        raw_axis_vectors = (slice_direction, column_direction, row_direction)
-        patient_axes: list[int] = []
-        axis_signs: list[int] = []
-
-        for vector in raw_axis_vectors:
-            patient_axis = int(np.argmax(np.abs(vector)))
-            if patient_axis in patient_axes:
-                logger.warning("falling back to non-standardized volume because orientation axes are not orthogonal enough")
-                return raw_volume
-            patient_axes.append(patient_axis)
-            axis_signs.append(1 if vector[patient_axis] >= 0 else -1)
-
-        transpose_order = [patient_axes.index(2), patient_axes.index(1), patient_axes.index(0)]
-        canonical_signs = [
-            axis_signs[patient_axes.index(2)],
-            axis_signs[patient_axes.index(1)],
-            axis_signs[patient_axes.index(0)],
-        ]
-        volume = np.transpose(raw_volume, axes=transpose_order)
-        for axis, sign in enumerate(canonical_signs):
-            if sign < 0:
-                volume = np.flip(volume, axis=axis)
-
-        logger.info(
-            "standardized MPR volume shape=%s raw_axes=%s canonical_signs=%s row_dir=%s col_dir=%s slice_dir=%s",
-            volume.shape,
-            patient_axes,
-            canonical_signs,
-            np.round(row_direction, 4).tolist(),
-            np.round(column_direction, 4).tolist(),
-            np.round(slice_direction, 4).tolist(),
-        )
-        return volume.astype(np.float32, copy=False)
+        return build_standardized_volume(slice_entries, logger=self._logger)
 
     def _handle_drag_pan(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if payload.action_type == DRAG_ACTION_START:
@@ -2717,14 +2650,8 @@ class ViewerService:
             self._series_patient_transform_cache[series.series_id] = None
             return None
 
-        row_direction = self._normalize_vector(orientation[:3])
-        column_direction = self._normalize_vector(orientation[3:6])
-        if row_direction is None or column_direction is None:
-            self._series_patient_transform_cache[series.series_id] = None
-            return None
-
-        slice_direction = self._normalize_vector(np.cross(row_direction, column_direction))
-        if slice_direction is None:
+        axis_mapping = get_standardized_axis_mapping(orientation)
+        if axis_mapping is None:
             self._series_patient_transform_cache[series.series_id] = None
             return None
 
@@ -2734,7 +2661,7 @@ class ViewerService:
         else:
             ordered_entries = sorted(
                 slice_entries,
-                key=lambda item: float(np.dot(item[2], slice_direction)) if item[2] is not None else 0.0,
+                key=lambda item: float(np.dot(item[2], axis_mapping.slice_direction)) if item[2] is not None else 0.0,
             )
 
         first_dataset = ordered_entries[0][3]
@@ -2751,9 +2678,9 @@ class ViewerService:
             return None
 
         ordered_positions = [item[2] for item in ordered_entries if item[2] is not None]
-        slice_spacing = self._estimate_slice_spacing(ordered_positions, slice_direction, first_dataset)
+        slice_spacing = self._estimate_slice_spacing(ordered_positions, axis_mapping.slice_direction, first_dataset)
 
-        raw_axis_vectors = (slice_direction, column_direction, row_direction)
+        raw_axis_vectors = (axis_mapping.slice_direction, axis_mapping.column_direction, axis_mapping.row_direction)
         raw_axis_steps = (slice_spacing, row_spacing, col_spacing)
         raw_lengths = (
             len(ordered_entries),
@@ -2763,33 +2690,16 @@ class ViewerService:
         if any(length <= 0 for length in raw_lengths):
             return None
 
-        patient_axes: list[int] = []
-        axis_signs: list[int] = []
-        for vector in raw_axis_vectors:
-            patient_axis = int(np.argmax(np.abs(vector)))
-            if patient_axis in patient_axes:
-                self._series_patient_transform_cache[series.series_id] = None
-                return None
-            patient_axes.append(patient_axis)
-            axis_signs.append(1 if vector[patient_axis] >= 0 else -1)
-
-        transpose_order = [patient_axes.index(2), patient_axes.index(1), patient_axes.index(0)]
-        canonical_signs = [
-            axis_signs[patient_axes.index(2)],
-            axis_signs[patient_axes.index(1)],
-            axis_signs[patient_axes.index(0)],
-        ]
-
         origin = np.asarray(ordered_entries[0][2], dtype=np.float64)
-        for canonical_axis, raw_axis in enumerate(transpose_order):
-            if canonical_signs[canonical_axis] < 0:
+        for canonical_axis, raw_axis in enumerate(axis_mapping.transpose_order):
+            if axis_mapping.canonical_signs[canonical_axis] < 0:
                 origin = origin + raw_axis_vectors[raw_axis] * raw_axis_steps[raw_axis] * float(raw_lengths[raw_axis] - 1)
 
         axis_vectors = tuple(
-            raw_axis_vectors[raw_axis] * raw_axis_steps[raw_axis] * float(canonical_signs[canonical_axis])
-            for canonical_axis, raw_axis in enumerate(transpose_order)
+            raw_axis_vectors[raw_axis] * raw_axis_steps[raw_axis] * float(axis_mapping.canonical_signs[canonical_axis])
+            for canonical_axis, raw_axis in enumerate(axis_mapping.transpose_order)
         )
-        shape = tuple(raw_lengths[raw_axis] for raw_axis in transpose_order)
+        shape = tuple(raw_lengths[raw_axis] for raw_axis in axis_mapping.transpose_order)
         result = {
             "origin": origin,
             "axis_vectors": axis_vectors,
