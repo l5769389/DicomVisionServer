@@ -296,3 +296,87 @@ class ViewMtfAnalyzeResponse(BaseModel):
 
     model_config = {"populate_by_name": True}
 
+
+QaWaterRoiKind = Literal["water", "air"]
+
+
+class QaWaterRoiPayload(BaseModel):
+    id: str
+    label: str
+    kind: QaWaterRoiKind
+    center: MeasurementPointPayload
+    radius: float = Field(ge=0.0, le=1.0)
+
+    model_config = {"populate_by_name": True}
+
+
+class QaWaterAccuracyMetricsPayload(BaseModel):
+    center_mean: float = Field(alias="centerMean")
+    deviation_hu: float = Field(alias="deviationHu")
+    target_hu: float = Field(default=0.0, alias="targetHu")
+    unit: str = "HU"
+
+    model_config = {"populate_by_name": True}
+
+
+class QaWaterRoiStatsPayload(BaseModel):
+    id: str
+    label: str
+    kind: QaWaterRoiKind
+    area: float
+    width: float
+    height: float
+    mean: float
+    std_dev: float = Field(alias="stdDev")
+    sample_count: int = Field(alias="sampleCount")
+    deviation_from_center: float | None = Field(default=None, alias="deviationFromCenter")
+    size_unit: str = Field(alias="sizeUnit")
+    area_unit: str = Field(alias="areaUnit")
+    unit: str = "HU"
+
+    model_config = {"populate_by_name": True}
+
+
+class QaWaterUniformityMetricsPayload(BaseModel):
+    center_mean: float = Field(alias="centerMean")
+    max_deviation: float = Field(alias="maxDeviation")
+    peripheral_means: list[float] = Field(alias="peripheralMeans")
+    roi_stats: list[QaWaterRoiStatsPayload] = Field(default_factory=list, alias="roiStats")
+    unit: str = "HU"
+
+    model_config = {"populate_by_name": True}
+
+
+class QaWaterNoiseMetricsPayload(BaseModel):
+    std_dev: float = Field(alias="stdDev")
+    unit: str = "HU"
+
+    model_config = {"populate_by_name": True}
+
+
+class QaWaterMetricsPayload(BaseModel):
+    accuracy: QaWaterAccuracyMetricsPayload | None = None
+    uniformity: QaWaterUniformityMetricsPayload | None = None
+    noise: QaWaterNoiseMetricsPayload | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewQaWaterAnalyzeRequest(BaseModel):
+    view_id: str = Field(alias="viewId")
+    viewport_key: str = Field(alias="viewportKey")
+    metrics: list[str] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class ViewQaWaterAnalyzeResponse(BaseModel):
+    view_id: str = Field(alias="viewId")
+    viewport_key: str = Field(alias="viewportKey")
+    rois: list[QaWaterRoiPayload]
+    metrics: QaWaterMetricsPayload = Field(default_factory=QaWaterMetricsPayload)
+    status: Literal["ready", "error"] = "ready"
+    message: str | None = None
+
+    model_config = {"populate_by_name": True}
+

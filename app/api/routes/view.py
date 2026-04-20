@@ -9,6 +9,8 @@ from app.schemas.view import (
     ViewExportRequest,
     ViewMtfAnalyzeRequest,
     ViewMtfAnalyzeResponse,
+    ViewQaWaterAnalyzeRequest,
+    ViewQaWaterAnalyzeResponse,
     ViewSetSizeRequest,
 )
 from app.sockets.runtime import view_socket_hub
@@ -40,6 +42,11 @@ async def set_view_size(payload: ViewSetSizeRequest, background_tasks: Backgroun
 @router.post("/mtf/analyze", response_model=ViewMtfAnalyzeResponse)
 async def analyze_mtf(payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
     return viewer_service.analyze_mtf(payload)
+
+
+@router.post("/qa/water/analyze", response_model=ViewQaWaterAnalyzeResponse)
+async def analyze_qa_water(payload: ViewQaWaterAnalyzeRequest) -> ViewQaWaterAnalyzeResponse:
+    return viewer_service.analyze_qa_water(payload)
 
 
 @router.post("/export")
