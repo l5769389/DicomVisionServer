@@ -79,6 +79,15 @@ class MprCrosshairInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprFrameInfo(BaseModel):
+    center: tuple[float, float, float]
+    axis_slice: tuple[float, float, float] = Field(alias="axisSlice")
+    axis_row: tuple[float, float, float] = Field(alias="axisRow")
+    axis_col: tuple[float, float, float] = Field(alias="axisCol")
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewExportPointPayload(BaseModel):
     x: float = Field(ge=0.0, le=1.0)
     y: float = Field(ge=0.0, le=1.0)
@@ -197,6 +206,7 @@ class ViewImageResponse(BaseModel):
     image_format: ImageFormat = Field(alias="imageFormat")
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
+    mpr_frame: MprFrameInfo | None = Field(default=None, alias="mprFrame")
     scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
     measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)

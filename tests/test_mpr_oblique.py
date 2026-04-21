@@ -9,6 +9,18 @@ from app.services.viewer_service import ViewerService
 from app.services.series_registry import series_registry
 
 
+def _run_with_stubbed_mpr_volume(service: ViewerService, callback):
+    original_get_volume = service._get_series_volume
+    original_series_get = series_registry.get
+    try:
+        series_registry.get = lambda _series_id: SimpleNamespace(series_id="s", instances=[])  # type: ignore[method-assign]
+        service._get_series_volume = lambda _series: np.zeros((5, 6, 7), dtype=np.float32)  # type: ignore[method-assign]
+        return callback()
+    finally:
+        series_registry.get = original_series_get  # type: ignore[method-assign]
+        service._get_series_volume = original_get_volume  # type: ignore[method-assign]
+
+
 def test_mpr_oblique_drag_updates_target_plane_and_reslices() -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
@@ -32,8 +44,13 @@ def test_mpr_oblique_drag_updates_target_plane_and_reslices() -> None:
         angleRad=0.35,
     )
 
-    assert service._handle_mpr_oblique(view, start) is False
-    assert service._handle_mpr_oblique(view, move) is True
+    start_result, move_result = _run_with_stubbed_mpr_volume(service, lambda: (
+        service._handle_mpr_oblique(view, start),
+        service._handle_mpr_oblique(view, move),
+    ))
+
+    assert start_result is False
+    assert move_result is True
     assert group.oblique_line_angles["mpr-ax"]["horizontal"] == 0.35
     assert math.isclose(group.oblique_line_angles["mpr-ax"]["vertical"], 0.35 + np.pi / 2.0, rel_tol=0.0, abs_tol=1e-6)
     assert group.oblique_planes["mpr-cor"].is_oblique is True
@@ -101,6 +118,10 @@ def test_mpr_reset_restores_group_to_initial_state() -> None:
     assert group.axial_index == 4
     assert group.coronal_index == 5
     assert group.sagittal_index == 6
+    assert group.mpr_frame.center == (4.0, 5.0, 6.0)
+    assert group.mpr_frame.axis_slice == (1.0, 0.0, 0.0)
+    assert group.mpr_frame.axis_row == (0.0, 1.0, 0.0)
+    assert group.mpr_frame.axis_col == (0.0, 0.0, 1.0)
     assert group.crosshair_drag_active is False
     assert group.oblique_drag_active is False
     assert group.oblique_planes["mpr-cor"].is_oblique is False
@@ -121,25 +142,29 @@ def test_mpr_oblique_editing_second_view_does_not_restore_first_view_angles_to_d
     axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
     coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
 
-    service._handle_mpr_oblique(
-        axial_view,
-        ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="start", line="horizontal", angleRad=0.35),
-    )
-    service._handle_mpr_oblique(
-        axial_view,
-        ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="move", line="horizontal", angleRad=0.35),
-    )
+    _run_with_stubbed_mpr_volume(service, lambda: (
+        service._handle_mpr_oblique(
+            axial_view,
+            ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="start", line="horizontal", angleRad=0.35),
+        ),
+        service._handle_mpr_oblique(
+            axial_view,
+            ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="move", line="horizontal", angleRad=0.35),
+        ),
+    ))
     first_axial_horizontal = group.oblique_line_angles["mpr-ax"]["horizontal"]
     first_axial_vertical = group.oblique_line_angles["mpr-ax"]["vertical"]
 
-    service._handle_mpr_oblique(
-        coronal_view,
-        ViewOperationRequest(viewId=coronal_view.view_id, opType="mprOblique", actionType="start", line="vertical", angleRad=1.2),
-    )
-    service._handle_mpr_oblique(
-        coronal_view,
-        ViewOperationRequest(viewId=coronal_view.view_id, opType="mprOblique", actionType="move", line="vertical", angleRad=1.2),
-    )
+    _run_with_stubbed_mpr_volume(service, lambda: (
+        service._handle_mpr_oblique(
+            coronal_view,
+            ViewOperationRequest(viewId=coronal_view.view_id, opType="mprOblique", actionType="start", line="vertical", angleRad=1.2),
+        ),
+        service._handle_mpr_oblique(
+            coronal_view,
+            ViewOperationRequest(viewId=coronal_view.view_id, opType="mprOblique", actionType="move", line="vertical", angleRad=1.2),
+        ),
+    ))
 
     assert not math.isclose(first_axial_horizontal, 0.0, rel_tol=0.0, abs_tol=1e-6)
     assert not math.isclose(group.oblique_line_angles["mpr-ax"]["horizontal"], 0.0, rel_tol=0.0, abs_tol=1e-6)
@@ -156,6 +181,8 @@ def test_mpr_oblique_editing_second_view_does_not_restore_first_view_angles_to_d
         rel_tol=0.0,
         abs_tol=1e-6,
     )
+    assert not np.allclose(group.mpr_frame.axis_slice, np.array([1.0, 0.0, 0.0], dtype=np.float64), atol=1e-6)
+    assert not np.allclose(group.mpr_frame.axis_row, np.array([0.0, 1.0, 0.0], dtype=np.float64), atol=1e-6)
 
 
 def test_mpr_orientation_overlay_updates_after_oblique_rotation() -> None:
@@ -170,14 +197,16 @@ def test_mpr_orientation_overlay_updates_after_oblique_rotation() -> None:
     assert initial_overlay.left == "R"
     assert initial_overlay.right == "L"
 
-    service._handle_mpr_oblique(
-        axial_view,
-        ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="start", line="horizontal", angleRad=0.35),
-    )
-    service._handle_mpr_oblique(
-        axial_view,
-        ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="move", line="horizontal", angleRad=0.35),
-    )
+    _run_with_stubbed_mpr_volume(service, lambda: (
+        service._handle_mpr_oblique(
+            axial_view,
+            ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="start", line="horizontal", angleRad=0.35),
+        ),
+        service._handle_mpr_oblique(
+            axial_view,
+            ViewOperationRequest(viewId=axial_view.view_id, opType="mprOblique", actionType="move", line="horizontal", angleRad=0.35),
+        ),
+    ))
 
     rotated_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
     assert rotated_overlay.left == "R"

@@ -87,6 +87,23 @@ class MprObliquePlaneState:
     is_oblique: bool = False
 
 
+@dataclass
+class MprFrameState:
+    center: tuple[float, float, float]
+    axis_slice: tuple[float, float, float]
+    axis_row: tuple[float, float, float]
+    axis_col: tuple[float, float, float]
+
+
+def create_default_mpr_frame_state() -> MprFrameState:
+    return MprFrameState(
+        center=(0.0, 0.0, 0.0),
+        axis_slice=(1.0, 0.0, 0.0),
+        axis_row=(0.0, 1.0, 0.0),
+        axis_col=(0.0, 0.0, 1.0),
+    )
+
+
 def create_default_mpr_oblique_planes() -> dict[str, MprObliquePlaneState]:
     return {
         "mpr-ax": MprObliquePlaneState(
@@ -131,6 +148,7 @@ class ViewGroupRecord:
     crosshair_drag_active: bool = False
     oblique_drag_active: bool = False
     mpr_mip: MprMipState = field(default_factory=MprMipState)
+    mpr_frame: MprFrameState = field(default_factory=create_default_mpr_frame_state)
     oblique_planes: dict[str, MprObliquePlaneState] = field(default_factory=create_default_mpr_oblique_planes)
     oblique_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_line_angles)
 
@@ -348,6 +366,9 @@ class ViewRecord:
     def mpr_axial_index(self, value: int) -> None:
         if self.view_group is not None:
             self.view_group.axial_index = value
+            center = list(self.view_group.mpr_frame.center)
+            center[0] = float(value)
+            self.view_group.mpr_frame.center = tuple(center)
 
     @property
     def mpr_coronal_index(self) -> int:
@@ -357,6 +378,9 @@ class ViewRecord:
     def mpr_coronal_index(self, value: int) -> None:
         if self.view_group is not None:
             self.view_group.coronal_index = value
+            center = list(self.view_group.mpr_frame.center)
+            center[1] = float(value)
+            self.view_group.mpr_frame.center = tuple(center)
 
     @property
     def mpr_sagittal_index(self) -> int:
@@ -366,6 +390,9 @@ class ViewRecord:
     def mpr_sagittal_index(self, value: int) -> None:
         if self.view_group is not None:
             self.view_group.sagittal_index = value
+            center = list(self.view_group.mpr_frame.center)
+            center[2] = float(value)
+            self.view_group.mpr_frame.center = tuple(center)
 
     @property
     def mpr_crosshair_drag_active(self) -> bool:
