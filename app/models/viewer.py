@@ -80,6 +80,42 @@ class MprMipState:
 
 
 @dataclass
+class MprObliquePlaneState:
+    row: tuple[float, float, float]
+    col: tuple[float, float, float]
+    normal: tuple[float, float, float]
+    is_oblique: bool = False
+
+
+def create_default_mpr_oblique_planes() -> dict[str, MprObliquePlaneState]:
+    return {
+        "mpr-ax": MprObliquePlaneState(
+            row=(0.0, 1.0, 0.0),
+            col=(0.0, 0.0, 1.0),
+            normal=(1.0, 0.0, 0.0),
+        ),
+        "mpr-cor": MprObliquePlaneState(
+            row=(-1.0, 0.0, 0.0),
+            col=(0.0, 0.0, 1.0),
+            normal=(0.0, 1.0, 0.0),
+        ),
+        "mpr-sag": MprObliquePlaneState(
+            row=(-1.0, 0.0, 0.0),
+            col=(0.0, 1.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        ),
+    }
+
+
+def create_default_mpr_oblique_line_angles() -> dict[str, dict[str, float]]:
+    return {
+        "mpr-ax": {"horizontal": 0.0, "vertical": 1.5707963267948966},
+        "mpr-cor": {"horizontal": 0.0, "vertical": 1.5707963267948966},
+        "mpr-sag": {"horizontal": 0.0, "vertical": 1.5707963267948966},
+    }
+
+
+@dataclass
 class ViewGroupRecord:
     group_id: str
     group_type: str
@@ -93,7 +129,10 @@ class ViewGroupRecord:
     drag_origin_window_center: float | None = None
     drag_origin_volume_render_config: dict[str, object] | None = None
     crosshair_drag_active: bool = False
+    oblique_drag_active: bool = False
     mpr_mip: MprMipState = field(default_factory=MprMipState)
+    oblique_planes: dict[str, MprObliquePlaneState] = field(default_factory=create_default_mpr_oblique_planes)
+    oblique_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_line_angles)
 
 
 @dataclass

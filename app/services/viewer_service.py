@@ -8,6 +8,7 @@ from uuid import uuid4
 import numpy as np
 from fastapi import HTTPException
 from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage
 from pydicom import dcmwrite
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.uid import (
@@ -43,7 +44,17 @@ from app.core import (
 )
 from app.core.logging import get_logger
 from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
-from app.models.viewer import InstanceRecord, MprMipState, MprMipViewportState, SeriesRecord, ViewRecord
+from app.models.viewer import (
+    InstanceRecord,
+    MprMipState,
+    MprMipViewportState,
+    MprObliquePlaneState,
+    SeriesRecord,
+    ViewGroupRecord,
+    ViewRecord,
+    create_default_mpr_oblique_line_angles,
+    create_default_mpr_oblique_planes,
+)
 from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
     ImageFormat,
@@ -1307,7 +1318,11 @@ class ViewerService:
         view.rotation_degrees = 0
         view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
         if view.view_group is not None:
+            view.view_group.crosshair_drag_active = False
             view.view_group.mpr_mip = self._create_default_mpr_mip_state()
+            view.view_group.oblique_drag_active = False
+            view.view_group.oblique_planes = create_default_mpr_oblique_planes()
+            view.view_group.oblique_line_angles = create_default_mpr_oblique_line_angles()
 
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
@@ -1378,18 +1393,29 @@ class ViewerService:
         )
 
     def _reset_view(self, view: ViewRecord) -> None:
-        view.rotation_degrees = 0
-        view.hor_flip = False
-        view.ver_flip = False
-
         if self._is_mpr_view_type(view.view_type):
-            self._initialize_mpr_viewport(view)
+            self._reset_mpr_view_group(view)
         elif self._is_3d_view_type(view.view_type):
+            view.rotation_degrees = 0
+            view.hor_flip = False
+            view.ver_flip = False
             self._initialize_3d_viewport(view)
         else:
+            view.rotation_degrees = 0
+            view.hor_flip = False
+            view.ver_flip = False
             self._initialize_viewport(view)
 
         view.is_initialized = True
+
+    def _reset_mpr_view_group(self, view: ViewRecord) -> None:
+        group_views = self._get_mpr_group_views(view)
+        for group_view in group_views:
+            group_view.rotation_degrees = 0
+            group_view.hor_flip = False
+            group_view.ver_flip = False
+            self._initialize_mpr_viewport(group_view)
+            group_view.is_initialized = True
 
     def _build_volume_render_request(
         self,
@@ -1831,6 +1857,9 @@ class ViewerService:
         depth, height, width = volume.shape
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
         mip_state = view.mpr_mip
+        oblique_plane = view.view_group.oblique_planes.get(target_viewport) if view.view_group is not None else None
+        if oblique_plane is not None and oblique_plane.is_oblique:
+            return self._extract_oblique_mpr_plane(view, volume, target_viewport, oblique_plane)
 
         def reduce_slab(slab: np.ndarray, axis: int) -> np.ndarray:
             if not mip_state.enabled:
@@ -1871,6 +1900,88 @@ class ViewerService:
         slab = volume[start:end, :, :]
         plane = reduce_slab(slab, axis=0)
         return plane.astype(np.float32), index, depth
+
+    def _extract_oblique_mpr_plane(
+        self,
+        view: ViewRecord,
+        volume: np.ndarray,
+        viewport_key: str,
+        plane_state: MprObliquePlaneState,
+    ) -> tuple[np.ndarray, int, int]:
+        depth, height, width = volume.shape
+        plane_height, plane_width = self._get_mpr_plane_shape(volume.shape, viewport_key)
+        center = np.array(
+            [
+                max(0, min(view.mpr_axial_index, depth - 1)),
+                max(0, min(view.mpr_coronal_index, height - 1)),
+                max(0, min(view.mpr_sagittal_index, width - 1)),
+            ],
+            dtype=np.float64,
+        )
+        row_dir = self._normalize_oblique_vector(plane_state.row, fallback=(1.0, 0.0, 0.0))
+        col_dir = self._normalize_oblique_vector(plane_state.col, fallback=(0.0, 0.0, 1.0))
+        normal_dir = self._normalize_oblique_vector(plane_state.normal, fallback=(0.0, 1.0, 0.0))
+        row_offsets = np.arange(plane_height, dtype=np.float64) - (float(plane_height) - 1.0) / 2.0
+        col_offsets = np.arange(plane_width, dtype=np.float64) - (float(plane_width) - 1.0) / 2.0
+        col_grid, row_grid = np.meshgrid(col_offsets, row_offsets)
+
+        mip_state = view.mpr_mip
+        if mip_state.enabled:
+            thickness = max(1, int(mip_state.viewports.get(viewport_key, MprMipViewportState()).thickness))
+            half_before = (thickness - 1) // 2
+            slab_offsets = np.arange(-half_before, thickness - half_before, dtype=np.float64)
+        else:
+            slab_offsets = np.array([0.0], dtype=np.float64)
+
+        sampled_planes: list[np.ndarray] = []
+        for offset in slab_offsets:
+            coords = (
+                center[:, None, None]
+                + row_dir[:, None, None] * row_grid[None, :, :]
+                + col_dir[:, None, None] * col_grid[None, :, :]
+                + normal_dir[:, None, None] * offset
+            )
+            sampled = ndimage.map_coordinates(volume, coords, order=1, mode="nearest")
+            sampled_planes.append(sampled.astype(np.float32))
+
+        slab = np.stack(sampled_planes, axis=0)
+        if mip_state.enabled:
+            algorithm = str(mip_state.algorithm or "maximum")
+            if algorithm == "minimum":
+                plane = np.min(slab, axis=0)
+            elif algorithm == "average":
+                plane = np.mean(slab, axis=0)
+            elif algorithm == "sum":
+                plane = np.sum(slab, axis=0)
+            else:
+                plane = np.max(slab, axis=0)
+        else:
+            plane = slab[0]
+
+        current, total = self._get_mpr_viewport_index_info(view, volume.shape, viewport_key)
+        return plane.astype(np.float32), current, total
+
+    @staticmethod
+    def _normalize_oblique_vector(
+        value: tuple[float, float, float] | np.ndarray,
+        *,
+        fallback: tuple[float, float, float],
+    ) -> np.ndarray:
+        vector = np.array(value, dtype=np.float64)
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm) or norm <= 1e-6:
+            vector = np.array(fallback, dtype=np.float64)
+            norm = float(np.linalg.norm(vector))
+        return vector / max(norm, 1e-6)
+
+    @staticmethod
+    def _get_mpr_viewport_index_info(view: ViewRecord, volume_shape: tuple[int, int, int], viewport_key: str) -> tuple[int, int]:
+        depth, height, width = volume_shape
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            return max(0, min(view.mpr_coronal_index, height - 1)), height
+        if viewport_key == MPR_VIEWPORT_SAGITTAL:
+            return max(0, min(view.mpr_sagittal_index, width - 1)), width
+        return max(0, min(view.mpr_axial_index, depth - 1)), depth
 
     @staticmethod
     def _clamp_3d_zoom(zoom: float) -> float:
@@ -2149,6 +2260,202 @@ class ViewerService:
         view.is_initialized = True
         return True
 
+    def _handle_mpr_oblique(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_mpr_view_type(view.view_type) or view.view_group is None:
+            return False
+        if payload.line not in {"horizontal", "vertical"}:
+            return False
+
+        group = view.view_group
+        active_viewport = self._resolve_mpr_viewport(view)
+        group.active_viewport = active_viewport
+
+        if payload.action_type == DRAG_ACTION_START:
+            group.oblique_drag_active = True
+            if payload.angle_rad is not None:
+                self._update_mpr_oblique_plane(view, active_viewport, payload.line, float(payload.angle_rad))
+            return False
+
+        if payload.action_type == DRAG_ACTION_END:
+            was_dragging = group.oblique_drag_active
+            group.oblique_drag_active = False
+            if payload.angle_rad is not None:
+                self._update_mpr_oblique_plane(view, active_viewport, payload.line, float(payload.angle_rad))
+                return True
+            return was_dragging
+
+        if payload.action_type != DRAG_ACTION_MOVE or not group.oblique_drag_active or payload.angle_rad is None:
+            return False
+
+        self._update_mpr_oblique_plane(view, active_viewport, payload.line, float(payload.angle_rad))
+        view.is_initialized = True
+        return True
+
+    def _update_mpr_oblique_plane(
+        self,
+        view: ViewRecord,
+        active_viewport: str,
+        line: str,
+        angle_rad: float,
+    ) -> None:
+        if view.view_group is None:
+            return
+
+        group = view.view_group
+        normalized_angle = float(angle_rad % np.pi)
+        active_plane = group.oblique_planes.get(active_viewport) or self._default_mpr_oblique_plane(active_viewport)
+        active_normal = self._normalize_oblique_vector(active_plane.normal, fallback=(0.0, 1.0, 0.0))
+        active_row, active_col = self._get_mpr_display_basis(active_viewport, active_normal)
+
+        horizontal_angle = normalized_angle if line == "horizontal" else float((normalized_angle + np.pi / 2.0) % np.pi)
+        vertical_angle = normalized_angle if line == "vertical" else float((normalized_angle + np.pi / 2.0) % np.pi)
+        group.oblique_line_angles[active_viewport] = {
+            "horizontal": horizontal_angle,
+            "vertical": vertical_angle,
+        }
+
+        horizontal_target = self._resolve_mpr_oblique_target_viewport(active_viewport, "horizontal")
+        vertical_target = self._resolve_mpr_oblique_target_viewport(active_viewport, "vertical")
+        horizontal_line_dir = self._normalize_oblique_vector(
+            np.cos(horizontal_angle) * active_col + np.sin(horizontal_angle) * active_row,
+            fallback=tuple(active_col),
+        )
+        vertical_line_dir = self._normalize_oblique_vector(
+            np.cos(vertical_angle) * active_col + np.sin(vertical_angle) * active_row,
+            fallback=tuple(active_row),
+        )
+        horizontal_target_plane = group.oblique_planes.get(horizontal_target) or self._default_mpr_oblique_plane(horizontal_target)
+        vertical_target_plane = group.oblique_planes.get(vertical_target) or self._default_mpr_oblique_plane(vertical_target)
+        horizontal_target_normal = self._normalize_oblique_vector(
+            np.cross(horizontal_line_dir, active_normal),
+            fallback=tuple(horizontal_target_plane.normal),
+        )
+        vertical_target_normal = self._normalize_oblique_vector(
+            np.cross(vertical_line_dir, active_normal),
+            fallback=tuple(vertical_target_plane.normal),
+        )
+        if float(np.dot(horizontal_target_normal, self._normalize_oblique_vector(horizontal_target_plane.normal, fallback=tuple(horizontal_target_normal)))) < 0.0:
+            horizontal_target_normal = -horizontal_target_normal
+        if float(np.dot(vertical_target_normal, self._normalize_oblique_vector(vertical_target_plane.normal, fallback=tuple(vertical_target_normal)))) < 0.0:
+            vertical_target_normal = -vertical_target_normal
+        group.oblique_planes[horizontal_target] = self._build_mpr_oblique_plane_from_normal(horizontal_target, horizontal_target_normal)
+        group.oblique_planes[vertical_target] = self._build_mpr_oblique_plane_from_normal(vertical_target, vertical_target_normal)
+        self._sync_mpr_oblique_plane_bases(group)
+        self._sync_mpr_oblique_line_angles(group)
+
+    def _build_mpr_oblique_plane_from_normal(
+        self,
+        viewport_key: str,
+        normal_dir: np.ndarray,
+    ) -> MprObliquePlaneState:
+        default_plane = self._default_mpr_oblique_plane(viewport_key)
+        fallback_normal = self._normalize_oblique_vector(default_plane.normal, fallback=(0.0, 1.0, 0.0))
+        normalized_normal = self._normalize_oblique_vector(normal_dir, fallback=tuple(fallback_normal))
+        row_dir, col_dir = self._get_mpr_display_basis(viewport_key, normalized_normal)
+        return MprObliquePlaneState(
+            row=tuple(float(value) for value in row_dir),
+            col=tuple(float(value) for value in col_dir),
+            normal=tuple(float(value) for value in normalized_normal),
+            is_oblique=True,
+        )
+
+    def _sync_mpr_oblique_plane_bases(self, group: ViewGroupRecord) -> None:
+        for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL):
+            current_plane = group.oblique_planes.get(viewport_key) or self._default_mpr_oblique_plane(viewport_key)
+            default_plane = self._default_mpr_oblique_plane(viewport_key)
+            normal_dir = self._normalize_oblique_vector(current_plane.normal, fallback=tuple(default_plane.normal))
+            row_dir, col_dir = self._get_mpr_display_basis(viewport_key, normal_dir)
+            is_oblique = current_plane.is_oblique or float(np.linalg.norm(normal_dir - np.asarray(default_plane.normal, dtype=np.float64))) > 1e-6
+            group.oblique_planes[viewport_key] = MprObliquePlaneState(
+                row=tuple(float(value) for value in row_dir),
+                col=tuple(float(value) for value in col_dir),
+                normal=tuple(float(value) for value in normal_dir),
+                is_oblique=is_oblique,
+            )
+
+    def _sync_mpr_oblique_line_angles(self, group: ViewGroupRecord) -> None:
+        for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL):
+            current_plane = group.oblique_planes.get(viewport_key) or self._default_mpr_oblique_plane(viewport_key)
+            current_normal = self._normalize_oblique_vector(current_plane.normal, fallback=(0.0, 1.0, 0.0))
+            current_row, current_col = self._get_mpr_display_basis(viewport_key, current_normal)
+            horizontal_target = self._resolve_mpr_oblique_target_viewport(viewport_key, "horizontal")
+            vertical_target = self._resolve_mpr_oblique_target_viewport(viewport_key, "vertical")
+            horizontal_angle = self._resolve_mpr_crosshair_line_angle(
+                current_normal,
+                current_row,
+                current_col,
+                group.oblique_planes.get(horizontal_target) or self._default_mpr_oblique_plane(horizontal_target),
+                fallback=0.0,
+            )
+            vertical_angle = self._resolve_mpr_crosshair_line_angle(
+                current_normal,
+                current_row,
+                current_col,
+                group.oblique_planes.get(vertical_target) or self._default_mpr_oblique_plane(vertical_target),
+                fallback=float(np.pi / 2.0),
+            )
+            group.oblique_line_angles[viewport_key] = {
+                "horizontal": horizontal_angle,
+                "vertical": vertical_angle,
+            }
+
+    def _resolve_mpr_crosshair_line_angle(
+        self,
+        current_normal: np.ndarray,
+        current_row: np.ndarray,
+        current_col: np.ndarray,
+        target_plane: MprObliquePlaneState,
+        *,
+        fallback: float,
+    ) -> float:
+        target_normal = self._normalize_oblique_vector(target_plane.normal, fallback=tuple(current_col))
+        line_dir = self._normalize_oblique_vector(np.cross(current_normal, target_normal), fallback=tuple(current_col))
+        col_component = float(np.dot(line_dir, current_col))
+        row_component = float(np.dot(line_dir, current_row))
+        if not np.isfinite(col_component) or not np.isfinite(row_component):
+            return fallback
+        magnitude = float(np.hypot(col_component, row_component))
+        if magnitude <= 1e-8:
+            return fallback
+        return float(np.arctan2(row_component, col_component) % np.pi)
+
+    def _get_mpr_display_basis(
+        self,
+        viewport_key: str,
+        normal_dir: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        default_plane = self._default_mpr_oblique_plane(viewport_key)
+        canonical_row = self._normalize_oblique_vector(default_plane.row, fallback=(1.0, 0.0, 0.0))
+        canonical_col = self._normalize_oblique_vector(default_plane.col, fallback=(0.0, 0.0, 1.0))
+        normalized_normal = self._normalize_oblique_vector(normal_dir, fallback=tuple(default_plane.normal))
+        projected_col = canonical_col - float(np.dot(canonical_col, normalized_normal)) * normalized_normal
+        if float(np.linalg.norm(projected_col)) <= 1e-8:
+            projected_col = canonical_row - float(np.dot(canonical_row, normalized_normal)) * normalized_normal
+        col_dir = self._normalize_oblique_vector(projected_col, fallback=tuple(canonical_col))
+        row_dir = self._normalize_oblique_vector(np.cross(col_dir, normalized_normal), fallback=tuple(canonical_row))
+        projected_row = canonical_row - float(np.dot(canonical_row, normalized_normal)) * normalized_normal
+        projected_row = self._normalize_oblique_vector(projected_row, fallback=tuple(canonical_row))
+        if float(np.dot(row_dir, projected_row)) < 0.0:
+            row_dir = -row_dir
+            col_dir = -col_dir
+        return row_dir, col_dir
+
+    @staticmethod
+    def _resolve_mpr_oblique_target_viewport(active_viewport: str, line: str) -> str:
+        if active_viewport == MPR_VIEWPORT_CORONAL:
+            return MPR_VIEWPORT_AXIAL if line == "horizontal" else MPR_VIEWPORT_SAGITTAL
+        if active_viewport == MPR_VIEWPORT_SAGITTAL:
+            return MPR_VIEWPORT_AXIAL if line == "horizontal" else MPR_VIEWPORT_CORONAL
+        return MPR_VIEWPORT_CORONAL if line == "horizontal" else MPR_VIEWPORT_SAGITTAL
+
+    @staticmethod
+    def _default_mpr_oblique_plane(viewport_key: str) -> MprObliquePlaneState:
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            return MprObliquePlaneState(row=(-1.0, 0.0, 0.0), col=(0.0, 0.0, 1.0), normal=(0.0, 1.0, 0.0))
+        if viewport_key == MPR_VIEWPORT_SAGITTAL:
+            return MprObliquePlaneState(row=(-1.0, 0.0, 0.0), col=(0.0, 1.0, 0.0), normal=(0.0, 0.0, 1.0))
+        return MprObliquePlaneState(row=(0.0, 1.0, 0.0), col=(0.0, 0.0, 1.0), normal=(1.0, 0.0, 0.0))
+
     @staticmethod
     def _build_scale_bar_info(
         render_view: ViewRecord,
@@ -2295,6 +2602,8 @@ class ViewerService:
                 if overlay.vertical_position is not None and overlay.width > 0
                 else None
             ),
+            horizontalAngleRad=float(overlay.horizontal_angle_rad),
+            verticalAngleRad=float(overlay.vertical_angle_rad),
         )
 
     @staticmethod
@@ -2330,6 +2639,7 @@ class ViewerService:
         target_viewport = ViewerService._resolve_mpr_viewport(view)
         is_active = view.mpr_active_viewport == target_viewport
         line_alpha = 255
+        horizontal_angle, vertical_angle = ViewerService._get_mpr_crosshair_line_angles(view, target_viewport)
 
         def with_alpha(rgb: tuple[int, int, int], alpha: int) -> tuple[int, int, int, int]:
             return rgb[0], rgb[1], rgb[2], alpha
@@ -2368,6 +2678,8 @@ class ViewerService:
                 horizontal_color=axial_color,
                 vertical_position=vertical_position,
                 vertical_color=sagittal_color,
+                horizontal_angle_rad=horizontal_angle,
+                vertical_angle_rad=vertical_angle,
                 center_x=center_x,
                 center_y=center_y,
                 is_active=is_active,
@@ -2387,6 +2699,8 @@ class ViewerService:
                 horizontal_color=axial_color,
                 vertical_position=vertical_position,
                 vertical_color=coronal_color,
+                horizontal_angle_rad=horizontal_angle,
+                vertical_angle_rad=vertical_angle,
                 center_x=center_x,
                 center_y=center_y,
                 is_active=is_active,
@@ -2405,9 +2719,23 @@ class ViewerService:
             horizontal_color=coronal_color,
             vertical_position=vertical_position,
             vertical_color=sagittal_color,
+            horizontal_angle_rad=horizontal_angle,
+            vertical_angle_rad=vertical_angle,
             center_x=center_x,
             center_y=center_y,
             is_active=is_active,
+        )
+
+    @staticmethod
+    def _get_mpr_crosshair_line_angles(view: ViewRecord, viewport_key: str) -> tuple[float, float]:
+        default_horizontal = 0.0
+        default_vertical = 1.5707963267948966
+        if view.view_group is None:
+            return default_horizontal, default_vertical
+        viewport_angles = view.view_group.oblique_line_angles.get(viewport_key, {})
+        return (
+            float(viewport_angles.get("horizontal", default_horizontal)),
+            float(viewport_angles.get("vertical", default_vertical)),
         )
 
     @staticmethod
@@ -2781,7 +3109,13 @@ class ViewerService:
         )
 
     def _build_mpr_orientation_overlay(self, view: ViewRecord, viewport_key: str) -> OrientationOverlay:
-        if viewport_key == MPR_VIEWPORT_CORONAL:
+        plane = view.view_group.oblique_planes.get(viewport_key) if view.view_group is not None else None
+        if plane is not None:
+            row_vector = self._normalize_oblique_vector(plane.row, fallback=(1.0, 0.0, 0.0))
+            col_vector = self._normalize_oblique_vector(plane.col, fallback=(0.0, 0.0, 1.0))
+            normal_vector = self._normalize_oblique_vector(plane.normal, fallback=(0.0, 1.0, 0.0))
+            x_vector, y_vector = self._resolve_mpr_orientation_screen_axes(viewport_key, row_vector, col_vector, normal_vector)
+        elif viewport_key == MPR_VIEWPORT_CORONAL:
             x_vector = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
             y_vector = np.asarray([0.0, 0.0, -1.0], dtype=np.float64)
         elif viewport_key == MPR_VIEWPORT_SAGITTAL:
@@ -2803,6 +3137,19 @@ class ViewerService:
             bottom=self._orientation_text_for_vector(y_vector),
             left=self._orientation_text_for_vector(-x_vector),
         )
+
+    @staticmethod
+    def _resolve_mpr_orientation_screen_axes(
+        viewport_key: str,
+        row_vector: np.ndarray,
+        col_vector: np.ndarray,
+        normal_vector: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            return -row_vector, -col_vector
+        if viewport_key == MPR_VIEWPORT_SAGITTAL:
+            return col_vector, -normal_vector
+        return normal_vector, row_vector
 
     @staticmethod
     def _build_mpr_viewport_label(viewport_key: str) -> str:

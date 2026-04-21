@@ -25,6 +25,8 @@ class MprCrosshairOverlay:
     horizontal_color: ColorRGBA | None
     vertical_position: float | None
     vertical_color: ColorRGBA | None
+    horizontal_angle_rad: float = 0.0
+    vertical_angle_rad: float = 1.5707963267948966
     center_x: float | None = None
     center_y: float | None = None
     is_active: bool = False

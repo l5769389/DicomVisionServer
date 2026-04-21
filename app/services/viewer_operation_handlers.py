@@ -17,6 +17,7 @@ from app.core import (
     VIEW_OP_TYPE_VOLUME_PRESET,
     VIEW_OP_TYPE_VOLUME_CONFIG,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
+    VIEW_OP_TYPE_MPR_OBLIQUE,
     VIEW_OP_TYPE_MEASUREMENT,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
@@ -113,6 +114,7 @@ def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
         VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
         VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
         VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
+        VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
         VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
     }
     return operation_handlers.get(payload.op_type, _handle_generic_operation)
@@ -332,6 +334,23 @@ def _handle_mpr_mip_config_operation(
     return _render_broadcast()
 
 
+def _handle_mpr_oblique_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series
+    if not is_mpr_view:
+        return _render_none()
+    if not service._handle_mpr_oblique(view, payload):
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_broadcast("jpeg", fast_preview=True)
+    return _render_broadcast()
+
+
 def _handle_generic_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -351,7 +370,7 @@ def _handle_generic_operation(
 
 
 def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest) -> None:
-    handled_drag_ops = {VIEW_OP_TYPE_CROSSHAIR, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN, VIEW_OP_TYPE_ROTATE_3D}
+    handled_drag_ops = {VIEW_OP_TYPE_CROSSHAIR, VIEW_OP_TYPE_MPR_OBLIQUE, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN, VIEW_OP_TYPE_ROTATE_3D}
     if payload.x is not None and payload.op_type not in handled_drag_ops:
         view.offset_x += float(payload.x)
         view.is_initialized = True
