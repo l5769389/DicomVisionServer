@@ -146,7 +146,11 @@ class ViewGroupRecord:
     drag_origin_window_center: float | None = None
     drag_origin_volume_render_config: dict[str, object] | None = None
     crosshair_drag_active: bool = False
+    crosshair_drag_origin_center: tuple[float, float, float] | None = None
+    crosshair_drag_origin_image: tuple[float, float] | None = None
     oblique_drag_active: bool = False
+    oblique_source_viewport: str | None = None
+    oblique_source_line: str | None = None
     mpr_mip: MprMipState = field(default_factory=MprMipState)
     mpr_frame: MprFrameState = field(default_factory=create_default_mpr_frame_state)
     oblique_planes: dict[str, MprObliquePlaneState] = field(default_factory=create_default_mpr_oblique_planes)
