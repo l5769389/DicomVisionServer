@@ -269,7 +269,22 @@ def _handle_reset_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series, payload
+    del series
+    reset_target = str(payload.sub_op_type or "view").strip().lower()
+
+    if reset_target == "measurements":
+        if not service._clear_measurements(view):
+            return _render_none()
+        return _render_broadcast() if is_mpr_view else _render_single()
+
+    if reset_target in {"mtf", "annotations"}:
+        return _render_broadcast() if is_mpr_view else _render_single()
+
+    if reset_target == "all":
+        service._clear_measurements(view)
+        service._reset_view(view)
+        return _render_broadcast() if is_mpr_view else _render_single()
+
     service._reset_view(view)
     return _render_broadcast() if is_mpr_view else _render_single()
 

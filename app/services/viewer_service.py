@@ -1114,6 +1114,15 @@ class ViewerService:
         view.is_initialized = True
         return True
 
+    @staticmethod
+    def _clear_measurements(view: ViewRecord) -> bool:
+        if not view.measurements:
+            return False
+
+        view.measurements = []
+        view.is_initialized = True
+        return True
+
     def _build_visible_measurements(self, view: ViewRecord) -> tuple[MeasurementRecord, ...]:
         if not view.measurements:
             return ()
