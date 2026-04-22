@@ -4,6 +4,7 @@ from fastapi.responses import Response
 
 from app.schemas.view import (
     OperationAcceptedResponse,
+    ViewCloseRequest,
     ViewCreateRequest,
     ViewCreateResponse,
     ViewExportRequest,
@@ -30,6 +31,13 @@ async def _emit_render_after_resize(view_id: str) -> None:
 @router.post("/create", response_model=ViewCreateResponse)
 async def create_view(payload: ViewCreateRequest) -> ViewCreateResponse:
     return view_registry.create(payload)
+
+
+@router.post("/close", response_model=OperationAcceptedResponse)
+async def close_view(payload: ViewCloseRequest) -> OperationAcceptedResponse:
+    result = viewer_service.close_view_by_id(payload.view_id)
+    view_socket_hub.unbind_view(payload.view_id)
+    return result
 
 
 @router.post("/setSize", response_model=OperationAcceptedResponse)

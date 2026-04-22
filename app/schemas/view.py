@@ -30,6 +30,12 @@ class ViewCreateResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ViewCloseRequest(BaseModel):
+    view_id: str = Field(alias="viewId")
+
+    model_config = {"populate_by_name": True}
+
+
 class OperationAcceptedResponse(BaseModel):
     success: bool = True
     message: str

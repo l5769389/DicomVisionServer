@@ -43,6 +43,12 @@ class ViewRegistry:
             raise HTTPException(status_code=404, detail="viewId not found")
         return view
 
+    def delete(self, view_id: str) -> ViewRecord:
+        view = self._view_by_id.pop(view_id, None)
+        if view is None:
+            raise HTTPException(status_code=404, detail="viewId not found")
+        return view
+
     def list_all(self) -> list[ViewRecord]:
         return list(self._view_by_id.values())
 

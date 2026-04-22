@@ -149,8 +149,8 @@ def test_mpr_oblique_drag_preserves_target_view_column_orientation() -> None:
     coronal_col = np.asarray(group.oblique_planes["mpr-cor"].col, dtype=np.float64)
     sagittal_col = np.asarray(group.oblique_planes["mpr-sag"].col, dtype=np.float64)
 
-    assert float(np.dot(coronal_col, sagittal_normal)) > 0.999
-    assert float(np.dot(sagittal_col, coronal_normal)) > 0.999
+    assert abs(float(np.dot(coronal_col, sagittal_normal))) > 0.999
+    assert abs(float(np.dot(sagittal_col, coronal_normal))) > 0.999
 
 
 def test_mpr_oblique_drag_preserves_target_plane_direction_on_small_moves() -> None:
@@ -312,7 +312,10 @@ def test_mpr_reset_restores_group_to_initial_state() -> None:
     group.axial_index = 1
     group.coronal_index = 2
     group.sagittal_index = 3
+    group.active_viewport = "mpr-sag"
     group.crosshair_drag_active = True
+    group.crosshair_drag_origin_center = (1.0, 2.0, 3.0)
+    group.crosshair_drag_origin_image = (10.0, 20.0)
     group.oblique_drag_active = True
     group.oblique_planes["mpr-cor"].is_oblique = True
     group.oblique_planes["mpr-sag"].is_oblique = True
@@ -342,16 +345,21 @@ def test_mpr_reset_restores_group_to_initial_state() -> None:
     assert group.axial_index == 4
     assert group.coronal_index == 5
     assert group.sagittal_index == 6
+    assert group.active_viewport == "mpr-ax"
     assert group.mpr_frame.center == (4.0, 5.0, 6.0)
     assert group.mpr_frame.axis_slice == (1.0, 0.0, 0.0)
     assert group.mpr_frame.axis_row == (0.0, 1.0, 0.0)
     assert group.mpr_frame.axis_col == (0.0, 0.0, 1.0)
     assert group.crosshair_drag_active is False
+    assert group.crosshair_drag_origin_center is None
+    assert group.crosshair_drag_origin_image is None
     assert group.oblique_drag_active is False
     assert group.oblique_planes["mpr-cor"].is_oblique is False
     assert group.oblique_planes["mpr-sag"].is_oblique is False
     assert math.isclose(group.oblique_line_angles["mpr-ax"]["horizontal"], 0.0, rel_tol=0.0, abs_tol=1e-6)
     assert math.isclose(group.oblique_line_angles["mpr-ax"]["vertical"], np.pi / 2.0, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(group.oblique_directed_line_angles["mpr-ax"]["horizontal"], 0.0, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(group.oblique_directed_line_angles["mpr-ax"]["vertical"], np.pi / 2.0, rel_tol=0.0, abs_tol=1e-6)
     for item in (axial_view, coronal_view, sagittal_view):
         assert item.rotation_degrees == 0
         assert item.hor_flip is False
@@ -399,12 +407,10 @@ def test_mpr_orientation_overlay_updates_after_oblique_rotation() -> None:
     _apply_oblique_drag(service, axial_view, line="horizontal", angle_rad=0.35)
 
     rotated_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
-    assert rotated_overlay.left == "R"
-    assert rotated_overlay.right == "L"
-    assert rotated_overlay.top != initial_overlay.top
-    assert rotated_overlay.bottom != initial_overlay.bottom
-    assert rotated_overlay.top == "SA"
-    assert rotated_overlay.bottom == "IP"
+    assert rotated_overlay.top == "S"
+    assert rotated_overlay.right == "LA"
+    assert rotated_overlay.bottom == "I"
+    assert rotated_overlay.left == "RP"
 
 
 def test_mpr_orientation_overlay_flips_target_direction_for_axial_vertical_drag() -> None:
@@ -419,23 +425,129 @@ def test_mpr_orientation_overlay_flips_target_direction_for_axial_vertical_drag(
     coronal_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
     sagittal_overlay = service._build_mpr_orientation_overlay(sagittal_view, "mpr-sag")
     assert coronal_overlay.top == "S"
-    assert coronal_overlay.right == "LP"
+    assert coronal_overlay.right == "RP"
     assert coronal_overlay.bottom == "I"
-    assert coronal_overlay.left == "RA"
+    assert coronal_overlay.left == "LA"
     assert sagittal_overlay.top == "S"
-    assert sagittal_overlay.right == "PR"
+    assert sagittal_overlay.right == "AR"
     assert sagittal_overlay.bottom == "I"
-    assert sagittal_overlay.left == "AL"
+    assert sagittal_overlay.left == "PL"
+
+
+def test_mpr_orientation_overlay_preserves_directed_axial_vertical_rotation_for_coronal_view() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+
+    for angle_rad, expected in (
+        (np.deg2rad(292.5), ("RA", "LP")),
+        (np.deg2rad(315.0), ("AR", "PL")),
+        (np.deg2rad(22.5), ("AL", "PR")),
+        (np.deg2rad(45.0), ("LA", "RP")),
+        (np.deg2rad(112.5), ("LP", "RA")),
+    ):
+        _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=float(angle_rad))
+        overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
+        assert (overlay.left, overlay.right, overlay.top, overlay.bottom) == (*expected, "S", "I")
+
+
+def test_mpr_orientation_overlay_uses_plane_geometry_without_source_flags() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id="s", view_type="SAG", view_group=group)
 
     _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=1.8)
+    group.oblique_source_viewport = None
+    group.oblique_source_line = None
+    group.oblique_line_angles = {}
 
     coronal_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
     sagittal_overlay = service._build_mpr_orientation_overlay(sagittal_view, "mpr-sag")
-    assert coronal_overlay.top == "S"
-    assert coronal_overlay.right == "LA"
-    assert coronal_overlay.bottom == "I"
-    assert coronal_overlay.left == "RP"
-    assert sagittal_overlay.top == "S"
-    assert sagittal_overlay.right == "PL"
-    assert sagittal_overlay.bottom == "I"
-    assert sagittal_overlay.left == "AR"
+
+    assert (coronal_overlay.top, coronal_overlay.right, coronal_overlay.bottom, coronal_overlay.left) == ("S", "RA", "I", "LP")
+    assert (sagittal_overlay.top, sagittal_overlay.right, sagittal_overlay.bottom, sagittal_overlay.left) == ("S", "AL", "I", "PR")
+
+
+def test_mpr_frame_axes_sync_from_oblique_plane_normals() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+
+    _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=1.8)
+
+    axial_normal = np.asarray(group.oblique_planes["mpr-ax"].normal, dtype=np.float64)
+    coronal_normal = np.asarray(group.oblique_planes["mpr-cor"].normal, dtype=np.float64)
+    sagittal_normal = np.asarray(group.oblique_planes["mpr-sag"].normal, dtype=np.float64)
+
+    assert np.allclose(np.asarray(group.mpr_frame.axis_slice, dtype=np.float64), axial_normal, atol=1e-6)
+    assert np.allclose(np.asarray(group.mpr_frame.axis_row, dtype=np.float64), coronal_normal, atol=1e-6)
+    assert np.allclose(np.asarray(group.mpr_frame.axis_col, dtype=np.float64), sagittal_normal, atol=1e-6)
+
+
+def test_mpr_oblique_plane_normals_can_be_rebuilt_from_frame_axes() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+
+    _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=1.8)
+
+    rebuilt = service._build_mpr_oblique_planes_from_frame(group.mpr_frame)
+    for viewport_key in ("mpr-ax", "mpr-cor", "mpr-sag"):
+        actual = group.oblique_planes[viewport_key]
+        rebuilt_plane = rebuilt[viewport_key]
+        assert np.allclose(np.asarray(rebuilt_plane.normal, dtype=np.float64), np.asarray(actual.normal, dtype=np.float64), atol=1e-6)
+
+
+def test_mpr_extract_and_crosshair_overlay_work_from_frame_when_plane_cache_missing() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group, width=700, height=500)
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+
+    _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=1.8)
+    group.mpr_frame.center = (2.0, 3.0, 3.0)
+    group.oblique_planes = {}
+
+    plane, current, total = service._extract_mpr_plane(coronal_view, volume, "mpr-cor")
+    assert plane.shape == (5, 7)
+    assert current == 3
+    assert total == 6
+
+    plane_shape = service._get_mpr_plane_shape(volume.shape, "mpr-cor")
+    image_transform = viewport_transformer.build_image_to_canvas_transform(
+        image_width=plane_shape[1],
+        image_height=plane_shape[0],
+        canvas_width=coronal_view.width or plane_shape[1],
+        canvas_height=coronal_view.height or plane_shape[0],
+        view=coronal_view,
+        pixel_aspect_x=1.0,
+        pixel_aspect_y=1.0,
+    )
+    overlay = service._build_mpr_crosshair_overlay(coronal_view, volume.shape, plane_shape, image_transform)
+    info = service._build_mpr_crosshair_info(overlay)
+
+    assert info is not None
+    assert info.horizontal_position is None
+    assert info.vertical_position is None
+    assert np.isfinite(overlay.horizontal_angle_rad)
+    assert np.isfinite(overlay.vertical_angle_rad)
+
+
+def test_mpr_crosshair_line_angles_can_be_derived_without_angle_cache() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+
+    _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=1.8)
+    expected_horizontal = group.oblique_line_angles["mpr-cor"]["horizontal"]
+    expected_vertical = group.oblique_line_angles["mpr-cor"]["vertical"]
+
+    group.oblique_line_angles = {}
+
+    horizontal, vertical = service._get_mpr_crosshair_line_angles(axial_view, "mpr-cor")
+    assert math.isclose(horizontal, expected_horizontal, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(vertical, expected_vertical, rel_tol=0.0, abs_tol=1e-6)

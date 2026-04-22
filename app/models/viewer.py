@@ -132,6 +132,14 @@ def create_default_mpr_oblique_line_angles() -> dict[str, dict[str, float]]:
     }
 
 
+def create_default_mpr_oblique_directed_line_angles() -> dict[str, dict[str, float]]:
+    return {
+        "mpr-ax": {"horizontal": 0.0, "vertical": 1.5707963267948966},
+        "mpr-cor": {"horizontal": 0.0, "vertical": 1.5707963267948966},
+        "mpr-sag": {"horizontal": 0.0, "vertical": 1.5707963267948966},
+    }
+
+
 @dataclass
 class ViewGroupRecord:
     group_id: str
@@ -155,6 +163,7 @@ class ViewGroupRecord:
     mpr_frame: MprFrameState = field(default_factory=create_default_mpr_frame_state)
     oblique_planes: dict[str, MprObliquePlaneState] = field(default_factory=create_default_mpr_oblique_planes)
     oblique_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_line_angles)
+    oblique_directed_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_directed_line_angles)
 
 
 @dataclass

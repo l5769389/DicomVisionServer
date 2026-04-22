@@ -31,5 +31,12 @@ class ViewGroupRegistry:
     def get_view_group(self, group_id: str) -> ViewGroupRecord | None:
         return self._view_groups_by_id.get(group_id)
 
+    def delete(self, group_id: str) -> None:
+        group = self._view_groups_by_id.pop(group_id, None)
+        if group is None:
+            return
+        if self._mpr_group_id_by_series_id.get(group.series_id) == group_id:
+            self._mpr_group_id_by_series_id.pop(group.series_id, None)
+
 
 view_group_registry = ViewGroupRegistry()

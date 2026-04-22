@@ -39,6 +39,18 @@ class ViewSocketHub:
             if not sids:
                 self._view_sids.pop(view_id, None)
 
+    def unbind_view(self, view_id: str) -> None:
+        sids = self._view_sids.pop(view_id, set())
+        for sid in sids:
+            views = self._sid_views.get(sid)
+            if views is None:
+                continue
+            views.discard(view_id)
+            if not views:
+                self._sid_views.pop(sid, None)
+        self._pending_render_requests.pop(view_id, None)
+        self._render_locks.pop(view_id, None)
+
     def _get_render_lock(self, view_id: str) -> asyncio.Lock:
         lock = self._render_locks.get(view_id)
         if lock is None:
