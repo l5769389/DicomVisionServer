@@ -37,12 +37,20 @@ class VolumePatientTransform:
 
     def direction_to_patient(self, direction: np.ndarray | tuple[float, float, float]) -> np.ndarray:
         volume_direction = normalize_oblique_vector(direction, fallback=(1.0, 0.0, 0.0))
-        patient_vector = (
+        patient_vector = self.direction_step_to_patient(volume_direction)
+        return normalize_patient_vector(patient_vector, fallback=np.asarray([0.0, 0.0, 1.0], dtype=np.float64))
+
+    def direction_step_to_patient(self, direction: np.ndarray | tuple[float, float, float]) -> np.ndarray:
+        volume_direction = np.asarray(direction, dtype=np.float64)
+        return (
             np.asarray(self.axis_vectors[0], dtype=np.float64) * float(volume_direction[0])
             + np.asarray(self.axis_vectors[1], dtype=np.float64) * float(volume_direction[1])
             + np.asarray(self.axis_vectors[2], dtype=np.float64) * float(volume_direction[2])
         )
-        return normalize_patient_vector(patient_vector, fallback=np.asarray([0.0, 0.0, 1.0], dtype=np.float64))
+
+    def spacing_for_direction(self, direction: np.ndarray | tuple[float, float, float]) -> float:
+        step_vector = self.direction_step_to_patient(normalize_oblique_vector(direction, fallback=(1.0, 0.0, 0.0)))
+        return max(float(np.linalg.norm(step_vector)), 1e-3)
 
     def spacing_xyz(self) -> tuple[float, float, float]:
         return tuple(max(float(np.linalg.norm(self.axis_vectors[index])), 1e-3) for index in (2, 1, 0))
@@ -169,9 +177,11 @@ def build_mpr_plane_state_from_group_normals(
         normal_dir = axial_normal
 
     reference = reference_plane or default_mpr_oblique_plane(viewport_key)
+    reference_row = normalize_oblique_vector(reference.row, fallback=tuple(row_dir))
     reference_col = normalize_oblique_vector(reference.col, fallback=tuple(col_dir))
-    if float(np.dot(col_dir, reference_col)) < 0.0:
+    if float(np.dot(row_dir, reference_row)) < 0.0:
         row_dir = -row_dir
+    if float(np.dot(col_dir, reference_col)) < 0.0:
         col_dir = -col_dir
 
     default_plane = default_mpr_oblique_plane(viewport_key)
@@ -207,24 +217,16 @@ def normalize_screen_half_turn_angle(angle_rad: float) -> float:
     return float(angle_rad % np.pi)
 
 
-def normalize_screen_line_angle(angle_rad: float, *, line: str) -> float:
-    if line == "vertical":
-        return float((np.pi - angle_rad) % (np.pi * 2.0))
-    return angle_rad
-
-
 def direction_from_screen_angle(active_row: np.ndarray, active_col: np.ndarray, angle_rad: float) -> np.ndarray:
     return normalize_oblique_vector(
-        np.cos(angle_rad) * active_col - np.sin(angle_rad) * active_row,
+        np.cos(angle_rad) * active_col + np.sin(angle_rad) * active_row,
         fallback=tuple(active_col),
     )
 
 
 def build_mpr_oblique_line_direction(active_row: np.ndarray, active_col: np.ndarray, angle_rad: float, *, line: str) -> np.ndarray:
-    normalized_angle = float(angle_rad % (np.pi * 2.0))
-    if normalized_angle < 0.0:
-        normalized_angle += float(np.pi * 2.0)
-    normalized_angle = normalize_screen_line_angle(normalized_angle, line=line)
+    del line
+    normalized_angle = normalize_screen_half_turn_angle(angle_rad)
     return direction_from_screen_angle(active_row, active_col, normalized_angle)
 
 
@@ -245,7 +247,7 @@ def resolve_mpr_crosshair_line_angle(
     magnitude = float(np.hypot(col_component, row_component))
     if magnitude <= 1e-8:
         return fallback
-    return normalize_screen_half_turn_angle(np.arctan2(-row_component, col_component))
+    return normalize_screen_half_turn_angle(np.arctan2(row_component, col_component))
 
 
 def project_vector_to_plane(direction: np.ndarray, normal: np.ndarray) -> np.ndarray | None:

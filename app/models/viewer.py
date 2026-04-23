@@ -161,6 +161,7 @@ class ViewGroupRecord:
     oblique_source_line: str | None = None
     mpr_mip: MprMipState = field(default_factory=MprMipState)
     mpr_frame: MprFrameState = field(default_factory=create_default_mpr_frame_state)
+    mpr_reference_center: tuple[float, float, float] | None = None
     oblique_planes: dict[str, MprObliquePlaneState] = field(default_factory=create_default_mpr_oblique_planes)
     oblique_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_line_angles)
     oblique_directed_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_directed_line_angles)

@@ -63,6 +63,7 @@ from app.schemas.view import (
     MprFrameInfo,
     MprMipConfig,
     MprMipViewportConfig,
+    MprPlaneInfo,
     MeasurementOverlayPayload,
     OperationAcceptedResponse,
     OrientationInfo,
@@ -861,7 +862,9 @@ class ViewerService:
         pixel_aspect_y = 1.0
         if self._is_mpr_view_type(view.view_type):
             series = series_registry.get(view.series_id)
-            pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, self._resolve_mpr_viewport(view))
+            target_viewport = self._resolve_mpr_viewport(view)
+            plane_state = self._resolve_mpr_plane_state(view.view_group, target_viewport) if view.view_group is not None else None
+            pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport, plane_state)
         render_plan = self._build_render_plan_for_shape(
             view,
             image_height,
@@ -939,9 +942,10 @@ class ViewerService:
             volume = self._get_series_volume(series)
             target_viewport = self._resolve_mpr_viewport(view)
             plane_pixels, current_index, _ = self._extract_mpr_plane(view, volume, target_viewport)
+            plane_state = self._resolve_mpr_plane_state(view.view_group, target_viewport) if view.view_group is not None else None
             return (
                 plane_pixels,
-                self._get_mpr_spacing_xy(series, target_viewport),
+                self._get_mpr_spacing_xy(series, target_viewport, plane_state),
                 MeasurementSliceContext(kind="mpr", slice_index=current_index),
             )
 
@@ -1197,7 +1201,19 @@ class ViewerService:
             return None
         return (col_spacing, row_spacing)
 
-    def _get_mpr_spacing_xy(self, series: SeriesRecord, viewport_key: str) -> tuple[float, float] | None:
+    def _get_mpr_spacing_xy(
+        self,
+        series: SeriesRecord,
+        viewport_key: str,
+        plane_state: MprObliquePlaneState | None = None,
+    ) -> tuple[float, float] | None:
+        if plane_state is not None:
+            transform = self._get_series_patient_transform(series)
+            if transform is not None:
+                return (
+                    transform.spacing_for_direction(plane_state.col),
+                    transform.spacing_for_direction(plane_state.row),
+                )
         spacing_x, spacing_y, spacing_z = self._get_3d_spacing_xyz(series)
         if viewport_key == MPR_VIEWPORT_CORONAL:
             return (spacing_x, spacing_z)
@@ -1205,8 +1221,13 @@ class ViewerService:
             return (spacing_y, spacing_z)
         return (spacing_x, spacing_y)
 
-    def _get_mpr_display_aspect_xy(self, series: SeriesRecord, viewport_key: str) -> tuple[float, float]:
-        spacing_xy = self._get_mpr_spacing_xy(series, viewport_key)
+    def _get_mpr_display_aspect_xy(
+        self,
+        series: SeriesRecord,
+        viewport_key: str,
+        plane_state: MprObliquePlaneState | None = None,
+    ) -> tuple[float, float]:
+        spacing_xy = self._get_mpr_spacing_xy(series, viewport_key, plane_state)
         if spacing_xy is None:
             return (1.0, 1.0)
         return (
@@ -1391,6 +1412,7 @@ class ViewerService:
         group.oblique_drag_active = False
         group.mpr_mip = self._create_default_mpr_mip_state()
         group.mpr_frame = self._build_default_mpr_frame_state(volume_shape)
+        group.mpr_reference_center = tuple(float(value) for value in group.mpr_frame.center)
         self._reset_mpr_oblique_state(group)
         self._sync_mpr_legacy_state_from_frame(group, volume_shape)
 
@@ -1419,7 +1441,9 @@ class ViewerService:
 
     def _fit_mpr_view_to_plane(self, view: ViewRecord, series: SeriesRecord, volume: np.ndarray) -> None:
         plane_pixels, _, _ = self._extract_mpr_plane(view, volume)
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, self._resolve_mpr_viewport(view))
+        target_viewport = self._resolve_mpr_viewport(view)
+        plane_state = self._resolve_mpr_plane_state(view.view_group, target_viewport) if view.view_group is not None else None
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport, plane_state)
         view.zoom = viewport_transformer.calculate_contain_zoom(
             image_width=plane_pixels.shape[1],
             image_height=plane_pixels.shape[0],
@@ -1619,8 +1643,9 @@ class ViewerService:
             view.is_initialized = True
 
         target_viewport = self._resolve_mpr_viewport(view)
+        plane_state = self._resolve_mpr_plane_state(view.view_group, target_viewport) if view.view_group is not None else None
         plane_pixels, current, total = self._extract_mpr_plane(view, volume, target_viewport)
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport)
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport, plane_state)
         render_plan = self._build_render_plan_for_shape(
             view,
             *plane_pixels.shape[:2],
@@ -1639,7 +1664,7 @@ class ViewerService:
         scale_bar = self._build_scale_bar_info(
             render_plan.render_view,
             image_transform,
-            self._get_mpr_spacing_xy(series, target_viewport),
+            self._get_mpr_spacing_xy(series, target_viewport, plane_state),
         )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
@@ -1656,7 +1681,8 @@ class ViewerService:
             reference_cached.dataset if reference_cached is not None else None,
             current_index=current,
             total_slices=total,
-            viewport_label=self._build_mpr_viewport_label(target_viewport),
+            viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
+            plane_state=plane_state,
         )
         context = RenderContext(
             view=render_plan.render_view,
@@ -1686,6 +1712,7 @@ class ViewerService:
                 viewId=view.view_id,
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 mprFrame=self._build_mpr_frame_payload(view),
+                mprPlane=self._build_mpr_plane_payload(view, target_viewport),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
@@ -1698,7 +1725,7 @@ class ViewerService:
                 ),
                 transform=self._build_view_transform_payload(view),
                 orientation=self._serialize_orientation_overlay(
-                    self._build_mpr_orientation_overlay(render_plan.render_view, target_viewport)
+                    self._build_mpr_orientation_overlay(render_plan.render_view, target_viewport, plane_state)
                 ),
             ),
             image_bytes=self._encode_image(image, image_format),
@@ -1996,6 +2023,18 @@ class ViewerService:
     def _build_default_mpr_frame_state(self, volume_shape: tuple[int, int, int]) -> MprFrameState:
         return mpr_geometry.default_mpr_frame_state(volume_shape)
 
+    def _ensure_mpr_reference_center(
+        self,
+        group: ViewGroupRecord,
+        volume_shape: tuple[int, int, int],
+    ) -> tuple[float, float, float]:
+        if group.mpr_reference_center is None:
+            group.mpr_reference_center = tuple(
+                float(value)
+                for value in self._build_default_mpr_frame_state(volume_shape).center
+            )
+        return group.mpr_reference_center
+
     def _set_mpr_frame_center(
         self,
         group: ViewGroupRecord,
@@ -2258,7 +2297,12 @@ class ViewerService:
         volume = self._get_series_volume(series_registry.get(view.series_id))
         target_viewport = self._resolve_mpr_viewport(view)
         plane_shape = self._get_mpr_plane_shape(volume.shape, target_viewport)
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series_registry.get(view.series_id), target_viewport)
+        plane_state = self._resolve_mpr_plane_state(view.view_group, target_viewport) if view.view_group is not None else None
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(
+            series_registry.get(view.series_id),
+            target_viewport,
+            plane_state,
+        )
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_shape[1],
             image_height=plane_shape[0],
@@ -2368,6 +2412,7 @@ class ViewerService:
 
         group = view.view_group
         volume_shape = self._get_series_volume(series_registry.get(view.series_id)).shape
+        self._ensure_mpr_reference_center(group, volume_shape)
         active_viewport = self._resolve_mpr_viewport(view)
         group.active_viewport = active_viewport
 
@@ -2440,10 +2485,14 @@ class ViewerService:
         line_dir: np.ndarray,
     ) -> None:
         primary_target_viewport = self._resolve_mpr_oblique_target_viewport(active_viewport, line)
+        primary_reference_normal = self._resolve_mpr_plane_normal(group, primary_target_viewport)
         primary_target_normal = self._normalize_oblique_vector(
             np.cross(line_dir, active_normal),
-            fallback=tuple(self._resolve_mpr_plane_normal(group, primary_target_viewport)),
+            fallback=tuple(primary_reference_normal),
         )
+        if float(np.dot(primary_target_normal, primary_reference_normal)) < 0.0:
+            line_dir = -line_dir
+            primary_target_normal = -primary_target_normal
 
         secondary_line = self._resolve_perpendicular_crosshair_line(line)
         secondary_target_viewport = self._resolve_mpr_oblique_target_viewport(active_viewport, secondary_line)
@@ -3102,9 +3151,17 @@ class ViewerService:
         current_index: int,
         total_slices: int,
         viewport_label: str,
+        plane_state: MprObliquePlaneState | None = None,
     ) -> CornerInfoOverlay:
         zoom = self._format_number(view.zoom, precision=2, suffix="x")
-        physical_location = self._build_physical_location_label(view, series, dataset, current_index, viewport_label)
+        physical_location = self._build_physical_location_label(
+            view,
+            series,
+            dataset,
+            current_index,
+            viewport_label,
+            plane_state=plane_state,
+        )
         top_left = tuple(
             line
             for line in (
@@ -3181,48 +3238,99 @@ class ViewerService:
         dataset: Dataset | None,
         current_index: int,
         viewport_label: str,
+        *,
+        plane_state: MprObliquePlaneState | None = None,
     ) -> str | None:
         label = viewport_label.lower()
+        if label.startswith("oblique "):
+            label = label.removeprefix("oblique ").strip()
         if self._is_mpr_view_type(view.view_type):
-            transform = self._get_series_patient_transform(series)
-            if transform is not None:
-                frame_center = (
-                    np.asarray(view.view_group.mpr_frame.center, dtype=np.float64)
-                    if view.view_group is not None
-                    else np.asarray(
-                        [float(view.mpr_axial_index), float(view.mpr_coronal_index), float(view.mpr_sagittal_index)],
-                        dtype=np.float64,
-                    )
+            frame_center = (
+                np.asarray(view.view_group.mpr_frame.center, dtype=np.float64)
+                if view.view_group is not None
+                else np.asarray(
+                    [float(view.mpr_axial_index), float(view.mpr_coronal_index), float(view.mpr_sagittal_index)],
+                    dtype=np.float64,
                 )
+            )
+            transform = self._get_series_patient_transform(series)
+            oblique_volume_normal = self._resolve_mpr_oblique_volume_normal(view, plane_state) if plane_state is not None else None
+            reference_center = self._get_mpr_reference_center(view, series, frame_center)
+            if transform is not None:
                 patient_point = transform.clamped_point_to_patient(frame_center)
-                if label.startswith("cor"):
-                    return self._format_oriented_mm(float(patient_point[1]), positive="P", negative="A")
-                if label.startswith("sag"):
-                    return self._format_oriented_mm(float(patient_point[0]), positive="L", negative="R")
-                if label.startswith("ax"):
-                    return self._format_oriented_mm(float(patient_point[2]), positive="S", negative="I")
-                return self._join_non_empty(
-                    " ",
-                    self._format_oriented_mm(float(patient_point[0]), positive="L", negative="R"),
-                    self._format_oriented_mm(float(patient_point[1]), positive="P", negative="A"),
-                    self._format_oriented_mm(float(patient_point[2]), positive="S", negative="I"),
+                if oblique_volume_normal is not None:
+                    patient_normal = mpr_geometry.volume_direction_to_patient_vector(oblique_volume_normal, transform)
+                    orientation_vector = self._resolve_mpr_oblique_orientation_vector(view, transform)
+                    return self._format_projected_physical_location(
+                        patient_point,
+                        patient_normal,
+                        origin_point=transform.clamped_point_to_patient(reference_center),
+                        orientation_vector=orientation_vector,
+                    )
+                return self._format_standard_physical_location(label, patient_point)
+
+            if oblique_volume_normal is not None:
+                spacing_x, spacing_y, spacing_z = self._get_3d_spacing_xyz(series)
+                fallback_patient_point = np.asarray(
+                    [
+                        float(frame_center[2]) * spacing_x,
+                        float(frame_center[1]) * spacing_y,
+                        float(frame_center[0]) * spacing_z,
+                    ],
+                    dtype=np.float64,
+                )
+                fallback_origin_point = np.asarray(
+                    [
+                        float(reference_center[2]) * spacing_x,
+                        float(reference_center[1]) * spacing_y,
+                        float(reference_center[0]) * spacing_z,
+                    ],
+                    dtype=np.float64,
+                )
+                patient_normal = mpr_geometry.fallback_volume_direction_to_patient_vector(oblique_volume_normal)
+                orientation_vector = self._resolve_mpr_oblique_orientation_vector(view, None)
+                return self._format_projected_physical_location(
+                    fallback_patient_point,
+                    patient_normal,
+                    origin_point=fallback_origin_point,
+                    orientation_vector=orientation_vector,
                 )
 
         position = self._get_dataset_position(dataset)
         if position is None:
             return None
+        return self._format_standard_physical_location(label, position)
+
+    def _format_standard_physical_location(self, label: str, patient_point: np.ndarray) -> str | None:
         if label.startswith("stack") or label.startswith("ax"):
-            return self._format_oriented_mm(float(position[2]), positive="S", negative="I")
+            return self._format_oriented_mm(float(patient_point[2]), positive="I", negative="S")
         if label.startswith("cor"):
-            return self._format_oriented_mm(float(position[1]), positive="P", negative="A")
+            return self._format_oriented_mm(float(patient_point[1]), positive="P", negative="A")
         if label.startswith("sag"):
-            return self._format_oriented_mm(float(position[0]), positive="L", negative="R")
+            return self._format_oriented_mm(float(patient_point[0]), positive="L", negative="R")
         return self._join_non_empty(
             " ",
-            self._format_oriented_mm(float(position[0]), positive="L", negative="R"),
-            self._format_oriented_mm(float(position[1]), positive="P", negative="A"),
-            self._format_oriented_mm(float(position[2]), positive="S", negative="I"),
+            self._format_oriented_mm(float(patient_point[0]), positive="L", negative="R"),
+            self._format_oriented_mm(float(patient_point[1]), positive="P", negative="A"),
+            self._format_oriented_mm(float(patient_point[2]), positive="S", negative="I"),
         )
+
+    def _get_mpr_reference_center(
+        self,
+        view: ViewRecord,
+        series: SeriesRecord,
+        fallback_center: np.ndarray,
+    ) -> np.ndarray:
+        group = view.view_group
+        if group is not None and group.mpr_reference_center is not None:
+            return np.asarray(group.mpr_reference_center, dtype=np.float64)
+        if group is not None:
+            try:
+                reference_center = self._ensure_mpr_reference_center(group, self._get_series_volume(series).shape)
+                return np.asarray(reference_center, dtype=np.float64)
+            except Exception:
+                pass
+        return np.asarray(fallback_center, dtype=np.float64)
 
     def _get_series_patient_transform(self, series: SeriesRecord) -> VolumePatientTransform | None:
         cached_transform = self._series_patient_transform_cache.get(series.series_id, Ellipsis)
@@ -3337,6 +3445,139 @@ class ViewerService:
         magnitude = abs(float(value))
         return f"{orientation} {magnitude:.2f}mm"
 
+    def _format_projected_physical_location(
+        self,
+        patient_point: np.ndarray,
+        patient_normal: np.ndarray,
+        *,
+        origin_point: np.ndarray | None = None,
+        orientation_vector: np.ndarray | None = None,
+    ) -> str | None:
+        normal = mpr_geometry.normalize_patient_vector(patient_normal, fallback=np.asarray([0.0, 0.0, 1.0], dtype=np.float64))
+        point = np.asarray(patient_point, dtype=np.float64)
+        origin = np.zeros(3, dtype=np.float64) if origin_point is None else np.asarray(origin_point, dtype=np.float64)
+        orientation_source = normal if orientation_vector is None else mpr_geometry.normalize_patient_vector(
+            orientation_vector,
+            fallback=normal,
+        )
+        if float(np.dot(normal, orientation_source)) < 0.0:
+            normal = -normal
+        distance = float(np.dot(point - origin, normal))
+        if abs(distance) < 0.005:
+            distance = 0.0
+        orientation = self._dominant_orientation_text_for_vector(orientation_source if distance >= 0.0 else -orientation_source)
+        if not orientation:
+            return None
+        magnitude = self._format_number(abs(distance), precision=2, suffix="mm") or "0mm"
+        return f"{orientation} {magnitude}"
+
+    def _resolve_mpr_oblique_orientation_vector(
+        self,
+        view: ViewRecord,
+        transform: VolumePatientTransform | None,
+    ) -> np.ndarray | None:
+        group = view.view_group
+        if group is None:
+            return None
+        source_viewport = group.oblique_source_viewport
+        source_line = group.oblique_source_line
+        viewport_key = self._resolve_mpr_viewport(view)
+        if source_viewport == MPR_VIEWPORT_AXIAL and source_line == "vertical" and viewport_key == MPR_VIEWPORT_CORONAL:
+            directed_angle = group.oblique_directed_line_angles.get(source_viewport, {}).get(source_line)
+            if directed_angle is None:
+                return None
+            # Reference viewers label AX vertical-line driven COR obliques by 45-degree sectors:
+            # -45/45/135/225 degrees map to P/R/A/L respectively.
+            adjusted_angle = float(directed_angle) + float(np.pi / 4.0)
+            return mpr_geometry.normalize_patient_vector(
+                np.asarray(
+                    [-np.sin(adjusted_angle), np.cos(adjusted_angle), 0.0],
+                    dtype=np.float64,
+                ),
+                fallback=np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
+            )
+        return None
+
+    def _resolve_mpr_oblique_volume_normal(
+        self,
+        view: ViewRecord,
+        plane_state: MprObliquePlaneState,
+    ) -> np.ndarray | None:
+        viewport_key = self._resolve_mpr_viewport(view)
+        if view.view_group is not None:
+            directed_normal = self._resolve_directed_mpr_oblique_normal(view.view_group, viewport_key, plane_state)
+            if directed_normal is not None:
+                return directed_normal
+        if plane_state.is_oblique:
+            return np.asarray(plane_state.normal, dtype=np.float64)
+        return None
+
+    def _resolve_directed_mpr_oblique_normal(
+        self,
+        group: ViewGroupRecord,
+        viewport_key: str,
+        plane_state: MprObliquePlaneState,
+    ) -> np.ndarray | None:
+        source_viewport = group.oblique_source_viewport
+        source_line = group.oblique_source_line
+        if source_viewport is None or source_line not in {"horizontal", "vertical"}:
+            return None
+        directed_angle = group.oblique_directed_line_angles.get(source_viewport, {}).get(source_line)
+        if directed_angle is None:
+            return None
+
+        source_row, source_col, source_normal = self._resolve_mpr_plane_basis(group, source_viewport)
+        line_dir = mpr_geometry.direction_from_screen_angle(source_row, source_col, float(directed_angle))
+        primary_target = self._resolve_mpr_oblique_target_viewport(source_viewport, source_line)
+        if viewport_key == primary_target:
+            return self._normalize_oblique_vector(
+                np.cross(line_dir, source_normal),
+                fallback=tuple(plane_state.normal),
+            )
+
+        secondary_line = self._resolve_perpendicular_crosshair_line(source_line)
+        secondary_target = self._resolve_mpr_oblique_target_viewport(source_viewport, secondary_line)
+        if viewport_key == secondary_target:
+            return self._normalize_oblique_vector(line_dir, fallback=tuple(plane_state.normal))
+        return None
+
+    @staticmethod
+    def _dominant_orientation_text_for_vector(vector: np.ndarray | None) -> str | None:
+        return ViewerService._orientation_text_for_vector(
+            vector,
+            minimum_magnitude=1e-4,
+            max_components=1,
+            axis_priority=(1, 0, 2),
+        )
+
+    @staticmethod
+    def _orientation_text_for_vector(
+        vector: np.ndarray | None,
+        *,
+        minimum_magnitude: float = 0.2,
+        max_components: int = 3,
+        axis_priority: tuple[int, int, int] = (0, 1, 2),
+    ) -> str | None:
+        if vector is None:
+            return None
+        axis_map = (
+            (0, "L", "R", axis_priority[0]),
+            (1, "P", "A", axis_priority[1]),
+            (2, "S", "I", axis_priority[2]),
+        )
+        components: list[tuple[float, int, str]] = []
+        for axis_index, positive_label, negative_label, priority in axis_map:
+            component = float(vector[axis_index])
+            magnitude = abs(component)
+            if magnitude < minimum_magnitude:
+                continue
+            label = positive_label if component >= 0 else negative_label
+            components.append((magnitude, priority, label))
+        if not components:
+            return None
+        components.sort(key=lambda item: (-item[0], item[1]))
+        return ''.join(label for _, _, label in components[:max(1, max_components)])
+
     @staticmethod
     def _rotate_screen_axes(
         x_vector: np.ndarray,
@@ -3372,6 +3613,17 @@ class ViewerService:
             axisCol=tuple(float(value) for value in frame.axis_col),
         )
 
+    def _build_mpr_plane_payload(self, view: ViewRecord, viewport_key: str) -> MprPlaneInfo | None:
+        if view.view_group is None:
+            return None
+        plane = self._resolve_mpr_plane_state(view.view_group, viewport_key)
+        return MprPlaneInfo(
+            row=tuple(float(value) for value in plane.row),
+            col=tuple(float(value) for value in plane.col),
+            normal=tuple(float(value) for value in plane.normal),
+            isOblique=bool(plane.is_oblique),
+        )
+
     def _build_stack_orientation_overlay(self, view: ViewRecord, dataset: Dataset | None) -> OrientationOverlay | None:
         orientation = self._get_dataset_orientation(dataset)
         if orientation is None:
@@ -3392,17 +3644,22 @@ class ViewerService:
             left=self._orientation_text_for_vector(-x_vector),
         )
 
-    def _build_mpr_orientation_overlay(self, view: ViewRecord, viewport_key: str) -> OrientationOverlay:
+    def _build_mpr_orientation_overlay(
+        self,
+        view: ViewRecord,
+        viewport_key: str,
+        plane_state: MprObliquePlaneState | None = None,
+    ) -> OrientationOverlay:
         group = view.view_group
+        resolved_plane = plane_state
         if group is not None:
+            resolved_plane = resolved_plane or self._resolve_mpr_plane_state(group, viewport_key)
             _, _, normal_vector = self._resolve_mpr_plane_basis(group, viewport_key)
         else:
-            normal_vector = self._normalize_oblique_vector(
-                self._default_mpr_oblique_plane(viewport_key).normal,
-                fallback=(1.0, 0.0, 0.0),
-            )
+            resolved_plane = self._default_mpr_oblique_plane(viewport_key)
+            normal_vector = self._normalize_oblique_vector(resolved_plane.normal, fallback=(1.0, 0.0, 0.0))
 
-        x_vector, y_vector = self._resolve_mpr_orientation_screen_axes(view, normal_vector)
+        x_vector, y_vector = self._resolve_mpr_orientation_screen_axes(view, normal_vector, resolved_plane)
 
         if view.hor_flip:
             x_vector = -x_vector
@@ -3411,16 +3668,17 @@ class ViewerService:
         x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
 
         return OrientationOverlay(
-            top=self._orientation_text_for_vector(-y_vector),
-            right=self._orientation_text_for_vector(x_vector),
-            bottom=self._orientation_text_for_vector(y_vector),
-            left=self._orientation_text_for_vector(-x_vector),
+            top=self._dominant_orientation_text_for_vector(-y_vector),
+            right=self._dominant_orientation_text_for_vector(x_vector),
+            bottom=self._dominant_orientation_text_for_vector(y_vector),
+            left=self._dominant_orientation_text_for_vector(-x_vector),
         )
 
     def _resolve_mpr_orientation_screen_axes(
         self,
         view: ViewRecord,
         normal_vector: np.ndarray,
+        plane_state: MprObliquePlaneState | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         series = None
         try:
@@ -3428,15 +3686,24 @@ class ViewerService:
         except Exception:
             series = None
         transform = self._get_series_patient_transform(series) if series is not None else None
+        if plane_state is not None and transform is not None:
+            return (
+                mpr_geometry.volume_direction_to_patient_vector(plane_state.col, transform),
+                mpr_geometry.volume_direction_to_patient_vector(plane_state.row, transform),
+            )
         return mpr_geometry.resolve_mpr_orientation_screen_axes(normal_vector, transform)
 
     @staticmethod
-    def _build_mpr_viewport_label(viewport_key: str) -> str:
+    def _build_mpr_viewport_label(viewport_key: str, plane_state: MprObliquePlaneState | None = None) -> str:
         if viewport_key == MPR_VIEWPORT_CORONAL:
-            return "CORONAL"
-        if viewport_key == MPR_VIEWPORT_SAGITTAL:
-            return "SAGITTAL"
-        return "AXIAL"
+            label = "CORONAL"
+        elif viewport_key == MPR_VIEWPORT_SAGITTAL:
+            label = "SAGITTAL"
+        else:
+            label = "AXIAL"
+        if plane_state is not None and plane_state.is_oblique:
+            return f"OBLIQUE {label}"
+        return label
 
     @staticmethod
     def _build_window_label(window_width: float | None, window_center: float | None) -> str | None:
@@ -3498,28 +3765,6 @@ class ViewerService:
         if len(digits) < 6:
             return text
         return f"{digits[:2]}:{digits[2:4]}:{digits[4:6]}"
-
-    @staticmethod
-    def _orientation_text_for_vector(vector: np.ndarray | None) -> str | None:
-        if vector is None:
-            return None
-        axis_map = (
-            (0, "L", "R"),
-            (1, "P", "A"),
-            (2, "S", "I"),
-        )
-        components: list[tuple[float, str]] = []
-        for axis_index, positive_label, negative_label in axis_map:
-            component = float(vector[axis_index])
-            magnitude = abs(component)
-            if magnitude < 0.2:
-                continue
-            label = positive_label if component >= 0 else negative_label
-            components.append((magnitude, label))
-        if not components:
-            return None
-        components.sort(key=lambda item: item[0], reverse=True)
-        return ''.join(label for _, label in components[:3])
 
     @staticmethod
     def _window_array(

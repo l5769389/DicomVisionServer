@@ -94,6 +94,15 @@ class MprFrameInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprPlaneInfo(BaseModel):
+    row: tuple[float, float, float]
+    col: tuple[float, float, float]
+    normal: tuple[float, float, float]
+    is_oblique: bool = Field(alias="isOblique")
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewExportPointPayload(BaseModel):
     x: float = Field(ge=0.0, le=1.0)
     y: float = Field(ge=0.0, le=1.0)
@@ -213,6 +222,7 @@ class ViewImageResponse(BaseModel):
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
     mpr_frame: MprFrameInfo | None = Field(default=None, alias="mprFrame")
+    mpr_plane: MprPlaneInfo | None = Field(default=None, alias="mprPlane")
     scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
     measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)

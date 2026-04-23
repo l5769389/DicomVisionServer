@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from app.models.viewer import ViewGroupRecord, ViewRecord
+from app.models.viewer import MprObliquePlaneState, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
+from app.services import mpr_geometry
+from app.services.mpr_geometry import VolumePatientTransform
 from app.services.viewer_service import ViewerService
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
@@ -153,6 +155,22 @@ def test_mpr_oblique_drag_preserves_target_view_column_orientation() -> None:
     assert abs(float(np.dot(sagittal_col, coronal_normal))) > 0.999
 
 
+def test_mpr_oblique_drag_keeps_axial_rotation_target_views_upright() -> None:
+    service = ViewerService()
+
+    for line in ("horizontal", "vertical"):
+        for angle_rad in np.linspace(0.0, np.pi / 2.0, 5):
+            group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+            axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+
+            _apply_oblique_drag(service, axial_view, line=line, angle_rad=float(angle_rad))
+
+            for viewport_key in ("mpr-cor", "mpr-sag"):
+                plane_row = np.asarray(group.oblique_planes[viewport_key].row, dtype=np.float64)
+                default_row = np.asarray(service._default_mpr_oblique_plane(viewport_key).row, dtype=np.float64)
+                assert float(np.dot(plane_row, default_row)) > 0.999
+
+
 def test_mpr_oblique_drag_preserves_target_plane_direction_on_small_moves() -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
@@ -195,7 +213,7 @@ def test_mpr_crosshair_move_uses_oblique_plane_basis_after_rotation() -> None:
     try:
         series_registry.get = lambda _series_id: SimpleNamespace(series_id="s", instances=[])  # type: ignore[method-assign]
         service._get_series_volume = lambda _series: np.zeros(volume_shape, dtype=np.float32)  # type: ignore[method-assign]
-        service._get_mpr_display_aspect_xy = lambda _series, _viewport: (1.0, 1.0)  # type: ignore[method-assign]
+        service._get_mpr_display_aspect_xy = lambda _series, _viewport, _plane_state=None: (1.0, 1.0)  # type: ignore[method-assign]
         service._canvas_to_image_coordinates = lambda _transform, _canvas_x, _canvas_y: next(image_points)  # type: ignore[method-assign]
         service._handle_mpr_crosshair(coronal_view, ViewOperationRequest(viewId=coronal_view.view_id, opType="crosshair", actionType="start", x=0.5, y=0.5))
         service._handle_mpr_crosshair(coronal_view, ViewOperationRequest(viewId=coronal_view.view_id, opType="crosshair", actionType="move", x=0.75, y=0.75))
@@ -228,7 +246,7 @@ def test_mpr_crosshair_move_preserves_active_view_oblique_angles() -> None:
     try:
         series_registry.get = lambda _series_id: SimpleNamespace(series_id="s", instances=[])  # type: ignore[method-assign]
         service._get_series_volume = lambda _series: np.zeros(volume_shape, dtype=np.float32)  # type: ignore[method-assign]
-        service._get_mpr_display_aspect_xy = lambda _series, _viewport: (1.0, 1.0)  # type: ignore[method-assign]
+        service._get_mpr_display_aspect_xy = lambda _series, _viewport, _plane_state=None: (1.0, 1.0)  # type: ignore[method-assign]
         service._canvas_to_image_coordinates = lambda _transform, _canvas_x, _canvas_y: next(image_points)  # type: ignore[method-assign]
         service._handle_mpr_crosshair(coronal_view, ViewOperationRequest(viewId=coronal_view.view_id, opType="crosshair", actionType="start", x=0.5, y=0.5))
         service._handle_mpr_crosshair(coronal_view, ViewOperationRequest(viewId=coronal_view.view_id, opType="crosshair", actionType="move", x=0.75, y=0.5))
@@ -257,7 +275,7 @@ def test_mpr_crosshair_move_does_not_accumulate_absolute_offset_every_frame() ->
     try:
         series_registry.get = lambda _series_id: SimpleNamespace(series_id="s", instances=[])  # type: ignore[method-assign]
         service._get_series_volume = lambda _series: np.zeros(volume_shape, dtype=np.float32)  # type: ignore[method-assign]
-        service._get_mpr_display_aspect_xy = lambda _series, _viewport: (1.0, 1.0)  # type: ignore[method-assign]
+        service._get_mpr_display_aspect_xy = lambda _series, _viewport, _plane_state=None: (1.0, 1.0)  # type: ignore[method-assign]
         service._canvas_to_image_coordinates = lambda _transform, _canvas_x, _canvas_y: next(image_points)  # type: ignore[method-assign]
         service._handle_mpr_crosshair(coronal_view, ViewOperationRequest(viewId=coronal_view.view_id, opType="crosshair", actionType="start", x=0.5, y=0.5))
         service._handle_mpr_crosshair(coronal_view, ViewOperationRequest(viewId=coronal_view.view_id, opType="crosshair", actionType="move", x=0.75, y=0.5))
@@ -334,7 +352,7 @@ def test_mpr_reset_restores_group_to_initial_state() -> None:
         series_registry.get = lambda _series_id: SimpleNamespace(series_id="s", instances=[])  # type: ignore[method-assign]
         service._get_mpr_group_views = lambda _view: [axial_view, coronal_view, sagittal_view]  # type: ignore[method-assign]
         service._get_series_volume = lambda _series: np.zeros((8, 10, 12), dtype=np.float32)  # type: ignore[method-assign]
-        service._get_mpr_display_aspect_xy = lambda _series, _viewport: (1.0, 1.0)  # type: ignore[method-assign]
+        service._get_mpr_display_aspect_xy = lambda _series, _viewport, _plane_state=None: (1.0, 1.0)  # type: ignore[method-assign]
         service._reset_mpr_view_group(axial_view)
     finally:
         series_registry.get = original_series_get  # type: ignore[method-assign]
@@ -408,9 +426,9 @@ def test_mpr_orientation_overlay_updates_after_oblique_rotation() -> None:
 
     rotated_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
     assert rotated_overlay.top == "S"
-    assert rotated_overlay.right == "LA"
+    assert rotated_overlay.right == "L"
     assert rotated_overlay.bottom == "I"
-    assert rotated_overlay.left == "RP"
+    assert rotated_overlay.left == "R"
 
 
 def test_mpr_orientation_overlay_flips_target_direction_for_axial_vertical_drag() -> None:
@@ -425,31 +443,42 @@ def test_mpr_orientation_overlay_flips_target_direction_for_axial_vertical_drag(
     coronal_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
     sagittal_overlay = service._build_mpr_orientation_overlay(sagittal_view, "mpr-sag")
     assert coronal_overlay.top == "S"
-    assert coronal_overlay.right == "RP"
+    assert coronal_overlay.right == "R"
     assert coronal_overlay.bottom == "I"
-    assert coronal_overlay.left == "LA"
+    assert coronal_overlay.left == "L"
     assert sagittal_overlay.top == "S"
-    assert sagittal_overlay.right == "AR"
+    assert sagittal_overlay.right == "A"
     assert sagittal_overlay.bottom == "I"
-    assert sagittal_overlay.left == "PL"
+    assert sagittal_overlay.left == "P"
 
-
-def test_mpr_orientation_overlay_preserves_directed_axial_vertical_rotation_for_coronal_view() -> None:
+def test_mpr_orientation_overlay_normalizes_axial_vertical_rotation_to_undirected_line_orientation() -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
     axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
     coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
 
     for angle_rad, expected in (
-        (np.deg2rad(292.5), ("RA", "LP")),
-        (np.deg2rad(315.0), ("AR", "PL")),
-        (np.deg2rad(22.5), ("AL", "PR")),
-        (np.deg2rad(45.0), ("LA", "RP")),
-        (np.deg2rad(112.5), ("LP", "RA")),
+        (np.deg2rad(292.5), ("L", "R")),
+        (np.deg2rad(315.0), ("L", "R")),
+        (np.deg2rad(22.5), ("P", "A")),
+        (np.deg2rad(45.0), ("P", "A")),
+        (np.deg2rad(112.5), ("R", "L")),
     ):
         _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=float(angle_rad))
         overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
         assert (overlay.left, overlay.right, overlay.top, overlay.bottom) == (*expected, "S", "I")
+
+
+def test_mpr_orientation_overlay_uses_single_axis_labels_on_small_oblique_angle() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+
+    _apply_oblique_drag(service, axial_view, line="vertical", angle_rad=float(np.deg2rad(2.0)))
+
+    overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
+    assert (overlay.left, overlay.right) == ("A", "P")
 
 
 def test_mpr_orientation_overlay_uses_plane_geometry_without_source_flags() -> None:
@@ -467,8 +496,8 @@ def test_mpr_orientation_overlay_uses_plane_geometry_without_source_flags() -> N
     coronal_overlay = service._build_mpr_orientation_overlay(coronal_view, "mpr-cor")
     sagittal_overlay = service._build_mpr_orientation_overlay(sagittal_view, "mpr-sag")
 
-    assert (coronal_overlay.top, coronal_overlay.right, coronal_overlay.bottom, coronal_overlay.left) == ("S", "RA", "I", "LP")
-    assert (sagittal_overlay.top, sagittal_overlay.right, sagittal_overlay.bottom, sagittal_overlay.left) == ("S", "AL", "I", "PR")
+    assert (coronal_overlay.top, coronal_overlay.right, coronal_overlay.bottom, coronal_overlay.left) == ("S", "R", "I", "L")
+    assert (sagittal_overlay.top, sagittal_overlay.right, sagittal_overlay.bottom, sagittal_overlay.left) == ("S", "A", "I", "P")
 
 
 def test_mpr_frame_axes_sync_from_oblique_plane_normals() -> None:
@@ -551,3 +580,247 @@ def test_mpr_crosshair_line_angles_can_be_derived_without_angle_cache() -> None:
     horizontal, vertical = service._get_mpr_crosshair_line_angles(axial_view, "mpr-cor")
     assert math.isclose(horizontal, expected_horizontal, rel_tol=0.0, abs_tol=1e-6)
     assert math.isclose(vertical, expected_vertical, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_mpr_oblique_line_direction_matches_client_screen_angle_convention() -> None:
+    current_normal = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    current_row = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+    current_col = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    angle_rad = 0.35
+
+    line_dir = mpr_geometry.build_mpr_oblique_line_direction(current_row, current_col, angle_rad, line="horizontal")
+    expected_line_dir = np.asarray([0.0, math.sin(angle_rad), math.cos(angle_rad)], dtype=np.float64)
+    target_normal = np.cross(line_dir, current_normal)
+    target_plane = MprObliquePlaneState(
+        row=(0.0, 0.0, 1.0),
+        col=(0.0, 1.0, 0.0),
+        normal=tuple(float(value) for value in target_normal),
+        is_oblique=True,
+    )
+
+    resolved_angle = mpr_geometry.resolve_mpr_crosshair_line_angle(
+        current_normal,
+        current_row,
+        current_col,
+        target_plane,
+        fallback=0.0,
+    )
+
+    assert np.allclose(line_dir, expected_line_dir, atol=1e-6)
+    assert math.isclose(resolved_angle, angle_rad, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_mpr_spacing_uses_resolved_oblique_plane_basis() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    plane = MprObliquePlaneState(
+        row=(-1.0, 0.0, 0.0),
+        col=(0.0, -math.sqrt(0.5), math.sqrt(0.5)),
+        normal=(0.0, math.sqrt(0.5), math.sqrt(0.5)),
+        is_oblique=True,
+    )
+    transform = VolumePatientTransform(
+        origin=np.zeros(3, dtype=np.float64),
+        axis_vectors=(
+            np.asarray([2.0, 0.0, 0.0], dtype=np.float64),
+            np.asarray([0.0, 3.0, 0.0], dtype=np.float64),
+            np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+        ),
+        shape=(16, 16, 16),
+    )
+
+    original_get_transform = service._get_series_patient_transform
+    try:
+        service._get_series_patient_transform = lambda _series: transform  # type: ignore[method-assign]
+        spacing_x, spacing_y = service._get_mpr_spacing_xy(series, "mpr-cor", plane)
+    finally:
+        service._get_series_patient_transform = original_get_transform  # type: ignore[method-assign]
+
+    assert math.isclose(spacing_x, math.sqrt(17.0), rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(spacing_y, 2.0, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_mpr_oblique_corner_info_marks_viewport_and_projects_relative_mm_location() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    group.mpr_frame.center = (2.0, 3.0, 5.0)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+    plane = MprObliquePlaneState(
+        row=(-1.0, 0.0, 0.0),
+        col=(0.0, -math.sqrt(0.5), math.sqrt(0.5)),
+        normal=(0.0, math.sqrt(0.5), math.sqrt(0.5)),
+        is_oblique=True,
+    )
+    transform = VolumePatientTransform(
+        origin=np.zeros(3, dtype=np.float64),
+        axis_vectors=(
+            np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
+            np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
+            np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+        ),
+        shape=(16, 16, 16),
+    )
+
+    original_get_transform = service._get_series_patient_transform
+    try:
+        service._get_series_patient_transform = lambda _series: transform  # type: ignore[method-assign]
+        corner_info = service._build_slice_corner_info_overlay(
+            coronal_view,
+            series,
+            None,
+            current_index=3,
+            total_slices=8,
+            viewport_label=service._build_mpr_viewport_label("mpr-cor", plane),
+            plane_state=plane,
+        )
+    finally:
+        service._get_series_patient_transform = original_get_transform  # type: ignore[method-assign]
+
+    assert corner_info.top_left[0] == "OBLIQUE CORONAL  P 0mm"
+
+
+def test_mpr_oblique_corner_info_uses_single_axis_mm_label_without_patient_transform() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    group.mpr_frame.center = (20.0, 30.0, 10.0)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+    plane = MprObliquePlaneState(
+        row=(-1.0, 0.0, 0.0),
+        col=(0.0, 0.0, 1.0),
+        normal=(0.0, math.sqrt(0.5), -math.sqrt(0.5)),
+        is_oblique=True,
+    )
+
+    original_get_transform = service._get_series_patient_transform
+    try:
+        service._get_series_patient_transform = lambda _series: None  # type: ignore[method-assign]
+        corner_info = service._build_slice_corner_info_overlay(
+            coronal_view,
+            series,
+            None,
+            current_index=3,
+            total_slices=8,
+            viewport_label=service._build_mpr_viewport_label("mpr-cor", plane),
+            plane_state=plane,
+        )
+    finally:
+        service._get_series_patient_transform = original_get_transform  # type: ignore[method-assign]
+
+    assert corner_info.top_left[0] == "OBLIQUE CORONAL  P 0mm"
+
+
+def test_mpr_oblique_corner_info_uses_directed_axial_vertical_rotation_labels() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+
+    original_get_transform = service._get_series_patient_transform
+    try:
+        service._get_series_patient_transform = lambda _series: None  # type: ignore[method-assign]
+        for angle_degrees, expected_label in (
+            (-45.0, "P"),
+            (45.0, "R"),
+            (135.0, "A"),
+            (225.0, "L"),
+        ):
+            group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+            group.mpr_frame.center = (2.0, 3.0, 3.0)
+            axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+            coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+
+            _apply_oblique_drag(
+                service,
+                axial_view,
+                line="vertical",
+                angle_rad=float(np.deg2rad(angle_degrees)),
+            )
+            plane = service._resolve_mpr_plane_state(group, "mpr-cor")
+            corner_info = service._build_slice_corner_info_overlay(
+                coronal_view,
+                series,
+                None,
+                current_index=3,
+                total_slices=8,
+                viewport_label=service._build_mpr_viewport_label("mpr-cor", plane),
+                plane_state=plane,
+            )
+
+            assert corner_info.top_left[0] == f"{service._build_mpr_viewport_label('mpr-cor', plane)}  {expected_label} 0mm"
+    finally:
+        service._get_series_patient_transform = original_get_transform  # type: ignore[method-assign]
+
+
+def test_mpr_oblique_corner_info_uses_initial_center_as_distance_origin_after_center_move() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    group.mpr_frame.center = (2.0, 4.0, 3.0)
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+
+    original_get_transform = service._get_series_patient_transform
+    try:
+        service._get_series_patient_transform = lambda _series: None  # type: ignore[method-assign]
+        _apply_oblique_drag(
+            service,
+            axial_view,
+            line="vertical",
+            angle_rad=float(np.deg2rad(-45.0)),
+        )
+        plane = service._resolve_mpr_plane_state(group, "mpr-cor")
+        corner_info = service._build_slice_corner_info_overlay(
+            coronal_view,
+            series,
+            None,
+            current_index=4,
+            total_slices=8,
+            viewport_label=service._build_mpr_viewport_label("mpr-cor", plane),
+            plane_state=plane,
+        )
+    finally:
+        service._get_series_patient_transform = original_get_transform  # type: ignore[method-assign]
+
+    assert corner_info.top_left[0] != "OBLIQUE CORONAL  P 0mm"
+    assert corner_info.top_left[0].startswith("OBLIQUE CORONAL  ")
+    assert corner_info.top_left[0].endswith("0.71mm")
+
+
+def test_mpr_oblique_corner_info_keeps_anterior_label_after_axial_rotation_and_center_move() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    group.mpr_frame.center = (2.0, 3.0, 3.0)
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group)
+
+    original_get_transform = service._get_series_patient_transform
+    try:
+        service._get_series_patient_transform = lambda _series: None  # type: ignore[method-assign]
+        _apply_oblique_drag(
+            service,
+            axial_view,
+            line="vertical",
+            angle_rad=float(np.deg2rad(-30.0)),
+        )
+        group.mpr_frame.center = (2.0, 2.0, 3.0)
+        plane = service._resolve_mpr_plane_state(group, "mpr-cor")
+        corner_info = service._build_slice_corner_info_overlay(
+            coronal_view,
+            series,
+            None,
+            current_index=2,
+            total_slices=8,
+            viewport_label=service._build_mpr_viewport_label("mpr-cor", plane),
+            plane_state=plane,
+        )
+    finally:
+        service._get_series_patient_transform = original_get_transform  # type: ignore[method-assign]
+
+    assert corner_info.top_left[0] == "OBLIQUE CORONAL  A 0.5mm"
+
+
+def test_mpr_axial_standard_location_uses_inferior_for_positive_patient_z() -> None:
+    service = ViewerService()
+
+    assert service._format_standard_physical_location("axial", np.asarray([0.0, 0.0, 1476.88])) == "I 1476.88mm"
