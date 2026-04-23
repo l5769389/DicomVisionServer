@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
-from app.models.viewer import MprFrameState, MprObliquePlaneState, create_default_mpr_oblique_planes
+from app.models.viewer import MprFrameState, MprObliquePlaneState
 
 
 @dataclass(frozen=True)
@@ -80,119 +80,24 @@ def default_mpr_frame_state(volume_shape: tuple[int, int, int]) -> MprFrameState
 
 
 def default_mpr_oblique_plane(viewport_key: str) -> MprObliquePlaneState:
-    default_planes = create_default_mpr_oblique_planes()
-    return default_planes.get(viewport_key) or default_planes[MPR_VIEWPORT_AXIAL]
-
-
-def build_mpr_oblique_planes_from_frame(frame: MprFrameState) -> dict[str, MprObliquePlaneState]:
-    slice_axis = normalize_oblique_vector(frame.axis_slice, fallback=(1.0, 0.0, 0.0))
-    row_axis = normalize_oblique_vector(frame.axis_row, fallback=(0.0, 1.0, 0.0))
-    col_axis = normalize_oblique_vector(frame.axis_col, fallback=(0.0, 0.0, 1.0))
-    default_planes = create_default_mpr_oblique_planes()
-
-    def build(row_dir: np.ndarray, col_dir: np.ndarray, normal_dir: np.ndarray, viewport_key: str) -> MprObliquePlaneState:
-        default_plane = default_planes[viewport_key]
-        default_normal = normalize_oblique_vector(default_plane.normal, fallback=(1.0, 0.0, 0.0))
-        is_oblique = float(np.linalg.norm(normal_dir - default_normal)) > 1e-6
-        return MprObliquePlaneState(
-            row=tuple(float(value) for value in row_dir),
-            col=tuple(float(value) for value in col_dir),
-            normal=tuple(float(value) for value in normal_dir),
-            is_oblique=is_oblique,
-        )
-
-    return {
-        MPR_VIEWPORT_AXIAL: build(row_axis, col_axis, slice_axis, MPR_VIEWPORT_AXIAL),
-        MPR_VIEWPORT_CORONAL: build(-slice_axis, col_axis, row_axis, MPR_VIEWPORT_CORONAL),
-        MPR_VIEWPORT_SAGITTAL: build(-slice_axis, row_axis, col_axis, MPR_VIEWPORT_SAGITTAL),
+    default_planes = {
+        MPR_VIEWPORT_AXIAL: MprObliquePlaneState(
+            row=(0.0, 1.0, 0.0),
+            col=(0.0, 0.0, 1.0),
+            normal=(1.0, 0.0, 0.0),
+        ),
+        MPR_VIEWPORT_CORONAL: MprObliquePlaneState(
+            row=(-1.0, 0.0, 0.0),
+            col=(0.0, 0.0, 1.0),
+            normal=(0.0, 1.0, 0.0),
+        ),
+        MPR_VIEWPORT_SAGITTAL: MprObliquePlaneState(
+            row=(-1.0, 0.0, 0.0),
+            col=(0.0, 1.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+        ),
     }
-
-
-def resolve_mpr_plane_basis(
-    frame: MprFrameState,
-    viewport_key: str,
-    *,
-    cached_plane: MprObliquePlaneState | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    frame_plane = build_mpr_oblique_planes_from_frame(frame).get(viewport_key) or default_mpr_oblique_plane(viewport_key)
-    default_plane = default_mpr_oblique_plane(viewport_key)
-    plane = cached_plane or frame_plane
-    normal_dir = normalize_oblique_vector(frame_plane.normal, fallback=tuple(default_plane.normal))
-    row_dir = normalize_oblique_vector(plane.row, fallback=tuple(frame_plane.row))
-    col_dir = normalize_oblique_vector(plane.col, fallback=tuple(frame_plane.col))
-    projected_row = project_vector_to_plane(row_dir, normal_dir)
-    projected_col = project_vector_to_plane(col_dir, normal_dir)
-    if projected_row is not None and projected_col is not None:
-        row_dir = projected_row
-        col_dir = normalize_oblique_vector(
-            projected_col - float(np.dot(projected_col, row_dir)) * row_dir,
-            fallback=tuple(frame_plane.col),
-        )
-    else:
-        row_dir, col_dir = get_mpr_display_basis(viewport_key, normal_dir)
-    return row_dir, col_dir, normal_dir
-
-
-def resolve_mpr_plane_state(
-    frame: MprFrameState,
-    viewport_key: str,
-    *,
-    cached_plane: MprObliquePlaneState | None = None,
-) -> MprObliquePlaneState:
-    row_dir, col_dir, normal_dir = resolve_mpr_plane_basis(frame, viewport_key, cached_plane=cached_plane)
-    default_plane = default_mpr_oblique_plane(viewport_key)
-    default_normal = normalize_oblique_vector(default_plane.normal, fallback=(0.0, 1.0, 0.0))
-    is_oblique = float(np.linalg.norm(normal_dir - default_normal)) > 1e-6
-    return MprObliquePlaneState(
-        row=tuple(float(value) for value in row_dir),
-        col=tuple(float(value) for value in col_dir),
-        normal=tuple(float(value) for value in normal_dir),
-        is_oblique=is_oblique,
-    )
-
-
-def build_mpr_plane_state_from_group_normals(
-    viewport_key: str,
-    axial_normal: np.ndarray,
-    coronal_normal: np.ndarray,
-    sagittal_normal: np.ndarray,
-    *,
-    reference_plane: MprObliquePlaneState | None = None,
-) -> MprObliquePlaneState:
-    axial_normal = normalize_oblique_vector(axial_normal, fallback=(1.0, 0.0, 0.0))
-    coronal_normal = normalize_oblique_vector(coronal_normal, fallback=(0.0, 1.0, 0.0))
-    sagittal_normal = normalize_oblique_vector(sagittal_normal, fallback=(0.0, 0.0, 1.0))
-
-    if viewport_key == MPR_VIEWPORT_CORONAL:
-        row_dir = -axial_normal
-        col_dir = sagittal_normal
-        normal_dir = coronal_normal
-    elif viewport_key == MPR_VIEWPORT_SAGITTAL:
-        row_dir = -axial_normal
-        col_dir = coronal_normal
-        normal_dir = sagittal_normal
-    else:
-        row_dir = coronal_normal
-        col_dir = sagittal_normal
-        normal_dir = axial_normal
-
-    reference = reference_plane or default_mpr_oblique_plane(viewport_key)
-    reference_row = normalize_oblique_vector(reference.row, fallback=tuple(row_dir))
-    reference_col = normalize_oblique_vector(reference.col, fallback=tuple(col_dir))
-    if float(np.dot(row_dir, reference_row)) < 0.0:
-        row_dir = -row_dir
-    if float(np.dot(col_dir, reference_col)) < 0.0:
-        col_dir = -col_dir
-
-    default_plane = default_mpr_oblique_plane(viewport_key)
-    default_normal = normalize_oblique_vector(default_plane.normal, fallback=(0.0, 1.0, 0.0))
-    is_oblique = float(np.linalg.norm(normal_dir - default_normal)) > 1e-6
-    return MprObliquePlaneState(
-        row=tuple(float(value) for value in row_dir),
-        col=tuple(float(value) for value in col_dir),
-        normal=tuple(float(value) for value in normal_dir),
-        is_oblique=is_oblique,
-    )
+    return default_planes.get(viewport_key) or default_planes[MPR_VIEWPORT_AXIAL]
 
 
 def get_mpr_display_basis(viewport_key: str, normal_dir: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

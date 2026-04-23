@@ -94,7 +94,29 @@ class MprFrameInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprCursorInfo(BaseModel):
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    reference_center_world: tuple[float, float, float] = Field(alias="referenceCenterWorld")
+    orientation_world: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] = Field(alias="orientationWorld")
+    linked_to_volume_rotation: bool = Field(default=False, alias="linkedToVolumeRotation")
+
+    model_config = {"populate_by_name": True}
+
+
 class MprPlaneInfo(BaseModel):
+    viewport: str
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    cursor_center_world: tuple[float, float, float] = Field(alias="cursorCenterWorld")
+    row_world: tuple[float, float, float] = Field(alias="rowWorld")
+    col_world: tuple[float, float, float] = Field(alias="colWorld")
+    normal_world: tuple[float, float, float] = Field(alias="normalWorld")
+    pixel_spacing_row_mm: float = Field(alias="pixelSpacingRowMm")
+    pixel_spacing_col_mm: float = Field(alias="pixelSpacingColMm")
+    output_shape: tuple[int, int] = Field(alias="outputShape")
     row: tuple[float, float, float]
     col: tuple[float, float, float]
     normal: tuple[float, float, float]
@@ -221,6 +243,7 @@ class ViewImageResponse(BaseModel):
     image_format: ImageFormat = Field(alias="imageFormat")
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
+    mpr_cursor: MprCursorInfo | None = Field(default=None, alias="mprCursor")
     mpr_frame: MprFrameInfo | None = Field(default=None, alias="mprFrame")
     mpr_plane: MprPlaneInfo | None = Field(default=None, alias="mprPlane")
     scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
