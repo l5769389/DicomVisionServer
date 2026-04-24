@@ -109,7 +109,6 @@ class MprCursorRecord:
 class MprRotationDragRecord:
     viewport: str
     line: str
-    start_angle_rad: float
     start_cursor: MprCursorRecord
 
 

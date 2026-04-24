@@ -75,6 +75,27 @@ def test_reslice_plane_matches_legacy_orthogonal_default_planes() -> None:
     assert np.allclose(sagittal, np.flipud(volume[:, :, 4]), atol=1e-6)
 
 
+def test_derive_plane_pose_uses_stable_display_axes_after_large_axial_rotation() -> None:
+    geometry = build_identity_geometry((5, 6, 7))
+    frame = MprFrameState(
+        center=(2.0, 3.0, 4.0),
+        axis_slice=(1.0, 0.0, 0.0),
+        axis_row=(0.0, -0.1, 0.995),
+        axis_col=(0.0, -0.995, -0.1),
+    )
+    cursor = legacy_frame_to_cursor(frame, geometry, reference_center=frame.center)
+
+    coronal = derive_plane_pose(cursor, "mpr-cor", geometry)
+    sagittal = derive_plane_pose(cursor, "mpr-sag", geometry)
+
+    assert np.allclose(coronal.row_world, [-1.0, 0.0, 0.0], atol=1e-6)
+    assert float(np.dot(coronal.col_world, frame.axis_col)) > 0.999
+    assert np.allclose(sagittal.row_world, [-1.0, 0.0, 0.0], atol=1e-6)
+    assert np.isclose(float(np.dot(sagittal.row_world, sagittal.col_world)), 0.0, atol=1e-6)
+    assert np.isclose(float(np.dot(sagittal.col_world, sagittal.normal_world)), 0.0, atol=1e-6)
+    assert np.isclose(float(np.linalg.norm(sagittal.col_world)), 1.0, atol=1e-6)
+
+
 def test_viewer_service_uses_cursor_as_group_geometry_source() -> None:
     service = ViewerService()
     geometry = build_identity_geometry((5, 6, 7))

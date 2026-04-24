@@ -300,6 +300,7 @@ class ViewOperationRequest(BaseModel):
     y: float | None = None
     line: MprCrosshairLine | None = None
     angle_rad: float | None = Field(default=None, alias="angleRad")
+    delta_angle_rad: float | None = Field(default=None, alias="deltaAngleRad")
     points: list[MeasurementPointPayload] | None = None
     zoom: float | None = None
     delta: int | None = None

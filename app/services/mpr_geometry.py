@@ -105,16 +105,14 @@ def get_mpr_display_basis(viewport_key: str, normal_dir: np.ndarray) -> tuple[np
     canonical_row = normalize_oblique_vector(default_plane.row, fallback=(1.0, 0.0, 0.0))
     canonical_col = normalize_oblique_vector(default_plane.col, fallback=(0.0, 0.0, 1.0))
     normalized_normal = normalize_oblique_vector(normal_dir, fallback=tuple(default_plane.normal))
+    projected_row = canonical_row - float(np.dot(canonical_row, normalized_normal)) * normalized_normal
+    if float(np.linalg.norm(projected_row)) > 1e-8:
+        row_dir = normalize_oblique_vector(projected_row, fallback=tuple(canonical_row))
+        col_dir = normalize_oblique_vector(np.cross(normalized_normal, row_dir), fallback=tuple(canonical_col))
+        return row_dir, col_dir
     projected_col = canonical_col - float(np.dot(canonical_col, normalized_normal)) * normalized_normal
-    if float(np.linalg.norm(projected_col)) <= 1e-8:
-        projected_col = canonical_row - float(np.dot(canonical_row, normalized_normal)) * normalized_normal
     col_dir = normalize_oblique_vector(projected_col, fallback=tuple(canonical_col))
     row_dir = normalize_oblique_vector(np.cross(col_dir, normalized_normal), fallback=tuple(canonical_row))
-    projected_row = canonical_row - float(np.dot(canonical_row, normalized_normal)) * normalized_normal
-    projected_row = normalize_oblique_vector(projected_row, fallback=tuple(canonical_row))
-    if float(np.dot(row_dir, projected_row)) < 0.0:
-        row_dir = -row_dir
-        col_dir = -col_dir
     return row_dir, col_dir
 
 

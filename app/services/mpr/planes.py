@@ -63,6 +63,26 @@ def _project_vector_to_plane(direction: np.ndarray, normal: np.ndarray) -> np.nd
     return projected / norm
 
 
+def _resolve_display_basis_from_normal(
+    normal_world: np.ndarray,
+    default_row_world: np.ndarray,
+    default_col_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    projected_row = _project_vector_to_plane(default_row_world, normal_world)
+    if projected_row is not None:
+        row_world = _normalize_world_vector(projected_row, default_row_world)
+        col_world = _normalize_world_vector(np.cross(normal_world, row_world), default_col_world)
+        return row_world, col_world
+
+    projected_col = _project_vector_to_plane(default_col_world, normal_world)
+    if projected_col is not None:
+        col_world = _normalize_world_vector(projected_col, default_col_world)
+        row_world = _normalize_world_vector(np.cross(col_world, normal_world), default_row_world)
+        return row_world, col_world
+
+    return default_row_world, default_col_world
+
+
 def _resolve_output_shape(geometry: VolumeGeometry, viewport: str, policy: OutputShapePolicy) -> tuple[int, int]:
     if viewport in policy.viewport_shapes:
         return tuple(int(value) for value in policy.viewport_shapes[viewport])
@@ -99,19 +119,16 @@ def derive_plane_pose(
         default_orientation[:, convention.normal_axis_index] * convention.normal_sign,
         np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
     )
-    projected_row = _project_vector_to_plane(default_row_world, normal_world)
-    projected_col = _project_vector_to_plane(default_col_world, normal_world)
-    if projected_row is not None and projected_col is not None:
-        row_world = projected_row
-        orthogonal_col = projected_col - float(np.dot(projected_col, row_world)) * row_world
-        col_world = _normalize_world_vector(orthogonal_col, default_col_world)
-    else:
-        fallback_col = default_col_world - float(np.dot(default_col_world, normal_world)) * normal_world
-        if float(np.linalg.norm(fallback_col)) <= 1e-6:
-            fallback_col = default_row_world - float(np.dot(default_row_world, normal_world)) * normal_world
-        col_world = _normalize_world_vector(fallback_col, default_col_world)
-        row_world = _normalize_world_vector(np.cross(col_world, normal_world), default_row_world)
     is_oblique = float(np.linalg.norm(normal_world - default_normal_world)) > 1e-6
+    if is_oblique:
+        row_world, col_world = _resolve_display_basis_from_normal(
+            normal_world,
+            default_row_world,
+            default_col_world,
+        )
+    else:
+        row_world = default_row_world
+        col_world = default_col_world
     output_shape = _resolve_output_shape(geometry, viewport, policy)
     cursor_center_world = np.asarray(cursor.center_world, dtype=np.float64)
     if is_oblique:

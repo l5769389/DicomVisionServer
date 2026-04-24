@@ -29,11 +29,7 @@ def _normalize_vector(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
 def orthonormalize_matrix(matrix: np.ndarray) -> np.ndarray:
     candidate = np.asarray(matrix, dtype=np.float64)
     u, _, vh = np.linalg.svd(candidate, full_matrices=False)
-    orthonormal = u @ vh
-    if float(np.linalg.det(orthonormal)) < 0.0:
-        u[:, -1] *= -1.0
-        orthonormal = u @ vh
-    return orthonormal
+    return u @ vh
 
 
 def _geometry_axis_orientation(geometry: VolumeGeometry) -> np.ndarray:

@@ -157,14 +157,6 @@ class MprPoseContext:
 
 
 @dataclass(frozen=True)
-class MprRotationDragState:
-    viewport: str
-    line: str
-    start_angle_rad: float
-    start_cursor: MprCursorState
-
-
-@dataclass(frozen=True)
 class ExportedFileResult:
     file_bytes: bytes
     file_name: str
@@ -2403,26 +2395,20 @@ class ViewerService:
             group.oblique_drag_active = True
             group.oblique_source_viewport = active_viewport
             group.oblique_source_line = payload.line
-            if payload.angle_rad is None:
-                current_angles = self._get_mpr_crosshair_line_angles_from_poses(pose_context.poses, active_viewport)
-                start_angle = current_angles[0] if payload.line == "horizontal" else current_angles[1]
-            else:
-                start_angle = float(payload.angle_rad)
             group.rotation_drag = MprRotationDragRecord(
                 viewport=active_viewport,
                 line=payload.line,
-                start_angle_rad=float(start_angle),
                 start_cursor=self._serialize_mpr_cursor_record(pose_context.cursor),
             )
             return False
 
         if payload.action_type == DRAG_ACTION_END:
             was_dragging = group.oblique_drag_active
-            if was_dragging and payload.angle_rad is not None and group.rotation_drag is not None:
+            if was_dragging and payload.delta_angle_rad is not None and group.rotation_drag is not None:
                 self._apply_mpr_rotation_drag(
                     group,
                     group.rotation_drag,
-                    float(payload.angle_rad),
+                    float(payload.delta_angle_rad),
                     pose_context.geometry,
                     volume_shape,
                 )
@@ -2432,22 +2418,19 @@ class ViewerService:
             group.oblique_source_line = payload.line
             return was_dragging
 
-        if payload.action_type != DRAG_ACTION_MOVE or not group.oblique_drag_active or payload.angle_rad is None:
+        if payload.action_type != DRAG_ACTION_MOVE or not group.oblique_drag_active or payload.delta_angle_rad is None:
             return False
         if group.rotation_drag is None:
-            current_angles = self._get_mpr_crosshair_line_angles_from_poses(pose_context.poses, active_viewport)
-            start_angle = current_angles[0] if payload.line == "horizontal" else current_angles[1]
             group.rotation_drag = MprRotationDragRecord(
                 viewport=active_viewport,
                 line=payload.line,
-                start_angle_rad=float(start_angle),
                 start_cursor=self._serialize_mpr_cursor_record(pose_context.cursor),
             )
 
         self._apply_mpr_rotation_drag(
             group,
             group.rotation_drag,
-            float(payload.angle_rad),
+            float(payload.delta_angle_rad),
             pose_context.geometry,
             volume_shape,
         )
@@ -2458,7 +2441,7 @@ class ViewerService:
         self,
         group: ViewGroupRecord,
         drag: MprRotationDragRecord,
-        current_angle_rad: float,
+        delta_angle_rad: float,
         geometry: VolumeGeometry,
         volume_shape: tuple[int, int, int],
     ) -> None:
@@ -2470,11 +2453,20 @@ class ViewerService:
             }
         )
         start_active_plane = derive_plane_pose(start_cursor, drag.viewport, geometry, shape_policy)
+        # The client reports drag deltas in the same screen-space convention used
+        # by the rendered crosshair angles (+Y points downward). The world
+        # cursor rotation uses the opposite handedness for all oblique active
+        # planes. The default sagittal plane is the only non-oblique convention
+        # that already matches the screen delta.
+        if drag.viewport == MPR_VIEWPORT_SAGITTAL and not start_active_plane.is_oblique:
+            effective_delta_angle_rad = float(delta_angle_rad)
+        else:
+            effective_delta_angle_rad = -float(delta_angle_rad)
         next_cursor = rotate_cursor_from_drag(
             start_cursor,
             np.asarray(start_active_plane.normal_world, dtype=np.float64),
-            float(drag.start_angle_rad),
-            float(current_angle_rad),
+            0.0,
+            effective_delta_angle_rad,
         )
         self._sync_group_from_mpr_cursor(group, next_cursor, geometry, volume_shape)
         group.oblique_source_viewport = drag.viewport
@@ -3415,6 +3407,15 @@ class ViewerService:
         )
 
     @staticmethod
+    def _mpr_oblique_orientation_text_for_vector(vector: np.ndarray | None) -> str | None:
+        return ViewerService._orientation_text_for_vector(
+            vector,
+            minimum_magnitude=0.2,
+            max_components=2,
+            axis_priority=(1, 0, 2),
+        )
+
+    @staticmethod
     def _orientation_text_for_vector(
         vector: np.ndarray | None,
         *,
@@ -3602,11 +3603,17 @@ class ViewerService:
             y_vector = -y_vector
         x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
 
+        orientation_text = (
+            self._mpr_oblique_orientation_text_for_vector
+            if ((plane_pose is not None and plane_pose.is_oblique) or resolved_plane.is_oblique)
+            else self._dominant_orientation_text_for_vector
+        )
+
         return OrientationOverlay(
-            top=self._dominant_orientation_text_for_vector(-y_vector),
-            right=self._dominant_orientation_text_for_vector(x_vector),
-            bottom=self._dominant_orientation_text_for_vector(y_vector),
-            left=self._dominant_orientation_text_for_vector(-x_vector),
+            top=orientation_text(-y_vector),
+            right=orientation_text(x_vector),
+            bottom=orientation_text(y_vector),
+            left=orientation_text(-x_vector),
         )
 
     def _resolve_mpr_orientation_screen_axes(
