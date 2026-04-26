@@ -1,4 +1,17 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+class FourDPhaseItem(BaseModel):
+    phase_index: int = Field(alias="phaseIndex")
+    label: str
+    series_id: str | None = Field(default=None, alias="seriesId")
+    image_src: str = Field(default="", alias="imageSrc")
+    viewport_images: dict[str, str] = Field(default_factory=dict, alias="viewportImages")
+    status: Literal["pending", "ready", "error"] = "pending"
+
+    model_config = {"populate_by_name": True}
 
 
 class SeriesSummary(BaseModel):
@@ -12,6 +25,9 @@ class SeriesSummary(BaseModel):
     width: int | None = None
     height: int | None = None
     folder_path: str = Field(alias="folderPath")
+    is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
+    four_d_phase_count: int | None = Field(default=None, alias="fourDPhaseCount")
+    four_d_phases: list[FourDPhaseItem] | None = Field(default=None, alias="fourDPhases")
 
     model_config = {"populate_by_name": True}
 
@@ -31,6 +47,21 @@ class LoadFolderResponse(BaseModel):
 
 class LoadSampleResponse(LoadFolderResponse):
     sample_path: str = Field(alias="samplePath")
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPhasesRequest(BaseModel):
+    series_id: str = Field(alias="seriesId")
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPhasesResponse(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
+    four_d_phase_count: int = Field(default=0, alias="fourDPhaseCount")
+    four_d_phases: list[FourDPhaseItem] = Field(default_factory=list, alias="fourDPhases")
 
     model_config = {"populate_by_name": True}
 

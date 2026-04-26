@@ -6,11 +6,14 @@ from app.schemas.dicom import (
     CornerInfoResponse,
     DicomTagsRequest,
     DicomTagsResponse,
+    FourDPhasesRequest,
+    FourDPhasesResponse,
     LoadFolderRequest,
     LoadFolderResponse,
     LoadSampleResponse,
 )
 from app.services.dicom_tag_service import dicom_tag_service
+from app.services.four_d_service import four_d_service
 from app.services.series_registry import series_registry
 from app.services.viewer_service import viewer_service
 
@@ -40,6 +43,12 @@ async def load_sample_folder() -> LoadSampleResponse:
 @router.post("/cornerInfo", response_model=CornerInfoResponse)
 async def get_corner_info(payload: CornerInfoRequest) -> CornerInfoResponse:
     return viewer_service.get_series_corner_info(payload)
+
+
+@router.post("/fourD/phases", response_model=FourDPhasesResponse)
+async def get_four_d_phases(payload: FourDPhasesRequest) -> FourDPhasesResponse:
+    series_registry.get(payload.series_id)
+    return four_d_service.get_four_d_phases(payload.series_id, series_registry.list_all())
 
 
 @router.post("/tags", response_model=DicomTagsResponse)

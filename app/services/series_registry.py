@@ -6,6 +6,7 @@ from fastapi import HTTPException
 
 from app.models.viewer import InstanceRecord, SeriesRecord
 from app.schemas.dicom import LoadFolderRequest, LoadFolderResponse, SeriesSummary
+from app.services.four_d_service import four_d_service
 
 
 class SeriesRegistry:
@@ -142,6 +143,7 @@ class SeriesRegistry:
             raise HTTPException(status_code=404, detail="No readable DICOM series found in folder")
 
         series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
+        four_d_service.apply_four_d_metadata(series_list, list(grouped.values()))
         series_list.sort(key=lambda item: item.series_id)
         return LoadFolderResponse(seriesId=series_list[0].series_id, seriesList=series_list)
 
