@@ -1,9 +1,14 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 
+from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL
 from app.models.viewer import MprFrameState, ViewGroupRecord, ViewRecord
+from app.schemas.view import ViewOperationRequest
+from app.services import viewer_service as viewer_service_module
 from app.services.mpr import (
+    axis_angle_rotation_matrix,
     build_geometry_from_patient_transform,
     build_identity_geometry,
     create_default_cursor,
@@ -183,3 +188,187 @@ def test_viewer_service_uses_cursor_as_group_geometry_source() -> None:
     assert np.allclose(rebuilt_frame.axis_row, next_frame.axis_row, atol=1e-6)
     assert np.allclose(rebuilt_frame.axis_col, next_frame.axis_col, atol=1e-6)
     assert not np.allclose(rebuilt_cursor.center_world, ijk_to_world_point(geometry, (4.0, 4.0, 4.0)), atol=1e-6)
+
+
+def test_mpr_model_rotation_changes_reslice_without_rotating_cursor() -> None:
+    service = ViewerService()
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+    geometry = build_identity_geometry(volume.shape)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    frame = MprFrameState(
+        center=(2.0, 3.0, 4.0),
+        axis_slice=(1.0, 0.0, 0.0),
+        axis_row=(0.0, 1.0, 0.0),
+        axis_col=(0.0, 0.0, 1.0),
+    )
+    cursor = legacy_frame_to_cursor(frame, geometry, reference_center=frame.center)
+    service._sync_group_from_mpr_cursor(group, cursor, geometry, volume.shape)
+
+    base_plane, _, _ = service._extract_mpr_plane(view, volume, MPR_VIEWPORT_AXIAL)
+    active_plane = service._build_mpr_pose_context(view, volume.shape).poses[MPR_VIEWPORT_AXIAL]
+    service._set_mpr_model_rotation_matrix(
+        group,
+        axis_angle_rotation_matrix(np.asarray(active_plane.normal_world, dtype=np.float64), np.pi / 2.0),
+    )
+    rotated_plane, _, _ = service._extract_mpr_plane(view, volume, MPR_VIEWPORT_AXIAL)
+    resolved_cursor = service._get_mpr_cursor_state(view, geometry, volume.shape)
+
+    assert not np.allclose(rotated_plane, base_plane, atol=1e-6)
+    assert np.allclose(resolved_cursor.orientation_world, cursor.orientation_world, atol=1e-6)
+
+
+def test_mpr_model_rotation_uses_fixed_pivot_when_crosshair_center_moves() -> None:
+    service = ViewerService()
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+    geometry = build_identity_geometry(volume.shape)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    service._reset_mpr_group_geometry(group, volume.shape)
+    pose_context = service._build_mpr_pose_context(view, volume.shape)
+    cursor = pose_context.cursor
+    active_plane = pose_context.poses[MPR_VIEWPORT_AXIAL]
+    service._set_mpr_model_rotation_matrix(
+        group,
+        axis_angle_rotation_matrix(np.asarray(active_plane.normal_world, dtype=np.float64), np.pi / 2.0),
+        pivot_world=active_plane.cursor_center_world,
+    )
+    rotated_before, _, _ = service._extract_mpr_plane(view, volume, MPR_VIEWPORT_AXIAL)
+    origin_x, origin_y = service._project_world_point_to_plane_image(
+        active_plane,
+        active_plane.cursor_center_world,
+    )
+    next_center_world = service._resolve_mpr_center_from_image_point(
+        group,
+        active_plane,
+        geometry,
+        origin_x + 1.0,
+        origin_y,
+    )
+
+    service._sync_group_from_mpr_cursor(
+        group,
+        replace(cursor, center_world=np.asarray(next_center_world, dtype=np.float64)),
+        geometry,
+        volume.shape,
+    )
+    rotated_after, _, _ = service._extract_mpr_plane(view, volume, MPR_VIEWPORT_AXIAL)
+
+    assert not np.allclose(next_center_world, active_plane.cursor_center_world, atol=1e-6)
+    assert np.allclose(rotated_after, rotated_before, atol=1e-6)
+
+
+def test_mpr_rotate3d_drag_updates_model_rotation_without_rotating_cursor(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group, width=240, height=240)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    before_cursor = service._get_mpr_cursor_state(view, build_identity_geometry(volume.shape), volume.shape)
+    active_plane = service._build_mpr_pose_context(view, volume.shape, series=series).poses[MPR_VIEWPORT_AXIAL]
+
+    assert not service._handle_mpr_model_rotate_3d(
+        view,
+        ViewOperationRequest(viewId="v", opType="rotate3d", actionType="start", x=0.5, y=0.25),
+    )
+    assert service._handle_mpr_model_rotate_3d(
+        view,
+        ViewOperationRequest(viewId="v", opType="rotate3d", actionType="move", x=0.75, y=0.5),
+    )
+
+    after_cursor = service._get_mpr_cursor_state(view, build_identity_geometry(volume.shape), volume.shape)
+    rotation_matrix = service._get_mpr_model_rotation_matrix(group)
+    top_direction = -np.asarray(active_plane.row_world, dtype=np.float64)
+    right_direction = np.asarray(active_plane.col_world, dtype=np.float64)
+    normal_direction = np.asarray(active_plane.normal_world, dtype=np.float64)
+    assert float(np.dot(rotation_matrix @ top_direction, -right_direction)) > 0.99
+    assert np.allclose(rotation_matrix @ normal_direction, normal_direction, atol=1e-6)
+    assert np.allclose(after_cursor.orientation_world, before_cursor.orientation_world, atol=1e-6)
+
+
+def test_mpr_crosshair_move_uses_screen_plane_direction_after_model_rotation() -> None:
+    service = ViewerService()
+    volume_shape = (5, 6, 7)
+    geometry = build_identity_geometry(volume_shape)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    service._reset_mpr_group_geometry(group, volume_shape)
+    active_plane = service._build_mpr_pose_context(view, volume_shape).poses[MPR_VIEWPORT_AXIAL]
+    service._set_mpr_model_rotation_matrix(
+        group,
+        axis_angle_rotation_matrix(np.asarray(active_plane.normal_world, dtype=np.float64), np.pi / 2.0),
+    )
+    origin_x, origin_y = service._project_world_point_to_plane_image(
+        active_plane,
+        active_plane.cursor_center_world,
+    )
+
+    next_center_world = service._resolve_mpr_center_from_image_point(
+        group,
+        active_plane,
+        geometry,
+        origin_x + 1.0,
+        origin_y,
+    )
+
+    assert np.allclose(
+        next_center_world - active_plane.cursor_center_world,
+        np.asarray(active_plane.col_world, dtype=np.float64) * active_plane.pixel_spacing_col_mm,
+        atol=1e-6,
+    )
+
+
+def test_mpr_model_rotation_keeps_active_view_labels_and_updates_other_view_labels() -> None:
+    service = ViewerService()
+    volume_shape = (5, 6, 7)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    service._reset_mpr_group_geometry(group, volume_shape)
+    pose_context = service._build_mpr_pose_context(view, volume_shape)
+    axial_plane = pose_context.poses[MPR_VIEWPORT_AXIAL]
+    coronal_plane = pose_context.poses[MPR_VIEWPORT_CORONAL]
+    axial_before = service._build_mpr_orientation_overlay(
+        view,
+        MPR_VIEWPORT_AXIAL,
+        service._plane_state_from_pose(axial_plane),
+        plane_pose=axial_plane,
+    )
+    coronal_before = service._build_mpr_orientation_overlay(
+        view,
+        MPR_VIEWPORT_CORONAL,
+        service._plane_state_from_pose(coronal_plane),
+        plane_pose=coronal_plane,
+    )
+    service._set_mpr_model_rotation_matrix(
+        group,
+        axis_angle_rotation_matrix(np.asarray(axial_plane.normal_world, dtype=np.float64), np.pi / 2.0),
+    )
+
+    axial_after = service._build_mpr_orientation_overlay(
+        view,
+        MPR_VIEWPORT_AXIAL,
+        service._plane_state_from_pose(axial_plane),
+        plane_pose=axial_plane,
+    )
+    coronal_after = service._build_mpr_orientation_overlay(
+        view,
+        MPR_VIEWPORT_CORONAL,
+        service._plane_state_from_pose(coronal_plane),
+        plane_pose=coronal_plane,
+    )
+
+    assert (axial_after.top, axial_after.right, axial_after.bottom, axial_after.left) == (
+        axial_before.top,
+        axial_before.right,
+        axial_before.bottom,
+        axial_before.left,
+    )
+    assert (coronal_after.top, coronal_after.right, coronal_after.bottom, coronal_after.left) != (
+        coronal_before.top,
+        coronal_before.right,
+        coronal_before.bottom,
+        coronal_before.left,
+    )

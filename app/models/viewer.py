@@ -144,6 +144,12 @@ class ViewGroupRecord:
     mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
     rotation_drag: MprRotationDragRecord | None = None
     mpr_reference_center: tuple[float, float, float] | None = None
+    mpr_model_rotation_world: Mat3 = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    mpr_model_rotation_pivot_world: Vec3 | None = None
 
 
 @dataclass

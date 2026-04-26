@@ -107,6 +107,7 @@ from app.services.mpr import (
     OutputShapePolicy,
     PlanePose,
     VolumeGeometry,
+    axis_angle_rotation_matrix,
     build_geometry_from_patient_transform,
     build_identity_geometry,
     create_default_cursor,
@@ -114,6 +115,7 @@ from app.services.mpr import (
     derive_plane_pose,
     ijk_to_world_point,
     legacy_frame_to_cursor,
+    orthonormalize_matrix,
     reslice_plane,
     translate_cursor,
     world_to_ijk_point,
@@ -1463,6 +1465,8 @@ class ViewerService:
         group.rotation_drag = None
         group.mpr_crosshair_angles.clear()
         group.mpr_mip = self._create_default_mpr_mip_state()
+        self._set_mpr_model_rotation_matrix(group, np.eye(3, dtype=np.float64))
+        group.mpr_model_rotation_pivot_world = None
         default_frame = self._build_default_mpr_frame_state(volume_shape)
         geometry = self._get_series_volume_geometry(series, volume_shape) if series is not None else build_identity_geometry(volume_shape)
         default_cursor = legacy_frame_to_cursor(default_frame, geometry, reference_center=default_frame.center)
@@ -1976,9 +1980,14 @@ class ViewerService:
             geometry,
             OutputShapePolicy(viewport_shapes={target_viewport: self._get_mpr_plane_shape(volume.shape, target_viewport)}),
         )
+        sampling_geometry = self._build_mpr_model_sampling_geometry(
+            view,
+            geometry,
+            pivot_world=cursor.center_world,
+        )
         plane = reslice_plane(
             volume,
-            geometry,
+            sampling_geometry,
             plane_pose,
             self._build_reslice_mip_config(view.mpr_mip, target_viewport),
         )
@@ -1996,6 +2005,98 @@ class ViewerService:
     ) -> tuple[np.ndarray, int, int]:
         del plane_state
         return self._extract_mpr_plane(view, volume, viewport_key)
+
+    def _build_mpr_model_sampling_geometry(
+        self,
+        view: ViewRecord,
+        geometry: VolumeGeometry,
+        *,
+        pivot_world: np.ndarray,
+    ) -> VolumeGeometry:
+        group = view.view_group
+        if group is None:
+            return geometry
+
+        rotation_world = self._get_mpr_model_rotation_matrix(group)
+        if np.allclose(rotation_world, np.eye(3, dtype=np.float64), atol=1e-8):
+            return geometry
+
+        if group.mpr_model_rotation_pivot_world is None:
+            self._set_mpr_model_rotation_pivot_world(group, pivot_world)
+        pivot = self._get_mpr_model_rotation_pivot_world(group, pivot_world)
+        inverse_rotation = rotation_world.T
+        inverse_model_transform = np.eye(4, dtype=np.float64)
+        inverse_model_transform[:3, :3] = inverse_rotation
+        inverse_model_transform[:3, 3] = pivot - inverse_rotation @ pivot
+        world_to_ijk = np.asarray(geometry.world_to_ijk, dtype=np.float64) @ inverse_model_transform
+        return VolumeGeometry(
+            shape_ijk=geometry.shape_ijk,
+            ijk_to_world=np.linalg.inv(world_to_ijk),
+            world_to_ijk=world_to_ijk,
+            spacing_hint_mm=geometry.spacing_hint_mm,
+        )
+
+    @staticmethod
+    def _get_mpr_model_rotation_matrix(group: ViewGroupRecord) -> np.ndarray:
+        matrix = np.asarray(group.mpr_model_rotation_world, dtype=np.float64)
+        if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+            return np.eye(3, dtype=np.float64)
+        return orthonormalize_matrix(matrix)
+
+    @staticmethod
+    def _get_mpr_model_rotation_pivot_world(group: ViewGroupRecord, fallback_world: np.ndarray) -> np.ndarray:
+        if group.mpr_model_rotation_pivot_world is not None:
+            pivot = np.asarray(group.mpr_model_rotation_pivot_world, dtype=np.float64)
+            if pivot.shape == (3,) and np.all(np.isfinite(pivot)):
+                return pivot
+        return np.asarray(fallback_world, dtype=np.float64)
+
+    @staticmethod
+    def _set_mpr_model_rotation_pivot_world(group: ViewGroupRecord, pivot_world: np.ndarray) -> None:
+        pivot = np.asarray(pivot_world, dtype=np.float64)
+        if pivot.shape != (3,) or not np.all(np.isfinite(pivot)):
+            return
+        group.mpr_model_rotation_pivot_world = tuple(float(value) for value in pivot)
+
+    @staticmethod
+    def _set_mpr_model_rotation_matrix(
+        group: ViewGroupRecord,
+        matrix: np.ndarray,
+        *,
+        pivot_world: np.ndarray | None = None,
+    ) -> None:
+        normalized = orthonormalize_matrix(np.asarray(matrix, dtype=np.float64))
+        group.mpr_model_rotation_world = tuple(
+            tuple(float(value) for value in normalized[row_index])
+            for row_index in range(3)
+        )
+        if np.allclose(normalized, np.eye(3, dtype=np.float64), atol=1e-8):
+            group.mpr_model_rotation_pivot_world = None
+        elif pivot_world is not None and group.mpr_model_rotation_pivot_world is None:
+            ViewerService._set_mpr_model_rotation_pivot_world(group, pivot_world)
+
+    @staticmethod
+    def _get_mpr_model_source_direction(group: ViewGroupRecord | None, direction_world: np.ndarray) -> np.ndarray:
+        direction = np.asarray(direction_world, dtype=np.float64)
+        if group is None:
+            return direction
+        return ViewerService._get_mpr_model_rotation_matrix(group).T @ direction
+
+    @staticmethod
+    def _should_apply_mpr_model_rotation_to_plane_labels(
+        group: ViewGroupRecord | None,
+        plane_pose: PlanePose | None,
+    ) -> bool:
+        if group is None or plane_pose is None:
+            return False
+        rotation = ViewerService._get_mpr_model_rotation_matrix(group)
+        if np.allclose(rotation, np.eye(3, dtype=np.float64), atol=1e-8):
+            return False
+        normal = mpr_geometry.normalize_oblique_vector(
+            np.asarray(plane_pose.normal_world, dtype=np.float64),
+            fallback=(1.0, 0.0, 0.0),
+        )
+        return not np.allclose(rotation @ normal, normal, atol=1e-6)
 
     @staticmethod
     def _normalize_oblique_vector(
@@ -2136,6 +2237,98 @@ class ViewerService:
         if payload.action_type == DRAG_ACTION_END:
             view.drag_origin_offset_x = None
             view.drag_origin_offset_y = None
+
+    def _handle_mpr_model_rotate_3d(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_mpr_view_type(view.view_type) or view.view_group is None:
+            return False
+        if payload.action_type not in {DRAG_ACTION_START, DRAG_ACTION_MOVE, DRAG_ACTION_END}:
+            return False
+        if payload.x is None or payload.y is None or not view.width or not view.height:
+            if payload.action_type == DRAG_ACTION_END:
+                was_dragging = view.drag_origin_arcball_x is not None
+                view.drag_origin_arcball_x = None
+                view.drag_origin_arcball_y = None
+                return was_dragging
+            return False
+
+        group = view.view_group
+        series = series_registry.get(view.series_id)
+        volume_shape = self._get_series_volume(series).shape
+        pose_context = self._build_mpr_pose_context(view, volume_shape, series=series)
+        active_viewport = self._resolve_mpr_viewport(view)
+        active_plane = pose_context.poses[active_viewport]
+        plane_shape = active_plane.output_shape
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(active_plane)
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=int(plane_shape[1]),
+            image_height=int(plane_shape[0]),
+            canvas_width=int(view.width or 0),
+            canvas_height=int(view.height or 0),
+            view=view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        pointer_angle_rad = self._resolve_mpr_rotation_pointer_angle(
+            view,
+            active_plane,
+            image_transform,
+            float(payload.x),
+            float(payload.y),
+        )
+        group.active_viewport = active_viewport
+
+        if payload.action_type == DRAG_ACTION_START:
+            view.drag_origin_arcball_x = pointer_angle_rad
+            view.drag_origin_arcball_y = None
+            if group.mpr_model_rotation_pivot_world is None:
+                self._set_mpr_model_rotation_pivot_world(group, active_plane.cursor_center_world)
+            return False
+
+        previous_angle_rad = view.drag_origin_arcball_x
+        if payload.action_type == DRAG_ACTION_END:
+            view.drag_origin_arcball_x = None
+            view.drag_origin_arcball_y = None
+        elif pointer_angle_rad is not None:
+            view.drag_origin_arcball_x = pointer_angle_rad
+
+        if previous_angle_rad is None:
+            if pointer_angle_rad is not None and payload.action_type != DRAG_ACTION_END:
+                view.drag_origin_arcball_x = pointer_angle_rad
+            return False
+        if pointer_angle_rad is None:
+            return payload.action_type == DRAG_ACTION_END
+
+        delta_angle_rad = self._normalize_screen_full_turn_delta(
+            float(pointer_angle_rad) - float(previous_angle_rad)
+        )
+        if abs(delta_angle_rad) < 1e-6:
+            return payload.action_type == DRAG_ACTION_END
+
+        self._apply_mpr_model_rotation_delta(
+            view.view_group,
+            active_plane,
+            screen_angle_delta_rad=delta_angle_rad,
+        )
+        view.is_initialized = True
+        return True
+
+    def _apply_mpr_model_rotation_delta(
+        self,
+        group: ViewGroupRecord,
+        active_plane: PlanePose,
+        *,
+        screen_angle_delta_rad: float,
+    ) -> None:
+        rotation_axis_world = mpr_geometry.normalize_oblique_vector(
+            np.asarray(active_plane.normal_world, dtype=np.float64),
+            fallback=(1.0, 0.0, 0.0),
+        )
+        delta_rotation = axis_angle_rotation_matrix(rotation_axis_world, float(screen_angle_delta_rad))
+        self._set_mpr_model_rotation_matrix(
+            group,
+            delta_rotation @ self._get_mpr_model_rotation_matrix(group),
+            pivot_world=active_plane.cursor_center_world,
+        )
 
     def _handle_drag_rotate_3d(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if payload.action_type not in {DRAG_ACTION_START, DRAG_ACTION_MOVE, DRAG_ACTION_END}:
@@ -3714,18 +3907,42 @@ class ViewerService:
         except Exception:
             series = None
         transform = self._get_series_patient_transform(series) if series is not None else None
+        use_model_label_directions = self._should_apply_mpr_model_rotation_to_plane_labels(
+            view.view_group,
+            plane_pose,
+        )
         if plane_pose is not None and transform is not None:
+            col_world = (
+                self._get_mpr_model_source_direction(view.view_group, plane_pose.col_world)
+                if use_model_label_directions
+                else plane_pose.col_world
+            )
+            row_world = (
+                self._get_mpr_model_source_direction(view.view_group, plane_pose.row_world)
+                if use_model_label_directions
+                else plane_pose.row_world
+            )
             x_vector = mpr_geometry.normalize_patient_vector(
-                plane_pose.col_world,
+                col_world,
                 fallback=np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
             )
             y_vector = mpr_geometry.normalize_patient_vector(
-                plane_pose.row_world,
+                row_world,
                 fallback=np.asarray([0.0, 0.0, -1.0], dtype=np.float64),
             )
         elif plane_pose is not None:
-            x_vector = mpr_geometry.fallback_volume_direction_to_patient_vector(plane_pose.col_world)
-            y_vector = mpr_geometry.fallback_volume_direction_to_patient_vector(plane_pose.row_world)
+            col_world = (
+                self._get_mpr_model_source_direction(view.view_group, plane_pose.col_world)
+                if use_model_label_directions
+                else plane_pose.col_world
+            )
+            row_world = (
+                self._get_mpr_model_source_direction(view.view_group, plane_pose.row_world)
+                if use_model_label_directions
+                else plane_pose.row_world
+            )
+            x_vector = mpr_geometry.fallback_volume_direction_to_patient_vector(col_world)
+            y_vector = mpr_geometry.fallback_volume_direction_to_patient_vector(row_world)
         elif transform is not None:
             x_vector = mpr_geometry.normalize_patient_vector(
                 transform.direction_step_to_patient(resolved_plane.col),
@@ -3747,7 +3964,7 @@ class ViewerService:
 
         orientation_text = (
             self._mpr_oblique_orientation_text_for_vector
-            if ((plane_pose is not None and plane_pose.is_oblique) or resolved_plane.is_oblique)
+            if use_model_label_directions or ((plane_pose is not None and plane_pose.is_oblique) or resolved_plane.is_oblique)
             else self._dominant_orientation_text_for_vector
         )
 

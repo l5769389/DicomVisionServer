@@ -244,7 +244,13 @@ def _handle_rotate_3d_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series, is_mpr_view
+    del series
+    if is_mpr_view:
+        if not service._handle_mpr_model_rotate_3d(view, payload):
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_broadcast("jpeg", fast_preview=True)
+        return _render_broadcast()
     service._handle_drag_rotate_3d(view, payload)
     return _resolve_drag_single_render_decision(service, view, payload, fast_preview_on_move=True)
 
