@@ -110,6 +110,8 @@ class MprRotationDragRecord:
     viewport: str
     line: str
     start_cursor: MprCursorRecord
+    start_pointer_angle_rad: float = 0.0
+    start_line_angle_rad: float = 0.0
 
 
 def create_default_mpr_frame_state() -> MprFrameState:
@@ -137,11 +139,9 @@ class ViewGroupRecord:
     crosshair_drag_active: bool = False
     crosshair_drag_origin_center: tuple[float, float, float] | None = None
     crosshair_drag_origin_image: tuple[float, float] | None = None
-    oblique_drag_active: bool = False
-    oblique_source_viewport: str | None = None
-    oblique_source_line: str | None = None
     mpr_mip: MprMipState = field(default_factory=MprMipState)
     mpr_cursor: MprCursorRecord | None = None
+    mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
     rotation_drag: MprRotationDragRecord | None = None
     mpr_reference_center: tuple[float, float, float] | None = None
 

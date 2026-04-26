@@ -127,32 +127,6 @@ def direction_from_screen_angle(active_row: np.ndarray, active_col: np.ndarray, 
     )
 
 
-def build_mpr_oblique_line_direction(active_row: np.ndarray, active_col: np.ndarray, angle_rad: float, *, line: str) -> np.ndarray:
-    del line
-    normalized_angle = normalize_screen_half_turn_angle(angle_rad)
-    return direction_from_screen_angle(active_row, active_col, normalized_angle)
-
-
-def resolve_mpr_crosshair_line_angle(
-    current_normal: np.ndarray,
-    current_row: np.ndarray,
-    current_col: np.ndarray,
-    target_plane: MprObliquePlaneState,
-    *,
-    fallback: float,
-) -> float:
-    target_normal = normalize_oblique_vector(target_plane.normal, fallback=tuple(current_col))
-    line_dir = normalize_oblique_vector(np.cross(current_normal, target_normal), fallback=tuple(current_col))
-    col_component = float(np.dot(line_dir, current_col))
-    row_component = float(np.dot(line_dir, current_row))
-    if not np.isfinite(col_component) or not np.isfinite(row_component):
-        return fallback
-    magnitude = float(np.hypot(col_component, row_component))
-    if magnitude <= 1e-8:
-        return fallback
-    return normalize_screen_half_turn_angle(np.arctan2(row_component, col_component))
-
-
 def project_vector_to_plane(direction: np.ndarray, normal: np.ndarray) -> np.ndarray | None:
     projected = np.asarray(direction, dtype=np.float64) - float(np.dot(direction, normal)) * normal
     norm = float(np.linalg.norm(projected))

@@ -103,6 +103,7 @@ from app.services.measurement_utils import build_measurement_metrics, clamp_poin
 from app.services.mpr import (
     MipConfig as ResliceMipConfig,
     MprCursorState,
+    DEFAULT_MPR_CONVENTION,
     OutputShapePolicy,
     PlanePose,
     VolumeGeometry,
@@ -114,7 +115,6 @@ from app.services.mpr import (
     ijk_to_world_point,
     legacy_frame_to_cursor,
     reslice_plane,
-    rotate_cursor_from_drag,
     translate_cursor,
     world_to_ijk_point,
 )
@@ -891,8 +891,9 @@ class ViewerService:
             target_viewport = self._resolve_mpr_viewport(view)
             volume = self._get_series_volume(series)
             pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
-            plane_state = self._plane_state_from_pose(pose_context.poses[target_viewport]) if view.view_group is not None else None
-            pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport, plane_state)
+            pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(
+                pose_context.poses[target_viewport]
+            )
         render_plan = self._build_render_plan_for_shape(
             view,
             image_height,
@@ -971,10 +972,9 @@ class ViewerService:
             target_viewport = self._resolve_mpr_viewport(view)
             plane_pixels, current_index, _ = self._extract_mpr_plane(view, volume, target_viewport)
             pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
-            plane_state = self._plane_state_from_pose(pose_context.poses[target_viewport]) if view.view_group is not None else None
             return (
                 plane_pixels,
-                self._get_mpr_spacing_xy(series, target_viewport, plane_state),
+                self._get_mpr_spacing_xy_from_pose(pose_context.poses[target_viewport]),
                 MeasurementSliceContext(kind="mpr", slice_index=current_index),
             )
 
@@ -1264,6 +1264,17 @@ class ViewerService:
             max(abs(float(spacing_xy[1])), 1e-6),
         )
 
+    @staticmethod
+    def _get_mpr_spacing_xy_from_pose(plane_pose: PlanePose) -> tuple[float, float]:
+        return (
+            max(abs(float(plane_pose.pixel_spacing_col_mm)), 1e-6),
+            max(abs(float(plane_pose.pixel_spacing_row_mm)), 1e-6),
+        )
+
+    @staticmethod
+    def _get_mpr_display_aspect_xy_from_pose(plane_pose: PlanePose) -> tuple[float, float]:
+        return ViewerService._get_mpr_spacing_xy_from_pose(plane_pose)
+
     def _render_by_view_type(
         self,
         view: ViewRecord,
@@ -1449,14 +1460,14 @@ class ViewerService:
         group.crosshair_drag_active = False
         group.crosshair_drag_origin_center = None
         group.crosshair_drag_origin_image = None
-        group.oblique_drag_active = False
         group.rotation_drag = None
+        group.mpr_crosshair_angles.clear()
         group.mpr_mip = self._create_default_mpr_mip_state()
         default_frame = self._build_default_mpr_frame_state(volume_shape)
         geometry = self._get_series_volume_geometry(series, volume_shape) if series is not None else build_identity_geometry(volume_shape)
         default_cursor = legacy_frame_to_cursor(default_frame, geometry, reference_center=default_frame.center)
         self._sync_group_from_mpr_cursor(group, default_cursor, geometry, volume_shape)
-        self._reset_mpr_oblique_state(group)
+        self._reset_mpr_rotation_state(group)
 
     def _reset_mpr_view_display_state(self, view: ViewRecord) -> None:
         view.current_index = view.mpr_axial_index
@@ -1485,8 +1496,9 @@ class ViewerService:
         plane_pixels, _, _ = self._extract_mpr_plane(view, volume)
         target_viewport = self._resolve_mpr_viewport(view)
         pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
-        plane_state = self._plane_state_from_pose(pose_context.poses[target_viewport]) if view.view_group is not None else None
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport, plane_state)
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(
+            pose_context.poses[target_viewport]
+        )
         view.zoom = viewport_transformer.calculate_contain_zoom(
             image_width=plane_pixels.shape[1],
             image_height=plane_pixels.shape[0],
@@ -1688,8 +1700,9 @@ class ViewerService:
         target_viewport = self._resolve_mpr_viewport(view)
         plane_pixels, current, total = self._extract_mpr_plane(view, volume, target_viewport)
         payload_pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
-        plane_state = self._plane_state_from_pose(payload_pose_context.poses[target_viewport]) if view.view_group is not None else None
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(series, target_viewport, plane_state)
+        target_plane_pose = payload_pose_context.poses[target_viewport]
+        plane_state = self._plane_state_from_pose(target_plane_pose) if view.view_group is not None else None
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(target_plane_pose)
         render_plan = self._build_render_plan_for_shape(
             view,
             *plane_pixels.shape[:2],
@@ -1708,7 +1721,7 @@ class ViewerService:
         scale_bar = self._build_scale_bar_info(
             render_plan.render_view,
             image_transform,
-            self._get_mpr_spacing_xy(series, target_viewport, plane_state),
+            self._get_mpr_spacing_xy_from_pose(target_plane_pose),
         )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
@@ -1727,7 +1740,7 @@ class ViewerService:
             total_slices=total,
             viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
             plane_state=plane_state,
-            plane_pose=payload_pose_context.poses[target_viewport],
+            plane_pose=target_plane_pose,
             cursor=payload_pose_context.cursor,
         )
         context = RenderContext(
@@ -1762,7 +1775,7 @@ class ViewerService:
                 mprPlane=self._build_mpr_plane_payload(
                     view,
                     target_viewport,
-                    plane_pose=payload_pose_context.poses[target_viewport],
+                    plane_pose=target_plane_pose,
                 ),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
@@ -1780,7 +1793,7 @@ class ViewerService:
                         render_plan.render_view,
                         target_viewport,
                         plane_state,
-                        plane_pose=payload_pose_context.poses[target_viewport],
+                        plane_pose=target_plane_pose,
                     )
                 ),
             ),
@@ -2007,9 +2020,9 @@ class ViewerService:
             )
         return group.mpr_reference_center
 
-    def _reset_mpr_oblique_state(self, group: ViewGroupRecord) -> None:
-        group.oblique_source_viewport = None
-        group.oblique_source_line = None
+    @staticmethod
+    def _reset_mpr_rotation_state(group: ViewGroupRecord) -> None:
+        group.rotation_drag = None
 
     @staticmethod
     def _get_mpr_viewport_index_info(
@@ -2251,15 +2264,13 @@ class ViewerService:
         if not view.width or not view.height:
             raise HTTPException(status_code=400, detail="View size has not been set")
 
-        volume = self._get_series_volume(series_registry.get(view.series_id))
+        series = series_registry.get(view.series_id)
+        volume = self._get_series_volume(series)
         target_viewport = self._resolve_mpr_viewport(view)
-        plane_shape = self._get_mpr_plane_shape(volume.shape, target_viewport)
-        pose_context = self._build_mpr_pose_context(view, volume.shape, series=series_registry.get(view.series_id))
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy(
-            series_registry.get(view.series_id),
-            target_viewport,
-            self._plane_state_from_pose(pose_context.poses[target_viewport]) if view.view_group is not None else None,
-        )
+        pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
+        active_plane = pose_context.poses[target_viewport]
+        plane_shape = active_plane.output_shape
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(active_plane)
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_shape[1],
             image_height=plane_shape[0],
@@ -2382,6 +2393,12 @@ class ViewerService:
             return False
         if payload.line not in {"horizontal", "vertical"}:
             return False
+        if payload.x is None or payload.y is None:
+            if payload.action_type == DRAG_ACTION_END:
+                was_dragging = view.view_group.rotation_drag is not None
+                view.view_group.rotation_drag = None
+                return was_dragging
+            return False
 
         group = view.view_group
         series = series_registry.get(view.series_id)
@@ -2390,58 +2407,104 @@ class ViewerService:
         self._ensure_mpr_reference_center(group, volume_shape)
         active_viewport = self._resolve_mpr_viewport(view)
         group.active_viewport = active_viewport
+        active_plane = pose_context.poses[active_viewport]
+        plane_shape = active_plane.output_shape
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(active_plane)
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=int(plane_shape[1]),
+            image_height=int(plane_shape[0]),
+            canvas_width=int(view.width or 0),
+            canvas_height=int(view.height or 0),
+            view=view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        pointer_angle_rad = self._resolve_mpr_rotation_pointer_angle(
+            view,
+            active_plane,
+            image_transform,
+            float(payload.x),
+            float(payload.y),
+        )
+        if pointer_angle_rad is None:
+            if payload.action_type == DRAG_ACTION_END:
+                was_dragging = group.rotation_drag is not None
+                group.rotation_drag = None
+                return was_dragging
+            return False
 
         if payload.action_type == DRAG_ACTION_START:
-            group.oblique_drag_active = True
-            group.oblique_source_viewport = active_viewport
-            group.oblique_source_line = payload.line
+            self._ensure_mpr_crosshair_angle_cache(group, pose_context.poses)
+            start_horizontal_angle, start_vertical_angle = self._get_mpr_visible_crosshair_line_angles(
+                group,
+                pose_context.poses,
+                active_viewport,
+            )
             group.rotation_drag = MprRotationDragRecord(
                 viewport=active_viewport,
                 line=payload.line,
                 start_cursor=self._serialize_mpr_cursor_record(pose_context.cursor),
+                start_pointer_angle_rad=pointer_angle_rad,
+                start_line_angle_rad=start_horizontal_angle if payload.line == "horizontal" else start_vertical_angle,
             )
             return False
 
         if payload.action_type == DRAG_ACTION_END:
-            was_dragging = group.oblique_drag_active
-            if was_dragging and payload.delta_angle_rad is not None and group.rotation_drag is not None:
-                self._apply_mpr_rotation_drag(
+            was_dragging = group.rotation_drag is not None
+            if was_dragging and group.rotation_drag is not None:
+                self._apply_mpr_rotation_pointer_drag(
                     group,
                     group.rotation_drag,
-                    float(payload.delta_angle_rad),
+                    pointer_angle_rad,
                     pose_context.geometry,
                     volume_shape,
                 )
-            group.oblique_drag_active = False
             group.rotation_drag = None
-            group.oblique_source_viewport = active_viewport
-            group.oblique_source_line = payload.line
             return was_dragging
 
-        if payload.action_type != DRAG_ACTION_MOVE or not group.oblique_drag_active or payload.delta_angle_rad is None:
+        if payload.action_type != DRAG_ACTION_MOVE or group.rotation_drag is None:
             return False
-        if group.rotation_drag is None:
-            group.rotation_drag = MprRotationDragRecord(
-                viewport=active_viewport,
-                line=payload.line,
-                start_cursor=self._serialize_mpr_cursor_record(pose_context.cursor),
-            )
 
-        self._apply_mpr_rotation_drag(
+        self._apply_mpr_rotation_pointer_drag(
             group,
             group.rotation_drag,
-            float(payload.delta_angle_rad),
+            pointer_angle_rad,
             pose_context.geometry,
             volume_shape,
         )
         view.is_initialized = True
         return True
 
-    def _apply_mpr_rotation_drag(
+    def _resolve_mpr_rotation_pointer_angle(
+        self,
+        view: ViewRecord,
+        active_plane: PlanePose,
+        image_transform,
+        normalized_x: float,
+        normalized_y: float,
+    ) -> float | None:
+        canvas_width = float(view.width or 0)
+        canvas_height = float(view.height or 0)
+        if canvas_width <= 0.0 or canvas_height <= 0.0:
+            return None
+        canvas_x = min(max(float(normalized_x) * canvas_width, 0.0), max(canvas_width - 1e-6, 0.0))
+        canvas_y = min(max(float(normalized_y) * canvas_height, 0.0), max(canvas_height - 1e-6, 0.0))
+        center_image_x, center_image_y = self._project_world_point_to_plane_image(
+            active_plane,
+            active_plane.cursor_center_world,
+        )
+        center_canvas = image_transform.matrix @ np.array([center_image_x, center_image_y, 1.0], dtype=np.float64)
+        delta_x = canvas_x - float(center_canvas[0])
+        delta_y = canvas_y - float(center_canvas[1])
+        if float(np.hypot(delta_x, delta_y)) <= 1e-6:
+            return None
+        return float(np.arctan2(delta_y, delta_x))
+
+    def _apply_mpr_rotation_pointer_drag(
         self,
         group: ViewGroupRecord,
         drag: MprRotationDragRecord,
-        delta_angle_rad: float,
+        pointer_angle_rad: float,
         geometry: VolumeGeometry,
         volume_shape: tuple[int, int, int],
     ) -> None:
@@ -2452,43 +2515,121 @@ class ViewerService:
                 for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
             }
         )
-        start_active_plane = derive_plane_pose(start_cursor, drag.viewport, geometry, shape_policy)
-        # The client reports drag deltas in the same screen-space convention used
-        # by the rendered crosshair angles (+Y points downward). The world
-        # cursor rotation uses the opposite handedness for all oblique active
-        # planes. The default sagittal plane is the only non-oblique convention
-        # that already matches the screen delta.
-        if drag.viewport == MPR_VIEWPORT_SAGITTAL and not start_active_plane.is_oblique:
-            effective_delta_angle_rad = float(delta_angle_rad)
-        else:
-            effective_delta_angle_rad = -float(delta_angle_rad)
-        next_cursor = rotate_cursor_from_drag(
-            start_cursor,
-            np.asarray(start_active_plane.normal_world, dtype=np.float64),
-            0.0,
-            effective_delta_angle_rad,
+        start_poses = {
+            viewport_key: derive_plane_pose(start_cursor, viewport_key, geometry, shape_policy)
+            for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+        }
+        start_active_plane = start_poses[drag.viewport]
+        active_normal = np.asarray(start_active_plane.normal_world, dtype=np.float64)
+        active_row = np.asarray(start_active_plane.row_world, dtype=np.float64)
+        active_col = np.asarray(start_active_plane.col_world, dtype=np.float64)
+        target_line_angle_rad = float(drag.start_line_angle_rad) + self._normalize_screen_full_turn_delta(
+            float(pointer_angle_rad) - float(drag.start_pointer_angle_rad)
         )
+        self._set_mpr_visible_crosshair_line_angles(group, drag.viewport, drag.line, target_line_angle_rad)
+        target_line_world = mpr_geometry.direction_from_screen_angle(
+            active_row,
+            active_col,
+            target_line_angle_rad,
+        )
+        perpendicular_line_world = mpr_geometry.direction_from_screen_angle(
+            active_row,
+            active_col,
+            target_line_angle_rad
+            + (float(np.pi / 2.0) if drag.line == "horizontal" else -float(np.pi / 2.0)),
+        )
+
+        line_directions = {
+            drag.line: target_line_world,
+            self._resolve_perpendicular_crosshair_line(drag.line): perpendicular_line_world,
+        }
+        normal_updates: dict[str, np.ndarray] = {}
+        for line, line_world in line_directions.items():
+            target_viewport = self._resolve_mpr_oblique_target_viewport(drag.viewport, line)
+            start_target_plane = start_poses[target_viewport]
+            next_target_normal = mpr_geometry.normalize_oblique_vector(
+                np.cross(line_world, active_normal),
+                fallback=tuple(start_target_plane.normal_world),
+            )
+            if float(np.dot(next_target_normal, np.asarray(start_target_plane.normal_world, dtype=np.float64))) < 0.0:
+                next_target_normal = -next_target_normal
+            normal_updates[target_viewport] = next_target_normal
+
+        next_cursor = self._replace_mpr_cursor_plane_normals(start_cursor, normal_updates)
         self._sync_group_from_mpr_cursor(group, next_cursor, geometry, volume_shape)
-        group.oblique_source_viewport = drag.viewport
-        group.oblique_source_line = drag.line
+
+    @staticmethod
+    def _replace_mpr_cursor_plane_normals(
+        cursor: MprCursorState,
+        normal_updates: dict[str, np.ndarray],
+    ) -> MprCursorState:
+        orientation = np.asarray(cursor.orientation_world, dtype=np.float64).copy()
+        for viewport_key, normal_world in normal_updates.items():
+            convention = DEFAULT_MPR_CONVENTION.get(viewport_key, DEFAULT_MPR_CONVENTION[MPR_VIEWPORT_AXIAL])
+            normalized_normal = mpr_geometry.normalize_oblique_vector(
+                normal_world,
+                fallback=tuple(orientation[:, convention.normal_axis_index]),
+            )
+            orientation[:, convention.normal_axis_index] = normalized_normal / float(convention.normal_sign)
+        return replace(cursor, orientation_world=orientation)
 
     @staticmethod
     def _resolve_perpendicular_crosshair_line(line: str) -> str:
         return "vertical" if line == "horizontal" else "horizontal"
 
-    def _build_mpr_oblique_line_direction(
-        self,
-        active_row: np.ndarray,
-        active_col: np.ndarray,
-        angle_rad: float,
-        *,
-        line: str,
-    ) -> np.ndarray:
-        return mpr_geometry.build_mpr_oblique_line_direction(active_row, active_col, angle_rad, line=line)
-
     @staticmethod
     def _normalize_screen_half_turn_angle(angle_rad: float) -> float:
         return mpr_geometry.normalize_screen_half_turn_angle(angle_rad)
+
+    def _ensure_mpr_crosshair_angle_cache(
+        self,
+        group: ViewGroupRecord,
+        poses: dict[str, PlanePose],
+    ) -> None:
+        for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL):
+            if viewport_key in group.mpr_crosshair_angles:
+                continue
+            group.mpr_crosshair_angles[viewport_key] = self._get_mpr_crosshair_line_angles_from_poses(
+                poses,
+                viewport_key,
+            )
+
+    def _get_mpr_visible_crosshair_line_angles(
+        self,
+        group: ViewGroupRecord | None,
+        poses: dict[str, PlanePose],
+        viewport_key: str,
+    ) -> tuple[float, float]:
+        cached_angles = group.mpr_crosshair_angles.get(viewport_key) if group is not None else None
+        if cached_angles is not None:
+            return (
+                self._normalize_screen_half_turn_angle(float(cached_angles[0])),
+                self._normalize_screen_half_turn_angle(float(cached_angles[1])),
+            )
+        return self._get_mpr_crosshair_line_angles_from_poses(poses, viewport_key)
+
+    def _set_mpr_visible_crosshair_line_angles(
+        self,
+        group: ViewGroupRecord,
+        viewport_key: str,
+        line: str,
+        line_angle_rad: float,
+    ) -> None:
+        if line == "horizontal":
+            horizontal_angle = self._normalize_screen_half_turn_angle(line_angle_rad)
+            vertical_angle = self._normalize_screen_half_turn_angle(line_angle_rad + float(np.pi / 2.0))
+        else:
+            vertical_angle = self._normalize_screen_half_turn_angle(line_angle_rad)
+            horizontal_angle = self._normalize_screen_half_turn_angle(line_angle_rad - float(np.pi / 2.0))
+        group.mpr_crosshair_angles[viewport_key] = (horizontal_angle, vertical_angle)
+
+    @staticmethod
+    def _normalize_screen_full_turn_delta(angle_rad: float) -> float:
+        full_turn = float(np.pi * 2.0)
+        delta = (float(angle_rad) + float(np.pi)) % full_turn - float(np.pi)
+        if delta <= -float(np.pi):
+            delta += full_turn
+        return delta
 
     def _get_mpr_display_basis(
         self,
@@ -2697,7 +2838,8 @@ class ViewerService:
             series = None
         pose_context = self._build_mpr_pose_context(view, volume_shape, series=series)
         plane_pose = pose_context.poses[target_viewport]
-        horizontal_angle, vertical_angle = self._get_mpr_crosshair_line_angles_from_poses(
+        horizontal_angle, vertical_angle = self._get_mpr_visible_crosshair_line_angles(
+            view.view_group,
             pose_context.poses,
             target_viewport,
         )

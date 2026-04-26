@@ -7,7 +7,6 @@ from .cursor import (
     legacy_frame_to_cursor,
     orthonormalize_matrix,
     rotate_cursor,
-    rotate_cursor_from_drag,
     translate_cursor,
 )
 from .geometry import (
@@ -48,7 +47,6 @@ __all__ = [
     "orthonormalize_matrix",
     "reslice_plane",
     "rotate_cursor",
-    "rotate_cursor_from_drag",
     "spacing_along_world_direction",
     "translate_cursor",
     "world_to_ijk_point",

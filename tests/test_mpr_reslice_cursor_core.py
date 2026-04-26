@@ -1,14 +1,19 @@
+from dataclasses import replace
+
 import numpy as np
 
 from app.models.viewer import MprFrameState, ViewGroupRecord, ViewRecord
 from app.services.mpr import (
+    build_geometry_from_patient_transform,
     build_identity_geometry,
+    create_default_cursor,
     cursor_to_legacy_frame,
     derive_plane_pose,
     ijk_to_world_point,
     legacy_frame_to_cursor,
     reslice_plane,
 )
+from app.services.mpr_geometry import VolumePatientTransform
 from app.services.viewer_service import ViewerService
 
 
@@ -28,6 +33,27 @@ def test_legacy_frame_round_trips_through_cursor_with_identity_geometry() -> Non
     assert np.allclose(rebuilt.axis_slice, frame.axis_slice, atol=1e-6)
     assert np.allclose(rebuilt.axis_row, frame.axis_row, atol=1e-6)
     assert np.allclose(rebuilt.axis_col, frame.axis_col, atol=1e-6)
+
+
+def test_cursor_to_legacy_frame_preserves_independent_orientation_columns() -> None:
+    geometry = build_identity_geometry((9, 11, 13))
+    cursor = replace(
+        create_default_cursor(geometry),
+        orientation_world=np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.5],
+                [0.0, 0.0, 0.8660254037844386],
+            ],
+            dtype=np.float64,
+        ),
+    )
+
+    frame = cursor_to_legacy_frame(cursor, geometry)
+
+    assert np.allclose(frame.axis_slice, [1.0, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(frame.axis_row, [0.0, 1.0, 0.0], atol=1e-6)
+    assert np.allclose(frame.axis_col, [0.0, 0.5, 0.8660254037844386], atol=1e-6)
 
 
 def test_derive_plane_pose_matches_legacy_default_viewport_conventions() -> None:
@@ -94,6 +120,29 @@ def test_derive_plane_pose_uses_stable_display_axes_after_large_axial_rotation()
     assert np.isclose(float(np.dot(sagittal.row_world, sagittal.col_world)), 0.0, atol=1e-6)
     assert np.isclose(float(np.dot(sagittal.col_world, sagittal.normal_world)), 0.0, atol=1e-6)
     assert np.isclose(float(np.linalg.norm(sagittal.col_world)), 1.0, atol=1e-6)
+
+
+def test_mpr_display_aspect_uses_plane_pose_physical_spacing() -> None:
+    transform = VolumePatientTransform(
+        origin=np.asarray([0.0, 0.0, 0.0], dtype=np.float64),
+        axis_vectors=(
+            np.asarray([3.0, 0.0, 0.0], dtype=np.float64),
+            np.asarray([0.0, 2.0, 0.0], dtype=np.float64),
+            np.asarray([0.0, 0.0, 0.5], dtype=np.float64),
+        ),
+        shape=(5, 6, 7),
+    )
+    geometry = build_geometry_from_patient_transform(transform)
+    cursor = create_default_cursor(geometry)
+    service = ViewerService()
+
+    axial = derive_plane_pose(cursor, "mpr-ax", geometry)
+    coronal = derive_plane_pose(cursor, "mpr-cor", geometry)
+    sagittal = derive_plane_pose(cursor, "mpr-sag", geometry)
+
+    assert np.allclose(service._get_mpr_display_aspect_xy_from_pose(axial), (0.5, 2.0), atol=1e-6)
+    assert np.allclose(service._get_mpr_display_aspect_xy_from_pose(coronal), (0.5, 3.0), atol=1e-6)
+    assert np.allclose(service._get_mpr_display_aspect_xy_from_pose(sagittal), (2.0, 3.0), atol=1e-6)
 
 
 def test_viewer_service_uses_cursor_as_group_geometry_source() -> None:

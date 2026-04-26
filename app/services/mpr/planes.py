@@ -6,7 +6,7 @@ import numpy as np
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
 
-from .cursor import MprCursorState, create_default_cursor, orthonormalize_matrix
+from .cursor import MprCursorState, create_default_cursor
 from .geometry import VolumeGeometry, ijk_to_world_point, spacing_along_world_direction, world_to_ijk_point
 
 
@@ -67,17 +67,23 @@ def _resolve_display_basis_from_normal(
     normal_world: np.ndarray,
     default_row_world: np.ndarray,
     default_col_world: np.ndarray,
+    default_normal_world: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    default_handedness = 1.0
+    default_basis_direction = float(np.dot(np.cross(default_normal_world, default_row_world), default_col_world))
+    if np.isfinite(default_basis_direction) and default_basis_direction < 0.0:
+        default_handedness = -1.0
+
     projected_row = _project_vector_to_plane(default_row_world, normal_world)
     if projected_row is not None:
         row_world = _normalize_world_vector(projected_row, default_row_world)
-        col_world = _normalize_world_vector(np.cross(normal_world, row_world), default_col_world)
+        col_world = _normalize_world_vector(default_handedness * np.cross(normal_world, row_world), default_col_world)
         return row_world, col_world
 
     projected_col = _project_vector_to_plane(default_col_world, normal_world)
     if projected_col is not None:
         col_world = _normalize_world_vector(projected_col, default_col_world)
-        row_world = _normalize_world_vector(np.cross(col_world, normal_world), default_row_world)
+        row_world = _normalize_world_vector(default_handedness * np.cross(col_world, normal_world), default_row_world)
         return row_world, col_world
 
     return default_row_world, default_col_world
@@ -93,6 +99,37 @@ def _resolve_output_shape(geometry: VolumeGeometry, viewport: str, policy: Outpu
     return (height, width)
 
 
+def _resolve_default_plane_center_world(
+    cursor_center_world: np.ndarray,
+    geometry: VolumeGeometry,
+    convention: PlaneConvention,
+) -> np.ndarray:
+    center_ijk = world_to_ijk_point(geometry, cursor_center_world)
+    plane_center_ijk = np.array(center_ijk, dtype=np.float64)
+    plane_center_ijk[convention.row_axis_index] = (geometry.shape_ijk[convention.row_axis_index] - 1) / 2.0
+    plane_center_ijk[convention.col_axis_index] = (geometry.shape_ijk[convention.col_axis_index] - 1) / 2.0
+    return ijk_to_world_point(geometry, plane_center_ijk)
+
+
+def _resolve_cursor_image_offsets(
+    cursor_center_world: np.ndarray,
+    default_center_world: np.ndarray,
+    default_row_world: np.ndarray,
+    default_col_world: np.ndarray,
+    geometry: VolumeGeometry,
+) -> tuple[float, float]:
+    delta_world = np.asarray(cursor_center_world, dtype=np.float64) - np.asarray(default_center_world, dtype=np.float64)
+    row_offset_px = float(np.dot(delta_world, default_row_world)) / max(
+        spacing_along_world_direction(geometry, default_row_world),
+        1e-6,
+    )
+    col_offset_px = float(np.dot(delta_world, default_col_world)) / max(
+        spacing_along_world_direction(geometry, default_col_world),
+        1e-6,
+    )
+    return row_offset_px, col_offset_px
+
+
 def derive_plane_pose(
     cursor: MprCursorState,
     viewport: str,
@@ -101,7 +138,7 @@ def derive_plane_pose(
 ) -> PlanePose:
     policy = output_shape_policy or OutputShapePolicy()
     convention = DEFAULT_MPR_CONVENTION.get(viewport, DEFAULT_MPR_CONVENTION[MPR_VIEWPORT_AXIAL])
-    orientation = orthonormalize_matrix(np.asarray(cursor.orientation_world, dtype=np.float64))
+    orientation = np.asarray(cursor.orientation_world, dtype=np.float64)
     normal_world = _normalize_world_vector(
         orientation[:, convention.normal_axis_index] * convention.normal_sign,
         np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
@@ -125,20 +162,28 @@ def derive_plane_pose(
             normal_world,
             default_row_world,
             default_col_world,
+            default_normal_world,
         )
     else:
         row_world = default_row_world
         col_world = default_col_world
-    output_shape = _resolve_output_shape(geometry, viewport, policy)
     cursor_center_world = np.asarray(cursor.center_world, dtype=np.float64)
-    if is_oblique:
-        center_world = cursor_center_world
-    else:
-        center_ijk = world_to_ijk_point(geometry, cursor_center_world)
-        plane_center_ijk = np.array(center_ijk, dtype=np.float64)
-        plane_center_ijk[convention.row_axis_index] = (geometry.shape_ijk[convention.row_axis_index] - 1) / 2.0
-        plane_center_ijk[convention.col_axis_index] = (geometry.shape_ijk[convention.col_axis_index] - 1) / 2.0
-        center_world = ijk_to_world_point(geometry, plane_center_ijk)
+    output_shape = _resolve_output_shape(geometry, viewport, policy)
+    default_center_world = _resolve_default_plane_center_world(cursor_center_world, geometry, convention)
+    row_offset_px, col_offset_px = _resolve_cursor_image_offsets(
+        cursor_center_world,
+        default_center_world,
+        default_row_world,
+        default_col_world,
+        geometry,
+    )
+    row_spacing_mm = spacing_along_world_direction(geometry, row_world)
+    col_spacing_mm = spacing_along_world_direction(geometry, col_world)
+    center_world = (
+        cursor_center_world
+        - row_world * row_offset_px * row_spacing_mm
+        - col_world * col_offset_px * col_spacing_mm
+    )
     return PlanePose(
         viewport=viewport,
         center_world=center_world,
@@ -146,8 +191,8 @@ def derive_plane_pose(
         row_world=row_world,
         col_world=col_world,
         normal_world=normal_world,
-        pixel_spacing_row_mm=spacing_along_world_direction(geometry, row_world),
-        pixel_spacing_col_mm=spacing_along_world_direction(geometry, col_world),
+        pixel_spacing_row_mm=row_spacing_mm,
+        pixel_spacing_col_mm=col_spacing_mm,
         output_shape=output_shape,
         is_oblique=is_oblique,
     )

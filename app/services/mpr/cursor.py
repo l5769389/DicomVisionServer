@@ -81,7 +81,7 @@ def legacy_frame_to_cursor(
 def cursor_to_legacy_frame(cursor: MprCursorState, geometry: VolumeGeometry) -> MprFrameState:
     center_ijk = world_to_ijk_point(geometry, cursor.center_world)
     inverse_affine = geometry.world_to_ijk[:3, :3]
-    orientation = orthonormalize_matrix(cursor.orientation_world)
+    orientation = np.asarray(cursor.orientation_world, dtype=np.float64)
     axis_slice = _normalize_vector(inverse_affine @ orientation[:, 0], np.asarray([1.0, 0.0, 0.0], dtype=np.float64))
     axis_row = _normalize_vector(inverse_affine @ orientation[:, 1], np.asarray([0.0, 1.0, 0.0], dtype=np.float64))
     axis_col = _normalize_vector(inverse_affine @ orientation[:, 2], np.asarray([0.0, 0.0, 1.0], dtype=np.float64))
@@ -145,13 +145,3 @@ def axis_angle_rotation_matrix(axis_world: np.ndarray, angle_rad: float) -> np.n
         ],
         dtype=np.float64,
     )
-
-
-def rotate_cursor_from_drag(
-    start_cursor: MprCursorState,
-    axis_world: np.ndarray,
-    start_angle_rad: float,
-    current_angle_rad: float,
-) -> MprCursorState:
-    rotation_world = axis_angle_rotation_matrix(axis_world, float(current_angle_rad) - float(start_angle_rad))
-    return rotate_cursor(start_cursor, rotation_world)
