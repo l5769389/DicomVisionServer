@@ -9,7 +9,7 @@ ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "mprOblique", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "mprOblique", "mprStateSync", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -20,6 +20,8 @@ MprCrosshairLine = Literal["horizontal", "vertical"]
 class ViewCreateRequest(BaseModel):
     series_id: str = Field(alias="seriesId")
     view_type: ViewType = Field(alias="viewType")
+    view_group_key: str | None = Field(default=None, alias="viewGroupKey")
+    four_d_phase_index: int | None = Field(default=None, alias="fourDPhaseIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -306,6 +308,7 @@ class ViewOperationRequest(BaseModel):
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
     ver_flip: bool | None = Field(default=None, alias="ver_flip")

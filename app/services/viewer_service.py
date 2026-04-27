@@ -1360,7 +1360,8 @@ class ViewerService:
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
         if view.view_group is not None:
-            self._reset_mpr_group_geometry(view.view_group, volume.shape, series=series)
+            if view.view_group.mpr_cursor is None:
+                self._reset_mpr_group_geometry(view.view_group, volume.shape, series=series)
         else:
             depth, height, width = volume.shape
             view.mpr_axial_index = depth // 2
@@ -1378,6 +1379,39 @@ class ViewerService:
             view.mpr_sagittal_index,
             view.zoom,
         )
+
+    def _sync_mpr_state_from_source_view(self, target_view: ViewRecord, source_view_id: str) -> bool:
+        if not self._is_mpr_view_type(target_view.view_type) or target_view.view_group is None:
+            return False
+
+        source_view = view_registry.get(source_view_id)
+        if not self._is_mpr_view_type(source_view.view_type) or source_view.view_group is None:
+            return False
+        if source_view.view_group.group_id == target_view.view_group.group_id:
+            return False
+
+        source_series = series_registry.get(source_view.series_id)
+        target_series = series_registry.get(target_view.series_id)
+        source_volume = self._get_series_volume(source_series)
+        target_volume = self._get_series_volume(target_series)
+        source_context = self._build_mpr_pose_context(source_view, source_volume.shape, series=source_series)
+        target_geometry = self._get_series_volume_geometry(target_series, target_volume.shape)
+        source_group = source_view.view_group
+        target_group = target_view.view_group
+
+        target_group.active_viewport = source_group.active_viewport
+        target_group.crosshair_drag_active = False
+        target_group.crosshair_drag_origin_center = None
+        target_group.crosshair_drag_origin_image = None
+        target_group.rotation_drag = None
+        target_group.mpr_crosshair_angles = deepcopy(source_group.mpr_crosshair_angles)
+        target_group.mpr_mip = deepcopy(source_group.mpr_mip)
+        target_group.mpr_model_rotation_world = deepcopy(source_group.mpr_model_rotation_world)
+        target_group.mpr_model_rotation_pivot_world = deepcopy(source_group.mpr_model_rotation_pivot_world)
+        self._sync_group_from_mpr_cursor(target_group, source_context.cursor, target_geometry, target_volume.shape)
+        if target_view.width and target_view.height:
+            target_view.is_initialized = True
+        return True
 
     def _initialize_3d_viewport(self, view: ViewRecord) -> None:
         if not view.width or not view.height:

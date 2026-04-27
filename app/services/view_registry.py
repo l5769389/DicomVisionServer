@@ -33,6 +33,7 @@ class ViewRegistry:
             view.view_group = view_group_registry.get_or_create_mpr_group_for_series(
                 payload.series_id,
                 active_viewport=_resolve_mpr_active_viewport(payload.view_type),
+                view_group_key=payload.view_group_key,
             )
         self._view_by_id[view.view_id] = view
         return ViewCreateResponse(viewId=view.view_id)

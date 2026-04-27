@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.main import fastapi_app
 from app.models.viewer import SeriesRecord
+from app.schemas.view import ViewOperationRequest
 from app.sockets.runtime import view_socket_hub
 from app.services.series_registry import series_registry
 from app.services.view_group_registry import view_group_registry
@@ -66,10 +67,14 @@ def _register_series(series_id: str = "series-1") -> str:
     return series_id
 
 
-def _create_view(client: TestClient, series_id: str, view_type: str) -> str:
+def _create_view(client: TestClient, series_id: str, view_type: str, view_group_key: str | None = None) -> str:
+    payload = {"seriesId": series_id, "viewType": view_type}
+    if view_group_key:
+        payload["viewGroupKey"] = view_group_key
+
     response = client.post(
         "/api/v1/view/create",
-        json={"seriesId": series_id, "viewType": view_type},
+        json=payload,
     )
     assert response.status_code == 200
     return str(response.json()["viewId"])
@@ -108,3 +113,28 @@ def test_close_last_mpr_view_releases_view_group() -> None:
     assert second_response.status_code == 200
     assert view_group_registry.get_view_group(group_id) is None
     assert view_group_registry._mpr_group_id_by_series_id.get(series_id) is None
+
+
+def test_mpr_view_group_key_isolates_same_series_groups() -> None:
+    client = TestClient(fastapi_app)
+    series_id = _register_series()
+    default_view_id = _create_view(client, series_id, "AX")
+    four_d_axial_view_id = _create_view(client, series_id, "AX", "4d:tab:phase-0")
+    four_d_coronal_view_id = _create_view(client, series_id, "COR", "4d:tab:phase-0")
+    other_phase_view_id = _create_view(client, series_id, "AX", "4d:tab:phase-1")
+
+    default_group_id = view_registry.get(default_view_id).view_group.group_id
+    four_d_group_id = view_registry.get(four_d_axial_view_id).view_group.group_id
+
+    assert four_d_group_id != default_group_id
+    assert view_registry.get(four_d_coronal_view_id).view_group.group_id == four_d_group_id
+    assert view_registry.get(other_phase_view_id).view_group.group_id not in {default_group_id, four_d_group_id}
+
+
+def test_mpr_state_sync_operation_accepts_source_view_alias() -> None:
+    payload = ViewOperationRequest.model_validate(
+        {"viewId": "target-view", "opType": "mprStateSync", "sourceViewId": "source-view"}
+    )
+
+    assert payload.view_id == "target-view"
+    assert payload.source_view_id == "source-view"

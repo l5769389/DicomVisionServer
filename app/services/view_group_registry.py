@@ -8,15 +8,25 @@ class ViewGroupRegistry:
         self._view_groups_by_id: dict[str, ViewGroupRecord] = {}
         self._mpr_group_id_by_series_id: dict[str, str] = {}
 
+    def _get_mpr_registry_key(self, series_id: str, view_group_key: str | None = None) -> str:
+        if view_group_key:
+            return f"{series_id}::{view_group_key}"
+        return series_id
+
     def get_or_create_mpr_group_for_series(
         self,
         series_id: str,
         *,
         active_viewport: str,
+        view_group_key: str | None = None,
     ) -> ViewGroupRecord:
-        group_id = self._mpr_group_id_by_series_id.get(series_id)
+        registry_key = self._get_mpr_registry_key(series_id, view_group_key)
+        group_id = self._mpr_group_id_by_series_id.get(registry_key)
         if group_id is not None:
-            return self._view_groups_by_id[group_id]
+            group = self._view_groups_by_id.get(group_id)
+            if group is not None:
+                return group
+            self._mpr_group_id_by_series_id.pop(registry_key, None)
 
         group = ViewGroupRecord(
             group_id=str(uuid4()),
@@ -25,7 +35,7 @@ class ViewGroupRegistry:
             active_viewport=active_viewport,
         )
         self._view_groups_by_id[group.group_id] = group
-        self._mpr_group_id_by_series_id[series_id] = group.group_id
+        self._mpr_group_id_by_series_id[registry_key] = group.group_id
         return group
 
     def get_view_group(self, group_id: str) -> ViewGroupRecord | None:
@@ -35,8 +45,13 @@ class ViewGroupRegistry:
         group = self._view_groups_by_id.pop(group_id, None)
         if group is None:
             return
-        if self._mpr_group_id_by_series_id.get(group.series_id) == group_id:
-            self._mpr_group_id_by_series_id.pop(group.series_id, None)
+        stale_keys = [
+            registry_key
+            for registry_key, candidate_group_id in self._mpr_group_id_by_series_id.items()
+            if candidate_group_id == group_id
+        ]
+        for registry_key in stale_keys:
+            self._mpr_group_id_by_series_id.pop(registry_key, None)
 
 
 view_group_registry = ViewGroupRegistry()
