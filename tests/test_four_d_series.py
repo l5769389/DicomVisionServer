@@ -107,6 +107,61 @@ def test_load_folder_marks_related_phase_series_as_four_d(tmp_path: Path) -> Non
         assert all(phase.viewport_images == {} for phase in summary.four_d_phases)
 
 
+def test_load_folder_recognizes_percent_only_series_description_as_phase(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for series_description, base_value in (("5%", 100), ("50\uFF05", 500)):
+        series_uid = generate_uid()
+        for slice_index in range(3):
+            _create_test_dicom(
+                tmp_path / f"series-description-{series_description}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=series_description,
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=base_value,
+            )
+
+    response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+
+    assert len(response.series_list) == 2
+    for summary in response.series_list:
+        assert summary.is_four_d_series is True
+        assert summary.four_d_phase_count == 2
+        assert summary.four_d_phases is not None
+        assert [phase.label for phase in summary.four_d_phases] == ["Phase 5%", "Phase 50%"]
+
+
+def test_load_folder_groups_percent_only_phase_series_with_different_slice_counts(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+    phase_percents = list(range(5, 100, 10))
+
+    for phase_index, phase_percent in enumerate(phase_percents):
+        series_uid = generate_uid()
+        slice_count = 2 + (phase_index % 3)
+        for slice_index in range(slice_count):
+            _create_test_dicom(
+                tmp_path / f"phase-{phase_percent}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=f"{phase_percent}%",
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=100 + phase_index * 100,
+            )
+
+    response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+
+    assert len(response.series_list) == len(phase_percents)
+    expected_labels = [f"Phase {phase_percent}%" for phase_percent in phase_percents]
+    for summary in response.series_list:
+        assert summary.is_four_d_series is True
+        assert summary.four_d_phase_count == len(phase_percents)
+        assert summary.four_d_phases is not None
+        assert [phase.label for phase in summary.four_d_phases] == expected_labels
+
+
 def test_load_folder_splits_same_series_uid_across_phase_folders_into_distinct_four_d_series(tmp_path: Path) -> None:
     study_uid = generate_uid()
     shared_series_uid = generate_uid()
@@ -243,9 +298,15 @@ def test_four_d_phases_api_returns_phase_manifest_for_selected_series(tmp_path: 
     assert preview_response.status_code == 200
     preview_data = preview_response.json()
     assert preview_data["fourDPhases"][0]["status"] == "ready"
-    assert preview_data["fourDPhases"][0]["viewportImages"]["mpr-ax"].startswith("data:image/png;base64,")
+    preview_url = preview_data["fourDPhases"][0]["viewportImages"]["mpr-ax"]
+    assert preview_url.startswith("/api/v1/dicom/fourD/preview?")
     assert preview_data["fourDPhases"][1]["status"] == "pending"
     assert preview_data["fourDPhases"][1]["viewportImages"] == {}
+
+    image_response = client.get(preview_url)
+    assert image_response.status_code == 200
+    assert image_response.headers["content-type"] == "image/png"
+    assert image_response.content.startswith(b"\x89PNG")
 
 
 def test_four_d_phases_api_returns_virtual_series_ids_for_single_series_phases(tmp_path: Path) -> None:

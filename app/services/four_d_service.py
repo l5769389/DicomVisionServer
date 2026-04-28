@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import base64
 import io
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import numpy as np
 import pydicom
+from fastapi import HTTPException
 from PIL import Image
 from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
@@ -30,7 +31,7 @@ MAX_PREVIEW_SLICES = 96
 PREVIEW_SIZE = (320, 320)
 
 _PERCENT_PHASE_RE = re.compile(
-    r"(?<!\d)(100(?:\.0+)?|[0-9]{1,2}(?:\.\d+)?)[\s_-]*(?:%|pct\b|percent\b)",
+    r"(?<!\d)(100(?:\.0+)?|[0-9]{1,2}(?:\.\d+)?)[\s_-]*(?:[%\uFF05\uFE6A]|pct\b|percent\b)",
     re.IGNORECASE,
 )
 _NAMED_PHASE_RE = re.compile(r"\b(?:phase|ph)[\s_:#-]*(\d{1,3}(?:\.\d+)?)\b", re.IGNORECASE)
@@ -71,15 +72,7 @@ class FourDService:
         if target_series is None:
             return FourDPhasesResponse(seriesId=series_id, isFourDSeries=False, fourDPhaseCount=0, fourDPhases=[])
 
-        real_series_records = [series for series in series_records if not series.is_virtual]
-        if target_series.is_virtual and target_series.source_series_id:
-            source_series = next((series for series in real_series_records if series.series_id == target_series.source_series_id), None)
-            if source_series is not None:
-                target_series = source_series
-
-        phase_entries = self._resolve_multi_series_phase_entries(target_series, real_series_records)
-        if not phase_entries:
-            phase_entries = self._resolve_single_series_phase_entries(target_series, series_records)
+        phase_entries = self._resolve_phase_entries(target_series, series_records)
 
         if len(phase_entries) < 2:
             return FourDPhasesResponse(seriesId=series_id, isFourDSeries=False, fourDPhaseCount=0, fourDPhases=[])
@@ -101,6 +94,27 @@ class FourDService:
             fourDPhaseCount=len(phase_items),
             fourDPhases=phase_items,
         )
+
+    def get_four_d_preview_png(
+        self,
+        series_id: str,
+        series_records: list[SeriesRecord],
+        *,
+        phase_index: int,
+        viewport_key: str,
+    ) -> bytes:
+        target_series = next((series for series in series_records if series.series_id == series_id), None)
+        if target_series is None:
+            raise HTTPException(status_code=404, detail="seriesId not found")
+
+        phase_entries = self._resolve_phase_entries(target_series, series_records)
+        if len(phase_entries) < 2:
+            raise HTTPException(status_code=404, detail="4D phase preview is not available")
+
+        if phase_index < 0 or phase_index >= len(phase_entries):
+            raise HTTPException(status_code=404, detail="phaseIndex not found")
+
+        return self._build_phase_viewport_image_png(phase_entries[phase_index].instances, viewport_key)
 
     def apply_four_d_metadata(
         self,
@@ -216,6 +230,22 @@ class FourDService:
             return []
         return self._phase_entries_from_grouped_instances(series, grouped_instances)
 
+    def _resolve_phase_entries(
+        self,
+        target_series: SeriesRecord,
+        series_records: list[SeriesRecord],
+    ) -> list[PhaseEntry]:
+        real_series_records = [series for series in series_records if not series.is_virtual]
+        if target_series.is_virtual and target_series.source_series_id:
+            source_series = next((series for series in real_series_records if series.series_id == target_series.source_series_id), None)
+            if source_series is not None:
+                target_series = source_series
+
+        phase_entries = self._resolve_multi_series_phase_entries(target_series, real_series_records)
+        if phase_entries:
+            return phase_entries
+        return self._resolve_single_series_phase_entries(target_series, series_records)
+
     def get_single_series_phase_groups(
         self,
         series: SeriesRecord,
@@ -294,7 +324,8 @@ class FourDService:
 
         for phase_index, entry in enumerate(phase_entries):
             if phase_index in preview_phase_indexes:
-                viewport_images, status = self._build_phase_viewport_images(entry.instances)
+                viewport_images = self._build_phase_preview_image_urls(entry, phase_index)
+                status = "ready" if viewport_images else "error"
             else:
                 viewport_images, status = {}, "pending"
             phase_items.append(
@@ -308,6 +339,26 @@ class FourDService:
                 )
             )
         return phase_items
+
+    def _build_phase_preview_image_urls(self, entry: PhaseEntry, phase_index: int) -> dict[str, str]:
+        if not entry.instances:
+            return {}
+        series_id = entry.series_id or ""
+        if not series_id:
+            return {}
+        return {
+            viewport_key: self._build_phase_preview_url(series_id, phase_index, viewport_key)
+            for viewport_key in (MPR_AXIAL, MPR_CORONAL, MPR_SAGITTAL)
+        }
+
+    @staticmethod
+    def _build_phase_preview_url(series_id: str, phase_index: int, viewport_key: str) -> str:
+        return (
+            "/api/v1/dicom/fourD/preview"
+            f"?seriesId={quote(series_id, safe='')}"
+            f"&phaseIndex={int(phase_index)}"
+            f"&viewportKey={quote(viewport_key, safe='')}"
+        )
 
     def _group_instances_by_dataset_phase(
         self,
@@ -359,7 +410,6 @@ class FourDService:
         base_key = (
             series.study_instance_uid or series.folder_path,
             series.modality or "",
-            len(series.instances),
             first.rows if first is not None else None,
             first.columns if first is not None else None,
         )
@@ -513,26 +563,26 @@ class FourDService:
             logger.debug("failed to read DICOM header for 4D phase detection path=%s error=%s", path, exc)
             return None
 
-    def _build_phase_viewport_images(self, instances: list[InstanceRecord]) -> tuple[dict[str, str], str]:
+    def _build_phase_viewport_image_png(self, instances: list[InstanceRecord], viewport_key: str) -> bytes:
+        if viewport_key not in {MPR_AXIAL, MPR_CORONAL, MPR_SAGITTAL}:
+            raise HTTPException(status_code=400, detail="Unsupported viewportKey")
         if not instances:
-            return {}, "pending"
+            raise HTTPException(status_code=404, detail="4D phase preview is not available")
 
         try:
             volume = self._build_preview_volume(instances)
             volume_min, volume_max = self._resolve_window_range(volume)
             depth, height, width = volume.shape
-            axial = volume[depth // 2, :, :]
-            coronal = volume[:, height // 2, :]
-            sagittal = volume[:, :, width // 2]
-            viewport_images = {
-                MPR_AXIAL: self._encode_plane_data_url(axial, volume_min, volume_max),
-                MPR_CORONAL: self._encode_plane_data_url(coronal, volume_min, volume_max),
-                MPR_SAGITTAL: self._encode_plane_data_url(sagittal, volume_min, volume_max),
-            }
-            return viewport_images, "ready"
+            if viewport_key == MPR_CORONAL:
+                plane = volume[:, height // 2, :]
+            elif viewport_key == MPR_SAGITTAL:
+                plane = volume[:, :, width // 2]
+            else:
+                plane = volume[depth // 2, :, :]
+            return self._encode_plane_png(plane, volume_min, volume_max)
         except Exception as exc:
-            logger.warning("failed to build 4D phase preview images error=%s", exc)
-            return {}, "error"
+            logger.warning("failed to build 4D phase preview image viewport_key=%s error=%s", viewport_key, exc)
+            raise HTTPException(status_code=500, detail="Failed to build 4D phase preview") from exc
 
     def _build_preview_volume(self, instances: list[InstanceRecord]) -> np.ndarray:
         selected_instances = self._select_preview_instances(instances)
@@ -589,7 +639,7 @@ class FourDService:
         return low, high
 
     @staticmethod
-    def _encode_plane_data_url(plane: np.ndarray, low: float, high: float) -> str:
+    def _encode_plane_png(plane: np.ndarray, low: float, high: float) -> bytes:
         pixels = np.asarray(plane, dtype=np.float32)
         clipped = np.clip(pixels, low, high)
         normalized = ((clipped - low) * (255.0 / max(high - low, 1e-6))).astype(np.uint8)
@@ -598,8 +648,7 @@ class FourDService:
 
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", optimize=True)
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"
+        return buffer.getvalue()
 
 
 four_d_service = FourDService()

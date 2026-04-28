@@ -66,9 +66,7 @@ class LayeredRenderer:
 
     @staticmethod
     def _build_base_image(base_pixels):
-        if getattr(base_pixels, "ndim", 0) == 3 and base_pixels.shape[-1] == 3:
-            return Image.fromarray(base_pixels, mode="RGB")
-        return Image.fromarray(base_pixels, mode="L")
+        return Image.fromarray(base_pixels)
 
 
 layered_renderer = LayeredRenderer()

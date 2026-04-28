@@ -29,36 +29,36 @@ async def _emit_render_after_resize(view_id: str) -> None:
 
 
 @router.post("/create", response_model=ViewCreateResponse)
-async def create_view(payload: ViewCreateRequest) -> ViewCreateResponse:
+def create_view(payload: ViewCreateRequest) -> ViewCreateResponse:
     return view_registry.create(payload)
 
 
 @router.post("/close", response_model=OperationAcceptedResponse)
-async def close_view(payload: ViewCloseRequest) -> OperationAcceptedResponse:
+def close_view(payload: ViewCloseRequest) -> OperationAcceptedResponse:
     result = viewer_service.close_view_by_id(payload.view_id)
     view_socket_hub.unbind_view(payload.view_id)
     return result
 
 
 @router.post("/setSize", response_model=OperationAcceptedResponse)
-async def set_view_size(payload: ViewSetSizeRequest, background_tasks: BackgroundTasks) -> OperationAcceptedResponse:
+def set_view_size(payload: ViewSetSizeRequest, background_tasks: BackgroundTasks) -> OperationAcceptedResponse:
     result = viewer_service.set_view_size(payload)
     background_tasks.add_task(_emit_render_after_resize, payload.view_id)
     return result
 
 
 @router.post("/mtf/analyze", response_model=ViewMtfAnalyzeResponse)
-async def analyze_mtf(payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
+def analyze_mtf(payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
     return viewer_service.analyze_mtf(payload)
 
 
 @router.post("/qa/water/analyze", response_model=ViewQaWaterAnalyzeResponse)
-async def analyze_qa_water(payload: ViewQaWaterAnalyzeRequest) -> ViewQaWaterAnalyzeResponse:
+def analyze_qa_water(payload: ViewQaWaterAnalyzeRequest) -> ViewQaWaterAnalyzeResponse:
     return viewer_service.analyze_qa_water(payload)
 
 
 @router.post("/export")
-async def export_view(payload: ViewExportRequest) -> Response:
+def export_view(payload: ViewExportRequest) -> Response:
     exported = viewer_service.export_view_by_id(
         payload.view_id,
         payload.export_format,

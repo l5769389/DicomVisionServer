@@ -1,6 +1,7 @@
-import base64
 import io
 from pathlib import Path
+from threading import RLock
+from urllib.parse import quote
 from uuid import uuid4
 
 import numpy as np
@@ -23,6 +24,7 @@ class SeriesRegistry:
     def __init__(self) -> None:
         self._series_by_id: dict[str, SeriesRecord] = {}
         self._series_id_by_key: dict[str, str] = {}
+        self._lock = RLock()
 
     @staticmethod
     def _build_series_folder_partition_key(folder: Path, path: Path) -> str:
@@ -179,13 +181,26 @@ class SeriesRegistry:
             instanceCount=len(series.instances),
             width=first.columns,
             height=first.rows,
-            thumbnailSrc=self._build_series_thumbnail_src(series),
+            thumbnailSrc="",
+            thumbnailUrl=self._build_series_thumbnail_url(series.series_id),
             folderPath=series.folder_path,
         )
 
-    def _build_series_thumbnail_src(self, series: SeriesRecord) -> str:
+    @staticmethod
+    def _build_series_thumbnail_url(series_id: str) -> str:
+        return f"/api/v1/dicom/thumbnail?seriesId={quote(series_id, safe='')}"
+
+    def get_series_thumbnail_png(self, series_id: str) -> bytes:
+        with self._lock:
+            series = self.get(series_id)
+        thumbnail = self._build_series_thumbnail_png(series)
+        if thumbnail is None:
+            raise HTTPException(status_code=404, detail="Series thumbnail is not available")
+        return thumbnail
+
+    def _build_series_thumbnail_png(self, series: SeriesRecord) -> bytes | None:
         if not series.instances:
-            return ""
+            return None
 
         thumbnail_instance = series.instances[len(series.instances) // 2]
         cache_key = thumbnail_instance.sop_instance_uid or thumbnail_instance.path.resolve().as_posix()
@@ -194,7 +209,7 @@ class SeriesRegistry:
             cached = dicom_cache.get(cache_key, thumbnail_instance.path)
             pixels = np.asarray(cached.source_pixels, dtype=np.float32)
             if pixels.ndim != 2:
-                return ""
+                return None
 
             low, high = self._resolve_thumbnail_window(
                 pixels,
@@ -204,7 +219,7 @@ class SeriesRegistry:
             clipped = np.clip(pixels, low, high)
             scale = high - low
             if scale <= 0:
-                return ""
+                return None
 
             normalized = ((clipped - low) * (255.0 / scale)).astype(np.uint8)
             image = Image.fromarray(normalized)
@@ -214,11 +229,10 @@ class SeriesRegistry:
 
             buffer = io.BytesIO()
             canvas.save(buffer, format="PNG", optimize=True)
-            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-            return f"data:image/png;base64,{encoded}"
+            return buffer.getvalue()
         except Exception as exc:
             logger.debug("failed to build series thumbnail series_id=%s error=%s", series.series_id, exc)
-            return ""
+            return None
 
     @staticmethod
     def _resolve_thumbnail_window(
@@ -278,36 +292,41 @@ class SeriesRegistry:
         return virtual_series_records
 
     def ensure_four_d_phase_series(self, series_id: str) -> SeriesRecord:
-        series = self.get(series_id)
-        source_series = self.get(series.source_series_id) if series.is_virtual and series.source_series_id else series
-        self._register_virtual_four_d_phase_series([source_series])
-        return series
+        with self._lock:
+            series = self.get(series_id)
+            source_series = self.get(series.source_series_id) if series.is_virtual and series.source_series_id else series
+            self._register_virtual_four_d_phase_series([source_series])
+            return series
 
     def load_folder(self, payload: LoadFolderRequest) -> LoadFolderResponse:
-        folder = self._resolve_folder(payload.folder_path)
-        grouped = self._collect_grouped_series(folder)
-        if not grouped:
-            raise HTTPException(status_code=404, detail="No readable DICOM series found in folder")
+        with self._lock:
+            folder = self._resolve_folder(payload.folder_path)
+            grouped = self._collect_grouped_series(folder)
+            if not grouped:
+                raise HTTPException(status_code=404, detail="No readable DICOM series found in folder")
 
-        real_series_records = list(grouped.values())
-        series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
-        virtual_series_records = self._register_virtual_four_d_phase_series(real_series_records)
-        four_d_service.apply_four_d_metadata(series_list, [*real_series_records, *virtual_series_records])
-        series_list.sort(key=lambda item: item.series_id)
-        return LoadFolderResponse(seriesId=series_list[0].series_id, seriesList=series_list)
+            real_series_records = list(grouped.values())
+            series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
+            virtual_series_records = self._register_virtual_four_d_phase_series(real_series_records)
+            four_d_service.apply_four_d_metadata(series_list, [*real_series_records, *virtual_series_records])
+            series_list.sort(key=lambda item: item.series_id)
+            return LoadFolderResponse(seriesId=series_list[0].series_id, seriesList=series_list)
 
     def get(self, series_id: str) -> SeriesRecord:
-        series = self._series_by_id.get(series_id)
-        if series is None:
-            raise HTTPException(status_code=404, detail="seriesId not found")
-        return series
+        with self._lock:
+            series = self._series_by_id.get(series_id)
+            if series is None:
+                raise HTTPException(status_code=404, detail="seriesId not found")
+            return series
 
     def list_all(self) -> list[SeriesRecord]:
-        return list(self._series_by_id.values())
+        with self._lock:
+            return list(self._series_by_id.values())
 
     def clear(self) -> None:
-        self._series_by_id.clear()
-        self._series_id_by_key.clear()
+        with self._lock:
+            self._series_by_id.clear()
+            self._series_id_by_key.clear()
 
 
 series_registry = SeriesRegistry()

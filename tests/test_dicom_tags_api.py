@@ -97,4 +97,12 @@ def test_load_folder_response_includes_series_thumbnail(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     data = response.json()
-    assert data["seriesList"][0]["thumbnailSrc"].startswith("data:image/png;base64,")
+    series = data["seriesList"][0]
+    assert series["thumbnailSrc"] == ""
+    assert series["thumbnailUrl"].startswith("/api/v1/dicom/thumbnail?seriesId=")
+
+    thumbnail_response = client.get(series["thumbnailUrl"])
+
+    assert thumbnail_response.status_code == 200
+    assert thumbnail_response.headers["content-type"] == "image/png"
+    assert thumbnail_response.content.startswith(b"\x89PNG")

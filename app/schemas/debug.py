@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field
 class CacheStatsResponse(BaseModel):
     entries: int
     max_entries: int = Field(alias="maxEntries")
+    current_bytes: int = Field(default=0, alias="currentBytes")
+    max_bytes: int = Field(default=0, alias="maxBytes")
 
     model_config = {"populate_by_name": True}
 

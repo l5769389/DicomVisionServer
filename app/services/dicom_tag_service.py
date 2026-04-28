@@ -25,7 +25,7 @@ class DicomTagService:
         instance = series.instances[index]
 
         try:
-            dataset = pydicom.dcmread(str(instance.path), force=True)
+            dataset = pydicom.dcmread(str(instance.path), defer_size=1024, force=True)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to read DICOM tags: {exc}") from exc
 
@@ -90,12 +90,12 @@ class DicomTagService:
         ]
 
     def _format_value(self, element: DataElement) -> str:
+        if element.tag == 0x7FE00010:
+            return "<Pixel Data omitted>"
+
         value = element.value
         if value is None:
             return ""
-
-        if element.tag == 0x7FE00010:
-            return "<Pixel Data omitted>"
 
         if isinstance(value, bytes):
             return f"<{len(value)} bytes>"

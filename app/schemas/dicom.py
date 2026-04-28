@@ -25,6 +25,7 @@ class SeriesSummary(BaseModel):
     width: int | None = None
     height: int | None = None
     thumbnail_src: str = Field(default="", alias="thumbnailSrc")
+    thumbnail_url: str = Field(default="", alias="thumbnailUrl")
     folder_path: str = Field(alias="folderPath")
     is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
     four_d_phase_count: int | None = Field(default=None, alias="fourDPhaseCount")
