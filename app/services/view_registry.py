@@ -3,10 +3,13 @@
 from fastapi import HTTPException
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
+from app.core.logging import get_logger
 from app.models.viewer import ViewRecord
 from app.schemas.view import ViewCreateRequest, ViewCreateResponse
 from app.services.series_registry import series_registry
 from app.services.view_group_registry import view_group_registry
+
+logger = get_logger(__name__)
 
 
 def _resolve_mpr_active_viewport(view_type: str) -> str:
@@ -36,6 +39,14 @@ class ViewRegistry:
                 view_group_key=payload.view_group_key,
             )
         self._view_by_id[view.view_id] = view
+        logger.info(
+            "create view view_id=%s series_id=%s view_type=%s view_group_key=%s group_id=%s",
+            view.view_id,
+            view.series_id,
+            view.view_type,
+            payload.view_group_key,
+            view.view_group.group_id if view.view_group is not None else None,
+        )
         return ViewCreateResponse(viewId=view.view_id)
 
     def get(self, view_id: str) -> ViewRecord:

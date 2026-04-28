@@ -1392,6 +1392,13 @@ class ViewerService:
 
         source_series = series_registry.get(source_view.series_id)
         target_series = series_registry.get(target_view.series_id)
+        logger.info(
+            "mpr state sync source_view_id=%s source_series_id=%s target_view_id=%s target_series_id=%s",
+            source_view.view_id,
+            source_view.series_id,
+            target_view.view_id,
+            target_view.series_id,
+        )
         source_volume = self._get_series_volume(source_series)
         target_volume = self._get_series_volume(target_series)
         source_context = self._build_mpr_pose_context(source_view, source_volume.shape, series=source_series)
@@ -2497,16 +2504,8 @@ class ViewerService:
         pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
         active_plane = pose_context.poses[target_viewport]
         plane_shape = active_plane.output_shape
-        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(active_plane)
-        image_transform = viewport_transformer.build_image_to_canvas_transform(
-            image_width=plane_shape[1],
-            image_height=plane_shape[0],
-            canvas_width=view.width,
-            canvas_height=view.height,
-            view=view,
-            pixel_aspect_x=pixel_aspect_x,
-            pixel_aspect_y=pixel_aspect_y,
-        )
+        image_height = max(float(plane_shape[0]), 1.0)
+        image_width = max(float(plane_shape[1]), 1.0)
 
         if payload.action_type == DRAG_ACTION_START:
             view.mpr_crosshair_drag_active = True
@@ -2514,9 +2513,10 @@ class ViewerService:
                 origin_center_ijk = world_to_ijk_point(pose_context.geometry, pose_context.cursor.center_world)
                 view.view_group.crosshair_drag_origin_center = tuple(float(value) for value in origin_center_ijk)
                 if payload.x is not None and payload.y is not None:
-                    start_canvas_x = min(max(float(payload.x) * float(view.width or 0), 0.0), max(float(view.width or 0) - 1e-6, 0.0))
-                    start_canvas_y = min(max(float(payload.y) * float(view.height or 0), 0.0), max(float(view.height or 0) - 1e-6, 0.0))
-                    view.view_group.crosshair_drag_origin_image = self._canvas_to_image_coordinates(image_transform, start_canvas_x, start_canvas_y)
+                    view.view_group.crosshair_drag_origin_image = (
+                        min(max(float(payload.x), 0.0), 1.0) * image_width,
+                        min(max(float(payload.y), 0.0), 1.0) * image_height,
+                    )
                 else:
                     view.view_group.crosshair_drag_origin_image = None
             return False
@@ -2532,16 +2532,8 @@ class ViewerService:
         if payload.action_type != DRAG_ACTION_MOVE or not view.mpr_crosshair_drag_active:
             return False
 
-        canvas_width = float(view.width or 0)
-        canvas_height = float(view.height or 0)
-        if canvas_width <= 0 or canvas_height <= 0:
-            return False
-
-        max_canvas_x = max(canvas_width - 1e-6, 0.0)
-        max_canvas_y = max(canvas_height - 1e-6, 0.0)
-        canvas_x = min(max(float(payload.x) * canvas_width, 0.0), max_canvas_x)
-        canvas_y = min(max(float(payload.y) * canvas_height, 0.0), max_canvas_y)
-        image_x, image_y = self._canvas_to_image_coordinates(image_transform, canvas_x, canvas_y)
+        image_x = min(max(float(payload.x), 0.0), 1.0) * image_width
+        image_y = min(max(float(payload.y), 0.0), 1.0) * image_height
         depth, height, width = volume.shape
         if view.view_group is not None:
             previous_center = tuple(float(value) for value in world_to_ijk_point(pose_context.geometry, pose_context.cursor.center_world))
@@ -2996,31 +2988,36 @@ class ViewerService:
         if overlay.center_x is None or overlay.center_y is None:
             return None
 
+        image_width = float(overlay.image_width)
+        image_height = float(overlay.image_height)
+        image_left = float(overlay.image_left)
+        image_top = float(overlay.image_top)
+        min_image_dimension = min(image_width, image_height)
         normalized_radius = (
-            CROSSHAIR_HIT_RADIUS / float(min(overlay.width, overlay.height))
-            if min(overlay.width, overlay.height) > 0
+            CROSSHAIR_HIT_RADIUS / min_image_dimension
+            if min_image_dimension > 0
             else 0.0
         )
         return MprCrosshairInfo(
             centerX=(
-                float(overlay.center_x) / float(overlay.width)
-                if overlay.width > 0
+                (float(overlay.center_x) - image_left) / image_width
+                if image_width > 0
                 else 0.0
             ),
             centerY=(
-                float(overlay.center_y) / float(overlay.height)
-                if overlay.height > 0
+                (float(overlay.center_y) - image_top) / image_height
+                if image_height > 0
                 else 0.0
             ),
             hitRadius=normalized_radius,
             horizontalPosition=(
-                float(overlay.horizontal_position) / float(overlay.height)
-                if overlay.horizontal_position is not None and overlay.height > 0
+                (float(overlay.horizontal_position) - image_top) / image_height
+                if overlay.horizontal_position is not None and image_height > 0
                 else None
             ),
             verticalPosition=(
-                float(overlay.vertical_position) / float(overlay.width)
-                if overlay.vertical_position is not None and overlay.width > 0
+                (float(overlay.vertical_position) - image_left) / image_width
+                if overlay.vertical_position is not None and image_width > 0
                 else None
             ),
             horizontalAngleRad=float(overlay.horizontal_angle_rad),

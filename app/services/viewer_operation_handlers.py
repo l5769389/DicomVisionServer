@@ -428,8 +428,10 @@ def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest
 
 def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload: ViewOperationRequest) -> None:
     service._logger.info(
-        "view operation view_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f rotation=%s hor_flip=%s ver_flip=%s ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
+        "view operation view_id=%s series_id=%s group_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f rotation=%s hor_flip=%s ver_flip=%s ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
         view.view_id,
+        view.series_id,
+        view.view_group.group_id if view.view_group is not None else None,
         view.view_type,
         payload.op_type,
         payload.action_type,

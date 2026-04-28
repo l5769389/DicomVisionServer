@@ -28,6 +28,11 @@ class SeriesRecord:
     patient_id: str | None
     modality: str | None
     series_description: str | None
+    is_virtual: bool = False
+    source_series_id: str | None = None
+    four_d_phase_sort_value: float | None = None
+    four_d_phase_label_value: str | None = None
+    four_d_phase_source: str | None = None
     instances: list[InstanceRecord] = field(default_factory=list)
 
 

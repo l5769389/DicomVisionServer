@@ -102,12 +102,65 @@ def test_load_folder_marks_related_phase_series_as_four_d(tmp_path: Path) -> Non
         assert [phase.phase_index for phase in summary.four_d_phases] == [0, 1]
         assert {phase.label for phase in summary.four_d_phases} == {"Phase 0%", "Phase 50%"}
         assert all(phase.series_id for phase in summary.four_d_phases)
-        assert all(phase.status == "ready" for phase in summary.four_d_phases)
+        assert all(phase.status == "pending" for phase in summary.four_d_phases)
+        assert all(phase.image_src == "" for phase in summary.four_d_phases)
+        assert all(phase.viewport_images == {} for phase in summary.four_d_phases)
 
-        for phase in summary.four_d_phases:
-            assert phase.image_src.startswith("data:image/png;base64,")
-            assert set(phase.viewport_images) == {"mpr-ax", "mpr-cor", "mpr-sag"}
-            assert all(value.startswith("data:image/png;base64,") for value in phase.viewport_images.values())
+
+def test_load_folder_splits_same_series_uid_across_phase_folders_into_distinct_four_d_series(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+    shared_series_uid = generate_uid()
+
+    for phase_percent, base_value in ((0, 100), (50, 500)):
+        for slice_index in range(3):
+            _create_test_dicom(
+                tmp_path / f"phase-{phase_percent}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=shared_series_uid,
+                series_description="4D Lung",
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=base_value,
+            )
+
+    response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+
+    assert len(response.series_list) == 2
+    series_ids = {summary.series_id for summary in response.series_list}
+    for summary in response.series_list:
+        assert summary.is_four_d_series is True
+        assert summary.four_d_phases is not None
+        assert {phase.series_id for phase in summary.four_d_phases} == series_ids
+
+
+def test_load_folder_groups_phase_folders_when_series_descriptions_differ(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for phase_percent, description, base_value in (
+        (0, "Respiration position 1", 100),
+        (50, "Respiration position 2", 500),
+    ):
+        series_uid = generate_uid()
+        for slice_index in range(3):
+            _create_test_dicom(
+                tmp_path / f"phase-{phase_percent}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=description,
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=base_value,
+            )
+
+    response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+
+    assert len(response.series_list) == 2
+    series_ids = {summary.series_id for summary in response.series_list}
+    for summary in response.series_list:
+        assert summary.is_four_d_series is True
+        assert summary.four_d_phases is not None
+        assert [phase.label for phase in summary.four_d_phases] == ["Phase 00", "Phase 50"]
+        assert {phase.series_id for phase in summary.four_d_phases} == series_ids
 
 
 def test_load_folder_builds_single_series_temporal_phase_items(tmp_path: Path) -> None:
@@ -137,8 +190,17 @@ def test_load_folder_builds_single_series_temporal_phase_items(tmp_path: Path) -
     assert summary.four_d_phase_count == 2
     assert summary.four_d_phases is not None
     assert [phase.label for phase in summary.four_d_phases] == ["Phase 01", "Phase 02"]
-    assert {phase.series_id for phase in summary.four_d_phases} == {summary.series_id}
-    assert all(phase.status == "ready" for phase in summary.four_d_phases)
+    phase_series_ids = [phase.series_id for phase in summary.four_d_phases]
+    assert all(phase_series_ids)
+    assert len(set(phase_series_ids)) == 2
+    assert summary.series_id not in set(phase_series_ids)
+    assert all(phase.status == "pending" for phase in summary.four_d_phases)
+
+    for phase_series_id in phase_series_ids:
+        phase_series = series_registry.get(str(phase_series_id))
+        assert phase_series.is_virtual is True
+        assert phase_series.source_series_id == summary.series_id
+        assert len(phase_series.instances) == 2
 
 
 def test_four_d_phases_api_returns_phase_manifest_for_selected_series(tmp_path: Path) -> None:
@@ -169,5 +231,58 @@ def test_four_d_phases_api_returns_phase_manifest_for_selected_series(tmp_path: 
     assert data["isFourDSeries"] is True
     assert data["fourDPhaseCount"] == 2
     assert [phase["label"] for phase in data["fourDPhases"]] == ["Phase 0%", "Phase 50%"]
-    assert all(phase["status"] == "ready" for phase in data["fourDPhases"])
-    assert all(phase["viewportImages"]["mpr-ax"].startswith("data:image/png;base64,") for phase in data["fourDPhases"])
+    assert all(phase["status"] == "pending" for phase in data["fourDPhases"])
+    assert all(phase["imageSrc"] == "" for phase in data["fourDPhases"])
+    assert all(phase["viewportImages"] == {} for phase in data["fourDPhases"])
+
+    preview_response = client.post(
+        "/api/v1/dicom/fourD/phases",
+        json={"seriesId": selected_series_id, "includePreviewImages": True, "previewPhaseIndex": 0},
+    )
+
+    assert preview_response.status_code == 200
+    preview_data = preview_response.json()
+    assert preview_data["fourDPhases"][0]["status"] == "ready"
+    assert preview_data["fourDPhases"][0]["viewportImages"]["mpr-ax"].startswith("data:image/png;base64,")
+    assert preview_data["fourDPhases"][1]["status"] == "pending"
+    assert preview_data["fourDPhases"][1]["viewportImages"] == {}
+
+
+def test_four_d_phases_api_returns_virtual_series_ids_for_single_series_phases(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+    series_uid = generate_uid()
+
+    instance_number = 1
+    for phase_identifier, base_value in ((1, 100), (2, 300)):
+        for slice_index in range(2):
+            _create_test_dicom(
+                tmp_path / f"single-phase-api-{phase_identifier}-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description="Temporal 4D Lung",
+                instance_number=instance_number,
+                slice_index=slice_index,
+                pixel_value=base_value,
+                temporal_position_identifier=phase_identifier,
+            )
+            instance_number += 1
+
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    selected_series_id = load_response.series_list[0].series_id
+
+    client = TestClient(fastapi_app)
+    response = client.post("/api/v1/dicom/fourD/phases", json={"seriesId": selected_series_id})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["seriesId"] == selected_series_id
+    assert data["isFourDSeries"] is True
+    assert data["fourDPhaseCount"] == 2
+    phase_series_ids = [phase["seriesId"] for phase in data["fourDPhases"]]
+    assert len(set(phase_series_ids)) == 2
+    assert selected_series_id not in set(phase_series_ids)
+
+    for phase_series_id in phase_series_ids:
+        phase_series = series_registry.get(str(phase_series_id))
+        assert phase_series.is_virtual is True
+        assert phase_series.source_series_id == selected_series_id

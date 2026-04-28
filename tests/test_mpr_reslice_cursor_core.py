@@ -2,10 +2,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL
 from app.models.viewer import MprFrameState, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
+from app.services.render_layers.render_context import MprCrosshairOverlay
 from app.services import viewer_service as viewer_service_module
 from app.services.mpr import (
     axis_angle_rotation_matrix,
@@ -319,6 +321,74 @@ def test_mpr_crosshair_move_uses_screen_plane_direction_after_model_rotation() -
         np.asarray(active_plane.col_world, dtype=np.float64) * active_plane.pixel_spacing_col_mm,
         atol=1e-6,
     )
+
+
+def test_mpr_crosshair_move_uses_image_normalized_coordinates_when_canvas_has_letterbox(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group, width=320, height=240)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+
+    pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
+    active_plane = pose_context.poses[MPR_VIEWPORT_AXIAL]
+    center_image_x, center_image_y = service._project_world_point_to_plane_image(
+        active_plane,
+        active_plane.cursor_center_world,
+    )
+    start_x = float(center_image_x) / float(active_plane.output_shape[1])
+    start_y = float(center_image_y) / float(active_plane.output_shape[0])
+    target_x = min(1.0, start_x + 0.15)
+    target_y = min(1.0, start_y + 0.1)
+
+    assert not service._handle_mpr_crosshair(
+        view,
+        ViewOperationRequest(viewId="v", opType="crosshair", actionType="start", x=start_x, y=start_y),
+    )
+    assert service._handle_mpr_crosshair(
+        view,
+        ViewOperationRequest(viewId="v", opType="crosshair", actionType="move", x=target_x, y=target_y),
+    )
+
+    next_pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
+    next_plane = next_pose_context.poses[MPR_VIEWPORT_AXIAL]
+    next_center_image_x, next_center_image_y = service._project_world_point_to_plane_image(
+        next_plane,
+        next_pose_context.cursor.center_world,
+    )
+
+    assert next_center_image_x / float(next_plane.output_shape[1]) == pytest.approx(target_x, abs=1e-6)
+    assert next_center_image_y / float(next_plane.output_shape[0]) == pytest.approx(target_y, abs=1e-6)
+
+
+def test_build_mpr_crosshair_info_normalizes_against_rendered_image_frame() -> None:
+    info = ViewerService._build_mpr_crosshair_info(
+        MprCrosshairOverlay(
+            width=320,
+            height=240,
+            image_left=20.0,
+            image_top=30.0,
+            image_width=280.0,
+            image_height=180.0,
+            horizontal_position=120.0,
+            horizontal_color=(0, 0, 0, 255),
+            vertical_position=160.0,
+            vertical_color=(0, 0, 0, 255),
+            center_x=160.0,
+            center_y=120.0,
+        )
+    )
+
+    assert info is not None
+    assert info.center_x == pytest.approx(0.5, abs=1e-6)
+    assert info.center_y == pytest.approx(0.5, abs=1e-6)
+    assert info.vertical_position == pytest.approx(0.5, abs=1e-6)
+    assert info.horizontal_position == pytest.approx(0.5, abs=1e-6)
+    assert info.hit_radius == pytest.approx(12.0 / 180.0, abs=1e-6)
 
 
 def test_mpr_model_rotation_keeps_active_view_labels_and_updates_other_view_labels() -> None:

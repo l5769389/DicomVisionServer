@@ -47,8 +47,13 @@ async def get_corner_info(payload: CornerInfoRequest) -> CornerInfoResponse:
 
 @router.post("/fourD/phases", response_model=FourDPhasesResponse)
 async def get_four_d_phases(payload: FourDPhasesRequest) -> FourDPhasesResponse:
-    series_registry.get(payload.series_id)
-    return four_d_service.get_four_d_phases(payload.series_id, series_registry.list_all())
+    series_registry.ensure_four_d_phase_series(payload.series_id)
+    return four_d_service.get_four_d_phases(
+        payload.series_id,
+        series_registry.list_all(),
+        include_preview_images=payload.include_preview_images,
+        preview_phase_index=payload.preview_phase_index,
+    )
 
 
 @router.post("/tags", response_model=DicomTagsResponse)

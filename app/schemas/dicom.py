@@ -24,6 +24,7 @@ class SeriesSummary(BaseModel):
     instance_count: int = Field(alias="instanceCount")
     width: int | None = None
     height: int | None = None
+    thumbnail_src: str = Field(default="", alias="thumbnailSrc")
     folder_path: str = Field(alias="folderPath")
     is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
     four_d_phase_count: int | None = Field(default=None, alias="fourDPhaseCount")
@@ -53,6 +54,8 @@ class LoadSampleResponse(LoadFolderResponse):
 
 class FourDPhasesRequest(BaseModel):
     series_id: str = Field(alias="seriesId")
+    include_preview_images: bool = Field(default=False, alias="includePreviewImages")
+    preview_phase_index: int | None = Field(default=None, alias="previewPhaseIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -62,6 +65,44 @@ class FourDPhasesResponse(BaseModel):
     is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
     four_d_phase_count: int = Field(default=0, alias="fourDPhaseCount")
     four_d_phases: list[FourDPhaseItem] = Field(default_factory=list, alias="fourDPhases")
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPlaybackStartRequest(BaseModel):
+    tab_key: str = Field(alias="tabKey")
+    phase_index: int = Field(alias="phaseIndex")
+    phase_count: int = Field(alias="phaseCount")
+    fps: int
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPlaybackStopRequest(BaseModel):
+    tab_key: str = Field(alias="tabKey")
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPlaybackFpsRequest(BaseModel):
+    tab_key: str = Field(alias="tabKey")
+    fps: int
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPlaybackPhaseEvent(BaseModel):
+    tab_key: str = Field(alias="tabKey")
+    phase_index: int = Field(alias="phaseIndex")
+
+    model_config = {"populate_by_name": True}
+
+
+class FourDPlaybackStateEvent(BaseModel):
+    tab_key: str = Field(alias="tabKey")
+    is_playing: bool = Field(alias="isPlaying")
+    fps: int | None = None
+    phase_index: int | None = Field(default=None, alias="phaseIndex")
 
     model_config = {"populate_by_name": True}
 

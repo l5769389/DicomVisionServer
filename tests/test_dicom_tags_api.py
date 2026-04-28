@@ -7,6 +7,7 @@ from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, ge
 
 from app.main import fastapi_app
 from app.schemas.dicom import LoadFolderRequest
+from app.services.dicom_cache import dicom_cache
 from app.services.series_registry import series_registry
 
 
@@ -48,6 +49,7 @@ def _create_test_dicom(path: Path) -> None:
 
 def test_dicom_tags_api_returns_instance_tags(tmp_path: Path) -> None:
     series_registry.clear()
+    dicom_cache.clear()
     dicom_path = tmp_path / "tag-test.dcm"
     _create_test_dicom(dicom_path)
 
@@ -82,3 +84,17 @@ def test_dicom_tags_api_returns_instance_tags(tmp_path: Path) -> None:
     nested_row = next(item for item in data["items"] if item["name"] == "Code Meaning")
     assert nested_row["value"] == "Nested value"
     assert nested_row["depth"] >= 2
+
+
+def test_load_folder_response_includes_series_thumbnail(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "thumbnail-test.dcm"
+    _create_test_dicom(dicom_path)
+
+    client = TestClient(fastapi_app)
+    response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["seriesList"][0]["thumbnailSrc"].startswith("data:image/png;base64,")

@@ -51,24 +51,50 @@ class PhaseCandidate:
     phase: PhaseValue
 
 
+@dataclass(frozen=True)
+class PhaseEntry:
+    phase: PhaseValue
+    series_id: str | None
+    instances: list[InstanceRecord]
+
+
 class FourDService:
     def get_four_d_phases(
         self,
         series_id: str,
         series_records: list[SeriesRecord],
+        *,
+        include_preview_images: bool = False,
+        preview_phase_index: int | None = None,
     ) -> FourDPhasesResponse:
         target_series = next((series for series in series_records if series.series_id == series_id), None)
         if target_series is None:
             return FourDPhasesResponse(seriesId=series_id, isFourDSeries=False, fourDPhaseCount=0, fourDPhases=[])
 
-        phase_entries = self._resolve_multi_series_phase_entries(target_series, series_records)
+        real_series_records = [series for series in series_records if not series.is_virtual]
+        if target_series.is_virtual and target_series.source_series_id:
+            source_series = next((series for series in real_series_records if series.series_id == target_series.source_series_id), None)
+            if source_series is not None:
+                target_series = source_series
+
+        phase_entries = self._resolve_multi_series_phase_entries(target_series, real_series_records)
         if not phase_entries:
-            phase_entries = self._resolve_single_series_phase_entries(target_series)
+            phase_entries = self._resolve_single_series_phase_entries(target_series, series_records)
 
         if len(phase_entries) < 2:
             return FourDPhasesResponse(seriesId=series_id, isFourDSeries=False, fourDPhaseCount=0, fourDPhases=[])
 
-        phase_items = self._build_phase_items(phase_entries)
+        phase_items = self._build_phase_items(
+            phase_entries,
+            include_preview_images=include_preview_images,
+            preview_phase_index=preview_phase_index,
+        )
+        logger.info(
+            "4D phase manifest series_id=%s phase_count=%s phase_series_ids=%s",
+            series_id,
+            len(phase_items),
+            [phase.series_id for phase in phase_items],
+        )
         return FourDPhasesResponse(
             seriesId=series_id,
             isFourDSeries=True,
@@ -88,6 +114,9 @@ class FourDService:
         self._apply_multi_series_groups(summaries_by_id, series_records)
         self._apply_single_series_groups(summaries_by_id, series_records)
 
+    def extract_phase_from_text(self, value: str | None) -> PhaseValue | None:
+        return self._extract_phase_from_text(value)
+
     def _apply_multi_series_groups(
         self,
         summaries_by_id: dict[str, SeriesSummary],
@@ -95,13 +124,17 @@ class FourDService:
     ) -> None:
         candidates_by_key: dict[tuple[Any, ...], list[PhaseCandidate]] = defaultdict(list)
         for series in series_records:
+            if series.is_virtual:
+                continue
             phase = self._detect_series_phase(series)
             if phase is None:
                 continue
-            group_key = self._build_multi_series_group_key(series)
-            candidates_by_key[group_key].append(PhaseCandidate(series=series, phase=phase))
+            candidate = PhaseCandidate(series=series, phase=phase)
+            for group_key in self._build_multi_series_group_keys(series):
+                candidates_by_key[group_key].append(candidate)
 
         for candidates in candidates_by_key.values():
+            candidates = self._dedupe_phase_candidates(candidates)
             if len(candidates) < 2:
                 continue
             if len({candidate.phase.sort_value for candidate in candidates}) < 2:
@@ -126,15 +159,13 @@ class FourDService:
         series_records: list[SeriesRecord],
     ) -> None:
         for series in series_records:
+            if series.is_virtual:
+                continue
             summary = summaries_by_id.get(series.series_id)
             if summary is None or summary.is_four_d_series:
                 continue
 
-            grouped_instances = self._group_instances_by_dataset_phase(series)
-            if len(grouped_instances) < 2:
-                continue
-
-            phase_entries = self._phase_entries_from_grouped_instances(series, grouped_instances)
+            phase_entries = self._resolve_single_series_phase_entries(series, series_records)
             phase_items = self._build_phase_items(phase_entries)
             if len(phase_items) < 2:
                 continue
@@ -147,15 +178,17 @@ class FourDService:
         self,
         target_series: SeriesRecord,
         series_records: list[SeriesRecord],
-    ) -> list[tuple[PhaseValue, str | None, list[InstanceRecord]]]:
+    ) -> list[PhaseEntry]:
         target_phase = self._detect_series_phase(target_series)
         if target_phase is None:
             return []
 
-        target_group_key = self._build_multi_series_group_key(target_series)
+        target_group_keys = self._build_multi_series_group_keys(target_series)
         candidates: list[PhaseCandidate] = []
         for series in series_records:
-            if self._build_multi_series_group_key(series) != target_group_key:
+            if series.is_virtual:
+                continue
+            if target_group_keys.isdisjoint(self._build_multi_series_group_keys(series)):
                 continue
             phase = self._detect_series_phase(series)
             if phase is None:
@@ -171,40 +204,104 @@ class FourDService:
     def _resolve_single_series_phase_entries(
         self,
         series: SeriesRecord,
-    ) -> list[tuple[PhaseValue, str | None, list[InstanceRecord]]]:
+        series_records: list[SeriesRecord] | None = None,
+    ) -> list[PhaseEntry]:
+        if series_records is not None:
+            registered_entries = self._resolve_registered_single_series_phase_entries(series, series_records)
+            if registered_entries:
+                return registered_entries
+
         grouped_instances = self._group_instances_by_dataset_phase(series)
         if len(grouped_instances) < 2:
             return []
         return self._phase_entries_from_grouped_instances(series, grouped_instances)
 
+    def get_single_series_phase_groups(
+        self,
+        series: SeriesRecord,
+    ) -> list[tuple[PhaseValue, list[InstanceRecord]]]:
+        grouped_instances = self._group_instances_by_dataset_phase(series)
+        if len(grouped_instances) < 2:
+            return []
+        return [
+            (phase, instances)
+            for phase, instances in sorted(grouped_instances.values(), key=lambda item: item[0].sort_value)
+        ]
+
     @staticmethod
     def _phase_entries_from_candidates(
         candidates: list[PhaseCandidate],
-    ) -> list[tuple[PhaseValue, str | None, list[InstanceRecord]]]:
-        return [(candidate.phase, candidate.series.series_id, candidate.series.instances) for candidate in candidates]
+    ) -> list[PhaseEntry]:
+        return [
+            PhaseEntry(
+                phase=candidate.phase,
+                series_id=candidate.series.series_id,
+                instances=candidate.series.instances,
+            )
+            for candidate in candidates
+        ]
 
     @staticmethod
     def _phase_entries_from_grouped_instances(
         series: SeriesRecord,
         grouped_instances: dict[float, tuple[PhaseValue, list[InstanceRecord]]],
-    ) -> list[tuple[PhaseValue, str | None, list[InstanceRecord]]]:
+    ) -> list[PhaseEntry]:
         return [
-            (phase, series.series_id, instances)
+            PhaseEntry(phase=phase, series_id=series.series_id, instances=instances)
             for phase, instances in sorted(grouped_instances.values(), key=lambda item: item[0].sort_value)
         ]
 
+    @staticmethod
+    def _resolve_registered_single_series_phase_entries(
+        series: SeriesRecord,
+        series_records: list[SeriesRecord],
+    ) -> list[PhaseEntry]:
+        phase_entries: list[PhaseEntry] = []
+        for candidate in series_records:
+            if not candidate.is_virtual or candidate.source_series_id != series.series_id:
+                continue
+            if candidate.four_d_phase_sort_value is None or candidate.four_d_phase_label_value is None:
+                continue
+
+            phase_entries.append(
+                PhaseEntry(
+                    phase=PhaseValue(
+                        sort_value=candidate.four_d_phase_sort_value,
+                        label_value=candidate.four_d_phase_label_value,
+                        source=candidate.four_d_phase_source or "virtual-series",
+                    ),
+                    series_id=candidate.series_id,
+                    instances=candidate.instances,
+                )
+            )
+
+        return sorted(phase_entries, key=lambda item: (item.phase.sort_value, item.series_id or ""))
+
     def _build_phase_items(
         self,
-        phase_entries: list[tuple[PhaseValue, str | None, list[InstanceRecord]]],
+        phase_entries: list[PhaseEntry],
+        *,
+        include_preview_images: bool = False,
+        preview_phase_index: int | None = None,
     ) -> list[FourDPhaseItem]:
         phase_items: list[FourDPhaseItem] = []
-        for phase_index, (phase, series_id, instances) in enumerate(phase_entries):
-            viewport_images, status = self._build_phase_viewport_images(instances)
+        preview_phase_indexes: set[int] = set()
+        if include_preview_images:
+            if preview_phase_index is None:
+                preview_phase_indexes = set(range(len(phase_entries)))
+            else:
+                preview_phase_indexes = {max(0, min(int(preview_phase_index), len(phase_entries) - 1))}
+
+        for phase_index, entry in enumerate(phase_entries):
+            if phase_index in preview_phase_indexes:
+                viewport_images, status = self._build_phase_viewport_images(entry.instances)
+            else:
+                viewport_images, status = {}, "pending"
             phase_items.append(
                 FourDPhaseItem(
                     phaseIndex=phase_index,
-                    label=self._format_phase_label(phase),
-                    seriesId=series_id,
+                    label=self._format_phase_label(entry.phase),
+                    seriesId=entry.series_id,
                     imageSrc=viewport_images.get(MPR_AXIAL, ""),
                     viewportImages=viewport_images,
                     status=status,
@@ -233,7 +330,7 @@ class FourDService:
         return grouped
 
     def _detect_series_phase(self, series: SeriesRecord) -> PhaseValue | None:
-        for text in (series.series_description, self._relative_parent_text(series)):
+        for text in self._series_phase_texts(series):
             phase = self._extract_phase_from_text(text)
             if phase is not None:
                 return phase
@@ -246,18 +343,47 @@ class FourDService:
             return None
         return self._extract_phase_from_dataset(first_header)
 
-    def _build_multi_series_group_key(self, series: SeriesRecord) -> tuple[Any, ...]:
+    @staticmethod
+    def _dedupe_phase_candidates(candidates: list[PhaseCandidate]) -> list[PhaseCandidate]:
+        seen_series_ids: set[str] = set()
+        unique_candidates: list[PhaseCandidate] = []
+        for candidate in candidates:
+            if candidate.series.series_id in seen_series_ids:
+                continue
+            seen_series_ids.add(candidate.series.series_id)
+            unique_candidates.append(candidate)
+        return unique_candidates
+
+    def _build_multi_series_group_keys(self, series: SeriesRecord) -> set[tuple[Any, ...]]:
         first = series.instances[0] if series.instances else None
-        description_key = self._normalize_phase_group_text(series.series_description)
-        folder_key = self._normalize_phase_group_text(self._relative_parent_text(series))
-        group_label_key = description_key or folder_key
-        return (
+        base_key = (
             series.study_instance_uid or series.folder_path,
             series.modality or "",
             len(series.instances),
             first.rows if first is not None else None,
             first.columns if first is not None else None,
-            group_label_key,
+        )
+        return {(*base_key, group_label_key) for group_label_key in self._build_multi_series_group_label_keys(series)}
+
+    def _build_multi_series_group_label_keys(self, series: SeriesRecord) -> set[str]:
+        texts = self._series_phase_texts(series)
+        description_key = self._normalize_phase_group_text(series.series_description)
+        folder_key = self._normalize_phase_group_text(self._relative_parent_text(series))
+        group_label_keys = {description_key or folder_key}
+
+        for text in texts:
+            if self._extract_phase_from_text(text) is None:
+                continue
+            group_label_keys.add(self._normalize_phase_group_text(text))
+
+        return group_label_keys
+
+    def _series_phase_texts(self, series: SeriesRecord) -> tuple[str | None, ...]:
+        first_instance = series.instances[0] if series.instances else None
+        return (
+            series.series_description,
+            self._relative_parent_text(series),
+            first_instance.path.stem if first_instance is not None else None,
         )
 
     @staticmethod
