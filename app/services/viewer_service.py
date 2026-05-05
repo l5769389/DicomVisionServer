@@ -138,7 +138,7 @@ from app.services.volume_rendering import VolumeRenderRequest, vtk_volume_render
 logger = get_logger(__name__)
 
 CROSSHAIR_HIT_RADIUS = 12.0
-MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle"}
+MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 
 
@@ -323,11 +323,16 @@ class ViewerService:
             self._draw_export_polyline(draw, points[:2])
             if len(points) >= 3:
                 self._draw_export_polyline(draw, points[1:3])
+        elif tool_type == "curve" and len(points) >= 2:
+            self._draw_export_polyline(draw, points)
+        elif tool_type == "freeform" and len(points) >= 3:
+            closed_points = (*points, points[0])
+            self._draw_export_polyline(draw, closed_points)
         else:
             return
 
         if label_lines:
-            anchor = points[1] if len(points) >= 2 else points[0]
+            anchor = points[-1] if tool_type == "curve" else points[1] if len(points) >= 2 else points[0]
             self._draw_export_label(draw, font, label_lines, anchor[0] + 12, anchor[1] - 32, width, height)
 
     @staticmethod
@@ -600,6 +605,10 @@ class ViewerService:
 
     @staticmethod
     def _is_empty_measurement(tool_type: str, points: tuple[MeasurementPoint, ...]) -> bool:
+        if tool_type == "freeform":
+            return len(points) < 3
+        if tool_type == "curve":
+            return len(points) < 2
         if tool_type == "angle" or len(points) < 2:
             return False
         start, end = points[:2]
@@ -659,8 +668,18 @@ class ViewerService:
                 slice_index=slice_context.slice_index,
             )
 
-        expected_points = 3 if tool_type == "angle" else 2
-        if len(image_points) != expected_points:
+        if tool_type == "angle":
+            expected_points = 3
+        elif tool_type in {"curve", "freeform"}:
+            expected_points = 3
+        else:
+            expected_points = 2
+        has_expected_points = (
+            len(image_points) >= expected_points
+            if tool_type in {"curve", "freeform"}
+            else len(image_points) == expected_points
+        )
+        if not has_expected_points:
             return None
 
         if self._is_empty_measurement(tool_type, image_points):
@@ -688,8 +707,18 @@ class ViewerService:
         if not payload.points:
             raise HTTPException(status_code=400, detail="Measurement points are required")
 
-        expected_points = 3 if tool_type == "angle" else 2
-        if len(payload.points) != expected_points:
+        if tool_type == "angle":
+            expected_points = 3
+        elif tool_type in {"curve", "freeform"}:
+            expected_points = 3
+        else:
+            expected_points = 2
+        has_expected_points = (
+            len(payload.points) >= expected_points
+            if tool_type in {"curve", "freeform"}
+            else len(payload.points) == expected_points
+        )
+        if not has_expected_points:
             return False
 
         image_points = self._resolve_measurement_image_points(view, payload)

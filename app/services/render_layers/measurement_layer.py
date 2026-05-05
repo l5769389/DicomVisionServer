@@ -65,6 +65,10 @@ class MeasurementLayer:
             self._draw_ellipse(draw, points[:2], scale=scale)
         elif measurement.tool_type == "angle" and len(points) >= 3:
             self._draw_angle(draw, points[:3], scale=scale)
+        elif measurement.tool_type == "curve" and len(points) >= 2:
+            self._draw_polyline(draw, points, scale=scale)
+        elif measurement.tool_type == "freeform" and len(points) >= 3:
+            self._draw_freeform(draw, points, scale=scale)
         else:
             return
 
@@ -93,6 +97,11 @@ class MeasurementLayer:
     def _draw_angle(self, draw: ImageDraw.ImageDraw, points: tuple[tuple[float, float], ...], *, scale: int) -> None:
         self._draw_polyline(draw, points[:2], scale=scale)
         self._draw_polyline(draw, points[1:3], scale=scale)
+
+    def _draw_freeform(self, draw: ImageDraw.ImageDraw, points: tuple[tuple[float, float], ...], *, scale: int) -> None:
+        point_list = list(points)
+        draw.polygon(point_list, outline=MEASUREMENT_STROKE_OUTLINE)
+        self._draw_polyline(draw, [*point_list, point_list[0]], scale=scale)
 
     def _draw_polyline(self, draw: ImageDraw.ImageDraw, points: Iterable[tuple[float, float]], *, scale: int) -> None:
         point_list = list(points)
@@ -145,13 +154,13 @@ class MeasurementLayer:
         measurement: MeasurementRecord,
         points: tuple[tuple[float, float], ...],
     ) -> tuple[float, float]:
-        if measurement.tool_type == "line" and len(points) >= 2:
-            return (points[1][0] + 20.0, points[1][1] - 56.0)
+        if measurement.tool_type in {"line", "curve"} and len(points) >= 2:
+            anchor = points[-1]
+            return (anchor[0] + 20.0, anchor[1] - 56.0)
 
-        if measurement.tool_type in {"rect", "ellipse"} and len(points) >= 2:
-            left = min(points[0][0], points[1][0])
-            top = min(points[0][1], points[1][1])
-            right = max(points[0][0], points[1][0])
+        if measurement.tool_type in {"rect", "ellipse", "freeform"} and len(points) >= 2:
+            top = min(point[1] for point in points)
+            right = max(point[0] for point in points)
             return (right + 20.0, top - 48.0)
 
         if measurement.tool_type == "angle" and len(points) >= 3:

@@ -36,6 +36,10 @@ def build_measurement_metrics(
         return _build_ellipse_metrics(points[:2], source_pixels, spacing_xy)
     if tool_type == "angle":
         return _build_angle_metrics(points[:3])
+    if tool_type == "curve":
+        return _build_curve_metrics(points, spacing_xy)
+    if tool_type == "freeform":
+        return _build_freeform_metrics(points, source_pixels, spacing_xy)
     raise ValueError(f"Unsupported measurement tool type: {tool_type}")
 
 
@@ -223,6 +227,101 @@ def _build_angle_metrics(points: tuple[MeasurementPoint, ...]) -> tuple[Measurem
     return (metrics, (f"{angle:.1f}\u00b0",))
 
 
+def _build_curve_metrics(
+    points: tuple[MeasurementPoint, ...],
+    spacing_xy: tuple[float, float] | None,
+) -> tuple[MeasurementMetrics, tuple[str, ...]]:
+    length = 0.0
+    for index in range(1, len(points)):
+        dx = float(points[index].x - points[index - 1].x)
+        dy = float(points[index].y - points[index - 1].y)
+        if spacing_xy is not None:
+            length += math.hypot(dx * spacing_xy[0], dy * spacing_xy[1])
+        else:
+            length += math.hypot(dx, dy)
+
+    if spacing_xy is not None:
+        metrics = MeasurementMetrics(unit="mm", area_unit="mm2", length=length)
+        return (metrics, (f"{length:.1f} mm",))
+    metrics = MeasurementMetrics(unit="px", area_unit="px2", length=length)
+    return (metrics, (f"{length:.1f} px",))
+
+
+def _build_freeform_metrics(
+    points: tuple[MeasurementPoint, ...],
+    source_pixels: np.ndarray,
+    spacing_xy: tuple[float, float] | None,
+) -> tuple[MeasurementMetrics, tuple[str, ...]]:
+    left, top, right, bottom = _resolve_bounds_for_points(points)
+    roi = source_pixels[top : bottom + 1, left : right + 1]
+    mask = _build_polygon_mask(points, left=left, top=top, shape=roi.shape) if roi.size else np.asarray([], dtype=bool)
+    masked = roi[mask] if roi.size and mask.size else np.asarray([], dtype=np.float32)
+
+    mean = float(np.mean(masked)) if masked.size else None
+    standard_deviation = float(np.std(masked)) if masked.size else None
+    minimum = float(np.min(masked)) if masked.size else None
+    maximum = float(np.max(masked)) if masked.size else None
+    pixel_width = max(0.0, float(right - left))
+    pixel_height = max(0.0, float(bottom - top))
+    pixel_area = float(np.count_nonzero(mask)) if mask.size else 0.0
+
+    if spacing_xy is not None:
+        width = pixel_width * spacing_xy[0]
+        height = pixel_height * spacing_xy[1]
+        area = pixel_area * spacing_xy[0] * spacing_xy[1]
+        metrics = MeasurementMetrics(
+            unit="mm",
+            area_unit="mm2",
+            width=width,
+            height=height,
+            area=area,
+            mean=mean,
+            standard_deviation=standard_deviation,
+            minimum=minimum,
+            maximum=maximum,
+        )
+        return (
+            metrics,
+            _build_roi_label_lines(
+                width=width,
+                height=height,
+                area=area,
+                length_unit="mm",
+                area_unit="mm2",
+                mean=mean,
+                minimum=minimum,
+                maximum=maximum,
+                standard_deviation=standard_deviation,
+            ),
+        )
+
+    metrics = MeasurementMetrics(
+        unit="px",
+        area_unit="px2",
+        width=pixel_width,
+        height=pixel_height,
+        area=pixel_area,
+        mean=mean,
+        standard_deviation=standard_deviation,
+        minimum=minimum,
+        maximum=maximum,
+    )
+    return (
+        metrics,
+        _build_roi_label_lines(
+            width=pixel_width,
+            height=pixel_height,
+            area=pixel_area,
+            length_unit="px",
+            area_unit="px2",
+            mean=mean,
+            minimum=minimum,
+            maximum=maximum,
+            standard_deviation=standard_deviation,
+        ),
+    )
+
+
 def _resolve_bounds(points: tuple[MeasurementPoint, ...]) -> tuple[int, int, int, int]:
     x0 = int(round(points[0].x))
     y0 = int(round(points[0].y))
@@ -233,6 +332,36 @@ def _resolve_bounds(points: tuple[MeasurementPoint, ...]) -> tuple[int, int, int
     top = min(y0, y1)
     bottom = max(y0, y1)
     return (left, top, right, bottom)
+
+
+def _resolve_bounds_for_points(points: tuple[MeasurementPoint, ...]) -> tuple[int, int, int, int]:
+    xs = [int(round(point.x)) for point in points]
+    ys = [int(round(point.y)) for point in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _build_polygon_mask(
+    points: tuple[MeasurementPoint, ...],
+    *,
+    left: int,
+    top: int,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    height, width = shape[:2]
+    if height <= 0 or width <= 0:
+        return np.asarray([], dtype=bool)
+
+    yy, xx = np.indices((height, width), dtype=np.float64)
+    x = xx + float(left)
+    y = yy + float(top)
+    inside = np.zeros((height, width), dtype=bool)
+    previous = points[-1]
+    for current in points:
+        y_crosses = (current.y > y) != (previous.y > y)
+        x_intersection = (previous.x - current.x) * (y - current.y) / ((previous.y - current.y) or 1e-9) + current.x
+        inside ^= y_crosses & (x < x_intersection)
+        previous = current
+    return inside
 
 
 def _build_roi_label_lines(
