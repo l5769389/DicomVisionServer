@@ -117,12 +117,18 @@ class DicomCache:
         return pixels
 
     @staticmethod
-    def _get_first_number(value: float | MultiValue | None) -> float | None:
+    def _get_first_number(value: object) -> float | None:
         if value is None:
             return None
         if isinstance(value, MultiValue):
-            return float(value[0])
-        return float(value)
+            if not value:
+                return None
+            value = value[0]
+        try:
+            parsed_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed_value if np.isfinite(parsed_value) else None
 
 
 dicom_cache = DicomCache()

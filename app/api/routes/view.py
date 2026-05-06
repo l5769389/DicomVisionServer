@@ -1,7 +1,7 @@
 ﻿from fastapi import APIRouter, BackgroundTasks
 
 from fastapi.responses import Response
-
+from urllib.parse import quote
 from app.schemas.view import (
     OperationAcceptedResponse,
     ViewCloseRequest,
@@ -19,6 +19,28 @@ from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 
 router = APIRouter(prefix="/view", tags=["view"])
+
+
+def _sanitize_attachment_filename(file_name: str) -> str:
+    sanitized = file_name.replace("\r\n", "_").replace("\r", "_").replace("\n", "_").strip()
+    return sanitized or "dicomvision-export"
+
+
+def _build_ascii_attachment_fallback(file_name: str) -> str:
+    fallback = "".join(
+        character if 32 <= ord(character) < 127 and character not in {'"', "\\", ";"} else "_"
+        for character in file_name
+    ).strip(" ._")
+    return fallback or "dicomvision-export"
+
+
+def _build_attachment_headers(file_name: str) -> dict[str, str]:
+    safe_file_name = _sanitize_attachment_filename(file_name)
+    ascii_fallback = _build_ascii_attachment_fallback(safe_file_name)
+    encoded_file_name = quote(safe_file_name, safe="")
+    return {
+        "Content-Disposition": f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded_file_name}"
+    }
 
 
 async def _emit_render_after_resize(view_id: str) -> None:
@@ -67,5 +89,5 @@ def export_view(payload: ViewExportRequest) -> Response:
     return Response(
         content=exported.file_bytes,
         media_type=exported.media_type,
-        headers={"Content-Disposition": f'attachment; filename="{exported.file_name}"'},
+        headers=_build_attachment_headers(exported.file_name),
     )

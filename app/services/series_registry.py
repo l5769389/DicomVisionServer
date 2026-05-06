@@ -120,7 +120,10 @@ class SeriesRegistry:
 
     @staticmethod
     def _build_instance_record(path: Path, dataset, default_instance_number: int) -> InstanceRecord:
-        instance_number = int(getattr(dataset, "InstanceNumber", default_instance_number) or default_instance_number)
+        instance_number = SeriesRegistry._resolve_instance_number(
+            getattr(dataset, "InstanceNumber", None),
+            default_instance_number,
+        )
         return InstanceRecord(
             path=path,
             sop_instance_uid=getattr(dataset, "SOPInstanceUID", None),
@@ -128,6 +131,16 @@ class SeriesRegistry:
             rows=getattr(dataset, "Rows", None),
             columns=getattr(dataset, "Columns", None),
         )
+
+    @staticmethod
+    def _resolve_instance_number(value, fallback: int) -> int:
+        try:
+            raw_value = str(value).strip()
+            if not raw_value:
+                return fallback
+            return int(float(raw_value))
+        except (OverflowError, TypeError, ValueError):
+            return fallback
 
     def _collect_grouped_series(self, folder: Path) -> dict[str, SeriesRecord]:
         grouped: dict[str, SeriesRecord] = {}
