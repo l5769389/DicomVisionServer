@@ -63,12 +63,23 @@ class ViewSocketHub:
         if current.target_sids is None or incoming.target_sids is None:
             target_sids = None
         else:
-            target_sids = tuple(set(current.target_sids).union(incoming.target_sids))
+            target_sids = tuple(dict.fromkeys((*current.target_sids, *incoming.target_sids)))
         return RenderRequest(
-            image_format=incoming.image_format,
-            fast_preview=incoming.fast_preview,
+            image_format=ViewSocketHub._choose_render_image_format(current.image_format, incoming.image_format),
+            fast_preview=current.fast_preview and incoming.fast_preview,
             target_sids=target_sids,
         )
+
+    @staticmethod
+    def _choose_render_image_format(current: str, incoming: str) -> str:
+        quality_rank = {"jpeg": 0, "png": 1}
+        current_rank = quality_rank.get(current, 0)
+        incoming_rank = quality_rank.get(incoming, 0)
+        if incoming_rank > current_rank:
+            return incoming
+        if current_rank > incoming_rank:
+            return current
+        return incoming
 
     def _queue_pending_render(self, view_id: str, incoming_request: RenderRequest) -> None:
         current_request = self._pending_render_requests.get(view_id)

@@ -2,7 +2,13 @@ import asyncio
 import socketio
 
 from app.core.logging import get_logger
+from app.schemas.dicom import (
+    FourDPlaybackFpsRequest,
+    FourDPlaybackStartRequest,
+    FourDPlaybackStopRequest,
+)
 from app.schemas.view import ViewHoverRequest, ViewOperationRequest, ViewSetSizeRequest
+from app.sockets.four_d_playback import four_d_playback_hub
 from app.sockets.runtime import view_socket_hub
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
@@ -34,7 +40,7 @@ async def _emit_render(server: socketio.AsyncServer, sid: str, view_id: str) -> 
 
 
 @timer
-async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) -> None:
+async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) -> dict[str, object]:
     try:
         payload = ViewOperationRequest.model_validate(data)
         view_socket_hub.bind_view(sid, payload.view_id)
@@ -68,9 +74,11 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
                     )
                 )
         logger.info("socket view_operation sid=%s view_id=%s op_type=%s", sid, payload.view_id, payload.op_type)
+        return {"ok": True}
     except Exception as exc:
         logger.exception("socket view_operation failed sid=%s", sid)
         await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
+        return {"ok": False, "message": _build_error_payload(exc)["message"]}
 
 
 async def _handle_hover(server: socketio.AsyncServer, sid: str, data: dict) -> None:
@@ -97,8 +105,45 @@ async def _handle_set_size(server: socketio.AsyncServer, sid: str, data: dict) -
         await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
 
 
+async def _handle_four_d_playback_start(server: socketio.AsyncServer, sid: str, data: dict) -> None:
+    try:
+        payload = FourDPlaybackStartRequest.model_validate(data)
+        await four_d_playback_hub.start(sid, payload)
+        logger.info(
+            "socket four_d_playback_start sid=%s tab_key=%s phase_index=%s fps=%s",
+            sid,
+            payload.tab_key,
+            payload.phase_index,
+            payload.fps,
+        )
+    except Exception as exc:
+        logger.exception("socket four_d_playback_start failed sid=%s", sid)
+        await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
+
+
+async def _handle_four_d_playback_stop(server: socketio.AsyncServer, sid: str, data: dict) -> None:
+    try:
+        payload = FourDPlaybackStopRequest.model_validate(data)
+        await four_d_playback_hub.stop(sid, payload)
+        logger.info("socket four_d_playback_stop sid=%s tab_key=%s", sid, payload.tab_key)
+    except Exception as exc:
+        logger.exception("socket four_d_playback_stop failed sid=%s", sid)
+        await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
+
+
+async def _handle_four_d_playback_fps(server: socketio.AsyncServer, sid: str, data: dict) -> None:
+    try:
+        payload = FourDPlaybackFpsRequest.model_validate(data)
+        await four_d_playback_hub.update_fps(sid, payload)
+        logger.info("socket four_d_playback_fps sid=%s tab_key=%s fps=%s", sid, payload.tab_key, payload.fps)
+    except Exception as exc:
+        logger.exception("socket four_d_playback_fps failed sid=%s", sid)
+        await _emit_errors(server, sid, events=("image_error", "render_error"), exc=exc)
+
+
 def register_socket_handlers(server: socketio.AsyncServer) -> None:
     view_socket_hub.attach_server(server)
+    four_d_playback_hub.attach_server(server)
 
     @server.event
     async def connect(sid: str, environ: dict, auth: dict | None = None) -> None:
@@ -107,26 +152,32 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
 
     @server.event
     async def disconnect(sid: str) -> None:
+        await four_d_playback_hub.unbind_sid(sid)
         view_socket_hub.unbind_sid(sid)
         logger.info("socket disconnected sid=%s", sid)
         return None
 
     @server.on("bind_view")
-    async def bind_view(sid: str, data: dict) -> None:
+    async def bind_view(sid: str, data: dict) -> dict[str, object] | None:
         view_id = str(data.get("viewId") or data.get("view_id") or "")
         if not view_id:
             await server.emit("image_error", {"message": "viewId is required"}, to=sid)
-            return
+            return {"ok": False, "message": "viewId is required"}
+        should_render = bool(data.get("render", True))
         view_socket_hub.bind_view(sid, view_id)
         logger.info("socket bind_view sid=%s view_id=%s", sid, view_id)
         await server.emit("view_bound", {"viewId": view_id}, to=sid)
+        if not should_render:
+            return {"ok": True}
         try:
             view = view_registry.get(view_id)
             if view.width and view.height:
                 await _emit_render(server, sid, view_id)
+            return {"ok": True}
         except Exception as exc:
             logger.exception("socket bind_view initial render failed sid=%s view_id=%s", sid, view_id)
             await _emit_errors(server, sid, events=("render_error",), exc=exc)
+            return {"ok": False, "message": _build_error_payload(exc)["message"]}
 
     @server.on("set_view_size")
     async def set_view_size(sid: str, data: dict) -> None:
@@ -137,9 +188,21 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
         await _handle_hover(server, sid, data)
 
     @server.on("view_operation")
-    async def view_operation(sid: str, data: dict) -> None:
-        await _handle_operation(server, sid, data)
+    async def view_operation(sid: str, data: dict) -> dict[str, object]:
+        return await _handle_operation(server, sid, data)
 
     @server.on("image_operation")
-    async def image_operation(sid: str, data: dict) -> None:
-        await _handle_operation(server, sid, data)
+    async def image_operation(sid: str, data: dict) -> dict[str, object]:
+        return await _handle_operation(server, sid, data)
+
+    @server.on("four_d_playback_start")
+    async def four_d_playback_start(sid: str, data: dict) -> None:
+        await _handle_four_d_playback_start(server, sid, data)
+
+    @server.on("four_d_playback_stop")
+    async def four_d_playback_stop(sid: str, data: dict) -> None:
+        await _handle_four_d_playback_stop(server, sid, data)
+
+    @server.on("four_d_playback_fps")
+    async def four_d_playback_fps(sid: str, data: dict) -> None:
+        await _handle_four_d_playback_fps(server, sid, data)

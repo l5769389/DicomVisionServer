@@ -4,6 +4,7 @@ from typing import Any, Protocol
 
 import numpy as np
 from fastapi import HTTPException
+from scipy import ndimage
 
 from app.models.viewer import ViewRecord
 from app.schemas.view import (
@@ -326,47 +327,33 @@ class WaterPhantomQaService:
 
     @staticmethod
     def _find_largest_mask_component(mask: np.ndarray) -> tuple[int, int, int, int, int, float, float] | None:
-        height, width = mask.shape
-        visited = np.zeros(mask.shape, dtype=bool)
-        best: tuple[int, int, int, int, int, float, float] | None = None
+        structure = np.array(((0, 1, 0), (1, 1, 1), (0, 1, 0)), dtype=bool)
+        labels, label_count = ndimage.label(np.asarray(mask, dtype=bool), structure=structure)
+        if label_count <= 0:
+            return None
 
-        for start_y in range(height):
-            for start_x in range(width):
-                if visited[start_y, start_x] or not mask[start_y, start_x]:
-                    continue
+        component_sizes = np.bincount(labels.ravel())
+        component_sizes[0] = 0
+        label_index = int(np.argmax(component_sizes))
+        area = int(component_sizes[label_index])
+        if area <= 0:
+            return None
 
-                stack = [(start_x, start_y)]
-                visited[start_y, start_x] = True
-                area = 0
-                min_x = width
-                max_x = 0
-                min_y = height
-                max_y = 0
-                sum_x = 0.0
-                sum_y = 0.0
+        component_slices = ndimage.find_objects(labels)
+        component_slice = component_slices[label_index - 1] if label_index - 1 < len(component_slices) else None
+        if component_slice is None:
+            return None
 
-                while stack:
-                    x, y = stack.pop()
-                    area += 1
-                    min_x = min(min_x, x)
-                    max_x = max(max_x, x)
-                    min_y = min(min_y, y)
-                    max_y = max(max_y, y)
-                    sum_x += float(x)
-                    sum_y += float(y)
-
-                    for next_x, next_y in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                        if next_x < 0 or next_x >= width or next_y < 0 or next_y >= height:
-                            continue
-                        if visited[next_y, next_x] or not mask[next_y, next_x]:
-                            continue
-                        visited[next_y, next_x] = True
-                        stack.append((next_x, next_y))
-
-                if best is None or area > best[0]:
-                    best = (area, min_x, max_x, min_y, max_y, sum_x, sum_y)
-
-        return best
+        y_slice, x_slice = component_slice
+        min_y = int(y_slice.start)
+        max_y = int(y_slice.stop - 1)
+        min_x = int(x_slice.start)
+        max_x = int(x_slice.stop - 1)
+        local_mask = labels[component_slice] == label_index
+        local_y, local_x = np.nonzero(local_mask)
+        sum_x = float(np.sum(local_x + min_x))
+        sum_y = float(np.sum(local_y + min_y))
+        return (area, min_x, max_x, min_y, max_y, sum_x, sum_y)
 
     def _detect_water_phantom_geometry(self, source_pixels: np.ndarray) -> tuple[float, float, float] | None:
         pixels = np.asarray(source_pixels, dtype=np.float64)

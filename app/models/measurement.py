@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-MeasurementToolType = Literal["line", "rect", "ellipse", "angle"]
+MeasurementToolType = Literal["line", "rect", "ellipse", "angle", "curve", "freeform"]
 MeasurementUnit = Literal["mm", "px"]
 MeasurementAreaUnit = Literal["mm2", "px2"]
 

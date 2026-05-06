@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 import numpy as np
 import pydicom
@@ -22,22 +23,27 @@ class CachedDicom:
     window_center: float | None
     pixel_min: float
     pixel_max: float
+    byte_size: int
 
 
 class DicomCache:
-    def __init__(self, max_entries: int = 128) -> None:
+    def __init__(self, max_entries: int = 128, max_bytes: int = 512 * 1024 * 1024) -> None:
         self.max_entries = max_entries
+        self.max_bytes = max_bytes
         self._cache: OrderedDict[str, CachedDicom] = OrderedDict()
+        self._current_bytes = 0
+        self._lock = RLock()
 
-    def get(self, instance_uid: str, path: Path) -> CachedDicom:
-        cache_key = instance_uid
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            self._cache.move_to_end(cache_key)
-            logger.debug("dicom cache hit instance_uid=%s", instance_uid)
-            return cached
+    def get(self, instance_uid: str | None, path: Path) -> CachedDicom:
+        cache_key = str(instance_uid or path.resolve().as_posix())
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._cache.move_to_end(cache_key)
+                logger.debug("dicom cache hit key=%s", cache_key)
+                return cached
 
-        logger.info("dicom cache miss instance_uid=%s path=%s", instance_uid, path)
+        logger.info("dicom cache miss key=%s path=%s", cache_key, path)
         dataset = pydicom.dcmread(str(path), force=True)
         source_pixels = self._extract_source_pixels(dataset)
         cached = CachedDicom(
@@ -47,21 +53,38 @@ class DicomCache:
             window_center=self._get_first_number(getattr(dataset, "WindowCenter", None)),
             pixel_min=float(np.min(source_pixels)),
             pixel_max=float(np.max(source_pixels)),
+            byte_size=int(source_pixels.nbytes),
         )
-        self._cache[cache_key] = cached
-        if len(self._cache) > self.max_entries:
-            evicted_key, _ = self._cache.popitem(last=False)
-            logger.debug("dicom cache evict instance_uid=%s", evicted_key)
+        with self._lock:
+            existing = self._cache.get(cache_key)
+            if existing is not None:
+                self._cache.move_to_end(cache_key)
+                return existing
+
+            self._cache[cache_key] = cached
+            self._current_bytes += cached.byte_size
+            self._evict_if_needed()
         return cached
 
+    def _evict_if_needed(self) -> None:
+        while len(self._cache) > self.max_entries or (self._current_bytes > self.max_bytes and len(self._cache) > 1):
+            evicted_key, evicted = self._cache.popitem(last=False)
+            self._current_bytes = max(0, self._current_bytes - evicted.byte_size)
+            logger.debug("dicom cache evict key=%s bytes=%s", evicted_key, evicted.byte_size)
+
     def stats(self) -> dict[str, int]:
-        return {
-            "entries": len(self._cache),
-            "max_entries": self.max_entries,
-        }
+        with self._lock:
+            return {
+                "entries": len(self._cache),
+                "max_entries": self.max_entries,
+                "current_bytes": self._current_bytes,
+                "max_bytes": self.max_bytes,
+            }
 
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
+            self._current_bytes = 0
         logger.info("dicom cache cleared")
 
     def _extract_source_pixels(self, dataset: Dataset) -> np.ndarray:
@@ -94,12 +117,18 @@ class DicomCache:
         return pixels
 
     @staticmethod
-    def _get_first_number(value: float | MultiValue | None) -> float | None:
+    def _get_first_number(value: object) -> float | None:
         if value is None:
             return None
         if isinstance(value, MultiValue):
-            return float(value[0])
-        return float(value)
+            if not value:
+                return None
+            value = value[0]
+        try:
+            parsed_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed_value if np.isfinite(parsed_value) else None
 
 
 dicom_cache = DicomCache()

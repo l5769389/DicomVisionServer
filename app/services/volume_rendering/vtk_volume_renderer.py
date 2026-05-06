@@ -761,7 +761,7 @@ class VtkVolumeRenderer:
         vtk_scalars = image_data.GetPointData().GetScalars()
         array = vtk_to_numpy(vtk_scalars).reshape(height, width, 3)
         array = np.flipud(array)
-        return Image.fromarray(array, mode="RGB")
+        return Image.fromarray(array)
 
 
 vtk_volume_renderer = VtkVolumeRenderer()

@@ -14,6 +14,7 @@ VIEW_OP_TYPE_VOLUME_PRESET: Final = "volumePreset"
 VIEW_OP_TYPE_VOLUME_CONFIG: Final = "volumeConfig"
 VIEW_OP_TYPE_MPR_MIP_CONFIG: Final = "mprMipConfig"
 VIEW_OP_TYPE_MPR_OBLIQUE: Final = "mprOblique"
+VIEW_OP_TYPE_MPR_STATE_SYNC: Final = "mprStateSync"
 VIEW_OP_TYPE_MEASUREMENT: Final = "measurement"
 
 DRAG_ACTION_START: Final = "start"

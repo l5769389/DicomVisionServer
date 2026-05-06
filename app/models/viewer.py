@@ -6,6 +6,8 @@ from app.models.measurement import MeasurementRecord
 
 
 Quaternion = tuple[float, float, float, float]
+Vec3 = tuple[float, float, float]
+Mat3 = tuple[Vec3, Vec3, Vec3]
 
 
 @dataclass
@@ -26,6 +28,11 @@ class SeriesRecord:
     patient_id: str | None
     modality: str | None
     series_description: str | None
+    is_virtual: bool = False
+    source_series_id: str | None = None
+    four_d_phase_sort_value: float | None = None
+    four_d_phase_label_value: str | None = None
+    four_d_phase_source: str | None = None
     instances: list[InstanceRecord] = field(default_factory=list)
 
 
@@ -89,10 +96,27 @@ class MprObliquePlaneState:
 
 @dataclass
 class MprFrameState:
-    center: tuple[float, float, float]
-    axis_slice: tuple[float, float, float]
-    axis_row: tuple[float, float, float]
-    axis_col: tuple[float, float, float]
+    center: Vec3
+    axis_slice: Vec3
+    axis_row: Vec3
+    axis_col: Vec3
+
+
+@dataclass
+class MprCursorRecord:
+    center_world: Vec3
+    reference_center_world: Vec3
+    orientation_world: Mat3
+    linked_to_volume_rotation: bool = False
+
+
+@dataclass
+class MprRotationDragRecord:
+    viewport: str
+    line: str
+    start_cursor: MprCursorRecord
+    start_pointer_angle_rad: float = 0.0
+    start_line_angle_rad: float = 0.0
 
 
 def create_default_mpr_frame_state() -> MprFrameState:
@@ -102,42 +126,6 @@ def create_default_mpr_frame_state() -> MprFrameState:
         axis_row=(0.0, 1.0, 0.0),
         axis_col=(0.0, 0.0, 1.0),
     )
-
-
-def create_default_mpr_oblique_planes() -> dict[str, MprObliquePlaneState]:
-    return {
-        "mpr-ax": MprObliquePlaneState(
-            row=(0.0, 1.0, 0.0),
-            col=(0.0, 0.0, 1.0),
-            normal=(1.0, 0.0, 0.0),
-        ),
-        "mpr-cor": MprObliquePlaneState(
-            row=(-1.0, 0.0, 0.0),
-            col=(0.0, 0.0, 1.0),
-            normal=(0.0, 1.0, 0.0),
-        ),
-        "mpr-sag": MprObliquePlaneState(
-            row=(-1.0, 0.0, 0.0),
-            col=(0.0, 1.0, 0.0),
-            normal=(0.0, 0.0, 1.0),
-        ),
-    }
-
-
-def create_default_mpr_oblique_line_angles() -> dict[str, dict[str, float]]:
-    return {
-        "mpr-ax": {"horizontal": 0.0, "vertical": 1.5707963267948966},
-        "mpr-cor": {"horizontal": 0.0, "vertical": 1.5707963267948966},
-        "mpr-sag": {"horizontal": 0.0, "vertical": 1.5707963267948966},
-    }
-
-
-def create_default_mpr_oblique_directed_line_angles() -> dict[str, dict[str, float]]:
-    return {
-        "mpr-ax": {"horizontal": 0.0, "vertical": 1.5707963267948966},
-        "mpr-cor": {"horizontal": 0.0, "vertical": 1.5707963267948966},
-        "mpr-sag": {"horizontal": 0.0, "vertical": 1.5707963267948966},
-    }
 
 
 @dataclass
@@ -156,15 +144,17 @@ class ViewGroupRecord:
     crosshair_drag_active: bool = False
     crosshair_drag_origin_center: tuple[float, float, float] | None = None
     crosshair_drag_origin_image: tuple[float, float] | None = None
-    oblique_drag_active: bool = False
-    oblique_source_viewport: str | None = None
-    oblique_source_line: str | None = None
     mpr_mip: MprMipState = field(default_factory=MprMipState)
-    mpr_frame: MprFrameState = field(default_factory=create_default_mpr_frame_state)
+    mpr_cursor: MprCursorRecord | None = None
+    mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
+    rotation_drag: MprRotationDragRecord | None = None
     mpr_reference_center: tuple[float, float, float] | None = None
-    oblique_planes: dict[str, MprObliquePlaneState] = field(default_factory=create_default_mpr_oblique_planes)
-    oblique_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_line_angles)
-    oblique_directed_line_angles: dict[str, dict[str, float]] = field(default_factory=create_default_mpr_oblique_directed_line_angles)
+    mpr_model_rotation_world: Mat3 = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    mpr_model_rotation_pivot_world: Vec3 | None = None
 
 
 @dataclass
@@ -380,9 +370,7 @@ class ViewRecord:
     def mpr_axial_index(self, value: int) -> None:
         if self.view_group is not None:
             self.view_group.axial_index = value
-            center = list(self.view_group.mpr_frame.center)
-            center[0] = float(value)
-            self.view_group.mpr_frame.center = tuple(center)
+            self.view_group.mpr_cursor = None
 
     @property
     def mpr_coronal_index(self) -> int:
@@ -392,9 +380,7 @@ class ViewRecord:
     def mpr_coronal_index(self, value: int) -> None:
         if self.view_group is not None:
             self.view_group.coronal_index = value
-            center = list(self.view_group.mpr_frame.center)
-            center[1] = float(value)
-            self.view_group.mpr_frame.center = tuple(center)
+            self.view_group.mpr_cursor = None
 
     @property
     def mpr_sagittal_index(self) -> int:
@@ -404,9 +390,7 @@ class ViewRecord:
     def mpr_sagittal_index(self, value: int) -> None:
         if self.view_group is not None:
             self.view_group.sagittal_index = value
-            center = list(self.view_group.mpr_frame.center)
-            center[2] = float(value)
-            self.view_group.mpr_frame.center = tuple(center)
+            self.view_group.mpr_cursor = None
 
     @property
     def mpr_crosshair_drag_active(self) -> bool:

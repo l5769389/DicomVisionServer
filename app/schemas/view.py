@@ -9,7 +9,7 @@ ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "mprOblique", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "mprOblique", "mprStateSync", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -20,6 +20,8 @@ MprCrosshairLine = Literal["horizontal", "vertical"]
 class ViewCreateRequest(BaseModel):
     series_id: str = Field(alias="seriesId")
     view_type: ViewType = Field(alias="viewType")
+    view_group_key: str | None = Field(default=None, alias="viewGroupKey")
+    four_d_phase_index: int | None = Field(default=None, alias="fourDPhaseIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -94,7 +96,29 @@ class MprFrameInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprCursorInfo(BaseModel):
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    reference_center_world: tuple[float, float, float] = Field(alias="referenceCenterWorld")
+    orientation_world: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] = Field(alias="orientationWorld")
+    linked_to_volume_rotation: bool = Field(default=False, alias="linkedToVolumeRotation")
+
+    model_config = {"populate_by_name": True}
+
+
 class MprPlaneInfo(BaseModel):
+    viewport: str
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    cursor_center_world: tuple[float, float, float] = Field(alias="cursorCenterWorld")
+    row_world: tuple[float, float, float] = Field(alias="rowWorld")
+    col_world: tuple[float, float, float] = Field(alias="colWorld")
+    normal_world: tuple[float, float, float] = Field(alias="normalWorld")
+    pixel_spacing_row_mm: float = Field(alias="pixelSpacingRowMm")
+    pixel_spacing_col_mm: float = Field(alias="pixelSpacingColMm")
+    output_shape: tuple[int, int] = Field(alias="outputShape")
     row: tuple[float, float, float]
     col: tuple[float, float, float]
     normal: tuple[float, float, float]
@@ -221,6 +245,7 @@ class ViewImageResponse(BaseModel):
     image_format: ImageFormat = Field(alias="imageFormat")
     view_id: str = Field(alias="viewId")
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
+    mpr_cursor: MprCursorInfo | None = Field(default=None, alias="mprCursor")
     mpr_frame: MprFrameInfo | None = Field(default=None, alias="mprFrame")
     mpr_plane: MprPlaneInfo | None = Field(default=None, alias="mprPlane")
     scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
@@ -276,7 +301,6 @@ class ViewOperationRequest(BaseModel):
     x: float | None = None
     y: float | None = None
     line: MprCrosshairLine | None = None
-    angle_rad: float | None = Field(default=None, alias="angleRad")
     points: list[MeasurementPointPayload] | None = None
     zoom: float | None = None
     delta: int | None = None
@@ -284,6 +308,7 @@ class ViewOperationRequest(BaseModel):
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
     ver_flip: bool | None = Field(default=None, alias="ver_flip")

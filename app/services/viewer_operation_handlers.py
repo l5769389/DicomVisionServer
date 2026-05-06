@@ -18,6 +18,7 @@ from app.core import (
     VIEW_OP_TYPE_VOLUME_CONFIG,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_MPR_OBLIQUE,
+    VIEW_OP_TYPE_MPR_STATE_SYNC,
     VIEW_OP_TYPE_MEASUREMENT,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
@@ -115,6 +116,7 @@ def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
         VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
         VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
         VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
+        VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
         VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
     }
     return operation_handlers.get(payload.op_type, _handle_generic_operation)
@@ -244,7 +246,13 @@ def _handle_rotate_3d_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series, is_mpr_view
+    del series
+    if is_mpr_view:
+        if not service._handle_mpr_model_rotate_3d(view, payload):
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_broadcast("jpeg", fast_preview=True)
+        return _render_broadcast()
     service._handle_drag_rotate_3d(view, payload)
     return _resolve_drag_single_render_decision(service, view, payload, fast_preview_on_move=True)
 
@@ -366,6 +374,21 @@ def _handle_mpr_oblique_operation(
     return _render_broadcast()
 
 
+def _handle_mpr_state_sync_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series
+    if not is_mpr_view or not payload.source_view_id:
+        return _render_none()
+    if not service._sync_mpr_state_from_source_view(view, payload.source_view_id):
+        return _render_none()
+    return _render_broadcast()
+
+
 def _handle_generic_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -405,8 +428,10 @@ def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest
 
 def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload: ViewOperationRequest) -> None:
     service._logger.info(
-        "view operation view_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f rotation=%s hor_flip=%s ver_flip=%s ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
+        "view operation view_id=%s series_id=%s group_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f rotation=%s hor_flip=%s ver_flip=%s ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
         view.view_id,
+        view.series_id,
+        view.view_group.group_id if view.view_group is not None else None,
         view.view_type,
         payload.op_type,
         payload.action_type,
