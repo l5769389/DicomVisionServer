@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from app.models.measurement import MeasurementPoint, MeasurementRecord
+from app.services.measurement_geometry import build_smooth_path_points
 from app.services.render_layers.render_context import LayerSpace, RenderContext
 
 
@@ -66,7 +67,7 @@ class MeasurementLayer:
         elif measurement.tool_type == "angle" and len(points) >= 3:
             self._draw_angle(draw, points[:3], scale=scale)
         elif measurement.tool_type == "curve" and len(points) >= 2:
-            self._draw_polyline(draw, points, scale=scale)
+            self._draw_curve(draw, points, scale=scale)
         elif measurement.tool_type == "freeform" and len(points) >= 3:
             self._draw_freeform(draw, points, scale=scale)
         else:
@@ -98,10 +99,11 @@ class MeasurementLayer:
         self._draw_polyline(draw, points[:2], scale=scale)
         self._draw_polyline(draw, points[1:3], scale=scale)
 
+    def _draw_curve(self, draw: ImageDraw.ImageDraw, points: tuple[tuple[float, float], ...], *, scale: int) -> None:
+        self._draw_polyline(draw, build_smooth_path_points(points), scale=scale)
+
     def _draw_freeform(self, draw: ImageDraw.ImageDraw, points: tuple[tuple[float, float], ...], *, scale: int) -> None:
-        point_list = list(points)
-        draw.polygon(point_list, outline=MEASUREMENT_STROKE_OUTLINE)
-        self._draw_polyline(draw, [*point_list, point_list[0]], scale=scale)
+        self._draw_polyline(draw, build_smooth_path_points(points, close_path=True), scale=scale)
 
     def _draw_polyline(self, draw: ImageDraw.ImageDraw, points: Iterable[tuple[float, float]], *, scale: int) -> None:
         point_list = list(points)

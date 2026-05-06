@@ -95,7 +95,9 @@ from app.services.dicom_geometry import (
 )
 from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
-from app.services.measurement_utils import build_measurement_metrics, clamp_point_to_image
+from app.services.measurement_geometry import build_smooth_path_points
+from app.services.measurement_rules import get_measurement_point_requirement, has_required_measurement_points
+from app.services.measurement_utils import build_measurement_metrics
 from app.services.mpr import (
     MipConfig as ResliceMipConfig,
     MprCursorState,
@@ -324,10 +326,9 @@ class ViewerService:
             if len(points) >= 3:
                 self._draw_export_polyline(draw, points[1:3])
         elif tool_type == "curve" and len(points) >= 2:
-            self._draw_export_polyline(draw, points)
+            self._draw_export_polyline(draw, build_smooth_path_points(points))
         elif tool_type == "freeform" and len(points) >= 3:
-            closed_points = (*points, points[0])
-            self._draw_export_polyline(draw, closed_points)
+            self._draw_export_polyline(draw, build_smooth_path_points(points, close_path=True))
         else:
             return
 
@@ -554,12 +555,7 @@ class ViewerService:
 
         affine_matrix, offset = image_transform.inverse_components()
         source_point = affine_matrix @ np.asarray([canvas_x, canvas_y], dtype=np.float64) + offset
-        clamped = clamp_point_to_image(
-            MeasurementPoint(x=float(source_point[0]), y=float(source_point[1])),
-            image_width=image_width,
-            image_height=image_height,
-        )
-        return clamped
+        return MeasurementPoint(x=float(source_point[0]), y=float(source_point[1]))
 
     def _resolve_measurement_source_context(
         self,
@@ -605,10 +601,8 @@ class ViewerService:
 
     @staticmethod
     def _is_empty_measurement(tool_type: str, points: tuple[MeasurementPoint, ...]) -> bool:
-        if tool_type == "freeform":
-            return len(points) < 3
-        if tool_type == "curve":
-            return len(points) < 2
+        if tool_type in {"curve", "freeform"}:
+            return len(points) < get_measurement_point_requirement(tool_type).min_points
         if tool_type == "angle" or len(points) < 2:
             return False
         start, end = points[:2]
@@ -660,7 +654,7 @@ class ViewerService:
         source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
         viewport_key = payload.viewport_key or self._resolve_measurement_viewport_key(view)
 
-        if tool_type == "angle" and len(image_points) < 3:
+        if tool_type == "angle" and len(image_points) < get_measurement_point_requirement(tool_type).min_points:
             return self._build_measurement_preview_payload(
                 view=view,
                 viewport_key=viewport_key,
@@ -668,18 +662,7 @@ class ViewerService:
                 slice_index=slice_context.slice_index,
             )
 
-        if tool_type == "angle":
-            expected_points = 3
-        elif tool_type in {"curve", "freeform"}:
-            expected_points = 3
-        else:
-            expected_points = 2
-        has_expected_points = (
-            len(image_points) >= expected_points
-            if tool_type in {"curve", "freeform"}
-            else len(image_points) == expected_points
-        )
-        if not has_expected_points:
+        if not has_required_measurement_points(tool_type, len(image_points)):
             return None
 
         if self._is_empty_measurement(tool_type, image_points):
@@ -707,18 +690,7 @@ class ViewerService:
         if not payload.points:
             raise HTTPException(status_code=400, detail="Measurement points are required")
 
-        if tool_type == "angle":
-            expected_points = 3
-        elif tool_type in {"curve", "freeform"}:
-            expected_points = 3
-        else:
-            expected_points = 2
-        has_expected_points = (
-            len(payload.points) >= expected_points
-            if tool_type in {"curve", "freeform"}
-            else len(payload.points) == expected_points
-        )
-        if not has_expected_points:
+        if not has_required_measurement_points(tool_type, len(payload.points)):
             return False
 
         image_points = self._resolve_measurement_image_points(view, payload)
