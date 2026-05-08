@@ -1,71 +1,64 @@
-﻿# DicomVision Server
+# DicomVision Server
 
 [中文说明](./README.zh-CN.md)
 
-DicomVision Server is the backend service for the DicomVision viewing system. It is responsible for DICOM series loading, viewport lifecycle management, 2D image rendering, MPR reconstruction, 3D volume rendering, and real-time image streaming to the frontend.
+DicomVision Server powers the backend side of DicomVision with DICOM series discovery, thumbnails and tag reading, Stack rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
 
-Companion frontend repository: [DicomVisionClient](https://github.com/l5769389/DicomVisionClient)
+## Repositories
 
-## Overview
+- Server: [https://github.com/l5769389/DicomVisionServer](https://github.com/l5769389/DicomVisionServer)
+- Client: [https://github.com/l5769389/DicomVisionClient](https://github.com/l5769389/DicomVisionClient)
 
-DicomVision uses a frontend-backend medical imaging architecture:
+## Feature Overview
 
-- `DicomVisionServer`: FastAPI + Socket.IO backend for data loading, rendering, and interaction processing
-- `DicomVisionClient`: Electron + Vue frontend for workflow orchestration, viewport interaction, and image presentation
+- **DICOM data services**: load local folders or server-side sample folders, discover series, generate thumbnails, and read instance-level DICOM tags.
+- **Stack rendering**: render 2D images from viewport size, window/level, pseudocolor, rotation, flip, zoom, and pan state.
+- **MPR and oblique MPR**: build standardized volumes for axial, coronal, and sagittal reconstruction, synchronized crosshair navigation, oblique rotation, and MIP configuration.
+- **4D support**: detect phase groups, generate phase lists and preview images, and coordinate frontend playback through Socket.IO.
+- **3D volume rendering**: render volumes through VTK with presets, transfer functions, lighting, interpolation, blend modes, and layer configuration.
+- **Measurement and QA analysis**: calculate line, rectangle, ellipse, angle, curve, and freeform ROI metrics, plus MTF/FWHM and water phantom QA results.
+- **Realtime interaction**: process scroll, window/level, zoom, pan, crosshair, oblique MPR, 3D rotation, hover, and measurement draft operations over Socket.IO.
+- **Deployment and packaging**: deploy as the web backend on Render, or build a Windows desktop backend bundle consumed by the Electron client.
 
-The backend is the rendering core of the system. It handles image computation, view synchronization, and real-time event delivery, while the frontend focuses on user interaction and workspace management.
+## Product Screenshots
 
-## Key Features
+Screenshots are maintained in the companion client repository. This backend README references those assets to show the full product experience.
 
-### DICOM Data Services
+| Stack viewing | MPR reconstruction |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/stack.png" alt="Stack viewing" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/mpr.png" alt="MPR reconstruction" width="420"> |
 
-- Load local DICOM folders and discover readable series
-- Maintain series metadata and runtime registries in memory
-- Provide sample-data loading entry points for web deployment scenarios
+| Oblique MPR / crosshair rotation | 4D phase playback |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/mpr_rotate.png" alt="Oblique MPR and crosshair rotation" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/4D.png" alt="4D phase playback" width="420"> |
 
-### Viewport and Rendering Pipeline
+| Measurement tools | DICOM tags |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/measure.png" alt="Measurement tools" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/dicomTags.png" alt="DICOM tags" width="420"> |
 
-- Create and manage `Stack`, `MPR`, and `3D` viewports
-- Render 2D stack images and overlays
-- Perform multi-planar reconstruction for orthogonal viewing workflows
-- Run VTK-based 3D volume rendering on the backend
+| MTF analysis | FWHM result |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/mtf.png" alt="MTF analysis" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/mtf_fwhm.png" alt="FWHM result" width="420"> |
 
-### Realtime Interaction
-
-- Support low-latency interaction over Socket.IO
-- Process pan, zoom, scroll, hover, reset, crosshair, and image operations
-- Push rendered frames, overlay data, and acknowledgement events back to the client
-
-### 3D Volume Capabilities
-
-- Built-in volume presets such as `aaa`, `red`, `cardiac`, `muscle`, and `mip`
-- Transfer-function normalization and application
-- Blend mode, lighting, interpolation, opacity, color, and layer controls
-- Fast preview path plus full-quality render path
+| Water phantom QA |
+| --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/water_phantom_qa.png" alt="Water phantom QA" width="420"> |
 
 ## Architecture
 
 The backend exposes two communication layers:
 
-- HTTP API for coarse-grained actions such as loading folders, creating views, and setting viewport size
-- Socket.IO for interactive commands and real-time render updates
+- HTTP API for loading data, reading tags, fetching thumbnails, creating and closing views, resizing views, analysis, and export.
+- Socket.IO for low-latency interaction commands and realtime image updates to bound frontend sessions.
 
-Typical request flow:
+Typical flow:
 
-1. The frontend calls `POST /api/v1/dicom/loadFolder` to register a folder.
-2. The frontend calls `POST /api/v1/view/create` to create a viewport.
-3. The viewport size is set through `POST /api/v1/view/setSize` or `set_view_size`.
-4. The frontend binds a socket session through `bind_view`.
-5. Interactive commands are sent through `view_operation`, `image_operation`, or `view_hover`.
-6. The backend emits `image_update`, `hover_info`, `view_ack`, or error events.
-
-Core backend responsibilities:
-
-- register and index readable DICOM series
-- manage lifecycle and state for `Stack`, `MPR`, and `3D` views
-- render image frames and overlays
-- synchronize multi-view interaction state
-- normalize and apply 3D rendering configuration
+1. The frontend calls `POST /api/v1/dicom/loadFolder` or `POST /api/v1/dicom/loadSample` to register data.
+2. The backend scans DICOM files and stores series, instance, and phase metadata.
+3. The frontend calls `POST /api/v1/view/create` to create a Stack, MPR, 3D, or other viewport.
+4. The frontend binds a Socket.IO session to the viewport with `bind_view`.
+5. The frontend sends `view_operation`, `image_operation`, `view_hover`, or 4D playback events.
+6. The backend returns `image_update`, `hover_info`, `measurement_draft`, `view_ack`, 4D playback state, or error events.
 
 ## Tech Stack
 
@@ -78,6 +71,7 @@ Core backend responsibilities:
 - Pillow
 - VTK
 - uv
+- PyInstaller for desktop bundle builds
 
 ## Repository Structure
 
@@ -87,31 +81,25 @@ app/
   core/                    settings, constants, logging
   models/                  in-memory runtime models
   schemas/                 request and response schemas
-  services/                DICOM processing, rendering, registries
-  sockets/                 Socket.IO handlers and runtime hub
+  services/                DICOM processing, rendering, analysis, and registries
+  services/render_layers/  overlay rendering
+  services/volume_rendering/ VTK volume rendering
+  sockets/                 Socket.IO events and realtime delivery
   utils/                   shared helpers
 sample-data/               optional sample DICOM data for web deployment
+scripts/                   desktop bundle and API type generation scripts
 tests/                     automated tests
 run.py                     local startup entry
 render.yaml                Render deployment manifest
 pyproject.toml             project metadata and dependencies
 ```
 
-## Core Modules
-
-- `series_registry`: series discovery and metadata management
-- `view_registry`: viewport instance lifecycle management
-- `dicom_cache`: decoded pixel caching
-- `viewer_service`: main interaction and rendering orchestration layer
-- `view_socket_hub`: targeted socket binding and render delivery
-- `app/services/volume_rendering/`: VTK-based volume rendering pipeline
-
 ## Quick Start
 
 ### Requirements
 
 - Python 3.13 or newer
-- A runtime environment compatible with VTK
+- A system environment compatible with VTK
 - Read access to the DICOM folders that will be loaded
 
 ### Install Dependencies
@@ -132,7 +120,7 @@ uv sync --extra dev
 uv run python run.py
 ```
 
-Default service addresses:
+Default addresses:
 
 - HTTP: `http://127.0.0.1:8000`
 - OpenAPI: `http://127.0.0.1:8000/docs`
@@ -141,7 +129,7 @@ Default service addresses:
 
 ## Configuration
 
-Create a local `.env` file when needed. Common settings:
+Create a local `.env` file when needed:
 
 ```env
 APP_NAME=DicomVision Server
@@ -152,30 +140,36 @@ CORS_ORIGINS=["*"]
 WEB_SAMPLE_DICOM_PATH=
 ```
 
-Key configuration items:
+Key settings:
 
-- `APP_ENV`: enables development-mode behavior such as reload
-- `APP_HOST`: bind host for the backend service
-- `APP_PORT`: listening port, default `8000`
-- `CORS_ORIGINS`: allowed origins for HTTP and Socket.IO
-- `WEB_SAMPLE_DICOM_PATH`: sample DICOM folder used by `POST /api/v1/dicom/loadSample`
+- `APP_ENV`: runtime environment, usually `production` for deployed services.
+- `APP_HOST`: bind host.
+- `APP_PORT`: listening port, default `8000`.
+- `CORS_ORIGINS`: allowed frontend origins for HTTP and Socket.IO.
+- `WEB_SAMPLE_DICOM_PATH`: server-side sample DICOM directory used by `POST /api/v1/dicom/loadSample`.
 
-## API and Realtime Events
+## HTTP API
 
-Base HTTP path: `/api/v1`
-
-### HTTP API
+Base path: `/api/v1`
 
 - `GET /health`
 - `POST /dicom/loadFolder`
 - `POST /dicom/loadSample`
 - `POST /dicom/cornerInfo`
+- `GET /dicom/thumbnail`
+- `POST /dicom/fourD/phases`
+- `GET /dicom/fourD/preview`
+- `POST /dicom/tags`
 - `POST /view/create`
+- `POST /view/close`
 - `POST /view/setSize`
+- `POST /view/mtf/analyze`
+- `POST /view/qa/water/analyze`
+- `POST /view/export`
 
 Use `/docs` for exact request and response schemas.
 
-### Socket.IO Events
+## Socket.IO Events
 
 Client-to-server:
 
@@ -184,6 +178,9 @@ Client-to-server:
 - `view_operation`
 - `image_operation`
 - `view_hover`
+- `four_d_playback_start`
+- `four_d_playback_stop`
+- `four_d_playback_fps`
 
 Server-to-client:
 
@@ -192,31 +189,15 @@ Server-to-client:
 - `view_ack`
 - `image_update`
 - `hover_info`
+- `measurement_draft`
+- `four_d_phase_index`
+- `four_d_playback_state`
 - `image_error`
 - `render_error`
 
-`image_update` carries rendered image payloads and viewport metadata.
+## Web Deployment
 
-## Frontend Integration
-
-Companion frontend repository:
-
-[https://github.com/l5769389/DicomVisionClient](https://github.com/l5769389/DicomVisionClient)
-
-Recommended local startup order:
-
-1. Start `DicomVisionServer`.
-2. Start `DicomVisionClient`.
-3. Load a DICOM folder from the client.
-4. Create Stack, MPR, or 3D viewports and begin interaction.
-
-The current frontend defaults to `http://127.0.0.1:8000` for both HTTP and Socket.IO in desktop development mode.
-
-## Render Deployment
-
-This repository includes `render.yaml` for deploying the backend to Render.
-
-Recommended environment variables:
+This repository includes `render.yaml` for deploying the backend to Render. Recommended environment variables:
 
 ```env
 APP_ENV=production
@@ -226,31 +207,15 @@ CORS_ORIGINS=["https://your-vercel-app.vercel.app"]
 WEB_SAMPLE_DICOM_PATH=/opt/render/project/src/sample-data
 ```
 
-Notes:
+For web frontend deployment:
 
-- `CORS_ORIGINS` is shared by FastAPI CORS and Socket.IO allowed origins
-- `WEB_SAMPLE_DICOM_PATH` must point to a readable directory
-- the web frontend can use `POST /api/v1/dicom/loadSample` without exposing local filesystem paths
+- Set frontend `VITE_BACKEND_ORIGIN` to the backend origin.
+- Add the frontend domain to backend `CORS_ORIGINS`.
+- If the web client should load server-side sample data, configure `WEB_SAMPLE_DICOM_PATH` and set frontend `VITE_WEB_USE_SERVER_SAMPLE=true`.
 
-## Testing
+## Desktop Bundle
 
-Run tests with:
-
-```bash
-uv run pytest
-```
-
-## Desktop Packaging
-
-This repository builds the backend desktop bundle consumed by the Electron client installer.
-
-Install PyInstaller when required:
-
-```bash
-uv run python -m pip install pyinstaller
-```
-
-Build the Windows backend bundle:
+This repository can build the Windows backend bundle consumed by the Electron client installer.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
@@ -265,10 +230,16 @@ dist/
     ...
 ```
 
-Override the output root if needed:
+Override the output root when needed:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1 -OutputRoot .\artifacts
 ```
 
-The frontend installer flow can then consume this directory through `DICOM_VISION_SERVER_BUNDLE_PATH`.
+The client packaging flow can then consume this directory through `DICOM_VISION_SERVER_BUNDLE_PATH` or `npm run release:win`.
+
+## Testing
+
+```bash
+uv run pytest
+```
