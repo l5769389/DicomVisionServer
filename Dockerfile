@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}" \
     APP_ENV=production \
     APP_HOST=0.0.0.0 \
-    APP_PORT=8080
+    APP_PORT=8000
 
 WORKDIR /app
 
@@ -33,6 +33,6 @@ COPY app ./app
 COPY sample-data ./sample-data
 COPY run.py ./
 
-EXPOSE 8080
+EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
