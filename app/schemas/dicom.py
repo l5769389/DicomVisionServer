@@ -151,6 +151,9 @@ class DicomTagItem(BaseModel):
     vr: str
     value: str
     depth: int = 0
+    tag_path: list[str] = Field(default_factory=list, alias="tagPath")
+
+    model_config = {"populate_by_name": True}
 
 
 class DicomTagsResponse(BaseModel):
@@ -161,5 +164,18 @@ class DicomTagsResponse(BaseModel):
     sop_instance_uid: str | None = Field(default=None, alias="sopInstanceUid")
     file_path: str | None = Field(default=None, alias="filePath")
     items: list[DicomTagItem] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class DicomTagModifyRequest(BaseModel):
+    series_id: str = Field(alias="seriesId", description="Registered series ID.")
+    index: int = Field(default=0, description="Zero-based instance index inside the series.")
+    tag_path: list[str] = Field(alias="tagPath", description="Path returned by the DICOM tag API for the target tag.")
+    value: str = Field(description="New DICOM tag value, using backslash separators for multi-value fields.")
+    scope: Literal["current", "series"] = Field(
+        default="current",
+        description="Whether to write the current instance only or every instance in the series.",
+    )
 
     model_config = {"populate_by_name": True}

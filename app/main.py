@@ -26,6 +26,16 @@ fastapi_app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+        "X-DicomVision-Artifact-Kind",
+        "X-DicomVision-File-Name",
+        "X-DicomVision-Keyword",
+        "X-DicomVision-Modified-Count",
+        "X-DicomVision-Series-Folder",
+        "X-DicomVision-Tag",
+        "X-DicomVision-VR",
+    ],
 )
 
 fastapi_app.include_router(health_router)

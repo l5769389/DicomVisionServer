@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 from fastapi import APIRouter, HTTPException, Response
 
 from app.core.config import get_settings
@@ -6,6 +8,7 @@ from app.schemas.dicom import (
     CornerInfoResponse,
     DicomTagsRequest,
     DicomTagsResponse,
+    DicomTagModifyRequest,
     FourDPhasesRequest,
     FourDPhasesResponse,
     LoadFolderRequest,
@@ -125,3 +128,41 @@ def get_four_d_preview(seriesId: str, phaseIndex: int, viewportKey: str) -> Resp
 def get_dicom_tags(payload: DicomTagsRequest) -> DicomTagsResponse:
     """Return metadata rows for the DICOM tag viewer."""
     return dicom_tag_service.get_series_tags(payload)
+
+
+@router.post(
+    "/modifyTag",
+    summary="Create modified DICOM tag download artifact",
+    description=(
+        "Updates one editable DICOM tag in the current instance or every instance in a registered series. "
+        "The source files are never overwritten; the modified DICOM file or ZIP archive is returned to the client "
+        "so desktop and web frontends can save it in the user's chosen location."
+    ),
+    responses={
+        200: {
+            "content": {
+                "application/dicom": {},
+                "application/zip": {},
+            },
+            "description": "A modified DICOM file for current scope, or a ZIP archive for series scope.",
+        }
+    },
+)
+def modify_dicom_tag(payload: DicomTagModifyRequest) -> Response:
+    """Return modified DICOM bytes for the requested tag edit."""
+    artifact = dicom_tag_service.modify_series_tag(payload)
+    quoted_file_name = quote(artifact.file_name)
+    return Response(
+        content=artifact.content,
+        media_type=artifact.media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{artifact.file_name}\"; filename*=UTF-8''{quoted_file_name}",
+            "X-DicomVision-Artifact-Kind": artifact.artifact_kind,
+            "X-DicomVision-File-Name": artifact.file_name,
+            "X-DicomVision-Keyword": artifact.keyword,
+            "X-DicomVision-Modified-Count": str(artifact.modified_count),
+            "X-DicomVision-Series-Folder": artifact.series_folder,
+            "X-DicomVision-Tag": artifact.tag,
+            "X-DicomVision-VR": artifact.vr,
+        },
+    )
