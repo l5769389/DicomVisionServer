@@ -1,5 +1,7 @@
 from io import BytesIO
+import os
 from pathlib import Path
+import time
 from zipfile import ZipFile
 
 import numpy as np
@@ -11,6 +13,7 @@ from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, ge
 from app.main import fastapi_app
 from app.schemas.dicom import LoadFolderRequest
 from app.services.dicom_cache import dicom_cache
+from app.services.dicom_tag_job_service import DicomTagModifyJobService, dicom_tag_job_service
 from app.services.series_registry import series_registry
 
 
@@ -233,3 +236,84 @@ def test_modify_dicom_tag_series_scope_writes_all_instances(tmp_path: Path) -> N
 
     for modified_dataset in datasets:
         assert str(modified_dataset.PatientName) == "Edited^Series"
+
+
+def _wait_for_tag_edit_job(client: TestClient, job_id: str) -> dict:
+    deadline = time.monotonic() + 5
+    while True:
+        response = client.get(f"/api/v1/dicom/modifyTag/jobs/{job_id}")
+        assert response.status_code == 200
+        data = response.json()
+        if data["status"] in {"succeeded", "failed"}:
+            return data
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+
+
+def test_tag_edit_job_service_removes_stale_temp_artifacts(tmp_path: Path) -> None:
+    stale_artifact = tmp_path / f"{'a' * 32}.zip"
+    fresh_artifact = tmp_path / f"{'b' * 32}.zip"
+    unrelated_file = tmp_path / "notes.zip"
+    stale_artifact.write_bytes(b"old")
+    fresh_artifact.write_bytes(b"new")
+    unrelated_file.write_bytes(b"notes")
+    os.utime(stale_artifact, (1, 1))
+
+    service = DicomTagModifyJobService(temp_root=tmp_path)
+
+    assert not stale_artifact.exists()
+    assert fresh_artifact.exists()
+    assert unrelated_file.exists()
+    service.clear()
+
+
+def test_modify_dicom_tag_series_scope_async_job_downloads_artifact(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_tag_job_service.clear()
+    series_instance_uid = generate_uid()
+    _create_test_dicom(tmp_path / "tag-edit-async-1.dcm", series_instance_uid=series_instance_uid, instance_number=1)
+    _create_test_dicom(tmp_path / "tag-edit-async-2.dcm", series_instance_uid=series_instance_uid, instance_number=2)
+
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    series_id = load_response.series_list[0].series_id
+    client = TestClient(fastapi_app)
+    tags_response = client.post("/api/v1/dicom/tags", json={"seriesId": series_id, "index": 0})
+    patient_id_row = next(item for item in tags_response.json()["items"] if item["keyword"] == "PatientID")
+
+    create_response = client.post(
+        "/api/v1/dicom/modifyTag/jobs",
+        json={
+            "seriesId": series_id,
+            "index": 0,
+            "tagPath": patient_id_row["tagPath"],
+            "value": "patient-async",
+            "scope": "series",
+        },
+    )
+
+    assert create_response.status_code == 202
+    created = create_response.json()
+    assert created["status"] in {"pending", "running", "succeeded"}
+    assert created["statusUrl"].endswith(created["jobId"])
+
+    completed = _wait_for_tag_edit_job(client, created["jobId"])
+    assert completed["status"] == "succeeded"
+    assert completed["artifactKind"] == "zip"
+    assert completed["modifiedCount"] == 2
+    assert completed["artifactUrl"].endswith(f"/{created['jobId']}/artifact")
+
+    artifact_response = client.get(completed["artifactUrl"])
+    assert artifact_response.status_code == 200
+    assert artifact_response.headers["content-type"] == "application/zip"
+    assert artifact_response.headers["x-dicomvision-artifact-kind"] == "zip"
+    assert artifact_response.headers["x-dicomvision-modified-count"] == "2"
+
+    with ZipFile(BytesIO(artifact_response.content)) as archive:
+        datasets = [pydicom.dcmread(BytesIO(archive.read(name)), force=True) for name in archive.namelist()]
+
+    assert len(datasets) == 2
+    for modified_dataset in datasets:
+        assert modified_dataset.PatientID == "patient-async"
+
+    dicom_tag_job_service.clear()

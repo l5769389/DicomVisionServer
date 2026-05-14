@@ -1,6 +1,7 @@
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Response, status
+from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
 from app.schemas.dicom import (
@@ -8,6 +9,7 @@ from app.schemas.dicom import (
     CornerInfoResponse,
     DicomTagsRequest,
     DicomTagsResponse,
+    DicomTagModifyJobStatusResponse,
     DicomTagModifyRequest,
     FourDPhasesRequest,
     FourDPhasesResponse,
@@ -15,6 +17,7 @@ from app.schemas.dicom import (
     LoadFolderResponse,
     LoadSampleResponse,
 )
+from app.services.dicom_tag_job_service import dicom_tag_job_service
 from app.services.dicom_tag_service import dicom_tag_service
 from app.services.four_d_service import four_d_service
 from app.services.series_registry import series_registry
@@ -22,6 +25,29 @@ from app.services.viewer_service import viewer_service
 
 router = APIRouter(prefix="/dicom", tags=["dicom"])
 settings = get_settings()
+
+
+def _dicom_tag_artifact_headers(
+    *,
+    artifact_kind: str,
+    file_name: str,
+    keyword: str,
+    modified_count: int,
+    series_folder: str,
+    tag: str,
+    vr: str,
+) -> dict[str, str]:
+    quoted_file_name = quote(file_name)
+    return {
+        "Content-Disposition": f"attachment; filename=\"{file_name}\"; filename*=UTF-8''{quoted_file_name}",
+        "X-DicomVision-Artifact-Kind": artifact_kind,
+        "X-DicomVision-File-Name": file_name,
+        "X-DicomVision-Keyword": keyword,
+        "X-DicomVision-Modified-Count": str(modified_count),
+        "X-DicomVision-Series-Folder": series_folder,
+        "X-DicomVision-Tag": tag,
+        "X-DicomVision-VR": vr,
+    }
 
 
 @router.post(
@@ -151,18 +177,73 @@ def get_dicom_tags(payload: DicomTagsRequest) -> DicomTagsResponse:
 def modify_dicom_tag(payload: DicomTagModifyRequest) -> Response:
     """Return modified DICOM bytes for the requested tag edit."""
     artifact = dicom_tag_service.modify_series_tag(payload)
-    quoted_file_name = quote(artifact.file_name)
     return Response(
         content=artifact.content,
         media_type=artifact.media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename=\"{artifact.file_name}\"; filename*=UTF-8''{quoted_file_name}",
-            "X-DicomVision-Artifact-Kind": artifact.artifact_kind,
-            "X-DicomVision-File-Name": artifact.file_name,
-            "X-DicomVision-Keyword": artifact.keyword,
-            "X-DicomVision-Modified-Count": str(artifact.modified_count),
-            "X-DicomVision-Series-Folder": artifact.series_folder,
-            "X-DicomVision-Tag": artifact.tag,
-            "X-DicomVision-VR": artifact.vr,
-        },
+        headers=_dicom_tag_artifact_headers(
+            artifact_kind=artifact.artifact_kind,
+            file_name=artifact.file_name,
+            keyword=artifact.keyword,
+            modified_count=artifact.modified_count,
+            series_folder=artifact.series_folder,
+            tag=artifact.tag,
+            vr=artifact.vr,
+        ),
+    )
+
+
+@router.post(
+    "/modifyTag/jobs",
+    response_model=DicomTagModifyJobStatusResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Start an asynchronous DICOM tag edit job",
+    description=(
+        "Starts a background job that updates one editable DICOM tag in the current instance or every instance "
+        "in a registered series. Use the returned statusUrl to poll until the artifact is ready."
+    ),
+)
+def create_modify_dicom_tag_job(payload: DicomTagModifyRequest) -> DicomTagModifyJobStatusResponse:
+    """Start a background DICOM tag edit job."""
+    return dicom_tag_job_service.create_job(payload)
+
+
+@router.get(
+    "/modifyTag/jobs/{job_id}",
+    response_model=DicomTagModifyJobStatusResponse,
+    summary="Get asynchronous DICOM tag edit job status",
+)
+def get_modify_dicom_tag_job(job_id: str) -> DicomTagModifyJobStatusResponse:
+    """Return current status for a background DICOM tag edit job."""
+    return dicom_tag_job_service.get_status(job_id)
+
+
+@router.get(
+    "/modifyTag/jobs/{job_id}/artifact",
+    summary="Download asynchronous DICOM tag edit artifact",
+    responses={
+        200: {
+            "content": {
+                "application/dicom": {},
+                "application/zip": {},
+            },
+            "description": "The modified DICOM file or ZIP archive produced by the background job.",
+        }
+    },
+)
+def get_modify_dicom_tag_job_artifact(job_id: str) -> FileResponse:
+    """Download the artifact produced by a completed background DICOM tag edit job."""
+    artifact = dicom_tag_job_service.get_completed_artifact(job_id)
+    return FileResponse(
+        artifact.path,
+        media_type=artifact.media_type,
+        filename=artifact.file_name,
+        headers=_dicom_tag_artifact_headers(
+            artifact_kind=artifact.artifact_kind,
+            file_name=artifact.file_name,
+            keyword=artifact.keyword,
+            modified_count=artifact.modified_count,
+            series_folder=artifact.series_folder,
+            tag=artifact.tag,
+            vr=artifact.vr,
+        ),
     )

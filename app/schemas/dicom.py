@@ -179,3 +179,23 @@ class DicomTagModifyRequest(BaseModel):
     )
 
     model_config = {"populate_by_name": True}
+
+
+DicomTagModifyJobState = Literal["pending", "running", "succeeded", "failed"]
+
+
+class DicomTagModifyJobStatusResponse(BaseModel):
+    job_id: str = Field(alias="jobId")
+    status: DicomTagModifyJobState
+    status_url: str = Field(alias="statusUrl")
+    artifact_url: str | None = Field(default=None, alias="artifactUrl")
+    error: str | None = None
+    artifact_kind: Literal["dicom", "zip"] | None = Field(default=None, alias="artifactKind")
+    file_name: str | None = Field(default=None, alias="fileName")
+    media_type: str | None = Field(default=None, alias="mediaType")
+    modified_count: int | None = Field(default=None, alias="modifiedCount")
+    series_folder: str | None = Field(default=None, alias="seriesFolder")
+    created_at: str = Field(alias="createdAt")
+    completed_at: str | None = Field(default=None, alias="completedAt")
+
+    model_config = {"populate_by_name": True}
