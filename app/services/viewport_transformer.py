@@ -8,6 +8,9 @@ from app.core import ZOOM_MAX, ZOOM_MIN
 from app.models.viewer import ViewRecord
 
 
+MIN_PIXEL_ASPECT = 1e-6
+
+
 @dataclass(frozen=True)
 class AffineTransform:
     matrix: np.ndarray
@@ -48,8 +51,8 @@ class ViewportTransformer:
         pixel_aspect_y: float = 1.0,
     ) -> AffineTransform:
         zoom = self.clamp_zoom(view.zoom)
-        resolved_aspect_x = max(abs(float(pixel_aspect_x)), 1e-6)
-        resolved_aspect_y = max(abs(float(pixel_aspect_y)), 1e-6)
+        resolved_aspect_x = max(abs(float(pixel_aspect_x)), MIN_PIXEL_ASPECT)
+        resolved_aspect_y = max(abs(float(pixel_aspect_y)), MIN_PIXEL_ASPECT)
         scale_x = (-zoom if view.hor_flip else zoom) * resolved_aspect_x
         scale_y = (-zoom if view.ver_flip else zoom) * resolved_aspect_y
         rotation_degrees = self.normalize_rotation_degrees(view.rotation_degrees)
@@ -90,6 +93,8 @@ class ViewportTransformer:
             dtype=np.float64,
         )
 
+        # Matrix order is right-to-left: image center -> scale/flip -> rotate ->
+        # canvas center plus user pan.
         matrix = translate_to_canvas @ rotate @ scale @ translate_to_origin
         return AffineTransform(matrix=matrix)
 
@@ -109,8 +114,8 @@ class ViewportTransformer:
     ) -> float:
         if image_width <= 0 or image_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
             return 1.0
-        resolved_aspect_x = max(abs(float(pixel_aspect_x)), 1e-6)
-        resolved_aspect_y = max(abs(float(pixel_aspect_y)), 1e-6)
+        resolved_aspect_x = max(abs(float(pixel_aspect_x)), MIN_PIXEL_ASPECT)
+        resolved_aspect_y = max(abs(float(pixel_aspect_y)), MIN_PIXEL_ASPECT)
         contain_zoom = min(
             canvas_width / (image_width * resolved_aspect_x),
             canvas_height / (image_height * resolved_aspect_y),

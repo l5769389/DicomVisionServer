@@ -25,6 +25,11 @@ from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 
 vtkObject.GlobalWarningDisplayOff()
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
+TRACKBALL_MOTION_FACTOR = 36.0
+TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
+TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = 20.0
+FAST_PREVIEW_SAMPLE_DISTANCE = 2.6
+FINAL_RENDER_SAMPLE_DISTANCE = 1.4
 
 
 @dataclass(frozen=True)
@@ -130,11 +135,10 @@ class VtkVolumeRenderer:
             session = self._get_or_create_session(request, volume)
             self._configure_session(session, request)
             camera = session.renderer.GetActiveCamera()
-            motion_factor = 36.0
-            delta_azimuth = -20.0 / max(float(request.canvas_width), 1.0)
-            delta_elevation = 20.0 / max(float(request.canvas_height), 1.0)
-            camera.Azimuth(float(delta_x_pixels) * delta_azimuth * motion_factor)
-            camera.Elevation(float(delta_y_pixels) * delta_elevation * motion_factor)
+            delta_azimuth = TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH / max(float(request.canvas_width), 1.0)
+            delta_elevation = TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT / max(float(request.canvas_height), 1.0)
+            camera.Azimuth(float(delta_x_pixels) * delta_azimuth * TRACKBALL_MOTION_FACTOR)
+            camera.Elevation(float(delta_y_pixels) * delta_elevation * TRACKBALL_MOTION_FACTOR)
             camera.OrthogonalizeViewUp()
             session.renderer.ResetCameraClippingRange()
             return self._camera_to_quaternion(session, camera)
@@ -277,7 +281,11 @@ class VtkVolumeRenderer:
     @staticmethod
     def _update_sampling(session: VolumeRenderSession, fast_preview: bool) -> None:
         if hasattr(session.mapper, "SetImageSampleDistance"):
-            session.mapper.SetImageSampleDistance(2.6 if fast_preview else 1.4)
+            # Drag previews intentionally sample more coarsely. The final frame
+            # is queued separately by the operation handler after interaction ends.
+            session.mapper.SetImageSampleDistance(
+                FAST_PREVIEW_SAMPLE_DISTANCE if fast_preview else FINAL_RENDER_SAMPLE_DISTANCE
+            )
 
     def _update_transfer_functions(
         self,

@@ -106,3 +106,22 @@ def test_load_folder_response_includes_series_thumbnail(tmp_path: Path) -> None:
     assert thumbnail_response.status_code == 200
     assert thumbnail_response.headers["content-type"] == "image/png"
     assert thumbnail_response.content.startswith(b"\x89PNG")
+
+
+def test_load_folder_accepts_single_dicom_file_path(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "single-file-test.dcm"
+    other_dicom_path = tmp_path / "other-series.dcm"
+    _create_test_dicom(dicom_path)
+    _create_test_dicom(other_dicom_path)
+
+    client = TestClient(fastapi_app)
+    response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(dicom_path)})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["seriesList"]) == 1
+    series = data["seriesList"][0]
+    assert series["folderPath"] == str(tmp_path)
+    assert series["instanceCount"] == 1

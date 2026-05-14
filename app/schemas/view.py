@@ -18,10 +18,18 @@ MprCrosshairLine = Literal["horizontal", "vertical"]
 
 
 class ViewCreateRequest(BaseModel):
-    series_id: str = Field(alias="seriesId")
-    view_type: ViewType = Field(alias="viewType")
-    view_group_key: str | None = Field(default=None, alias="viewGroupKey")
-    four_d_phase_index: int | None = Field(default=None, alias="fourDPhaseIndex")
+    series_id: str = Field(alias="seriesId", description="Registered series ID to view.")
+    view_type: ViewType = Field(alias="viewType", description="Requested view type: Stack, MPR, 3D, or a concrete MPR viewport.")
+    view_group_key: str | None = Field(
+        default=None,
+        alias="viewGroupKey",
+        description="Optional key for sharing MPR state across AX/COR/SAG views or 4D phases.",
+    )
+    four_d_phase_index: int | None = Field(
+        default=None,
+        alias="fourDPhaseIndex",
+        description="Optional 4D phase index represented by this view.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -52,9 +60,9 @@ class ViewSize(BaseModel):
 
 
 class ViewSetSizeRequest(BaseModel):
-    op_type: ViewSetSizeOperationType = Field(alias="opType")
-    size: ViewSize
-    view_id: str = Field(alias="viewId")
+    op_type: ViewSetSizeOperationType = Field(alias="opType", description="Operation name, always setSize for this endpoint.")
+    size: ViewSize = Field(description="Current frontend viewport size in CSS pixels.")
+    view_id: str = Field(alias="viewId", description="Server-side view ID returned by /view/create.")
 
     model_config = {"populate_by_name": True}
 
@@ -160,11 +168,18 @@ class ViewExportOverlaysPayload(BaseModel):
 
 
 class ViewExportRequest(BaseModel):
-    view_id: str = Field(alias="viewId")
-    export_format: ExportFormat = Field(alias="exportFormat")
-    overlays: ViewExportOverlaysPayload = Field(default_factory=ViewExportOverlaysPayload)
-    overlay_mode: str | None = Field(default=None, alias="overlayMode")
-    preserve_source_dicom: bool = Field(default=True, alias="preserveSourceDicom")
+    view_id: str = Field(alias="viewId", description="Server-side view ID to render for export.")
+    export_format: ExportFormat = Field(alias="exportFormat", description="Export container format: png or dicom.")
+    overlays: ViewExportOverlaysPayload = Field(
+        default_factory=ViewExportOverlaysPayload,
+        description="Frontend overlay geometry to burn into the exported image.",
+    )
+    overlay_mode: str | None = Field(default=None, alias="overlayMode", description="Reserved overlay rendering mode.")
+    preserve_source_dicom: bool = Field(
+        default=True,
+        alias="preserveSourceDicom",
+        description="When possible, copy patient/study metadata into Secondary Capture exports.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -292,8 +307,8 @@ class MeasurementOverlayPayload(BaseModel):
 
 
 class ViewOperationRequest(BaseModel):
-    view_id: str = Field(alias="viewId")
-    op_type: ViewOperationType = Field(alias="opType")
+    view_id: str = Field(alias="viewId", description="Server-side view ID that receives the interaction.")
+    op_type: ViewOperationType = Field(alias="opType", description="Interaction type such as scroll, window, crosshair, or measurement.")
     measurement_id: str | None = Field(default=None, alias="measurementId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")
     sub_op_type: str | None = Field(default=None, alias="subOpType")
@@ -301,7 +316,7 @@ class ViewOperationRequest(BaseModel):
     x: float | None = None
     y: float | None = None
     line: MprCrosshairLine | None = None
-    points: list[MeasurementPointPayload] | None = None
+    points: list[MeasurementPointPayload] | None = Field(default=None, description="Normalized points used by measurement and ROI operations.")
     zoom: float | None = None
     delta: int | None = None
     ww: float | None = None
@@ -312,7 +327,7 @@ class ViewOperationRequest(BaseModel):
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
     ver_flip: bool | None = Field(default=None, alias="ver_flip")
-    volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
+    volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig", description="3D transfer-function and lighting settings.")
 
     model_config = {"populate_by_name": True}
 
@@ -335,9 +350,9 @@ class MtfCurvePointPayload(BaseModel):
 
 
 class ViewMtfAnalyzeRequest(BaseModel):
-    view_id: str = Field(alias="viewId")
-    viewport_key: str = Field(alias="viewportKey")
-    points: list[MeasurementPointPayload]
+    view_id: str = Field(alias="viewId", description="2D view ID to analyze.")
+    viewport_key: str = Field(alias="viewportKey", description="Frontend viewport key used to route analysis results.")
+    points: list[MeasurementPointPayload] = Field(description="Normalized ROI points from the frontend MTF overlay.")
 
     model_config = {"populate_by_name": True}
 
@@ -419,9 +434,12 @@ class QaWaterMetricsPayload(BaseModel):
 
 
 class ViewQaWaterAnalyzeRequest(BaseModel):
-    view_id: str = Field(alias="viewId")
-    viewport_key: str = Field(alias="viewportKey")
-    metrics: list[str] = Field(default_factory=list)
+    view_id: str = Field(alias="viewId", description="2D view ID to analyze.")
+    viewport_key: str = Field(alias="viewportKey", description="Frontend viewport key used to route QA results.")
+    metrics: list[str] = Field(
+        default_factory=list,
+        description="Optional metric subset. Empty means the service may return all supported water phantom metrics.",
+    )
 
     model_config = {"populate_by_name": True}
 

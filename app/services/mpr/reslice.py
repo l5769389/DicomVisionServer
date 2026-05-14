@@ -9,21 +9,27 @@ from .geometry import VolumeGeometry, spacing_along_world_direction
 from .planes import PlanePose
 
 
+DEFAULT_MIP_ALGORITHM = "maximum"
+
+
 @dataclass(frozen=True)
 class MipConfig:
     enabled: bool = False
-    algorithm: str = "maximum"
+    algorithm: str = DEFAULT_MIP_ALGORITHM
     thickness: int = 1
 
 
+SLAB_REDUCERS = {
+    "minimum": np.min,
+    "average": np.mean,
+    "sum": np.sum,
+    DEFAULT_MIP_ALGORITHM: np.max,
+}
+
+
 def _reduce_slab(slab: np.ndarray, algorithm: str) -> np.ndarray:
-    if algorithm == "minimum":
-        return np.min(slab, axis=0)
-    if algorithm == "average":
-        return np.mean(slab, axis=0)
-    if algorithm == "sum":
-        return np.sum(slab, axis=0)
-    return np.max(slab, axis=0)
+    reducer = SLAB_REDUCERS.get(algorithm, SLAB_REDUCERS[DEFAULT_MIP_ALGORITHM])
+    return reducer(slab, axis=0)
 
 
 def _slab_offsets_mm(geometry: VolumeGeometry, plane: PlanePose, mip: MipConfig | None) -> np.ndarray:
@@ -33,6 +39,8 @@ def _slab_offsets_mm(geometry: VolumeGeometry, plane: PlanePose, mip: MipConfig 
     thickness = max(1, int(mip.thickness))
     half_before = (thickness - 1) // 2
     step_mm = spacing_along_world_direction(geometry, plane.normal_world)
+    # Offsets are centered on the displayed plane so enabling MIP does not shift
+    # the current crosshair slice.
     return (np.arange(-half_before, thickness - half_before, dtype=np.float64) * step_mm).astype(np.float64)
 
 
@@ -71,4 +79,4 @@ def reslice_plane(
     if mip is None or not mip.enabled:
         return slab[0].astype(np.float32, copy=False)
 
-    return _reduce_slab(slab, str(mip.algorithm or "maximum")).astype(np.float32, copy=False)
+    return _reduce_slab(slab, str(mip.algorithm or DEFAULT_MIP_ALGORITHM)).astype(np.float32, copy=False)

@@ -213,6 +213,92 @@ For web frontend deployment:
 - Add the frontend domain to backend `CORS_ORIGINS`.
 - If the web client should load server-side sample data, configure `WEB_SAMPLE_DICOM_PATH` and set frontend `VITE_WEB_USE_SERVER_SAMPLE=true`.
 
+## Fly.io Deployment
+
+This repository includes `fly.toml`, `Dockerfile`, and `.dockerignore`. The Fly CLI is recommended because it prints full build and startup logs.
+
+### 1. Install and sign in to Fly CLI
+
+Windows PowerShell:
+
+```powershell
+powershell -Command "iwr https://fly.io/install.ps1 -useb | iex"
+fly auth login
+```
+
+### 2. Create or confirm the app name
+
+The default app name in `fly.toml` is:
+
+```toml
+app = "dicomvision-server-l5769389"
+```
+
+Fly app names must be globally unique. If creation fails, change it to your own name:
+
+```toml
+app = "dicomvision-server-yourname"
+```
+
+Create the app:
+
+```powershell
+fly apps create dicomvision-server-l5769389
+```
+
+If the name is already taken, choose another name and update `fly.toml`.
+
+### 3. Configure CORS origins
+
+The current default is convenient for testing:
+
+```toml
+CORS_ORIGINS = "[\"*\"]"
+```
+
+For production, set your frontend origin:
+
+```powershell
+fly secrets set CORS_ORIGINS='["https://your-vercel-app.vercel.app"]'
+```
+
+If you use the bundled sample dataset, `fly.toml` already sets:
+
+```toml
+WEB_SAMPLE_DICOM_PATH = "/app/sample-data/test"
+```
+
+### 4. Deploy
+
+```powershell
+fly deploy
+```
+
+After deployment:
+
+```powershell
+fly status
+fly logs
+fly open
+```
+
+Health check URL:
+
+```text
+https://dicomvision-server-l5769389.fly.dev/health
+```
+
+### GitHub deploy page notes
+
+When using Fly.io's GitHub Deploy page:
+
+- Set `Working directory` to `./`
+- Set `Config path` to `fly.toml` or `./fly.toml`, not `./`
+- Set `Internal port` to `8000`
+- Use at least `shared-cpu-1x / 2GB`
+- Push `fly.toml`, `Dockerfile`, and `.dockerignore` to GitHub before deploying from the web UI
+- If the page says `Failed to create app`, first check whether the app name is already taken, or whether the generated/configured app name should be changed to a unique lowercase name with hyphens
+
 ## Desktop Bundle
 
 This repository can build the Windows backend bundle consumed by the Electron client installer.

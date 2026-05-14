@@ -17,6 +17,10 @@ from app.schemas.dicom import (
 
 logger = get_logger(__name__)
 
+FOUR_D_FPS_MIN = 1
+FOUR_D_FPS_MAX = 30
+FOUR_D_DEFAULT_FPS = 2
+
 
 def _normalize_phase_count(value: int) -> int:
     return max(1, int(value))
@@ -27,7 +31,7 @@ def _normalize_fps(value: int | None) -> int:
         numeric_value = int(value or 0)
     except (TypeError, ValueError):
         numeric_value = 0
-    return max(1, min(30, numeric_value or 2))
+    return max(FOUR_D_FPS_MIN, min(FOUR_D_FPS_MAX, numeric_value or FOUR_D_DEFAULT_FPS))
 
 
 def _normalize_phase_index(value: int, phase_count: int) -> int:

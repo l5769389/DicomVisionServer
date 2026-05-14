@@ -7,6 +7,9 @@ import socketio
 from app.services.viewer_service import viewer_service
 
 
+RENDER_FORMAT_QUALITY_RANK = {"jpeg": 0, "png": 1}
+
+
 @dataclass
 class RenderRequest:
     image_format: str = "png"
@@ -64,6 +67,9 @@ class ViewSocketHub:
             target_sids = None
         else:
             target_sids = tuple(dict.fromkeys((*current.target_sids, *incoming.target_sids)))
+
+        # Pending renders use "latest state wins", but a settled frame should not
+        # be downgraded by an older drag-preview request still waiting in the queue.
         return RenderRequest(
             image_format=ViewSocketHub._choose_render_image_format(current.image_format, incoming.image_format),
             fast_preview=current.fast_preview and incoming.fast_preview,
@@ -72,9 +78,8 @@ class ViewSocketHub:
 
     @staticmethod
     def _choose_render_image_format(current: str, incoming: str) -> str:
-        quality_rank = {"jpeg": 0, "png": 1}
-        current_rank = quality_rank.get(current, 0)
-        incoming_rank = quality_rank.get(incoming, 0)
+        current_rank = RENDER_FORMAT_QUALITY_RANK.get(current, 0)
+        incoming_rank = RENDER_FORMAT_QUALITY_RANK.get(incoming, 0)
         if incoming_rank > current_rank:
             return incoming
         if current_rank > incoming_rank:

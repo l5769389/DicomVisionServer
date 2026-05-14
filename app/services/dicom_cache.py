@@ -14,6 +14,9 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+DEFAULT_MAX_CACHE_ENTRIES = 128
+DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024
+
 
 @dataclass
 class CachedDicom:
@@ -27,7 +30,7 @@ class CachedDicom:
 
 
 class DicomCache:
-    def __init__(self, max_entries: int = 128, max_bytes: int = 512 * 1024 * 1024) -> None:
+    def __init__(self, max_entries: int = DEFAULT_MAX_CACHE_ENTRIES, max_bytes: int = DEFAULT_MAX_CACHE_BYTES) -> None:
         self.max_entries = max_entries
         self.max_bytes = max_bytes
         self._cache: OrderedDict[str, CachedDicom] = OrderedDict()
@@ -35,7 +38,7 @@ class DicomCache:
         self._lock = RLock()
 
     def get(self, instance_uid: str | None, path: Path) -> CachedDicom:
-        cache_key = str(instance_uid or path.resolve().as_posix())
+        cache_key = self._build_cache_key(instance_uid, path)
         with self._lock:
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -96,6 +99,8 @@ class DicomCache:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to decode pixel data: {exc}") from exc
 
+        # The viewer currently treats enhanced/multi-frame files as a single 2D frame.
+        # Keep this choice explicit so adding true multi-frame support has one obvious branch.
         if pixels.ndim == 3:
             pixels = pixels[0]
 
@@ -103,6 +108,8 @@ class DicomCache:
         intercept = float(getattr(dataset, "RescaleIntercept", 0.0))
         pixels = pixels * slope + intercept
 
+        # MONOCHROME1 stores lower values as visually brighter. Negating keeps the
+        # downstream windowing path using the same "larger value is brighter" model.
         if getattr(dataset, "PhotometricInterpretation", "") == "MONOCHROME1":
             pixels = -pixels
         logger.debug(
@@ -115,6 +122,10 @@ class DicomCache:
             float(np.max(pixels)),
         )
         return pixels
+
+    @staticmethod
+    def _build_cache_key(instance_uid: str | None, path: Path) -> str:
+        return str(instance_uid or path.resolve().as_posix())
 
     @staticmethod
     def _get_first_number(value: object) -> float | None:

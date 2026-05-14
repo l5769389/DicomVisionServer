@@ -142,6 +142,7 @@ logger = get_logger(__name__)
 CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
+FAST_PREVIEW_JPEG_QUALITY = 20
 
 
 @dataclass(frozen=True)
@@ -3779,7 +3780,9 @@ class ViewerService:
     def _encode_image(image: Image.Image, image_format: ImageFormat) -> bytes:
         output = io.BytesIO()
         if image_format == "jpeg":
-            image.convert("RGB").save(output, format="JPEG", quality=20)
+            # JPEG is only used for transient interaction previews. Settled frames
+            # stay PNG so overlays and measurements align with lossless pixels.
+            image.convert("RGB").save(output, format="JPEG", quality=FAST_PREVIEW_JPEG_QUALITY)
         else:
             image.save(output, format="PNG")
         return output.getvalue()

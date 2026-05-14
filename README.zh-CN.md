@@ -213,6 +213,92 @@ Web 前端部署时需要：
 - 将前端域名写入后端 `CORS_ORIGINS`。
 - 如果 Web 端使用示例数据，配置 `WEB_SAMPLE_DICOM_PATH` 并在前端设置 `VITE_WEB_USE_SERVER_SAMPLE=true`。
 
+## Fly.io 部署
+
+仓库内已提供 `fly.toml`、`Dockerfile` 和 `.dockerignore`。推荐优先使用 Fly CLI 部署，因为 CLI 会输出完整构建与启动日志。
+
+### 1. 安装并登录 Fly CLI
+
+Windows PowerShell：
+
+```powershell
+powershell -Command "iwr https://fly.io/install.ps1 -useb | iex"
+fly auth login
+```
+
+### 2. 创建或确认应用名
+
+`fly.toml` 中默认应用名为：
+
+```toml
+app = "dicomvision-server-l5769389"
+```
+
+Fly app 名称需要全局唯一。如果创建失败，可改成自己的名称，例如：
+
+```toml
+app = "dicomvision-server-yourname"
+```
+
+然后创建应用：
+
+```powershell
+fly apps create dicomvision-server-l5769389
+```
+
+如果该名称已存在，换一个名称后同时修改 `fly.toml`。
+
+### 3. 配置跨域来源
+
+开发阶段可使用当前默认值：
+
+```toml
+CORS_ORIGINS = "[\"*\"]"
+```
+
+生产环境建议改为你的前端域名：
+
+```powershell
+fly secrets set CORS_ORIGINS='["https://your-vercel-app.vercel.app"]'
+```
+
+如果使用仓库内示例数据，`fly.toml` 已配置：
+
+```toml
+WEB_SAMPLE_DICOM_PATH = "/app/sample-data/test"
+```
+
+### 4. 部署
+
+```powershell
+fly deploy
+```
+
+部署完成后验证：
+
+```powershell
+fly status
+fly logs
+fly open
+```
+
+健康检查地址：
+
+```text
+https://dicomvision-server-l5769389.fly.dev/health
+```
+
+### GitHub 页面部署注意事项
+
+如果使用 Fly.io 的 GitHub Deploy 页面：
+
+- `Working directory` 填 `./`
+- `Config path` 填 `fly.toml` 或 `./fly.toml`，不要填 `./`
+- `Internal port` 填 `8000`
+- `Machine Size` 建议至少 `shared-cpu-1x / 2GB`
+- 先把 `fly.toml`、`Dockerfile`、`.dockerignore` push 到 GitHub，否则网页部署读不到这些配置
+- 如果提示 `Failed to create app`，优先检查 app 名是否已被占用，或仓库名/配置里的 app 名是否需要改成全小写加短横线的唯一名称
+
 ## 桌面 bundle
 
 此仓库可构建供 Electron 客户端安装包内置的 Windows 后端 bundle。

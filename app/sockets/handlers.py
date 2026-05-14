@@ -41,6 +41,12 @@ async def _emit_render(server: socketio.AsyncServer, sid: str, view_id: str) -> 
 
 @timer
 async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) -> dict[str, object]:
+    """Apply an interactive viewer operation and push any resulting frames.
+
+    This is the realtime counterpart to the REST APIs: high-frequency operations
+    such as scroll, window, pan, zoom, MPR crosshair, 3D rotation, and measurement
+    edits enter here so the client can receive image_update events without polling.
+    """
     try:
         payload = ViewOperationRequest.model_validate(data)
         view_socket_hub.bind_view(sid, payload.view_id)
@@ -159,6 +165,7 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
 
     @server.on("bind_view")
     async def bind_view(sid: str, data: dict) -> dict[str, object] | None:
+        """Subscribe this Socket connection to a view's image_update events."""
         view_id = str(data.get("viewId") or data.get("view_id") or "")
         if not view_id:
             await server.emit("image_error", {"message": "viewId is required"}, to=sid)

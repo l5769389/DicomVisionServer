@@ -35,7 +35,7 @@ class SeriesSummary(BaseModel):
 
 
 class LoadFolderRequest(BaseModel):
-    folder_path: str = Field(alias="folderPath")
+    folder_path: str = Field(alias="folderPath", description="Local file or folder path to scan for DICOM files.")
 
     model_config = {"populate_by_name": True}
 
@@ -54,9 +54,17 @@ class LoadSampleResponse(LoadFolderResponse):
 
 
 class FourDPhasesRequest(BaseModel):
-    series_id: str = Field(alias="seriesId")
-    include_preview_images: bool = Field(default=False, alias="includePreviewImages")
-    preview_phase_index: int | None = Field(default=None, alias="previewPhaseIndex")
+    series_id: str = Field(alias="seriesId", description="Registered source series ID.")
+    include_preview_images: bool = Field(
+        default=False,
+        alias="includePreviewImages",
+        description="Whether to include preview image URLs in the phase manifest.",
+    )
+    preview_phase_index: int | None = Field(
+        default=None,
+        alias="previewPhaseIndex",
+        description="Optional phase index to prioritize when generating preview metadata.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -118,7 +126,7 @@ class CornerInfoPayload(BaseModel):
 
 
 class CornerInfoRequest(BaseModel):
-    series_id: str = Field(alias="seriesId")
+    series_id: str = Field(alias="seriesId", description="Registered series ID used to build viewport corner lines.")
 
     model_config = {"populate_by_name": True}
 
@@ -130,8 +138,8 @@ class CornerInfoResponse(BaseModel):
 
 
 class DicomTagsRequest(BaseModel):
-    series_id: str = Field(alias="seriesId")
-    index: int = 0
+    series_id: str = Field(alias="seriesId", description="Registered series ID.")
+    index: int = Field(default=0, description="Zero-based instance index inside the series.")
 
     model_config = {"populate_by_name": True}
 

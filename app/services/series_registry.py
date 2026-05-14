@@ -70,13 +70,17 @@ class SeriesRegistry:
         return f"{normalized_folder}::{fallback_path.parent.as_posix()}"
 
     @staticmethod
-    def _resolve_folder(folder_path: str) -> Path:
-        """Normalize the input path so registry keys remain stable across calls."""
+    def _resolve_scan_target(folder_path: str) -> tuple[Path, list[Path]]:
+        """Normalize an input file or folder path into a scan root and file list."""
 
-        folder = Path(folder_path).expanduser().resolve()
-        if not folder.exists() or not folder.is_dir():
-            raise HTTPException(status_code=404, detail="DICOM folder not found")
-        return folder
+        target = Path(folder_path).expanduser().resolve()
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="DICOM path not found")
+        if target.is_file():
+            return target.parent, [target]
+        if target.is_dir():
+            return target, sorted(target.rglob("*"))
+        raise HTTPException(status_code=404, detail="DICOM path is not a file or folder")
 
     @staticmethod
     def _read_dataset_header(path: Path):
@@ -142,11 +146,11 @@ class SeriesRegistry:
         except (OverflowError, TypeError, ValueError):
             return fallback
 
-    def _collect_grouped_series(self, folder: Path) -> dict[str, SeriesRecord]:
+    def _collect_grouped_series(self, folder: Path, scan_paths: list[Path]) -> dict[str, SeriesRecord]:
         grouped: dict[str, SeriesRecord] = {}
         instance_keys_by_series_key: dict[str, set[str]] = {}
 
-        for path in sorted(folder.rglob("*")):
+        for path in scan_paths:
             if not path.is_file():
                 continue
 
@@ -313,10 +317,10 @@ class SeriesRegistry:
 
     def load_folder(self, payload: LoadFolderRequest) -> LoadFolderResponse:
         with self._lock:
-            folder = self._resolve_folder(payload.folder_path)
-            grouped = self._collect_grouped_series(folder)
+            folder, scan_paths = self._resolve_scan_target(payload.folder_path)
+            grouped = self._collect_grouped_series(folder, scan_paths)
             if not grouped:
-                raise HTTPException(status_code=404, detail="No readable DICOM series found in folder")
+                raise HTTPException(status_code=404, detail="No readable DICOM series found in path")
 
             real_series_records = list(grouped.values())
             series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
