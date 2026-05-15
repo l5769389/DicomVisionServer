@@ -2,7 +2,15 @@
 
 [中文说明](./README.zh-CN.md)
 
-DicomVision Server powers the backend side of DicomVision with DICOM series discovery, thumbnails and tag reading, Stack rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
+DicomVision Server powers the backend side of DicomVision with DICOM series discovery, thumbnails and tag reading, DICOM tag editing, DICOM de-identification export, Stack rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
+
+## Version 1.1.0 Updates
+
+- Added asynchronous DICOM tag edit jobs with status polling, artifact download, and per-instance progress counters.
+- Added DICOM de-identification service and asynchronous de-identification jobs for full-series export.
+- Added progress metadata (`processedCount`, `totalCount`, `progressPercent`) to DICOM artifact job responses.
+- Improved DICOM artifact download headers for Unicode file names and shared desktop/web save flows.
+- Expanded tests for tag editing, de-identification, single-file loading, artifact headers, and job progress.
 
 ## Repositories
 
@@ -11,13 +19,15 @@ DicomVision Server powers the backend side of DicomVision with DICOM series disc
 
 ## Feature Overview
 
-- **DICOM data services**: load local folders or server-side sample folders, discover series, generate thumbnails, and read instance-level DICOM tags.
+- **DICOM data services**: load local folders or single DICOM files, discover series, generate thumbnails, and read instance-level DICOM tags.
 - **Stack rendering**: render 2D images from viewport size, window/level, pseudocolor, rotation, flip, zoom, and pan state.
 - **MPR and oblique MPR**: build standardized volumes for axial, coronal, and sagittal reconstruction, synchronized crosshair navigation, oblique rotation, and MIP configuration.
 - **4D support**: detect phase groups, generate phase lists and preview images, and coordinate frontend playback through Socket.IO.
 - **3D volume rendering**: render volumes through VTK with presets, transfer functions, lighting, interpolation, blend modes, and layer configuration.
 - **Measurement and QA analysis**: calculate line, rectangle, ellipse, angle, curve, and freeform ROI metrics, plus MTF/FWHM and water phantom QA results.
 - **Realtime interaction**: process scroll, window/level, zoom, pan, crosshair, oblique MPR, 3D rotation, hover, and measurement draft operations over Socket.IO.
+- **DICOM metadata export**: generate modified tag copies and de-identified DICOM series artifacts without overwriting source files.
+- **Background artifact jobs**: process long-running tag edits and de-identification exports asynchronously with pollable progress and downloadable artifacts.
 - **Deployment and packaging**: deploy as the web backend on Render, or build a Windows desktop backend bundle consumed by the Electron client.
 
 ## Product Screenshots
@@ -160,6 +170,14 @@ Base path: `/api/v1`
 - `POST /dicom/fourD/phases`
 - `GET /dicom/fourD/preview`
 - `POST /dicom/tags`
+- `POST /dicom/modifyTag`
+- `POST /dicom/modifyTag/jobs`
+- `GET /dicom/modifyTag/jobs/{job_id}`
+- `GET /dicom/modifyTag/jobs/{job_id}/artifact`
+- `POST /dicom/deidentify`
+- `POST /dicom/deidentify/jobs`
+- `GET /dicom/deidentify/jobs/{job_id}`
+- `GET /dicom/deidentify/jobs/{job_id}/artifact`
 - `POST /view/create`
 - `POST /view/close`
 - `POST /view/setSize`

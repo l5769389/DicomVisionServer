@@ -5,6 +5,9 @@ __pycache__/
 *.log
 .env
 .pytest_cache/
+.pytest-basetemp-run/
+.pytest-tmp/
+tmp_pytest_basetemp/
 .mypy_cache/
 dist/
 build/

@@ -11,54 +11,50 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from app.schemas.dicom import DicomTagModifyJobStatusResponse, DicomTagModifyRequest
-from app.services.dicom_tag_service import DicomTagModifyArtifact, dicom_tag_service
+from app.schemas.dicom import DicomDeidentifyRequest, DicomTagModifyJobStatusResponse
+from app.services.dicom_deidentify_service import DicomDeidentifyArtifact, dicom_deidentify_service
 
 
-DicomTagModifyJobState = Literal["pending", "running", "succeeded", "failed"]
+DicomDeidentifyJobState = Literal["pending", "running", "succeeded", "failed"]
 
 
 @dataclass(frozen=True)
-class DicomTagModifyJobArtifact:
+class DicomDeidentifyJobArtifact:
     path: Path
     file_name: str
     media_type: str
     modified_count: int
-    artifact_kind: Literal["dicom", "zip"]
+    artifact_kind: Literal["zip"]
     series_folder: str
-    tag: str
-    keyword: str
-    vr: str
 
 
 @dataclass
-class DicomTagModifyJob:
+class DicomDeidentifyJob:
     job_id: str
-    status: DicomTagModifyJobState
+    status: DicomDeidentifyJobState
     created_at: datetime
     processed_count: int = 0
     total_count: int = 0
     completed_at: datetime | None = None
     error: str | None = None
-    artifact: DicomTagModifyJobArtifact | None = None
+    artifact: DicomDeidentifyJobArtifact | None = None
 
 
-class DicomTagModifyJobService:
+class DicomDeidentifyJobService:
     _MAX_RETAINED_JOBS = 64
     _ARTIFACT_MAX_AGE_SECONDS = 24 * 60 * 60
-    _TEMP_ARTIFACT_SUFFIXES = {".dcm", ".zip"}
 
     def __init__(self, *, temp_root: Path | None = None) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dicom-tag-edit")
-        self._jobs: dict[str, DicomTagModifyJob] = {}
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dicom-deidentify")
+        self._jobs: dict[str, DicomDeidentifyJob] = {}
         self._lock = threading.Lock()
-        self._temp_root = temp_root or Path(tempfile.gettempdir()) / "dicomvision-tag-edit-jobs"
+        self._temp_root = temp_root or Path(tempfile.gettempdir()) / "dicomvision-deidentify-jobs"
         self._temp_root.mkdir(parents=True, exist_ok=True)
         self._delete_stale_temp_files()
 
-    def create_job(self, payload: DicomTagModifyRequest) -> DicomTagModifyJobStatusResponse:
+    def create_job(self, payload: DicomDeidentifyRequest) -> DicomTagModifyJobStatusResponse:
         job_id = uuid4().hex
-        job = DicomTagModifyJob(job_id=job_id, status="pending", created_at=self._utc_now())
+        job = DicomDeidentifyJob(job_id=job_id, status="pending", created_at=self._utc_now())
         with self._lock:
             self._jobs[job_id] = job
             self._prune_locked()
@@ -70,20 +66,20 @@ class DicomTagModifyJobService:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
-                raise HTTPException(status_code=404, detail="DICOM tag edit job was not found")
+                raise HTTPException(status_code=404, detail="DICOM de-identification job was not found")
             return self._to_response(job)
 
-    def get_completed_artifact(self, job_id: str) -> DicomTagModifyJobArtifact:
+    def get_completed_artifact(self, job_id: str) -> DicomDeidentifyJobArtifact:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
-                raise HTTPException(status_code=404, detail="DICOM tag edit job was not found")
+                raise HTTPException(status_code=404, detail="DICOM de-identification job was not found")
             if job.status != "succeeded" or job.artifact is None:
-                raise HTTPException(status_code=409, detail="DICOM tag edit job is not complete")
+                raise HTTPException(status_code=409, detail="DICOM de-identification job is not complete")
             artifact = job.artifact
 
         if not artifact.path.is_file():
-            raise HTTPException(status_code=410, detail="DICOM tag edit artifact is no longer available")
+            raise HTTPException(status_code=410, detail="DICOM de-identification artifact is no longer available")
         return artifact
 
     def clear(self) -> None:
@@ -93,10 +89,10 @@ class DicomTagModifyJobService:
         for artifact in artifacts:
             self._delete_artifact(artifact)
 
-    def _run_job(self, job_id: str, payload: DicomTagModifyRequest) -> None:
+    def _run_job(self, job_id: str, payload: DicomDeidentifyRequest) -> None:
         self._mark_running(job_id)
         try:
-            artifact = dicom_tag_service.modify_series_tag(
+            artifact = dicom_deidentify_service.deidentify_series(
                 payload,
                 progress_callback=lambda processed_count, total_count: self._update_progress(
                     job_id,
@@ -110,7 +106,7 @@ class DicomTagModifyJobService:
             self._mark_failed(job_id, detail)
             return
         except Exception as exc:
-            self._mark_failed(job_id, str(exc) or "DICOM tag edit job failed")
+            self._mark_failed(job_id, str(exc) or "DICOM de-identification job failed")
             return
 
         self._mark_succeeded(job_id, stored_artifact)
@@ -138,7 +134,7 @@ class DicomTagModifyJobService:
                 job.completed_at = self._utc_now()
             self._prune_locked()
 
-    def _mark_succeeded(self, job_id: str, artifact: DicomTagModifyJobArtifact) -> None:
+    def _mark_succeeded(self, job_id: str, artifact: DicomDeidentifyJobArtifact) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is not None:
@@ -149,26 +145,21 @@ class DicomTagModifyJobService:
                 job.completed_at = self._utc_now()
             self._prune_locked()
 
-    def _store_artifact(self, job_id: str, artifact: DicomTagModifyArtifact) -> DicomTagModifyJobArtifact:
-        suffix = ".zip" if artifact.artifact_kind == "zip" else ".dcm"
-        artifact_path = self._temp_root / f"{job_id}{suffix}"
+    def _store_artifact(self, job_id: str, artifact: DicomDeidentifyArtifact) -> DicomDeidentifyJobArtifact:
+        artifact_path = self._temp_root / f"{job_id}.zip"
         artifact_path.write_bytes(artifact.content)
-        return DicomTagModifyJobArtifact(
+        return DicomDeidentifyJobArtifact(
             path=artifact_path,
             file_name=artifact.file_name,
             media_type=artifact.media_type,
             modified_count=artifact.modified_count,
-            artifact_kind="zip" if artifact.artifact_kind == "zip" else "dicom",
+            artifact_kind="zip",
             series_folder=artifact.series_folder,
-            tag=artifact.tag,
-            keyword=artifact.keyword,
-            vr=artifact.vr,
         )
 
-    def _to_response(self, job: DicomTagModifyJob) -> DicomTagModifyJobStatusResponse:
+    def _to_response(self, job: DicomDeidentifyJob) -> DicomTagModifyJobStatusResponse:
         artifact = job.artifact
         artifact_url = self._artifact_url(job.job_id) if artifact is not None and job.status == "succeeded" else None
-        progress_percent = self._resolve_progress_percent(job)
         return DicomTagModifyJobStatusResponse(
             jobId=job.job_id,
             status=job.status,
@@ -180,7 +171,7 @@ class DicomTagModifyJobService:
             mediaType=artifact.media_type if artifact is not None else None,
             modifiedCount=artifact.modified_count if artifact is not None else None,
             processedCount=job.processed_count,
-            progressPercent=progress_percent,
+            progressPercent=self._resolve_progress_percent(job),
             seriesFolder=artifact.series_folder if artifact is not None else None,
             totalCount=job.total_count,
             createdAt=self._format_datetime(job.created_at),
@@ -188,7 +179,7 @@ class DicomTagModifyJobService:
         )
 
     @staticmethod
-    def _resolve_progress_percent(job: DicomTagModifyJob) -> int:
+    def _resolve_progress_percent(job: DicomDeidentifyJob) -> int:
         if job.status == "succeeded":
             return 100
         if job.total_count <= 0:
@@ -218,18 +209,18 @@ class DicomTagModifyJobService:
         for job in final_jobs[: max(0, len(self._jobs) - self._MAX_RETAINED_JOBS)]:
             self._remove_job_locked(job)
 
-    def _remove_job_locked(self, job: DicomTagModifyJob) -> None:
+    def _remove_job_locked(self, job: DicomDeidentifyJob) -> None:
         self._jobs.pop(job.job_id, None)
         if job.artifact is not None:
             self._delete_artifact(job.artifact)
 
     @staticmethod
     def _status_url(job_id: str) -> str:
-        return f"/api/v1/dicom/modifyTag/jobs/{job_id}"
+        return f"/api/v1/dicom/deidentify/jobs/{job_id}"
 
     @staticmethod
     def _artifact_url(job_id: str) -> str:
-        return f"/api/v1/dicom/modifyTag/jobs/{job_id}/artifact"
+        return f"/api/v1/dicom/deidentify/jobs/{job_id}/artifact"
 
     @staticmethod
     def _format_datetime(value: datetime | None) -> str | None:
@@ -242,7 +233,7 @@ class DicomTagModifyJobService:
         return datetime.now(UTC)
 
     @staticmethod
-    def _delete_artifact(artifact: DicomTagModifyJobArtifact) -> None:
+    def _delete_artifact(artifact: DicomDeidentifyJobArtifact) -> None:
         try:
             artifact.path.unlink(missing_ok=True)
         except OSError:
@@ -252,16 +243,13 @@ class DicomTagModifyJobService:
         cutoff_timestamp = self._utc_now().timestamp() - self._ARTIFACT_MAX_AGE_SECONDS
         for path in self._temp_root.iterdir():
             try:
-                if (
-                    not path.is_file()
-                    or path.suffix.lower() not in self._TEMP_ARTIFACT_SUFFIXES
-                    or len(path.stem) != 32
-                    or path.stat().st_mtime >= cutoff_timestamp
-                ):
+                if not path.is_file() or path.suffix.lower() != ".zip" or len(path.stem) != 32:
+                    continue
+                if path.stat().st_mtime >= cutoff_timestamp:
                     continue
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
 
 
-dicom_tag_job_service = DicomTagModifyJobService()
+dicom_deidentify_job_service = DicomDeidentifyJobService()

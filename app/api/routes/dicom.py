@@ -7,6 +7,7 @@ from app.core.config import get_settings
 from app.schemas.dicom import (
     CornerInfoRequest,
     CornerInfoResponse,
+    DicomDeidentifyRequest,
     DicomTagsRequest,
     DicomTagsResponse,
     DicomTagModifyJobStatusResponse,
@@ -17,6 +18,8 @@ from app.schemas.dicom import (
     LoadFolderResponse,
     LoadSampleResponse,
 )
+from app.services.dicom_deidentify_job_service import dicom_deidentify_job_service
+from app.services.dicom_deidentify_service import dicom_deidentify_service
 from app.services.dicom_tag_job_service import dicom_tag_job_service
 from app.services.dicom_tag_service import dicom_tag_service
 from app.services.four_d_service import four_d_service
@@ -25,6 +28,35 @@ from app.services.viewer_service import viewer_service
 
 router = APIRouter(prefix="/dicom", tags=["dicom"])
 settings = get_settings()
+
+
+def _dicom_artifact_headers(
+    *,
+    artifact_kind: str,
+    file_name: str,
+    modified_count: int,
+    series_folder: str,
+    fallback_file_name: str,
+    keyword: str = "",
+    purpose: str = "",
+    tag: str = "",
+    vr: str = "",
+) -> dict[str, str]:
+    ascii_file_name = file_name.replace("\\", "-").replace("/", "-").encode("ascii", errors="ignore").decode("ascii").strip()
+    quoted_file_name = quote(file_name, safe="")
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{ascii_file_name or fallback_file_name}\"; filename*=UTF-8''{quoted_file_name}",
+        "X-DicomVision-Artifact-Kind": artifact_kind,
+        "X-DicomVision-File-Name": quoted_file_name,
+        "X-DicomVision-Keyword": keyword,
+        "X-DicomVision-Modified-Count": str(modified_count),
+        "X-DicomVision-Series-Folder": series_folder,
+        "X-DicomVision-Tag": tag,
+        "X-DicomVision-VR": vr,
+    }
+    if purpose:
+        headers["X-DicomVision-Artifact-Purpose"] = purpose
+    return headers
 
 
 def _dicom_tag_artifact_headers(
@@ -37,17 +69,18 @@ def _dicom_tag_artifact_headers(
     tag: str,
     vr: str,
 ) -> dict[str, str]:
-    quoted_file_name = quote(file_name)
-    return {
-        "Content-Disposition": f"attachment; filename=\"{file_name}\"; filename*=UTF-8''{quoted_file_name}",
-        "X-DicomVision-Artifact-Kind": artifact_kind,
-        "X-DicomVision-File-Name": file_name,
-        "X-DicomVision-Keyword": keyword,
-        "X-DicomVision-Modified-Count": str(modified_count),
-        "X-DicomVision-Series-Folder": series_folder,
-        "X-DicomVision-Tag": tag,
-        "X-DicomVision-VR": vr,
-    }
+    fallback_file_name = "dicom-tag-edits.zip" if artifact_kind == "zip" else "dicom-tag-edit.dcm"
+    return _dicom_artifact_headers(
+        artifact_kind=artifact_kind,
+        fallback_file_name=fallback_file_name,
+        file_name=file_name,
+        keyword=keyword,
+        modified_count=modified_count,
+        purpose="tag-edit",
+        series_folder=series_folder,
+        tag=tag,
+        vr=vr,
+    )
 
 
 @router.post(
@@ -154,6 +187,91 @@ def get_four_d_preview(seriesId: str, phaseIndex: int, viewportKey: str) -> Resp
 def get_dicom_tags(payload: DicomTagsRequest) -> DicomTagsResponse:
     """Return metadata rows for the DICOM tag viewer."""
     return dicom_tag_service.get_series_tags(payload)
+
+
+@router.post(
+    "/deidentify",
+    summary="Create de-identified DICOM series artifact",
+    description=(
+        "Creates de-identified copies for every instance in a registered series. "
+        "Original files are never overwritten; the ZIP archive is returned to the client "
+        "so desktop and web frontends can save it with the same export pipeline."
+    ),
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+            "description": "A ZIP archive containing de-identified DICOM copies for the series.",
+        }
+    },
+)
+def deidentify_dicom_series(payload: DicomDeidentifyRequest) -> Response:
+    """Return a ZIP artifact with de-identified DICOM copies for the series."""
+    artifact = dicom_deidentify_service.deidentify_series(payload)
+    return Response(
+        content=artifact.content,
+        media_type=artifact.media_type,
+        headers=_dicom_artifact_headers(
+            artifact_kind=artifact.artifact_kind,
+            fallback_file_name="dicom-deidentified.zip",
+            file_name=artifact.file_name,
+            modified_count=artifact.modified_count,
+            purpose="deidentify",
+            series_folder=artifact.series_folder,
+        ),
+    )
+
+
+@router.post(
+    "/deidentify/jobs",
+    response_model=DicomTagModifyJobStatusResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Start an asynchronous DICOM de-identification job",
+    description=(
+        "Starts a background job that creates de-identified copies for every instance in a registered series. "
+        "Use the returned statusUrl to poll progress until the ZIP artifact is ready."
+    ),
+)
+def create_deidentify_dicom_series_job(payload: DicomDeidentifyRequest) -> DicomTagModifyJobStatusResponse:
+    """Start a background DICOM de-identification job."""
+    return dicom_deidentify_job_service.create_job(payload)
+
+
+@router.get(
+    "/deidentify/jobs/{job_id}",
+    response_model=DicomTagModifyJobStatusResponse,
+    summary="Get asynchronous DICOM de-identification job status",
+)
+def get_deidentify_dicom_series_job(job_id: str) -> DicomTagModifyJobStatusResponse:
+    """Return current status for a background DICOM de-identification job."""
+    return dicom_deidentify_job_service.get_status(job_id)
+
+
+@router.get(
+    "/deidentify/jobs/{job_id}/artifact",
+    summary="Download asynchronous DICOM de-identification artifact",
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+            "description": "The ZIP archive produced by the background de-identification job.",
+        }
+    },
+)
+def get_deidentify_dicom_series_job_artifact(job_id: str) -> FileResponse:
+    """Download the artifact produced by a completed background DICOM de-identification job."""
+    artifact = dicom_deidentify_job_service.get_completed_artifact(job_id)
+    return FileResponse(
+        artifact.path,
+        media_type=artifact.media_type,
+        filename=artifact.file_name,
+        headers=_dicom_artifact_headers(
+            artifact_kind=artifact.artifact_kind,
+            fallback_file_name="dicom-deidentified.zip",
+            file_name=artifact.file_name,
+            modified_count=artifact.modified_count,
+            purpose="deidentify",
+            series_folder=artifact.series_folder,
+        ),
+    )
 
 
 @router.post(

@@ -181,6 +181,35 @@ class DicomTagModifyRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+DicomDeidentifyFieldKey = Literal[
+    "patientIdentity",
+    "patientDemographics",
+    "datesAndTimes",
+    "accessionInstitution",
+    "physiciansOperators",
+    "descriptions",
+    "deviceInfo",
+    "privateTags",
+    "uids",
+]
+
+
+class DicomDeidentifyRequest(BaseModel):
+    series_id: str = Field(alias="seriesId", description="Registered series ID.")
+    field_keys: list[DicomDeidentifyFieldKey] = Field(
+        default_factory=list,
+        alias="fieldKeys",
+        description="De-identification groups selected by the user.",
+    )
+    replacement_prefix: str = Field(
+        default="ANON",
+        alias="replacementPrefix",
+        description="Short prefix used for replacement patient identifiers.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
 DicomTagModifyJobState = Literal["pending", "running", "succeeded", "failed"]
 
 
@@ -194,7 +223,10 @@ class DicomTagModifyJobStatusResponse(BaseModel):
     file_name: str | None = Field(default=None, alias="fileName")
     media_type: str | None = Field(default=None, alias="mediaType")
     modified_count: int | None = Field(default=None, alias="modifiedCount")
+    processed_count: int = Field(default=0, alias="processedCount")
+    progress_percent: int = Field(default=0, alias="progressPercent")
     series_folder: str | None = Field(default=None, alias="seriesFolder")
+    total_count: int = Field(default=0, alias="totalCount")
     created_at: str = Field(alias="createdAt")
     completed_at: str | None = Field(default=None, alias="completedAt")
 

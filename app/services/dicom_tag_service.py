@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 import re
+from typing import Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pydicom
@@ -16,6 +17,9 @@ from pydicom.valuerep import DSfloat, DSdecimal, IS
 
 from app.schemas.dicom import DicomTagItem, DicomTagModifyRequest, DicomTagsRequest, DicomTagsResponse
 from app.services.series_registry import series_registry
+
+
+DicomTagModifyProgressCallback = Callable[[int, int], None]
 
 
 @dataclass(frozen=True)
@@ -120,19 +124,26 @@ class DicomTagService:
             )
         ]
 
-    def modify_series_tag(self, payload: DicomTagModifyRequest) -> DicomTagModifyArtifact:
+    def modify_series_tag(
+        self,
+        payload: DicomTagModifyRequest,
+        progress_callback: DicomTagModifyProgressCallback | None = None,
+    ) -> DicomTagModifyArtifact:
         series = series_registry.get(payload.series_id)
         if not series.instances:
             raise HTTPException(status_code=404, detail="No instances found for seriesId")
 
         target_index = max(0, min(payload.index, len(series.instances) - 1))
         target_instances = series.instances if payload.scope == "series" else [series.instances[target_index]]
+        total_count = len(target_instances)
         modified_files: list[tuple[str, bytes]] = []
         used_file_names: set[str] = set()
         series_folder = self._safe_file_name_part(series.series_id)[:24] or "series"
         tag_label = ""
         keyword = ""
         vr = ""
+        if progress_callback is not None:
+            progress_callback(0, total_count)
 
         for write_index, instance in enumerate(target_instances, start=1):
             try:
@@ -155,6 +166,8 @@ class DicomTagService:
                 used_file_names=used_file_names,
             )
             modified_files.append((file_name, self._serialize_dataset(dataset)))
+            if progress_callback is not None:
+                progress_callback(write_index, total_count)
 
         if len(modified_files) == 1 and payload.scope == "current":
             file_name, content = modified_files[0]

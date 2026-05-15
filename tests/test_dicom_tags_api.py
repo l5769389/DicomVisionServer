@@ -8,11 +8,13 @@ import numpy as np
 import pydicom
 from fastapi.testclient import TestClient
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.tag import Tag
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
 from app.main import fastapi_app
 from app.schemas.dicom import LoadFolderRequest
 from app.services.dicom_cache import dicom_cache
+from app.services.dicom_deidentify_job_service import dicom_deidentify_job_service
 from app.services.dicom_tag_job_service import DicomTagModifyJobService, dicom_tag_job_service
 from app.services.series_registry import series_registry
 
@@ -29,6 +31,15 @@ def _create_test_dicom(path: Path, *, series_instance_uid: str | None = None, in
     dataset.is_implicit_VR = False
     dataset.PatientName = "Tag^Tester"
     dataset.PatientID = "patient-001"
+    dataset.PatientBirthDate = "19700101"
+    dataset.PatientSex = "O"
+    dataset.StudyDate = "20260514"
+    dataset.StudyTime = "101112"
+    dataset.AccessionNumber = "ACC-001"
+    dataset.InstitutionName = "DicomVision Hospital"
+    dataset.ReferringPhysicianName = "Doctor^Demo"
+    dataset.StationName = "CT-STATION-1"
+    dataset.DeviceSerialNumber = "DEVICE-SERIAL-1"
     dataset.StudyInstanceUID = generate_uid()
     dataset.SeriesInstanceUID = series_instance_uid or generate_uid()
     dataset.SOPClassUID = SecondaryCaptureImageStorage
@@ -50,6 +61,8 @@ def _create_test_dicom(path: Path, *, series_instance_uid: str | None = None, in
     nested.CodeValue = "ABC"
     nested.CodeMeaning = "Nested value"
     dataset.ConceptCodeSequence = [nested]
+    dataset.add_new((0x0011, 0x0010), "LO", "DICOMVISION_PRIVATE")
+    dataset.add_new((0x0011, 0x1001), "LO", "private-patient-note")
     dataset.save_as(str(path), write_like_original=False)
 
 
@@ -137,7 +150,7 @@ def test_load_folder_accepts_single_dicom_file_path(tmp_path: Path) -> None:
 def test_modify_dicom_tag_current_instance_returns_dicom_artifact(tmp_path: Path) -> None:
     series_registry.clear()
     dicom_cache.clear()
-    dicom_path = tmp_path / "tag-edit-current.dcm"
+    dicom_path = tmp_path / "tag-edit-current-中文.dcm"
     _create_test_dicom(dicom_path)
 
     load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
@@ -162,6 +175,7 @@ def test_modify_dicom_tag_current_instance_returns_dicom_artifact(tmp_path: Path
     assert response.headers["x-dicomvision-artifact-kind"] == "dicom"
     assert response.headers["x-dicomvision-modified-count"] == "1"
     assert response.headers["x-dicomvision-file-name"].endswith(".dcm")
+    assert "filename*=" in response.headers["content-disposition"]
 
     modified_dataset = pydicom.dcmread(BytesIO(response.content), force=True)
     original_dataset = pydicom.dcmread(str(dicom_path), force=True)
@@ -238,16 +252,140 @@ def test_modify_dicom_tag_series_scope_writes_all_instances(tmp_path: Path) -> N
         assert str(modified_dataset.PatientName) == "Edited^Series"
 
 
-def _wait_for_tag_edit_job(client: TestClient, job_id: str) -> dict:
+def test_deidentify_dicom_series_returns_zip_artifact(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    series_instance_uid = generate_uid()
+    first_path = tmp_path / "deid-series-1.dcm"
+    second_path = tmp_path / "deid-series-2.dcm"
+    _create_test_dicom(first_path, series_instance_uid=series_instance_uid, instance_number=1)
+    _create_test_dicom(second_path, series_instance_uid=series_instance_uid, instance_number=2)
+
+    original_dataset = pydicom.dcmread(str(first_path), force=True)
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    series_id = load_response.series_list[0].series_id
+    client = TestClient(fastapi_app)
+
+    response = client.post(
+        "/api/v1/dicom/deidentify",
+        json={
+            "seriesId": series_id,
+            "fieldKeys": [
+                "patientIdentity",
+                "patientDemographics",
+                "datesAndTimes",
+                "accessionInstitution",
+                "physiciansOperators",
+                "privateTags",
+                "uids",
+            ],
+            "replacementPrefix": "dv",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["x-dicomvision-artifact-kind"] == "zip"
+    assert response.headers["x-dicomvision-artifact-purpose"] == "deidentify"
+    assert response.headers["x-dicomvision-modified-count"] == "2"
+    assert response.headers["x-dicomvision-file-name"].endswith(".zip")
+
+    with ZipFile(BytesIO(response.content)) as archive:
+        names = archive.namelist()
+        assert len(names) == 2
+        assert all(name.endswith(".dcm") for name in names)
+        assert len({Path(name).parent for name in names}) == 1
+        datasets = [pydicom.dcmread(BytesIO(archive.read(name)), force=True) for name in names]
+
+    assert {str(dataset.PatientName) for dataset in datasets} == {"ANONYMIZED"}
+    assert all(str(dataset.PatientID).startswith("DV-") for dataset in datasets)
+    assert all(dataset.PatientBirthDate == "" for dataset in datasets)
+    assert all(dataset.StudyDate == "" for dataset in datasets)
+    assert all(dataset.AccessionNumber == "" for dataset in datasets)
+    assert all(dataset.InstitutionName == "" for dataset in datasets)
+    assert all(dataset.ReferringPhysicianName == "" for dataset in datasets)
+    assert all(dataset.PatientIdentityRemoved == "YES" for dataset in datasets)
+    assert all(not any(Tag(tag).is_private for tag in dataset.keys()) for dataset in datasets)
+
+    assert datasets[0].StudyInstanceUID != original_dataset.StudyInstanceUID
+    assert datasets[0].SeriesInstanceUID != original_dataset.SeriesInstanceUID
+    assert datasets[0].SeriesInstanceUID == datasets[1].SeriesInstanceUID
+    assert len({str(dataset.SOPInstanceUID) for dataset in datasets}) == 2
+    assert all(dataset.file_meta.MediaStorageSOPInstanceUID == dataset.SOPInstanceUID for dataset in datasets)
+
+    unchanged_original = pydicom.dcmread(str(first_path), force=True)
+    assert str(unchanged_original.PatientName) == "Tag^Tester"
+    assert unchanged_original.PatientID == "patient-001"
+
+
+def _wait_for_dicom_job(client: TestClient, status_url: str) -> dict:
     deadline = time.monotonic() + 5
     while True:
-        response = client.get(f"/api/v1/dicom/modifyTag/jobs/{job_id}")
+        response = client.get(status_url)
         assert response.status_code == 200
         data = response.json()
         if data["status"] in {"succeeded", "failed"}:
             return data
         assert time.monotonic() < deadline
         time.sleep(0.05)
+
+
+def _wait_for_tag_edit_job(client: TestClient, job_id: str) -> dict:
+    return _wait_for_dicom_job(client, f"/api/v1/dicom/modifyTag/jobs/{job_id}")
+
+
+def test_deidentify_dicom_series_async_job_downloads_artifact(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_deidentify_job_service.clear()
+    series_instance_uid = generate_uid()
+    _create_test_dicom(tmp_path / "deid-async-1.dcm", series_instance_uid=series_instance_uid, instance_number=1)
+    _create_test_dicom(tmp_path / "deid-async-2.dcm", series_instance_uid=series_instance_uid, instance_number=2)
+
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    series_id = load_response.series_list[0].series_id
+    client = TestClient(fastapi_app)
+
+    create_response = client.post(
+        "/api/v1/dicom/deidentify/jobs",
+        json={
+            "seriesId": series_id,
+            "fieldKeys": ["patientIdentity", "privateTags", "uids"],
+            "replacementPrefix": "job",
+        },
+    )
+
+    assert create_response.status_code == 202
+    created = create_response.json()
+    assert created["status"] in {"pending", "running", "succeeded"}
+    assert created["statusUrl"].endswith(created["jobId"])
+
+    completed = _wait_for_dicom_job(client, created["statusUrl"])
+    assert completed["status"] == "succeeded"
+    assert completed["artifactKind"] == "zip"
+    assert completed["modifiedCount"] == 2
+    assert completed["processedCount"] == 2
+    assert completed["totalCount"] == 2
+    assert completed["progressPercent"] == 100
+    assert completed["artifactUrl"].endswith(f"/{created['jobId']}/artifact")
+
+    artifact_response = client.get(completed["artifactUrl"])
+    assert artifact_response.status_code == 200
+    assert artifact_response.headers["content-type"] == "application/zip"
+    assert artifact_response.headers["x-dicomvision-artifact-kind"] == "zip"
+    assert artifact_response.headers["x-dicomvision-artifact-purpose"] == "deidentify"
+    assert artifact_response.headers["x-dicomvision-modified-count"] == "2"
+
+    with ZipFile(BytesIO(artifact_response.content)) as archive:
+        datasets = [pydicom.dcmread(BytesIO(archive.read(name)), force=True) for name in archive.namelist()]
+
+    assert len(datasets) == 2
+    assert {str(dataset.PatientName) for dataset in datasets} == {"ANONYMIZED"}
+    assert all(str(dataset.PatientID).startswith("JOB-") for dataset in datasets)
+    assert all(dataset.PatientIdentityRemoved == "YES" for dataset in datasets)
+    assert all(not any(Tag(tag).is_private for tag in dataset.keys()) for dataset in datasets)
+
+    dicom_deidentify_job_service.clear()
 
 
 def test_tag_edit_job_service_removes_stale_temp_artifacts(tmp_path: Path) -> None:
@@ -301,6 +439,9 @@ def test_modify_dicom_tag_series_scope_async_job_downloads_artifact(tmp_path: Pa
     assert completed["status"] == "succeeded"
     assert completed["artifactKind"] == "zip"
     assert completed["modifiedCount"] == 2
+    assert completed["processedCount"] == 2
+    assert completed["totalCount"] == 2
+    assert completed["progressPercent"] == 100
     assert completed["artifactUrl"].endswith(f"/{created['jobId']}/artifact")
 
     artifact_response = client.get(completed["artifactUrl"])
