@@ -54,6 +54,10 @@ DicomVision Server 是 DicomVision 的后端服务，提供 DICOM 序列发现�
 | --- |
 | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/water_phantom_qa.png" alt="水模 QA" width="420"> |
 
+| 拖拽导入 | 脱敏导出 |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/drag_import.png" alt="拖拽导入 DICOM" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/deIndentifyExport.png" alt="DICOM 脱敏导出" width="420"> |
+
 ## 系统架构
 
 后端提供两层通信能力：

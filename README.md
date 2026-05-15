@@ -54,6 +54,10 @@ Screenshots are maintained in the companion client repository. This backend READ
 | --- |
 | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/water_phantom_qa.png" alt="Water phantom QA" width="420"> |
 
+| Drag-and-drop import | De-identification export |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/drag_import.png" alt="Drag-and-drop DICOM import" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/deIndentifyExport.png" alt="DICOM de-identification export" width="420"> |
+
 ## Architecture
 
 The backend exposes two communication layers:
