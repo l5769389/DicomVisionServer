@@ -2,15 +2,14 @@
 
 [中文说明](./README.zh-CN.md)
 
-DicomVision Server powers the backend side of DicomVision with DICOM series discovery, thumbnails and tag reading, DICOM tag editing, DICOM de-identification export, Stack rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
+DicomVision Server powers the backend side of DicomVision with DICOM series discovery, thumbnails and tag reading, DICOM tag editing, DICOM de-identification export, Stack rendering and Stack Compare rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
 
-## Version 1.1.0 Updates
+## Version 1.2.0 Updates
 
-- Added asynchronous DICOM tag edit jobs with status polling, artifact download, and per-instance progress counters.
-- Added DICOM de-identification service and asynchronous de-identification jobs for full-series export.
-- Added progress metadata (`processedCount`, `totalCount`, `progressPercent`) to DICOM artifact job responses.
-- Improved DICOM artifact download headers for Unicode file names and shared desktop/web save flows.
-- Expanded tests for tag editing, de-identification, single-file loading, artifact headers, and job progress.
+- Supported the new client-side Stack Compare workflow by keeping independent backend views for the source and target series.
+- Ensured explicit pseudocolor operations re-render frames even when the requested preset matches the previous state, so Compare panes can reliably apply the configured default pseudocolor.
+- Kept the asynchronous DICOM tag edit and de-identification artifact jobs with pollable progress and downloadable results.
+- Kept desktop bundle packaging support for the Electron client release.
 
 ## Repositories
 
@@ -21,6 +20,7 @@ DicomVision Server powers the backend side of DicomVision with DICOM series disc
 
 - **DICOM data services**: load local folders or single DICOM files, discover series, generate thumbnails, and read instance-level DICOM tags.
 - **Stack rendering**: render 2D images from viewport size, window/level, pseudocolor, rotation, flip, zoom, and pan state.
+- **Stack Compare support**: maintain independent source/target Stack views for side-by-side comparison while accepting synchronized scroll, window, pseudocolor, zoom, pan, and transform operations from the client.
 - **MPR and oblique MPR**: build standardized volumes for axial, coronal, and sagittal reconstruction, synchronized crosshair navigation, oblique rotation, and MIP configuration.
 - **4D support**: detect phase groups, generate phase lists and preview images, and coordinate frontend playback through Socket.IO.
 - **3D volume rendering**: render volumes through VTK with presets, transfer functions, lighting, interpolation, blend modes, and layer configuration.
@@ -45,6 +45,10 @@ Screenshots are maintained in the companion client repository. This backend READ
 | Measurement tools | DICOM tags |
 | --- | --- |
 | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/measure.png" alt="Measurement tools" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/dicomTags.png" alt="DICOM tags" width="420"> |
+
+| Stack Compare | Batch DICOM tag editing |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/compare_stack.png" alt="Side-by-side Stack Compare" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/batch_modify_tags.png" alt="Batch DICOM tag editing" width="420"> |
 
 | MTF analysis | FWHM result |
 | --- | --- |

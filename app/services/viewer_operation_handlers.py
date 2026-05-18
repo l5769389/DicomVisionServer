@@ -234,8 +234,9 @@ def _handle_pseudocolor_operation(
     is_mpr_view: bool,
 ) -> RenderDecision:
     del series, is_mpr_view
-    if not service._handle_pseudocolor(view, payload):
+    if payload.pseudocolor_preset is None:
         return _render_none()
+    service._handle_pseudocolor(view, payload)
     return _render_single()
 
 
