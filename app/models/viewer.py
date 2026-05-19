@@ -26,6 +26,10 @@ class SeriesRecord:
     series_instance_uid: str | None
     study_instance_uid: str | None
     patient_id: str | None
+    patient_name: str | None
+    study_date: str | None
+    study_description: str | None
+    accession_number: str | None
     modality: str | None
     series_description: str | None
     is_virtual: bool = False

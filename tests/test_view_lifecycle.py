@@ -61,6 +61,10 @@ def _register_series(series_id: str = "series-1") -> str:
         series_instance_uid=None,
         study_instance_uid=None,
         patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
         modality="CT",
         series_description="Lifecycle test",
     )

@@ -19,6 +19,10 @@ class SeriesSummary(BaseModel):
     series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")
     study_instance_uid: str | None = Field(default=None, alias="studyInstanceUid")
     patient_id: str | None = Field(default=None, alias="patientId")
+    patient_name: str | None = Field(default=None, alias="patientName")
+    study_date: str | None = Field(default=None, alias="studyDate")
+    study_description: str | None = Field(default=None, alias="studyDescription")
+    accession_number: str | None = Field(default=None, alias="accessionNumber")
     modality: str | None = None
     series_description: str | None = Field(default=None, alias="seriesDescription")
     instance_count: int = Field(alias="instanceCount")

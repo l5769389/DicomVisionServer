@@ -39,6 +39,25 @@ class DicomTagService:
     _MAX_TEXT_LENGTH = 512
     _MAX_MULTI_VALUE_ITEMS = 12
     _BINARY_VR_VALUES = {"OB", "OD", "OF", "OL", "OV", "OW", "UN"}
+    _INTEGER_VR_VALUES = {"IS", "SL", "SS", "UL", "US", "SV", "UV"}
+    _DECIMAL_VR_VALUES = {"DS", "FL", "FD"}
+    _MAX_TEXT_LENGTH_BY_VR = {
+        "AE": 16,
+        "AS": 4,
+        "CS": 16,
+        "DA": 8,
+        "DT": 26,
+        "LO": 64,
+        "PN": 64,
+        "SH": 16,
+        "TM": 16,
+        "UI": 64,
+    }
+    _DA_PATTERN = re.compile(r"^\d{8}$")
+    _TM_PATTERN = re.compile(r"^(\d{2})(\d{2})?(\d{2})?(?:\.\d{1,6})?$")
+    _AS_PATTERN = re.compile(r"^\d{3}[DWMY]$")
+    _CS_PATTERN = re.compile(r"^[A-Z0-9_ ]*$")
+    _UI_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
     _SAFE_FILE_NAME_PATTERN = re.compile(r'[\\/:*?"<>|\s]+')
 
     def get_series_tags(self, payload: DicomTagsRequest) -> DicomTagsResponse:
@@ -288,10 +307,75 @@ class DicomTagService:
 
     @staticmethod
     def _coerce_value_for_element(element: DataElement, value: str) -> object:
+        vr = (element.VR or "").upper()
         normalized_value = value.strip()
-        if "\\" in normalized_value:
-            return [part.strip() for part in normalized_value.split("\\")]
-        return normalized_value
+        values = [part.strip() for part in normalized_value.split("\\")]
+        coerced_values = [DicomTagService._normalize_value_for_vr(vr, part) for part in values]
+        for part in coerced_values:
+            DicomTagService._validate_value_for_vr(vr, part)
+        return coerced_values if len(coerced_values) > 1 else coerced_values[0]
+
+    @staticmethod
+    def _normalize_value_for_vr(vr: str, value: str) -> str:
+        if vr == "CS":
+            return value.upper()
+        return value
+
+    @staticmethod
+    def _validate_value_for_vr(vr: str, value: str) -> None:
+        max_length = DicomTagService._MAX_TEXT_LENGTH_BY_VR.get(vr)
+        if max_length is not None and len(value) > max_length:
+            raise HTTPException(status_code=400, detail=f"{vr} value must be at most {max_length} characters")
+
+        if value == "":
+            return
+
+        if vr in DicomTagService._INTEGER_VR_VALUES and not re.fullmatch(r"[+-]?\d+", value):
+            raise HTTPException(status_code=400, detail=f"{vr} value must be an integer")
+        if vr in DicomTagService._DECIMAL_VR_VALUES:
+            try:
+                numeric_value = float(value)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"{vr} value must be numeric") from exc
+            if not numeric_value == numeric_value or numeric_value in {float("inf"), float("-inf")}:
+                raise HTTPException(status_code=400, detail=f"{vr} value must be finite")
+        if vr == "DA" and not DicomTagService._is_valid_dicom_date(value):
+            raise HTTPException(status_code=400, detail="DA value must use YYYYMMDD")
+        if vr == "TM" and not DicomTagService._is_valid_dicom_time(value):
+            raise HTTPException(status_code=400, detail="TM value must use HHMMSS")
+        if vr == "AS" and not DicomTagService._AS_PATTERN.fullmatch(value.upper()):
+            raise HTTPException(status_code=400, detail="AS value must use 3 digits plus D/W/M/Y")
+        if vr == "CS" and not DicomTagService._CS_PATTERN.fullmatch(value.upper()):
+            raise HTTPException(status_code=400, detail="CS value contains unsupported characters")
+        if vr == "UI" and not DicomTagService._UI_PATTERN.fullmatch(value):
+            raise HTTPException(status_code=400, detail="UI value must contain digits and dots only")
+
+    @staticmethod
+    def _is_valid_dicom_date(value: str) -> bool:
+        if not DicomTagService._DA_PATTERN.fullmatch(value):
+            return False
+        year = int(value[:4])
+        month = int(value[4:6])
+        day = int(value[6:8])
+        if month < 1 or month > 12 or day < 1 or day > 31:
+            return False
+        try:
+            from datetime import date
+
+            date(year, month, day)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _is_valid_dicom_time(value: str) -> bool:
+        match = DicomTagService._TM_PATTERN.fullmatch(value)
+        if not match:
+            return False
+        hour = int(match.group(1))
+        minute = int(match.group(2) or "0")
+        second = int(match.group(3) or "0")
+        return 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59
 
     @staticmethod
     def _sync_file_meta_after_edit(dataset: Dataset, element: DataElement) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import threading
@@ -13,6 +13,13 @@ from fastapi import HTTPException
 
 from app.schemas.dicom import DicomDeidentifyRequest, DicomTagModifyJobStatusResponse
 from app.services.dicom_deidentify_service import DicomDeidentifyArtifact, dicom_deidentify_service
+from app.services.dicom_job_utils import (
+    delete_stale_temp_files,
+    format_datetime,
+    normalize_progress_counts,
+    resolve_progress_percent,
+    utc_now,
+)
 
 
 DicomDeidentifyJobState = Literal["pending", "running", "succeeded", "failed"]
@@ -43,6 +50,7 @@ class DicomDeidentifyJob:
 class DicomDeidentifyJobService:
     _MAX_RETAINED_JOBS = 64
     _ARTIFACT_MAX_AGE_SECONDS = 24 * 60 * 60
+    _TEMP_ARTIFACT_SUFFIXES = {".zip"}
 
     def __init__(self, *, temp_root: Path | None = None) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dicom-deidentify")
@@ -54,7 +62,7 @@ class DicomDeidentifyJobService:
 
     def create_job(self, payload: DicomDeidentifyRequest) -> DicomTagModifyJobStatusResponse:
         job_id = uuid4().hex
-        job = DicomDeidentifyJob(job_id=job_id, status="pending", created_at=self._utc_now())
+        job = DicomDeidentifyJob(job_id=job_id, status="pending", created_at=utc_now())
         with self._lock:
             self._jobs[job_id] = job
             self._prune_locked()
@@ -122,8 +130,7 @@ class DicomDeidentifyJobService:
             job = self._jobs.get(job_id)
             if job is None:
                 return
-            job.total_count = max(0, total_count)
-            job.processed_count = max(0, min(processed_count, job.total_count or processed_count))
+            job.processed_count, job.total_count = normalize_progress_counts(processed_count, total_count)
 
     def _mark_failed(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -131,7 +138,7 @@ class DicomDeidentifyJobService:
             if job is not None:
                 job.status = "failed"
                 job.error = error
-                job.completed_at = self._utc_now()
+                job.completed_at = utc_now()
             self._prune_locked()
 
     def _mark_succeeded(self, job_id: str, artifact: DicomDeidentifyJobArtifact) -> None:
@@ -142,7 +149,7 @@ class DicomDeidentifyJobService:
                 job.artifact = artifact
                 job.total_count = max(job.total_count, artifact.modified_count)
                 job.processed_count = artifact.modified_count
-                job.completed_at = self._utc_now()
+                job.completed_at = utc_now()
             self._prune_locked()
 
     def _store_artifact(self, job_id: str, artifact: DicomDeidentifyArtifact) -> DicomDeidentifyJobArtifact:
@@ -171,24 +178,15 @@ class DicomDeidentifyJobService:
             mediaType=artifact.media_type if artifact is not None else None,
             modifiedCount=artifact.modified_count if artifact is not None else None,
             processedCount=job.processed_count,
-            progressPercent=self._resolve_progress_percent(job),
+            progressPercent=resolve_progress_percent(job.status, job.processed_count, job.total_count),
             seriesFolder=artifact.series_folder if artifact is not None else None,
             totalCount=job.total_count,
-            createdAt=self._format_datetime(job.created_at),
-            completedAt=self._format_datetime(job.completed_at),
+            createdAt=format_datetime(job.created_at),
+            completedAt=format_datetime(job.completed_at),
         )
 
-    @staticmethod
-    def _resolve_progress_percent(job: DicomDeidentifyJob) -> int:
-        if job.status == "succeeded":
-            return 100
-        if job.total_count <= 0:
-            return 0
-        progress = max(0, round((job.processed_count / job.total_count) * 100))
-        return min(100, progress)
-
     def _prune_locked(self) -> None:
-        now = self._utc_now()
+        now = utc_now()
         expired_jobs = [
             job
             for job in self._jobs.values()
@@ -223,16 +221,6 @@ class DicomDeidentifyJobService:
         return f"/api/v1/dicom/deidentify/jobs/{job_id}/artifact"
 
     @staticmethod
-    def _format_datetime(value: datetime | None) -> str | None:
-        if value is None:
-            return None
-        return value.isoformat()
-
-    @staticmethod
-    def _utc_now() -> datetime:
-        return datetime.now(UTC)
-
-    @staticmethod
     def _delete_artifact(artifact: DicomDeidentifyJobArtifact) -> None:
         try:
             artifact.path.unlink(missing_ok=True)
@@ -240,16 +228,11 @@ class DicomDeidentifyJobService:
             pass
 
     def _delete_stale_temp_files(self) -> None:
-        cutoff_timestamp = self._utc_now().timestamp() - self._ARTIFACT_MAX_AGE_SECONDS
-        for path in self._temp_root.iterdir():
-            try:
-                if not path.is_file() or path.suffix.lower() != ".zip" or len(path.stem) != 32:
-                    continue
-                if path.stat().st_mtime >= cutoff_timestamp:
-                    continue
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        delete_stale_temp_files(
+            self._temp_root,
+            max_age_seconds=self._ARTIFACT_MAX_AGE_SECONDS,
+            allowed_suffixes=self._TEMP_ARTIFACT_SUFFIXES,
+        )
 
 
 dicom_deidentify_job_service = DicomDeidentifyJobService()

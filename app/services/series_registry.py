@@ -90,6 +90,11 @@ class SeriesRegistry:
             return None
 
     @staticmethod
+    def _safe_header_text(value) -> str | None:
+        text = str(value or "").strip()
+        return text or None
+
+    @staticmethod
     def _is_readable_dicom(dataset) -> bool:
         return bool(getattr(dataset, "SeriesInstanceUID", None) or "PixelData" in dataset)
 
@@ -113,10 +118,14 @@ class SeriesRegistry:
             series_id=existing_series_id or str(uuid4()),
             folder_path=str(folder),
             series_instance_uid=series_instance_uid,
-            study_instance_uid=getattr(dataset, "StudyInstanceUID", None),
-            patient_id=getattr(dataset, "PatientID", None),
-            modality=getattr(dataset, "Modality", None),
-            series_description=getattr(dataset, "SeriesDescription", None),
+            study_instance_uid=self._safe_header_text(getattr(dataset, "StudyInstanceUID", None)),
+            patient_id=self._safe_header_text(getattr(dataset, "PatientID", None)),
+            patient_name=self._safe_header_text(getattr(dataset, "PatientName", None)),
+            study_date=self._safe_header_text(getattr(dataset, "StudyDate", None)),
+            study_description=self._safe_header_text(getattr(dataset, "StudyDescription", None)),
+            accession_number=self._safe_header_text(getattr(dataset, "AccessionNumber", None)),
+            modality=self._safe_header_text(getattr(dataset, "Modality", None)),
+            series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None)),
         )
         grouped[series_key] = series
         instance_keys_by_series_key[series_key] = set()
@@ -193,6 +202,10 @@ class SeriesRegistry:
             seriesInstanceUid=series.series_instance_uid,
             studyInstanceUid=series.study_instance_uid,
             patientId=series.patient_id,
+            patientName=series.patient_name,
+            studyDate=series.study_date,
+            studyDescription=series.study_description,
+            accessionNumber=series.accession_number,
             modality=series.modality,
             seriesDescription=series.series_description,
             instanceCount=len(series.instances),
@@ -294,6 +307,10 @@ class SeriesRegistry:
                     series_instance_uid=series.series_instance_uid,
                     study_instance_uid=series.study_instance_uid,
                     patient_id=series.patient_id,
+                    patient_name=series.patient_name,
+                    study_date=series.study_date,
+                    study_description=series.study_description,
+                    accession_number=series.accession_number,
                     modality=series.modality,
                     series_description=series.series_description,
                     is_virtual=True,

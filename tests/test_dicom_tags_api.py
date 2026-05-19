@@ -118,6 +118,10 @@ def test_load_folder_response_includes_series_thumbnail(tmp_path: Path) -> None:
     assert response.status_code == 200
     data = response.json()
     series = data["seriesList"][0]
+    assert series["patientName"] == "Tag^Tester"
+    assert series["patientId"] == "patient-001"
+    assert series["studyDate"] == "20260514"
+    assert series["accessionNumber"] == "ACC-001"
     assert series["thumbnailSrc"] == ""
     assert series["thumbnailUrl"].startswith("/api/v1/dicom/thumbnail?seriesId=")
 
@@ -209,6 +213,61 @@ def test_modify_nested_dicom_tag_writes_copy(tmp_path: Path) -> None:
     assert response.status_code == 200
     modified_dataset = pydicom.dcmread(BytesIO(response.content), force=True)
     assert modified_dataset.ConceptCodeSequence[0].CodeMeaning == "Edited nested value"
+
+
+def test_modify_dicom_tag_rejects_invalid_vr_value(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "tag-edit-invalid-vr.dcm"
+    _create_test_dicom(dicom_path)
+
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    series_id = load_response.series_list[0].series_id
+    client = TestClient(fastapi_app)
+    tags_response = client.post("/api/v1/dicom/tags", json={"seriesId": series_id, "index": 0})
+    birth_date_row = next(item for item in tags_response.json()["items"] if item["keyword"] == "PatientBirthDate")
+
+    response = client.post(
+        "/api/v1/dicom/modifyTag",
+        json={
+            "seriesId": series_id,
+            "index": 0,
+            "tagPath": birth_date_row["tagPath"],
+            "value": "20260230",
+            "scope": "current",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "DA value" in response.json()["detail"]
+
+
+def test_modify_dicom_tag_normalizes_code_string_value(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "tag-edit-cs-vr.dcm"
+    _create_test_dicom(dicom_path)
+
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    series_id = load_response.series_list[0].series_id
+    client = TestClient(fastapi_app)
+    tags_response = client.post("/api/v1/dicom/tags", json={"seriesId": series_id, "index": 0})
+    patient_sex_row = next(item for item in tags_response.json()["items"] if item["keyword"] == "PatientSex")
+
+    response = client.post(
+        "/api/v1/dicom/modifyTag",
+        json={
+            "seriesId": series_id,
+            "index": 0,
+            "tagPath": patient_sex_row["tagPath"],
+            "value": "m",
+            "scope": "current",
+        },
+    )
+
+    assert response.status_code == 200
+    modified_dataset = pydicom.dcmread(BytesIO(response.content), force=True)
+    assert modified_dataset.PatientSex == "M"
 
 
 def test_modify_dicom_tag_series_scope_writes_all_instances(tmp_path: Path) -> None:
