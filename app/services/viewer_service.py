@@ -128,6 +128,8 @@ from app.services.viewport_transformer import viewport_transformer
 from app.services.view_group_registry import view_group_registry
 from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
+from app.services.viewer_render_dispatch import render_by_view_type
+from app.services.viewer_render_guards import ensure_view_size
 from app.services.water_phantom_qa_service import WaterPhantomQaService
 from app.services.volume_render_config import (
     create_default_volume_render_config,
@@ -878,11 +880,7 @@ class ViewerService:
         *,
         fast_preview: bool = False,
     ) -> RenderedImageResult:
-        if self._is_mpr_view_type(view.view_type):
-            return self._render_mpr_view(view, image_format=image_format, fast_preview=fast_preview)
-        if self._is_3d_view_type(view.view_type):
-            return self._render_3d_view(view, image_format=image_format, fast_preview=fast_preview)
-        return self._render_view(view, image_format=image_format, fast_preview=fast_preview)
+        return render_by_view_type(self, view, image_format=image_format, fast_preview=fast_preview)
 
     def _handle_scroll(self, view: ViewRecord, series: SeriesRecord, scroll: int) -> None:
         if not self._is_mpr_view_type(view.view_type):
@@ -914,8 +912,7 @@ class ViewerService:
         view.is_initialized = True
 
     def _initialize_viewport(self, view: ViewRecord) -> None:
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         instance = series.instances[view.current_index]
@@ -948,8 +945,7 @@ class ViewerService:
         )
 
     def _initialize_mpr_viewport(self, view: ViewRecord) -> None:
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
@@ -1015,8 +1011,7 @@ class ViewerService:
         return True
 
     def _initialize_3d_viewport(self, view: ViewRecord) -> None:
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
@@ -1181,8 +1176,7 @@ class ViewerService:
         *,
         fast_preview: bool = False,
     ) -> RenderedImageResult:
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
@@ -1232,8 +1226,7 @@ class ViewerService:
         *,
         fast_preview: bool = False,
     ) -> RenderedImageResult:
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         instance = series.instances[view.current_index]
@@ -1327,8 +1320,7 @@ class ViewerService:
         *,
         fast_preview: bool = False,
     ) -> RenderedImageResult:
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
@@ -2116,8 +2108,7 @@ class ViewerService:
             return False
         if not self._is_mpr_view_type(view.view_type):
             return False
-        if not view.width or not view.height:
-            raise HTTPException(status_code=400, detail="View size has not been set")
+        ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)

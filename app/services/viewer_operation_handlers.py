@@ -102,24 +102,7 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
 
 
 def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
-    operation_handlers: dict[str, OperationHandler] = {
-        VIEW_OP_TYPE_SCROLL: _handle_scroll_operation,
-        VIEW_OP_TYPE_CROSSHAIR: _handle_crosshair_operation,
-        VIEW_OP_TYPE_ZOOM: _handle_zoom_operation,
-        VIEW_OP_TYPE_WINDOW: _handle_window_operation,
-        VIEW_OP_TYPE_PSEUDOCOLOR: _handle_pseudocolor_operation,
-        VIEW_OP_TYPE_PAN: _handle_pan_operation,
-        VIEW_OP_TYPE_TRANSFORM_2D: _handle_transform_2d_operation,
-        VIEW_OP_TYPE_ROTATE_3D: _handle_rotate_3d_operation,
-        VIEW_OP_TYPE_RESET: _handle_reset_operation,
-        VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
-        VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
-        VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
-        VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
-        VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
-        VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
-    }
-    return operation_handlers.get(payload.op_type, _handle_generic_operation)
+    return OPERATION_HANDLERS.get(payload.op_type, _handle_generic_operation)
 
 
 def _sync_mpr_active_viewport(service: ViewerService, view: ViewRecord) -> bool:
@@ -406,6 +389,25 @@ def _handle_generic_operation(
         view.is_initialized = True
         return _render_single()
     return _render_none()
+
+
+OPERATION_HANDLERS: dict[str, OperationHandler] = {
+    VIEW_OP_TYPE_SCROLL: _handle_scroll_operation,
+    VIEW_OP_TYPE_CROSSHAIR: _handle_crosshair_operation,
+    VIEW_OP_TYPE_ZOOM: _handle_zoom_operation,
+    VIEW_OP_TYPE_WINDOW: _handle_window_operation,
+    VIEW_OP_TYPE_PSEUDOCOLOR: _handle_pseudocolor_operation,
+    VIEW_OP_TYPE_PAN: _handle_pan_operation,
+    VIEW_OP_TYPE_TRANSFORM_2D: _handle_transform_2d_operation,
+    VIEW_OP_TYPE_ROTATE_3D: _handle_rotate_3d_operation,
+    VIEW_OP_TYPE_RESET: _handle_reset_operation,
+    VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
+    VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
+    VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
+    VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
+    VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
+    VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
+}
 
 
 def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest) -> None:
