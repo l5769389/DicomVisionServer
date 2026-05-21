@@ -71,7 +71,7 @@ The backend exposes two communication layers:
 
 Typical flow:
 
-1. The frontend calls `POST /api/v1/dicom/loadFolder` or `POST /api/v1/dicom/loadSample` to register data.
+1. The frontend calls `POST /api/v1/dicom/loadFolder`, `POST /api/v1/dicom/upload`, or `POST /api/v1/dicom/loadSample` to register data.
 2. The backend scans DICOM files and stores series, instance, and phase metadata.
 3. The frontend calls `POST /api/v1/view/create` to create a Stack, MPR, 3D, or other viewport.
 4. The frontend binds a Socket.IO session to the viewport with `bind_view`.
@@ -156,6 +156,9 @@ APP_HOST=0.0.0.0
 APP_PORT=8000
 CORS_ORIGINS=["*"]
 WEB_SAMPLE_DICOM_PATH=
+WEB_UPLOAD_DICOM_ROOT=
+WEB_UPLOAD_MAX_FILES=5000
+WEB_UPLOAD_MAX_BYTES=2147483648
 ```
 
 Key settings:
@@ -165,6 +168,8 @@ Key settings:
 - `APP_PORT`: listening port, default `8000`.
 - `CORS_ORIGINS`: allowed frontend origins for HTTP and Socket.IO.
 - `WEB_SAMPLE_DICOM_PATH`: server-side sample DICOM directory used by `POST /api/v1/dicom/loadSample`.
+- `WEB_UPLOAD_DICOM_ROOT`: optional temporary storage root for browser-uploaded DICOM files.
+- `WEB_UPLOAD_MAX_FILES` / `WEB_UPLOAD_MAX_BYTES`: upload limits for real web deployments.
 
 ## HTTP API
 
@@ -172,6 +177,7 @@ Base path: `/api/v1`
 
 - `GET /health`
 - `POST /dicom/loadFolder`
+- `POST /dicom/upload`
 - `POST /dicom/loadSample`
 - `POST /dicom/cornerInfo`
 - `GET /dicom/thumbnail`
@@ -237,7 +243,7 @@ For web frontend deployment:
 
 - Set frontend `VITE_BACKEND_ORIGIN` to the backend origin.
 - Add the frontend domain to backend `CORS_ORIGINS`.
-- If the web client should load server-side sample data, configure `WEB_SAMPLE_DICOM_PATH` and set frontend `VITE_WEB_USE_SERVER_SAMPLE=true`.
+- If the web client should load server-side sample data, configure `WEB_SAMPLE_DICOM_PATH` and set frontend `VITE_WEB_APP_MODE=demo-web`.
 
 ## Fly.io Deployment
 

@@ -1,6 +1,6 @@
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
@@ -22,6 +22,7 @@ from app.services.dicom_deidentify_job_service import dicom_deidentify_job_servi
 from app.services.dicom_deidentify_service import dicom_deidentify_service
 from app.services.dicom_tag_job_service import dicom_tag_job_service
 from app.services.dicom_tag_service import dicom_tag_service
+from app.services.dicom_upload_service import dicom_upload_service
 from app.services.four_d_service import four_d_service
 from app.services.series_registry import series_registry
 from app.services.viewer_service import viewer_service
@@ -96,6 +97,26 @@ def _dicom_tag_artifact_headers(
 def load_folder(payload: LoadFolderRequest) -> LoadFolderResponse:
     """Register DICOM files without decoding all pixel data up front."""
     return series_registry.load_folder(payload)
+
+
+@router.post(
+    "/upload",
+    response_model=LoadFolderResponse,
+    summary="Upload and scan DICOM files",
+    description=(
+        "Receives browser-selected DICOM files, stores them in a server-side temporary upload session, "
+        "groups them into series, registers those series in memory, and returns the same summary shape as loadFolder."
+    ),
+)
+async def upload_dicom_files(
+    files: list[UploadFile] = File(..., description="One or more DICOM files selected by the browser."),
+    relativePaths: list[str] | None = Form(
+        default=None,
+        description="Optional browser-relative paths, used to preserve folder structure for webkitdirectory uploads.",
+    ),
+) -> LoadFolderResponse:
+    """Upload browser-selected files and register discovered DICOM series."""
+    return await dicom_upload_service.upload_and_load(files, relativePaths)
 
 
 @router.post(

@@ -151,6 +151,29 @@ def test_load_folder_accepts_single_dicom_file_path(tmp_path: Path) -> None:
     assert series["instanceCount"] == 1
 
 
+def test_upload_dicom_files_registers_series(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "upload-test.dcm"
+    _create_test_dicom(dicom_path)
+
+    client = TestClient(fastapi_app)
+    with dicom_path.open("rb") as handle:
+        response = client.post(
+            "/api/v1/dicom/upload",
+            files=[("files", ("study/series/upload-test.dcm", handle.read(), "application/dicom"))],
+            data={"relativePaths": "study/series/upload-test.dcm"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["seriesList"]) == 1
+    series = data["seriesList"][0]
+    assert series["patientName"] == "Tag^Tester"
+    assert series["instanceCount"] == 1
+    assert series["folderPath"]
+
+
 def test_modify_dicom_tag_current_instance_returns_dicom_artifact(tmp_path: Path) -> None:
     series_registry.clear()
     dicom_cache.clear()

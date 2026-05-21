@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     web_sample_dicom_path: str | None = Field(default=None, alias="WEB_SAMPLE_DICOM_PATH")
+    web_upload_dicom_root: str | None = Field(default=None, alias="WEB_UPLOAD_DICOM_ROOT")
+    web_upload_max_files: int = Field(default=5000, alias="WEB_UPLOAD_MAX_FILES")
+    web_upload_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, alias="WEB_UPLOAD_MAX_BYTES")
 
     model_config = SettingsConfigDict(
         env_file=".env",
