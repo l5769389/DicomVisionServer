@@ -107,6 +107,74 @@ def test_load_folder_marks_related_phase_series_as_four_d(tmp_path: Path) -> Non
         assert all(phase.viewport_images == {} for phase in summary.four_d_phases)
 
 
+def test_incremental_phase_load_uses_existing_series_for_four_d_manifest(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for phase_percent, base_value in ((0, 100), (50, 500)):
+        series_uid = generate_uid()
+        for slice_index in range(3):
+            _create_test_dicom(
+                tmp_path / f"phase-{phase_percent}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=f"4D Lung {phase_percent}%",
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=base_value,
+            )
+
+    first_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path / "phase-0")))
+    assert len(first_response.series_list) == 1
+    assert first_response.series_list[0].is_four_d_series is False
+    phase_zero_series_id = first_response.series_list[0].series_id
+
+    second_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path / "phase-50")))
+    assert len(second_response.series_list) == 1
+    phase_fifty_summary = second_response.series_list[0]
+
+    assert phase_fifty_summary.is_four_d_series is True
+    assert phase_fifty_summary.four_d_phase_count == 2
+    assert phase_fifty_summary.four_d_phases is not None
+    assert [phase.label for phase in phase_fifty_summary.four_d_phases] == ["Phase 0%", "Phase 50%"]
+    assert {phase.series_id for phase in phase_fifty_summary.four_d_phases} == {
+        phase_zero_series_id,
+        phase_fifty_summary.series_id,
+    }
+
+
+def test_reload_parent_folder_reuses_preloaded_phase_series_id(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for phase_percent, base_value in ((0, 100), (10, 200), (20, 300)):
+        series_uid = generate_uid()
+        for slice_index in range(3):
+            _create_test_dicom(
+                tmp_path / f"ph{phase_percent}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=f"4D Lung {phase_percent}%",
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=base_value,
+            )
+
+    first_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path / "ph0")))
+    phase_zero_series_id = first_response.series_list[0].series_id
+    assert first_response.series_list[0].is_four_d_series is False
+
+    second_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+    phase_zero_summary = next(
+        (summary for summary in second_response.series_list if summary.series_id == phase_zero_series_id),
+        None,
+    )
+
+    assert phase_zero_summary is not None
+    assert phase_zero_summary.is_four_d_series is True
+    assert phase_zero_summary.four_d_phase_count == 3
+    assert phase_zero_summary.four_d_phases is not None
+    assert [phase.label for phase in phase_zero_summary.four_d_phases] == ["Phase 0%", "Phase 10%", "Phase 20%"]
+
+
 def test_load_folder_recognizes_percent_only_series_description_as_phase(tmp_path: Path) -> None:
     study_uid = generate_uid()
 

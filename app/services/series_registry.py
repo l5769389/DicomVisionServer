@@ -24,6 +24,7 @@ class SeriesRegistry:
     def __init__(self) -> None:
         self._series_by_id: dict[str, SeriesRecord] = {}
         self._series_id_by_key: dict[str, str] = {}
+        self._series_id_by_instance_path: dict[str, str] = {}
         self._lock = RLock()
 
     @staticmethod
@@ -70,6 +71,10 @@ class SeriesRegistry:
         return f"{normalized_folder}::{fallback_path.parent.as_posix()}"
 
     @staticmethod
+    def _build_instance_path_key(path: Path) -> str:
+        return path.resolve().as_posix()
+
+    @staticmethod
     def _resolve_scan_target(folder_path: str) -> tuple[Path, list[Path]]:
         """Normalize an input file or folder path into a scan root and file list."""
 
@@ -98,6 +103,11 @@ class SeriesRegistry:
     def _is_readable_dicom(dataset) -> bool:
         return bool(getattr(dataset, "SeriesInstanceUID", None) or "PixelData" in dataset)
 
+    def _resolve_existing_series_id(self, series_key: str, path: Path) -> str | None:
+        return self._series_id_by_key.get(series_key) or self._series_id_by_instance_path.get(
+            self._build_instance_path_key(path)
+        )
+
     def _get_or_create_grouped_series(
         self,
         *,
@@ -113,7 +123,7 @@ class SeriesRegistry:
         if series is not None:
             return (series_key, series)
 
-        existing_series_id = self._series_id_by_key.get(series_key)
+        existing_series_id = self._resolve_existing_series_id(series_key, path)
         series = SeriesRecord(
             series_id=existing_series_id or str(uuid4()),
             folder_path=str(folder),
@@ -155,6 +165,10 @@ class SeriesRegistry:
         except (OverflowError, TypeError, ValueError):
             return fallback
 
+    def _build_series_instance_key(self, path: Path, dataset) -> str:
+        sop_instance_uid = getattr(dataset, "SOPInstanceUID", None)
+        return str(sop_instance_uid or self._build_instance_path_key(path))
+
     def _collect_grouped_series(self, folder: Path, scan_paths: list[Path]) -> dict[str, SeriesRecord]:
         grouped: dict[str, SeriesRecord] = {}
         instance_keys_by_series_key: dict[str, set[str]] = {}
@@ -175,8 +189,7 @@ class SeriesRegistry:
                 dataset=dataset,
             )
 
-            sop_instance_uid = getattr(dataset, "SOPInstanceUID", None)
-            instance_key = str(sop_instance_uid or path.resolve().as_posix())
+            instance_key = self._build_series_instance_key(path, dataset)
             if instance_key in instance_keys_by_series_key[series_key]:
                 continue
             instance_keys_by_series_key[series_key].add(instance_key)
@@ -191,10 +204,15 @@ class SeriesRegistry:
 
         return grouped
 
+    def _index_series_instances(self, series: SeriesRecord) -> None:
+        for instance in series.instances:
+            self._series_id_by_instance_path[self._build_instance_path_key(instance.path)] = series.series_id
+
     def _build_series_summary(self, series_key: str, series: SeriesRecord) -> SeriesSummary:
         series.instances.sort(key=lambda item: item.instance_number)
         self._series_by_id[series.series_id] = series
         self._series_id_by_key[series_key] = series.series_id
+        self._index_series_instances(series)
 
         first = series.instances[0]
         return SeriesSummary(
@@ -233,7 +251,7 @@ class SeriesRegistry:
             return None
 
         thumbnail_instance = series.instances[len(series.instances) // 2]
-        cache_key = thumbnail_instance.sop_instance_uid or thumbnail_instance.path.resolve().as_posix()
+        cache_key = thumbnail_instance.sop_instance_uid or self._build_instance_path_key(thumbnail_instance.path)
 
         try:
             cached = dicom_cache.get(cache_key, thumbnail_instance.path)
@@ -325,6 +343,14 @@ class SeriesRegistry:
 
         return virtual_series_records
 
+    def _list_real_series_records(self) -> list[SeriesRecord]:
+        return [series for series in self._series_by_id.values() if not series.is_virtual]
+
+    def _apply_loaded_four_d_metadata(self, series_list: list[SeriesSummary]) -> None:
+        real_series_records = self._list_real_series_records()
+        virtual_series_records = self._register_virtual_four_d_phase_series(real_series_records)
+        four_d_service.apply_four_d_metadata(series_list, [*real_series_records, *virtual_series_records])
+
     def ensure_four_d_phase_series(self, series_id: str) -> SeriesRecord:
         with self._lock:
             series = self.get(series_id)
@@ -339,10 +365,8 @@ class SeriesRegistry:
             if not grouped:
                 raise HTTPException(status_code=404, detail="No readable DICOM series found in path")
 
-            real_series_records = list(grouped.values())
             series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
-            virtual_series_records = self._register_virtual_four_d_phase_series(real_series_records)
-            four_d_service.apply_four_d_metadata(series_list, [*real_series_records, *virtual_series_records])
+            self._apply_loaded_four_d_metadata(series_list)
             series_list.sort(key=lambda item: item.series_id)
             return LoadFolderResponse(seriesId=series_list[0].series_id, seriesList=series_list)
 
@@ -361,6 +385,7 @@ class SeriesRegistry:
         with self._lock:
             self._series_by_id.clear()
             self._series_id_by_key.clear()
+            self._series_id_by_instance_path.clear()
 
 
 series_registry = SeriesRegistry()
