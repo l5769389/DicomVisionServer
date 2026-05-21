@@ -17,6 +17,20 @@ class InstanceRecord:
     instance_number: int
     rows: int | None
     columns: int | None
+    transfer_syntax_uid: str | None = None
+    transfer_syntax_name: str | None = None
+    transfer_syntax_is_compressed: bool = False
+    photometric_interpretation: str | None = None
+    samples_per_pixel: int | None = None
+    pixel_spacing: tuple[float, float] | None = None
+    imager_pixel_spacing: tuple[float, float] | None = None
+    has_image_orientation_patient: bool = False
+    has_image_position_patient: bool = False
+    has_rescale_slope: bool = False
+    has_rescale_intercept: bool = False
+    has_window_width: bool = False
+    has_window_center: bool = False
+    number_of_frames: int | None = None
 
 
 @dataclass

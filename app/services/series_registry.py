@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 
 from app.core.logging import get_logger
 from app.models.viewer import InstanceRecord, SeriesRecord
-from app.schemas.dicom import LoadFolderRequest, LoadFolderResponse, SeriesSummary
+from app.schemas.dicom import DicomCompatibilityIssue, LoadFolderRequest, LoadFolderResponse, SeriesSummary
 from app.services.dicom_cache import dicom_cache
 from app.services.four_d_service import four_d_service
 
@@ -100,6 +100,59 @@ class SeriesRegistry:
         return text or None
 
     @staticmethod
+    def _has_header_value(dataset, keyword: str) -> bool:
+        value = getattr(dataset, keyword, None)
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        try:
+            return len(value) > 0
+        except TypeError:
+            return True
+
+    @staticmethod
+    def _safe_positive_int(value) -> int | None:
+        try:
+            resolved = int(float(str(value).strip()))
+        except (OverflowError, TypeError, ValueError):
+            return None
+        return resolved if resolved > 0 else None
+
+    @staticmethod
+    def _safe_numeric_pair(value) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            parts = value.replace("\\", " ").split()
+        else:
+            try:
+                parts = list(value)
+            except TypeError:
+                return None
+        if len(parts) < 2:
+            return None
+        try:
+            return (float(parts[0]), float(parts[1]))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _get_transfer_syntax_info(dataset) -> tuple[str | None, str | None, bool]:
+        file_meta = getattr(dataset, "file_meta", None)
+        transfer_syntax = getattr(file_meta, "TransferSyntaxUID", None)
+        if transfer_syntax is None:
+            return (None, None, False)
+
+        transfer_syntax_uid = str(transfer_syntax).strip() or None
+        transfer_syntax_name = str(getattr(transfer_syntax, "name", None) or transfer_syntax_uid or "").strip() or None
+        return (
+            transfer_syntax_uid,
+            transfer_syntax_name,
+            bool(getattr(transfer_syntax, "is_compressed", False)),
+        )
+
+    @staticmethod
     def _is_readable_dicom(dataset) -> bool:
         return bool(getattr(dataset, "SeriesInstanceUID", None) or "PixelData" in dataset)
 
@@ -147,12 +200,31 @@ class SeriesRegistry:
             getattr(dataset, "InstanceNumber", None),
             default_instance_number,
         )
+        transfer_syntax_uid, transfer_syntax_name, transfer_syntax_is_compressed = (
+            SeriesRegistry._get_transfer_syntax_info(dataset)
+        )
         return InstanceRecord(
             path=path,
             sop_instance_uid=getattr(dataset, "SOPInstanceUID", None),
             instance_number=instance_number,
             rows=getattr(dataset, "Rows", None),
             columns=getattr(dataset, "Columns", None),
+            transfer_syntax_uid=transfer_syntax_uid,
+            transfer_syntax_name=transfer_syntax_name,
+            transfer_syntax_is_compressed=transfer_syntax_is_compressed,
+            photometric_interpretation=SeriesRegistry._safe_header_text(
+                getattr(dataset, "PhotometricInterpretation", None)
+            ),
+            samples_per_pixel=SeriesRegistry._safe_positive_int(getattr(dataset, "SamplesPerPixel", None)),
+            pixel_spacing=SeriesRegistry._safe_numeric_pair(getattr(dataset, "PixelSpacing", None)),
+            imager_pixel_spacing=SeriesRegistry._safe_numeric_pair(getattr(dataset, "ImagerPixelSpacing", None)),
+            has_image_orientation_patient=SeriesRegistry._has_header_value(dataset, "ImageOrientationPatient"),
+            has_image_position_patient=SeriesRegistry._has_header_value(dataset, "ImagePositionPatient"),
+            has_rescale_slope=SeriesRegistry._has_header_value(dataset, "RescaleSlope"),
+            has_rescale_intercept=SeriesRegistry._has_header_value(dataset, "RescaleIntercept"),
+            has_window_width=SeriesRegistry._has_header_value(dataset, "WindowWidth"),
+            has_window_center=SeriesRegistry._has_header_value(dataset, "WindowCenter"),
+            number_of_frames=SeriesRegistry._safe_positive_int(getattr(dataset, "NumberOfFrames", None)),
         )
 
     @staticmethod
@@ -208,6 +280,166 @@ class SeriesRegistry:
         for instance in series.instances:
             self._series_id_by_instance_path[self._build_instance_path_key(instance.path)] = series.series_id
 
+    @staticmethod
+    def _build_compatibility_issues(series: SeriesRecord) -> list[DicomCompatibilityIssue]:
+        instances = series.instances
+        if not instances:
+            return []
+
+        total_count = len(instances)
+        issues: list[DicomCompatibilityIssue] = []
+
+        def add_issue(
+            code: str,
+            severity: str,
+            title: str,
+            detail: str,
+            affected_instances: int,
+        ) -> None:
+            if affected_instances <= 0:
+                return
+            issues.append(
+                DicomCompatibilityIssue(
+                    code=code,
+                    severity=severity,
+                    title=title,
+                    detail=detail,
+                    affectedInstances=affected_instances,
+                )
+            )
+
+        invalid_size_count = sum(
+            1
+            for instance in instances
+            if SeriesRegistry._safe_positive_int(instance.rows) is None
+            or SeriesRegistry._safe_positive_int(instance.columns) is None
+        )
+        add_issue(
+            "missing-image-size",
+            "error",
+            "Missing image dimensions",
+            "Rows or Columns are absent or invalid; this series may fail to display.",
+            invalid_size_count,
+        )
+
+        dimensions = {
+            (
+                SeriesRegistry._safe_positive_int(instance.rows),
+                SeriesRegistry._safe_positive_int(instance.columns),
+            )
+            for instance in instances
+            if SeriesRegistry._safe_positive_int(instance.rows) is not None
+            and SeriesRegistry._safe_positive_int(instance.columns) is not None
+        }
+        if len(dimensions) > 1:
+            add_issue(
+                "mixed-image-size",
+                "warning",
+                "Mixed image dimensions",
+                "Instances in this series use different Rows/Columns values; stack and MPR geometry may be inconsistent.",
+                total_count,
+            )
+
+        compressed_instances = [instance for instance in instances if instance.transfer_syntax_is_compressed]
+        if compressed_instances:
+            transfer_names = sorted(
+                {
+                    instance.transfer_syntax_name or instance.transfer_syntax_uid or "compressed transfer syntax"
+                    for instance in compressed_instances
+                }
+            )
+            add_issue(
+                "compressed-transfer-syntax",
+                "warning",
+                "Compressed transfer syntax",
+                f"Pixel decoding depends on installed DICOM codecs: {', '.join(transfer_names[:3])}.",
+                len(compressed_instances),
+            )
+
+        missing_transfer_syntax_count = sum(1 for instance in instances if not instance.transfer_syntax_uid)
+        add_issue(
+            "missing-transfer-syntax",
+            "warning",
+            "Missing transfer syntax",
+            "File meta TransferSyntaxUID is missing; decoding behavior may vary by reader.",
+            missing_transfer_syntax_count,
+        )
+
+        unsupported_photometric_instances = [
+            instance
+            for instance in instances
+            if (
+                instance.photometric_interpretation
+                and instance.photometric_interpretation.upper() not in {"MONOCHROME1", "MONOCHROME2"}
+            )
+            or (instance.samples_per_pixel is not None and instance.samples_per_pixel > 1)
+        ]
+        if unsupported_photometric_instances:
+            photometric_values = sorted(
+                {
+                    instance.photometric_interpretation or f"{instance.samples_per_pixel} samples per pixel"
+                    for instance in unsupported_photometric_instances
+                }
+            )
+            add_issue(
+                "unsupported-photometric",
+                "warning",
+                "Non-monochrome pixel data",
+                f"The viewer is optimized for MONOCHROME images; found {', '.join(photometric_values[:3])}.",
+                len(unsupported_photometric_instances),
+            )
+
+        multi_frame_instances = [
+            instance for instance in instances if instance.number_of_frames is not None and instance.number_of_frames > 1
+        ]
+        add_issue(
+            "multiframe-first-frame",
+            "warning",
+            "Multi-frame instances",
+            "Only the decoded first frame is used by the current image pipeline.",
+            len(multi_frame_instances),
+        )
+
+        missing_spacing_count = sum(
+            1 for instance in instances if instance.pixel_spacing is None and instance.imager_pixel_spacing is None
+        )
+        add_issue(
+            "missing-pixel-spacing",
+            "warning",
+            "Missing pixel spacing",
+            "Distance measurements may fall back to pixel units because PixelSpacing/ImagerPixelSpacing is unavailable.",
+            missing_spacing_count,
+        )
+
+        if total_count > 1:
+            missing_geometry_count = sum(
+                1
+                for instance in instances
+                if not instance.has_image_orientation_patient or not instance.has_image_position_patient
+            )
+            add_issue(
+                "missing-spatial-geometry",
+                "warning",
+                "Missing spatial geometry",
+                "ImageOrientationPatient or ImagePositionPatient is missing; stack order, MPR, and 3D geometry may be approximate.",
+                missing_geometry_count,
+            )
+
+        modality = (series.modality or "").upper()
+        if modality in {"CT", "PT", "PET"}:
+            missing_rescale_count = sum(
+                1 for instance in instances if not instance.has_rescale_slope or not instance.has_rescale_intercept
+            )
+            add_issue(
+                "missing-rescale",
+                "warning",
+                "Missing rescale metadata",
+                "RescaleSlope or RescaleIntercept is missing; quantitative pixel values may remain in stored units.",
+                missing_rescale_count,
+            )
+
+        return issues
+
     def _build_series_summary(self, series_key: str, series: SeriesRecord) -> SeriesSummary:
         series.instances.sort(key=lambda item: item.instance_number)
         self._series_by_id[series.series_id] = series
@@ -232,6 +464,7 @@ class SeriesRegistry:
             thumbnailSrc="",
             thumbnailUrl=self._build_series_thumbnail_url(series.series_id),
             folderPath=series.folder_path,
+            compatibilityIssues=self._build_compatibility_issues(series),
         )
 
     @staticmethod

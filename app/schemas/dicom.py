@@ -14,6 +14,19 @@ class FourDPhaseItem(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+DicomCompatibilitySeverity = Literal["info", "warning", "error"]
+
+
+class DicomCompatibilityIssue(BaseModel):
+    code: str
+    severity: DicomCompatibilitySeverity = "warning"
+    title: str
+    detail: str | None = None
+    affected_instances: int = Field(default=0, alias="affectedInstances")
+
+    model_config = {"populate_by_name": True}
+
+
 class SeriesSummary(BaseModel):
     series_id: str = Field(alias="seriesId")
     series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")
@@ -34,6 +47,7 @@ class SeriesSummary(BaseModel):
     is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
     four_d_phase_count: int | None = Field(default=None, alias="fourDPhaseCount")
     four_d_phases: list[FourDPhaseItem] | None = Field(default=None, alias="fourDPhases")
+    compatibility_issues: list[DicomCompatibilityIssue] = Field(default_factory=list, alias="compatibilityIssues")
 
     model_config = {"populate_by_name": True}
 
