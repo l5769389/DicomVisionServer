@@ -1,0 +1,128 @@
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from app.schemas.dicom import SeriesSummary
+
+
+DicomwebAuthType = Literal["none", "basic", "bearer"]
+DicomwebProfilePreset = Literal["orthanc", "dcm4chee", "custom"]
+PacsWadoDownloadJobState = Literal["pending", "running", "succeeded", "failed"]
+
+
+class PacsDicomwebProfile(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    base_url: str = Field(alias="baseUrl", min_length=1)
+    qido_path: str = Field(default="/dicom-web", alias="qidoPath")
+    wado_path: str = Field(default="/dicom-web", alias="wadoPath")
+    auth_type: DicomwebAuthType = Field(default="none", alias="authType")
+    username: str | None = None
+    password: str | None = None
+    bearer_token: str | None = Field(default=None, alias="bearerToken")
+    timeout_seconds: float = Field(default=8.0, ge=1.0, le=60.0, alias="timeoutSeconds")
+    preset: DicomwebProfilePreset = "custom"
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDicomwebTestRequest(BaseModel):
+    profile: PacsDicomwebProfile
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDicomwebTestResponse(BaseModel):
+    ok: bool
+    status_code: int | None = Field(default=None, alias="statusCode")
+    message: str
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsQidoStudyQueryRequest(BaseModel):
+    profile: PacsDicomwebProfile
+    patient_id: str | None = Field(default=None, alias="patientId")
+    patient_name: str | None = Field(default=None, alias="patientName")
+    accession_number: str | None = Field(default=None, alias="accessionNumber")
+    study_date_from: str | None = Field(default=None, alias="studyDateFrom")
+    study_date_to: str | None = Field(default=None, alias="studyDateTo")
+    modality: str | None = None
+    limit: int = Field(default=50, ge=1, le=200)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsQidoSeriesQueryRequest(BaseModel):
+    profile: PacsDicomwebProfile
+    study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    modality: str | None = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsStudyItem(BaseModel):
+    study_instance_uid: str = Field(alias="studyInstanceUid")
+    patient_name: str | None = Field(default=None, alias="patientName")
+    patient_id: str | None = Field(default=None, alias="patientId")
+    study_date: str | None = Field(default=None, alias="studyDate")
+    study_time: str | None = Field(default=None, alias="studyTime")
+    accession_number: str | None = Field(default=None, alias="accessionNumber")
+    study_description: str | None = Field(default=None, alias="studyDescription")
+    modalities_in_study: list[str] = Field(default_factory=list, alias="modalitiesInStudy")
+    number_of_study_related_series: int | None = Field(default=None, alias="numberOfStudyRelatedSeries")
+    number_of_study_related_instances: int | None = Field(default=None, alias="numberOfStudyRelatedInstances")
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsSeriesItem(BaseModel):
+    study_instance_uid: str = Field(alias="studyInstanceUid")
+    series_instance_uid: str = Field(alias="seriesInstanceUid")
+    series_number: str | None = Field(default=None, alias="seriesNumber")
+    modality: str | None = None
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+    body_part_examined: str | None = Field(default=None, alias="bodyPartExamined")
+    number_of_series_related_instances: int | None = Field(default=None, alias="numberOfSeriesRelatedInstances")
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsQidoStudyQueryResponse(BaseModel):
+    items: list[PacsStudyItem] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsQidoSeriesQueryResponse(BaseModel):
+    items: list[PacsSeriesItem] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsWadoSeriesDownloadRequest(BaseModel):
+    profile: PacsDicomwebProfile
+    study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    series_instance_uid: str = Field(alias="seriesInstanceUid", min_length=1)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsWadoSeriesDownloadJobStatusResponse(BaseModel):
+    job_id: str = Field(alias="jobId")
+    status: PacsWadoDownloadJobState
+    status_url: str = Field(alias="statusUrl")
+    error: str | None = None
+    folder_path: str | None = Field(default=None, alias="folderPath")
+    processed_count: int = Field(default=0, alias="processedCount")
+    progress_percent: int = Field(default=0, alias="progressPercent")
+    series_id: str | None = Field(default=None, alias="seriesId")
+    series_list: list[SeriesSummary] = Field(default_factory=list, alias="seriesList")
+    total_count: int = Field(default=0, alias="totalCount")
+    created_at: str = Field(alias="createdAt")
+    completed_at: str | None = Field(default=None, alias="completedAt")
+
+    model_config = {"populate_by_name": True}
