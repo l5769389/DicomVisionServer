@@ -7,7 +7,7 @@ from app.schemas.dicom import SeriesSummary
 
 DicomwebAuthType = Literal["none", "basic", "bearer"]
 DicomwebProfilePreset = Literal["orthanc", "dcm4chee", "custom"]
-PacsWadoDownloadJobState = Literal["pending", "running", "succeeded", "failed"]
+PacsWadoDownloadJobState = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 
 
 class PacsDicomwebProfile(BaseModel):
@@ -42,13 +42,16 @@ class PacsDicomwebTestResponse(BaseModel):
 
 class PacsQidoStudyQueryRequest(BaseModel):
     profile: PacsDicomwebProfile
+    study_instance_uid: str | None = Field(default=None, alias="studyInstanceUid")
     patient_id: str | None = Field(default=None, alias="patientId")
     patient_name: str | None = Field(default=None, alias="patientName")
     accession_number: str | None = Field(default=None, alias="accessionNumber")
+    study_description: str | None = Field(default=None, alias="studyDescription")
     study_date_from: str | None = Field(default=None, alias="studyDateFrom")
     study_date_to: str | None = Field(default=None, alias="studyDateTo")
     modality: str | None = None
     limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
 
     model_config = {"populate_by_name": True}
 
@@ -56,8 +59,12 @@ class PacsQidoStudyQueryRequest(BaseModel):
 class PacsQidoSeriesQueryRequest(BaseModel):
     profile: PacsDicomwebProfile
     study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")
     modality: str | None = None
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+    body_part_examined: str | None = Field(default=None, alias="bodyPartExamined")
     limit: int = Field(default=100, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
 
     model_config = {"populate_by_name": True}
 
@@ -99,6 +106,33 @@ class PacsQidoStudyQueryResponse(BaseModel):
 
 class PacsQidoSeriesQueryResponse(BaseModel):
     items: list[PacsSeriesItem] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsSeriesPreviewRequest(BaseModel):
+    profile: PacsDicomwebProfile
+    study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    series_instance_uid: str = Field(alias="seriesInstanceUid", min_length=1)
+    thumbnail: bool = True
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsSeriesPreviewResponse(BaseModel):
+    study_instance_uid: str = Field(alias="studyInstanceUid")
+    series_instance_uid: str = Field(alias="seriesInstanceUid")
+    instance_count: int = Field(default=0, alias="instanceCount")
+    rows: int | None = None
+    columns: int | None = None
+    number_of_frames: int | None = Field(default=None, alias="numberOfFrames")
+    has_multi_frame_instances: bool = Field(default=False, alias="hasMultiFrameInstances")
+    transfer_syntaxes: list[str] = Field(default_factory=list, alias="transferSyntaxes")
+    is_compressed: bool = Field(default=False, alias="isCompressed")
+    photometric_interpretations: list[str] = Field(default_factory=list, alias="photometricInterpretations")
+    sop_instance_uid: str | None = Field(default=None, alias="sopInstanceUid")
+    thumbnail_src: str | None = Field(default=None, alias="thumbnailSrc")
+    thumbnail_error: str | None = Field(default=None, alias="thumbnailError")
 
     model_config = {"populate_by_name": True}
 

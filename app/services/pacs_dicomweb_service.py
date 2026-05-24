@@ -1,8 +1,10 @@
+import base64
 import re
 from typing import Any
 from urllib.parse import quote, urljoin
 
 import httpx
+from pydicom.uid import UID
 
 from app.schemas.pacs import (
     PacsDicomwebProfile,
@@ -11,6 +13,8 @@ from app.schemas.pacs import (
     PacsQidoSeriesQueryResponse,
     PacsQidoStudyQueryRequest,
     PacsQidoStudyQueryResponse,
+    PacsSeriesPreviewRequest,
+    PacsSeriesPreviewResponse,
     PacsSeriesItem,
     PacsStudyItem,
 )
@@ -18,6 +22,7 @@ from app.schemas.pacs import (
 
 DICOMWEB_ACCEPT_HEADER = "application/dicom+json, application/json"
 DICOMWEB_DICOM_ACCEPT_HEADER = 'application/dicom, multipart/related; type="application/dicom"'
+DICOMWEB_RENDERED_ACCEPT_HEADER = "image/png, image/jpeg;q=0.9, image/*;q=0.8"
 
 
 class PacsDicomwebError(RuntimeError):
@@ -49,13 +54,70 @@ class PacsDicomwebService:
         return PacsQidoStudyQueryResponse(items=[self._parse_study(record) for record in records])
 
     def query_series(self, payload: PacsQidoSeriesQueryRequest) -> PacsQidoSeriesQueryResponse:
-        params: dict[str, str] = {"limit": str(payload.limit)}
-        if payload.modality:
-            params["Modality"] = payload.modality.strip()
+        params = self._series_query_params(payload)
         study_uid = quote(payload.study_instance_uid, safe="")
         path = f"studies/{study_uid}/series"
         records = self._get_dicom_json(payload.profile, self._qido_url(payload.profile, path), params=params)
         return PacsQidoSeriesQueryResponse(items=[self._parse_series(record, payload.study_instance_uid) for record in records])
+
+    def preview_series(self, payload: PacsSeriesPreviewRequest) -> PacsSeriesPreviewResponse:
+        records = self.query_instance_records(
+            payload.profile,
+            study_instance_uid=payload.study_instance_uid,
+            series_instance_uid=payload.series_instance_uid,
+        )
+        first_record = records[0] if records else {}
+        sop_instance_uid = self._value(first_record, "00080018")
+        metadata_record: dict[str, Any] = {}
+        if sop_instance_uid:
+            try:
+                metadata_record = self.get_instance_metadata(
+                    payload.profile,
+                    study_instance_uid=payload.study_instance_uid,
+                    series_instance_uid=payload.series_instance_uid,
+                    sop_instance_uid=sop_instance_uid,
+                )
+            except PacsDicomwebError:
+                metadata_record = {}
+
+        summary_record = {**first_record, **metadata_record}
+        summary_records = records + ([metadata_record] if metadata_record else [])
+        frame_counts = [frame_count for record in summary_records if (frame_count := self._int_value(record, "00280008")) is not None]
+        number_of_frames = max(frame_counts) if frame_counts else None
+        transfer_syntaxes = self._unique_values(summary_records, "00020010")
+        photometric_interpretations = self._unique_values(summary_records, "00280004")
+        thumbnail_src: str | None = None
+        thumbnail_error: str | None = None
+
+        if payload.thumbnail and sop_instance_uid:
+            try:
+                media_type, content = self.render_instance_thumbnail(
+                    payload.profile,
+                    study_instance_uid=payload.study_instance_uid,
+                    series_instance_uid=payload.series_instance_uid,
+                    sop_instance_uid=sop_instance_uid,
+                )
+                if content:
+                    encoded = base64.b64encode(content).decode("ascii")
+                    thumbnail_src = f"data:{media_type};base64,{encoded}"
+            except PacsDicomwebError as exc:
+                thumbnail_error = str(exc)
+
+        return PacsSeriesPreviewResponse(
+            studyInstanceUid=payload.study_instance_uid,
+            seriesInstanceUid=payload.series_instance_uid,
+            instanceCount=len(records),
+            rows=self._int_value(summary_record, "00280010"),
+            columns=self._int_value(summary_record, "00280011"),
+            numberOfFrames=number_of_frames,
+            hasMultiFrameInstances=any(frame_count > 1 for frame_count in frame_counts),
+            transferSyntaxes=transfer_syntaxes,
+            isCompressed=any(self._is_compressed_transfer_syntax(value) for value in transfer_syntaxes),
+            photometricInterpretations=photometric_interpretations,
+            sopInstanceUid=sop_instance_uid,
+            thumbnailSrc=thumbnail_src,
+            thumbnailError=thumbnail_error,
+        )
 
     def query_instance_uids(
         self,
@@ -64,11 +126,39 @@ class PacsDicomwebService:
         study_instance_uid: str,
         series_instance_uid: str,
     ) -> list[str]:
+        records = self.query_instance_records(
+            profile,
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+        )
+        return [uid for record in records if (uid := self._value(record, "00080018"))]
+
+    def query_instance_records(
+        self,
+        profile: PacsDicomwebProfile,
+        *,
+        study_instance_uid: str,
+        series_instance_uid: str,
+    ) -> list[dict[str, Any]]:
         study_uid = quote(study_instance_uid, safe="")
         series_uid = quote(series_instance_uid, safe="")
         path = f"studies/{study_uid}/series/{series_uid}/instances"
-        records = self._get_dicom_json(profile, self._qido_url(profile, path), params={})
-        return [uid for record in records if (uid := self._value(record, "00080018"))]
+        return self._get_dicom_json(profile, self._qido_url(profile, path), params={})
+
+    def get_instance_metadata(
+        self,
+        profile: PacsDicomwebProfile,
+        *,
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+    ) -> dict[str, Any]:
+        study_uid = quote(study_instance_uid, safe="")
+        series_uid = quote(series_instance_uid, safe="")
+        sop_uid = quote(sop_instance_uid, safe="")
+        path = f"studies/{study_uid}/series/{series_uid}/instances/{sop_uid}/metadata"
+        records = self._get_dicom_json(profile, self._wado_url(profile, path), params={})
+        return records[0] if records else {}
 
     def download_instance(
         self,
@@ -86,6 +176,26 @@ class PacsDicomwebService:
         if not 200 <= response.status_code < 300:
             raise PacsDicomwebError(f"DICOMweb WADO returned HTTP {response.status_code}.", status_code=response.status_code)
         return self._extract_dicom_payload(response.content, response.headers.get("content-type", ""))
+
+    def render_instance_thumbnail(
+        self,
+        profile: PacsDicomwebProfile,
+        *,
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+    ) -> tuple[str, bytes]:
+        study_uid = quote(study_instance_uid, safe="")
+        series_uid = quote(series_instance_uid, safe="")
+        sop_uid = quote(sop_instance_uid, safe="")
+        path = f"studies/{study_uid}/series/{series_uid}/instances/{sop_uid}/rendered"
+        response = self._get(profile, self._wado_url(profile, path), params={}, accept_header=DICOMWEB_RENDERED_ACCEPT_HEADER)
+        if not 200 <= response.status_code < 300:
+            raise PacsDicomwebError(f"DICOMweb rendered thumbnail returned HTTP {response.status_code}.", status_code=response.status_code)
+        media_type = response.headers.get("content-type", "image/png").split(";", 1)[0].strip().lower()
+        if not media_type.startswith("image/"):
+            media_type = "image/png"
+        return media_type, response.content
 
     def _get_dicom_json(
         self,
@@ -150,17 +260,38 @@ class PacsDicomwebService:
     @staticmethod
     def _study_query_params(payload: PacsQidoStudyQueryRequest) -> dict[str, str]:
         params: dict[str, str] = {"limit": str(payload.limit)}
+        if payload.offset:
+            params["offset"] = str(payload.offset)
+        if payload.study_instance_uid:
+            params["StudyInstanceUID"] = payload.study_instance_uid.strip()
         if payload.patient_id:
             params["PatientID"] = payload.patient_id.strip()
         if payload.patient_name:
             params["PatientName"] = payload.patient_name.strip()
         if payload.accession_number:
             params["AccessionNumber"] = payload.accession_number.strip()
+        if payload.study_description:
+            params["StudyDescription"] = payload.study_description.strip()
         if payload.modality:
             params["ModalitiesInStudy"] = payload.modality.strip()
         date_range = PacsDicomwebService._dicom_date_range(payload.study_date_from, payload.study_date_to)
         if date_range:
             params["StudyDate"] = date_range
+        return params
+
+    @staticmethod
+    def _series_query_params(payload: PacsQidoSeriesQueryRequest) -> dict[str, str]:
+        params: dict[str, str] = {"limit": str(payload.limit)}
+        if payload.offset:
+            params["offset"] = str(payload.offset)
+        if payload.series_instance_uid:
+            params["SeriesInstanceUID"] = payload.series_instance_uid.strip()
+        if payload.modality:
+            params["Modality"] = payload.modality.strip()
+        if payload.series_description:
+            params["SeriesDescription"] = payload.series_description.strip()
+        if payload.body_part_examined:
+            params["BodyPartExamined"] = payload.body_part_examined.strip()
         return params
 
     @staticmethod
@@ -240,6 +371,25 @@ class PacsDicomwebService:
             return int(value)
         except ValueError:
             return None
+
+    @staticmethod
+    def _unique_values(records: list[dict[str, Any]], tag: str) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for record in records:
+            for value in PacsDicomwebService._values(record, tag):
+                if value in seen:
+                    continue
+                seen.add(value)
+                values.append(value)
+        return values
+
+    @staticmethod
+    def _is_compressed_transfer_syntax(value: str) -> bool:
+        try:
+            return bool(UID(value).is_compressed)
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def _stringify_value(value: Any) -> str | None:

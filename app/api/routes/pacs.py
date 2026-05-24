@@ -7,6 +7,8 @@ from app.schemas.pacs import (
     PacsQidoSeriesQueryResponse,
     PacsQidoStudyQueryRequest,
     PacsQidoStudyQueryResponse,
+    PacsSeriesPreviewRequest,
+    PacsSeriesPreviewResponse,
     PacsWadoSeriesDownloadJobStatusResponse,
     PacsWadoSeriesDownloadRequest,
 )
@@ -42,6 +44,14 @@ def query_dicomweb_series(payload: PacsQidoSeriesQueryRequest) -> PacsQidoSeries
         raise _pacs_gateway_error(exc) from exc
 
 
+@router.post("/dicomweb/seriesPreview", response_model=PacsSeriesPreviewResponse)
+def preview_dicomweb_series(payload: PacsSeriesPreviewRequest) -> PacsSeriesPreviewResponse:
+    try:
+        return pacs_dicomweb_service.preview_series(payload)
+    except PacsDicomwebError as exc:
+        raise _pacs_gateway_error(exc) from exc
+
+
 @router.post(
     "/dicomweb/downloadSeries/jobs",
     response_model=PacsWadoSeriesDownloadJobStatusResponse,
@@ -64,3 +74,12 @@ def create_dicomweb_series_download_job(
 )
 def get_dicomweb_series_download_job(job_id: str) -> PacsWadoSeriesDownloadJobStatusResponse:
     return pacs_wado_download_job_service.get_status(job_id)
+
+
+@router.post(
+    "/dicomweb/downloadSeries/jobs/{job_id}/cancel",
+    response_model=PacsWadoSeriesDownloadJobStatusResponse,
+    summary="Cancel a PACS WADO series download job",
+)
+def cancel_dicomweb_series_download_job(job_id: str) -> PacsWadoSeriesDownloadJobStatusResponse:
+    return pacs_wado_download_job_service.cancel_job(job_id)

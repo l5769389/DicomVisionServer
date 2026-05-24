@@ -21,7 +21,7 @@ from app.services.pacs_dicomweb_service import PacsDicomwebError, PacsDicomwebSe
 from app.services.series_registry import series_registry
 
 
-PacsWadoDownloadJobState = Literal["pending", "running", "succeeded", "failed"]
+PacsWadoDownloadJobState = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 logger = get_logger(__name__)
 
 
@@ -36,10 +36,12 @@ class PacsWadoDownloadJob:
     error: str | None = None
     folder_path: str | None = None
     load_response: LoadFolderResponse | None = None
+    cancel_requested: bool = False
 
 
 class PacsWadoDownloadJobService:
     _MAX_RETAINED_JOBS = 64
+    _FINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 
     def __init__(
         self,
@@ -94,6 +96,25 @@ class PacsWadoDownloadJobService:
                 raise HTTPException(status_code=404, detail="PACS download job was not found")
             return self._to_response(job)
 
+    def cancel_job(self, job_id: str) -> PacsWadoSeriesDownloadJobStatusResponse:
+        should_delete_cache = False
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="PACS download job was not found")
+            if job.status not in self._FINAL_STATUSES:
+                job.cancel_requested = True
+                job.status = "cancelled"
+                job.error = "PACS download was cancelled."
+                job.completed_at = utc_now()
+                should_delete_cache = True
+            response = self._to_response(job)
+            self._prune_locked()
+
+        if should_delete_cache:
+            self._delete_job_cache_dir(job_id)
+        return response
+
     def clear(self) -> None:
         with self._lock:
             self._jobs.clear()
@@ -112,11 +133,18 @@ class PacsWadoDownloadJobService:
         self._mark_running(job_id)
         download_dir = self._job_cache_dir(job_id)
         try:
+            if self._should_stop_cancelled_job(job_id):
+                self._delete_job_cache_dir(job_id)
+                return
+
             instance_uids = self._dicomweb_service.query_instance_uids(
                 payload.profile,
                 study_instance_uid=payload.study_instance_uid,
                 series_instance_uid=payload.series_instance_uid,
             )
+            if self._should_stop_cancelled_job(job_id):
+                self._delete_job_cache_dir(job_id)
+                return
             if not instance_uids:
                 raise PacsDicomwebError("DICOMweb QIDO returned no instances for this series.")
 
@@ -124,15 +152,24 @@ class PacsWadoDownloadJobService:
             download_dir.mkdir(parents=True, exist_ok=True)
 
             for index, sop_instance_uid in enumerate(instance_uids, start=1):
+                if self._should_stop_cancelled_job(job_id):
+                    self._delete_job_cache_dir(job_id)
+                    return
                 content = self._dicomweb_service.download_instance(
                     payload.profile,
                     study_instance_uid=payload.study_instance_uid,
                     series_instance_uid=payload.series_instance_uid,
                     sop_instance_uid=sop_instance_uid,
                 )
+                if self._should_stop_cancelled_job(job_id):
+                    self._delete_job_cache_dir(job_id)
+                    return
                 (download_dir / f"IM_{index:04d}.dcm").write_bytes(content)
                 self._update_progress(job_id, index, len(instance_uids))
 
+            if self._should_stop_cancelled_job(job_id):
+                self._delete_job_cache_dir(job_id)
+                return
             load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(download_dir)))
             if not load_response.series_list:
                 raise HTTPException(status_code=400, detail="Downloaded PACS series did not contain readable DICOM images")
@@ -155,20 +192,20 @@ class PacsWadoDownloadJobService:
     def _mark_running(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None:
+            if job is not None and job.status == "pending":
                 job.status = "running"
 
     def _update_progress(self, job_id: str, processed_count: int, total_count: int) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None:
+            if job is None or job.status in self._FINAL_STATUSES:
                 return
             job.processed_count, job.total_count = normalize_progress_counts(processed_count, total_count)
 
     def _mark_failed(self, job_id: str, error: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None:
+            if job is not None and job.status != "cancelled":
                 job.status = "failed"
                 job.error = error
                 job.completed_at = utc_now()
@@ -177,13 +214,31 @@ class PacsWadoDownloadJobService:
     def _mark_succeeded(self, job_id: str, folder_path: str, load_response: LoadFolderResponse) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None:
+            if job is not None and job.status != "cancelled":
                 job.status = "succeeded"
                 job.folder_path = folder_path
                 job.load_response = load_response
                 job.processed_count = max(job.processed_count, job.total_count)
                 job.completed_at = utc_now()
             self._prune_locked()
+
+    def _mark_cancelled(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None and job.status not in {"succeeded", "failed"}:
+                job.cancel_requested = True
+                job.status = "cancelled"
+                job.error = job.error or "PACS download was cancelled."
+                job.completed_at = job.completed_at or utc_now()
+            self._prune_locked()
+
+    def _should_stop_cancelled_job(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            should_stop = job is None or job.cancel_requested or job.status == "cancelled"
+        if should_stop:
+            self._mark_cancelled(job_id)
+        return should_stop
 
     def _to_response(self, job: PacsWadoDownloadJob) -> PacsWadoSeriesDownloadJobStatusResponse:
         load_response = job.load_response
@@ -207,7 +262,7 @@ class PacsWadoDownloadJobService:
             return
 
         final_jobs = sorted(
-            (job for job in self._jobs.values() if job.status in {"succeeded", "failed"}),
+            (job for job in self._jobs.values() if job.status in self._FINAL_STATUSES),
             key=lambda item: item.completed_at or item.created_at,
         )
         for job in final_jobs[: max(0, len(self._jobs) - self._MAX_RETAINED_JOBS)]:
@@ -219,7 +274,7 @@ class PacsWadoDownloadJobService:
             expired_job_ids = [
                 job.job_id
                 for job in self._jobs.values()
-                if job.status in {"succeeded", "failed"}
+                if job.status in self._FINAL_STATUSES
                 and (job.completed_at or job.created_at).timestamp() < cutoff_timestamp
             ]
             for job_id in expired_job_ids:
