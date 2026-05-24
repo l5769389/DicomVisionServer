@@ -3,8 +3,9 @@ from collections import OrderedDict
 from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from threading import RLock
-from typing import Any
+from threading import Lock, RLock
+from time import perf_counter
+from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -173,12 +174,16 @@ class RenderPlan:
     render_ratio: float
 
 
+ViewRenderProgressCallback = Callable[[dict[str, object]], None]
+
+
 class ViewerService:
     def __init__(self) -> None:
         self._volume_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._volume_cache_bytes = 0
         self._volume_cache_max_bytes = VOLUME_CACHE_MAX_BYTES
         self._volume_cache_lock = RLock()
+        self._volume_build_locks: dict[str, Any] = {}
         self._series_patient_transform_cache: dict[str, VolumePatientTransform | None] = {}
         self._series_volume_geometry_cache: dict[str, VolumeGeometry] = {}
         self._mtf_analysis_service = MtfAnalysisService(self)
@@ -208,13 +213,9 @@ class ViewerService:
         )
 
         if not view.is_initialized:
-            if self._is_mpr_view_type(view.view_type):
-                self._initialize_mpr_viewport(view)
-            elif self._is_3d_view_type(view.view_type):
-                self._initialize_3d_viewport(view)
-            else:
+            if not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
                 self._initialize_viewport(view)
-            view.is_initialized = True
+                view.is_initialized = True
 
         return OperationAcceptedResponse(message="View size updated", viewId=view.view_id)
 
@@ -224,9 +225,15 @@ class ViewerService:
         *,
         image_format: ImageFormat = "png",
         fast_preview: bool = False,
+        progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         view = view_registry.get(view_id)
-        return self._render_by_view_type(view, image_format=image_format, fast_preview=fast_preview)
+        return self._render_by_view_type(
+            view,
+            image_format=image_format,
+            fast_preview=fast_preview,
+            progress_callback=progress_callback,
+        )
 
     def close_view_by_id(self, view_id: str) -> OperationAcceptedResponse:
         view = view_registry.delete(view_id)
@@ -879,8 +886,40 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
-        return render_by_view_type(self, view, image_format=image_format, fast_preview=fast_preview)
+        return render_by_view_type(
+            self,
+            view,
+            image_format=image_format,
+            fast_preview=fast_preview,
+            progress_callback=progress_callback,
+        )
+
+    def _emit_render_progress(
+        self,
+        progress_callback: ViewRenderProgressCallback | None,
+        phase: str,
+        *,
+        progress_percent: int | float | None = None,
+        loaded_count: int | None = None,
+        total_count: int | None = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+
+        payload: dict[str, object] = {"phase": phase}
+        if progress_percent is not None:
+            payload["progressPercent"] = max(0, min(100, int(round(float(progress_percent)))))
+        if loaded_count is not None:
+            payload["loadedCount"] = max(0, int(loaded_count))
+        if total_count is not None:
+            payload["totalCount"] = max(0, int(total_count))
+
+        try:
+            progress_callback(payload)
+        except Exception:
+            logger.debug("render progress callback failed", exc_info=True)
 
     def _handle_scroll(self, view: ViewRecord, series: SeriesRecord, scroll: int) -> None:
         if not self._is_mpr_view_type(view.view_type):
@@ -1175,16 +1214,20 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
-        volume = self._get_series_volume(series)
+        self._emit_render_progress(progress_callback, "volume", progress_percent=6)
+        volume = self._get_series_volume(series, progress_callback=progress_callback)
         if not view.is_initialized:
+            self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_3d_viewport(view)
             view.is_initialized = True
 
         spacing_xyz = self._get_3d_spacing_xyz(series)
+        self._emit_render_progress(progress_callback, "render", progress_percent=82)
         image = vtk_volume_renderer.render(
             self._build_volume_render_request(
                 view,
@@ -1203,6 +1246,9 @@ class ViewerService:
             viewport_label="3D VR",
         )
 
+        self._emit_render_progress(progress_callback, "encode", progress_percent=96)
+        image_bytes = self._encode_image(image, image_format)
+
         return RenderedImageResult(
             meta=ViewImageResponse(
                 slice_info=SliceInfo(current=view.current_index, total=max(1, volume.shape[0])),
@@ -1216,7 +1262,7 @@ class ViewerService:
                 volumePreset=str(view.volume_preset or "aaa"),
                 volumeConfig=view.volume_render_config,
             ),
-            image_bytes=self._encode_image(image, image_format),
+            image_bytes=image_bytes,
         )
 
     def _render_view(
@@ -1319,16 +1365,20 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
-        volume = self._get_series_volume(series)
+        self._emit_render_progress(progress_callback, "volume", progress_percent=6)
+        volume = self._get_series_volume(series, progress_callback=progress_callback)
         if not view.is_initialized:
+            self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_mpr_viewport(view)
             view.is_initialized = True
 
         target_viewport = self._resolve_mpr_viewport(view)
+        self._emit_render_progress(progress_callback, "render", progress_percent=82)
         plane_pixels, current, total = self._extract_mpr_plane(view, volume, target_viewport)
         payload_pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
         target_plane_pose = payload_pose_context.poses[target_viewport]
@@ -1394,6 +1444,9 @@ class ViewerService:
         else:
             image = layered_renderer.render(context)
 
+        self._emit_render_progress(progress_callback, "encode", progress_percent=96)
+        image_bytes = self._encode_image(image, image_format)
+
         return RenderedImageResult(
             meta=ViewImageResponse(
                 slice_info=SliceInfo(current=current, total=total),
@@ -1428,7 +1481,7 @@ class ViewerService:
                     )
                 ),
             ),
-            image_bytes=self._encode_image(image, image_format),
+            image_bytes=image_bytes,
         )
 
     @staticmethod
@@ -1803,12 +1856,69 @@ class ViewerService:
                 pass
         return (1.0, 1.0, 1.0)
 
-    def _get_series_volume(self, series: SeriesRecord) -> np.ndarray:
+    def _get_series_volume(
+        self,
+        series: SeriesRecord,
+        *,
+        progress_callback: ViewRenderProgressCallback | None = None,
+    ) -> np.ndarray:
         cached_volume = self._get_cached_series_volume(series.series_id)
         if cached_volume is not None:
+            self._emit_render_progress(
+                progress_callback,
+                "volume",
+                progress_percent=70,
+                loaded_count=len(series.instances),
+                total_count=len(series.instances),
+            )
             return cached_volume
 
+        build_lock = self._get_series_volume_build_lock(series.series_id)
+        if build_lock.locked():
+            self._emit_render_progress(progress_callback, "waiting", progress_percent=8)
+
+        with build_lock:
+            cached_volume = self._get_cached_series_volume(series.series_id)
+            if cached_volume is not None:
+                self._emit_render_progress(
+                    progress_callback,
+                    "volume",
+                    progress_percent=70,
+                    loaded_count=len(series.instances),
+                    total_count=len(series.instances),
+                )
+                return cached_volume
+
+            started_at = perf_counter()
+            volume = self._build_series_volume(series, progress_callback=progress_callback)
+            stored_volume = self._store_series_volume(series.series_id, volume)
+            self._emit_render_progress(
+                progress_callback,
+                "volume",
+                progress_percent=70,
+                loaded_count=len(series.instances),
+                total_count=len(series.instances),
+            )
+            logger.info(
+                "series volume built series_id=%s shape=%s bytes=%s elapsed_ms=%.1f",
+                series.series_id,
+                stored_volume.shape,
+                int(stored_volume.nbytes),
+                (perf_counter() - started_at) * 1000.0,
+            )
+            return stored_volume
+
+    def _build_series_volume(
+        self,
+        series: SeriesRecord,
+        *,
+        progress_callback: ViewRenderProgressCallback | None = None,
+    ) -> np.ndarray:
         slice_entries: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
+        readable_total = sum(1 for instance in series.instances if instance.sop_instance_uid)
+        loaded_count = 0
+        last_progress_percent = -1
+
         for instance in series.instances:
             if not instance.sop_instance_uid:
                 continue
@@ -1817,6 +1927,19 @@ class ViewerService:
             orientation = self._get_dataset_orientation(dataset)
             position = self._get_dataset_position(dataset)
             slice_entries.append((cached.source_pixels, orientation, position))
+            loaded_count += 1
+
+            if readable_total:
+                progress_percent = 10 + int((loaded_count / readable_total) * 55)
+                if progress_percent != last_progress_percent:
+                    self._emit_render_progress(
+                        progress_callback,
+                        "volume",
+                        progress_percent=progress_percent,
+                        loaded_count=loaded_count,
+                        total_count=readable_total,
+                    )
+                    last_progress_percent = progress_percent
 
         if not slice_entries:
             raise HTTPException(status_code=400, detail="Series does not contain readable pixel data")
@@ -1825,8 +1948,22 @@ class ViewerService:
         if any(item[0].shape != first_shape for item in slice_entries):
             raise HTTPException(status_code=400, detail="MPR requires a series with consistent slice dimensions")
 
-        volume = self._build_standardized_volume(slice_entries)
-        return self._store_series_volume(series.series_id, volume)
+        self._emit_render_progress(
+            progress_callback,
+            "normalize",
+            progress_percent=66,
+            loaded_count=loaded_count,
+            total_count=readable_total,
+        )
+        return self._build_standardized_volume(slice_entries)
+
+    def _get_series_volume_build_lock(self, series_id: str) -> Any:
+        with self._volume_cache_lock:
+            lock = self._volume_build_locks.get(series_id)
+            if lock is None:
+                lock = Lock()
+                self._volume_build_locks[series_id] = lock
+            return lock
 
     def _get_cached_series_volume(self, series_id: str) -> np.ndarray | None:
         with self._volume_cache_lock:

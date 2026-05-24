@@ -220,6 +220,8 @@ def _handle_pseudocolor_operation(
     if payload.pseudocolor_preset is None:
         return _render_none()
     service._handle_pseudocolor(view, payload)
+    if not view.width or not view.height:
+        return _render_none()
     return _render_single()
 
 
