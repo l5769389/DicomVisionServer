@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.28.0,<1.0.0",
     "scipy>=1.17.1",
     "vtk>=9.6.1",
+    "pynetdicom>=3.0.4",
 ]
 
 [project.optional-dependencies]
