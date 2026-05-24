@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     web_upload_dicom_root: str | None = Field(default=None, alias="WEB_UPLOAD_DICOM_ROOT")
     web_upload_max_files: int = Field(default=5000, alias="WEB_UPLOAD_MAX_FILES")
     web_upload_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, alias="WEB_UPLOAD_MAX_BYTES")
+    pacs_wado_cache_root: str | None = Field(default=None, alias="PACS_WADO_CACHE_ROOT")
+    pacs_wado_cache_max_age_seconds: int = Field(default=24 * 60 * 60, alias="PACS_WADO_CACHE_MAX_AGE_SECONDS")
+    pacs_wado_cache_cleanup_interval_seconds: int = Field(
+        default=60 * 60,
+        alias="PACS_WADO_CACHE_CLEANUP_INTERVAL_SECONDS",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
