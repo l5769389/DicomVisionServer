@@ -89,6 +89,14 @@ class PacsDimseSeriesQueryRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class PacsDimseSeriesDownloadRequest(BaseModel):
+    profile: PacsDimseProfile
+    study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    series_instance_uid: str = Field(alias="seriesInstanceUid", min_length=1)
+
+    model_config = {"populate_by_name": True}
+
+
 class PacsQidoStudyQueryRequest(BaseModel):
     profile: PacsDicomwebProfile
     study_instance_uid: str | None = Field(default=None, alias="studyInstanceUid")
@@ -209,3 +217,7 @@ class PacsWadoSeriesDownloadJobStatusResponse(BaseModel):
     completed_at: str | None = Field(default=None, alias="completedAt")
 
     model_config = {"populate_by_name": True}
+
+
+class PacsDimseSeriesDownloadJobStatusResponse(PacsWadoSeriesDownloadJobStatusResponse):
+    pass

@@ -2,11 +2,12 @@
 
 [中文说明](./README.zh-CN.md)
 
-DicomVision Server powers the backend side of DicomVision with DICOM series discovery, thumbnails and tag reading, DICOM tag editing, DICOM de-identification export, Stack rendering and Stack Compare rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
+DicomVision Server powers the backend side of DicomVision with DICOM series discovery, PACS DICOMweb/DIMSE query and series retrieval, thumbnails and tag reading, DICOM tag editing, DICOM de-identification export, Stack rendering and Stack Compare rendering, MPR and oblique MPR reconstruction, 4D phase preview and playback coordination, VTK-based 3D volume rendering, measurement calculation, MTF/FWHM analysis, water phantom QA, image export, and realtime image delivery to the frontend over Socket.IO.
 
 ## Version 1.2.0 Updates
 
 - Supported the new client-side Stack Compare workflow by keeping independent backend views for the source and target series.
+- Added PACS Browser backend support for DICOMweb QIDO/WADO and DIMSE C-ECHO, C-FIND, and C-GET series retrieval into the server cache.
 - Ensured explicit pseudocolor operations re-render frames even when the requested preset matches the previous state, so Compare panes can reliably apply the configured default pseudocolor.
 - Kept the asynchronous DICOM tag edit and de-identification artifact jobs with pollable progress and downloadable results.
 - Kept desktop bundle packaging support for the Electron client release.
@@ -19,6 +20,7 @@ DicomVision Server powers the backend side of DicomVision with DICOM series disc
 ## Feature Overview
 
 - **DICOM data services**: load local folders or single DICOM files, discover series, generate thumbnails, and read instance-level DICOM tags.
+- **PACS integration**: query studies and series through DICOMweb or DIMSE, download DICOMweb WADO or DIMSE C-GET series into the server cache, and register retrieved data through the same local-folder loading pipeline.
 - **Stack rendering**: render 2D images from viewport size, window/level, pseudocolor, rotation, flip, zoom, and pan state.
 - **Stack Compare support**: maintain independent source/target Stack views for side-by-side comparison while accepting synchronized scroll, window, pseudocolor, zoom, pan, and transform operations from the client.
 - **MPR and oblique MPR**: build standardized volumes for axial, coronal, and sagittal reconstruction, synchronized crosshair navigation, oblique rotation, and MIP configuration.
@@ -37,6 +39,10 @@ Screenshots are maintained in the companion client repository. This backend READ
 | Stack viewing | MPR reconstruction |
 | --- | --- |
 | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/stack.png" alt="Stack viewing" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/mpr.png" alt="MPR reconstruction" width="420"> |
+
+| PACS data sources | PACS browser import |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/pacs_dicom_import.png" alt="PACS DICOMweb and DIMSE profile setup" width="420"> | <img src="https://raw.githubusercontent.com/l5769389/DicomVisionClient/main/screenshots/pacs_dicom_import_1.png" alt="PACS Browser query and downloaded series import" width="420"> |
 
 | Oblique MPR / crosshair rotation | 4D phase playback |
 | --- | --- |
@@ -192,6 +198,19 @@ Base path: `/api/v1`
 - `POST /dicom/deidentify/jobs`
 - `GET /dicom/deidentify/jobs/{job_id}`
 - `GET /dicom/deidentify/jobs/{job_id}/artifact`
+- `POST /pacs/dicomweb/test`
+- `POST /pacs/dicomweb/studies`
+- `POST /pacs/dicomweb/series`
+- `POST /pacs/dicomweb/seriesPreview`
+- `POST /pacs/dicomweb/downloadSeries/jobs`
+- `GET /pacs/dicomweb/downloadSeries/jobs/{job_id}`
+- `POST /pacs/dicomweb/downloadSeries/jobs/{job_id}/cancel`
+- `POST /pacs/dimse/test`
+- `POST /pacs/dimse/studies`
+- `POST /pacs/dimse/series`
+- `POST /pacs/dimse/downloadSeries/jobs`
+- `GET /pacs/dimse/downloadSeries/jobs/{job_id}`
+- `POST /pacs/dimse/downloadSeries/jobs/{job_id}/cancel`
 - `POST /view/create`
 - `POST /view/close`
 - `POST /view/setSize`

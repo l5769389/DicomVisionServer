@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from pathlib import Path
+import re
 from typing import Any
 
 from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
-from pynetdicom import AE
+from pynetdicom import AE, StoragePresentationContexts, build_role, evt
 from pynetdicom.sop_class import (
     PatientRootQueryRetrieveInformationModelFind,
+    PatientRootQueryRetrieveInformationModelGet,
     StudyRootQueryRetrieveInformationModelFind,
+    StudyRootQueryRetrieveInformationModelGet,
     Verification,
 )
 
@@ -26,6 +30,7 @@ from app.schemas.pacs import (
 
 DIMSE_PENDING_STATUSES = {0xFF00, 0xFF01}
 DIMSE_SUCCESS_STATUS = 0x0000
+DIMSE_WARNING_STATUSES = {0xB000, 0xB006, 0xB007}
 
 
 class PacsDimseError(RuntimeError):
@@ -66,6 +71,77 @@ class PacsDimseService:
         records = self._send_c_find(payload.profile, dataset, limit=payload.limit, offset=payload.offset)
         return PacsQidoSeriesQueryResponse(items=[self._parse_series(record, payload.study_instance_uid) for record in records])
 
+    def retrieve_series(
+        self,
+        profile: PacsDimseProfile,
+        *,
+        study_instance_uid: str,
+        series_instance_uid: str,
+        output_dir: Path,
+        progress_callback: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> int:
+        dataset = Dataset()
+        dataset.QueryRetrieveLevel = "SERIES"
+        dataset.StudyInstanceUID = study_instance_uid.strip()
+        dataset.SeriesInstanceUID = series_instance_uid.strip()
+        context = self._query_model_get_context(profile)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        received_count = 0
+        expected_total = 0
+
+        def handle_store(event: Any) -> int:
+            nonlocal received_count, expected_total
+            if should_cancel is not None and should_cancel():
+                return 0xC000
+
+            try:
+                received_count += 1
+                self._store_c_get_dataset(event, output_dir, received_count)
+            except Exception:
+                return 0xA701
+
+            expected_total = max(expected_total, received_count)
+            if progress_callback is not None:
+                progress_callback(received_count, expected_total)
+            return 0x0000
+
+        ext_neg = [build_role(cx.abstract_syntax, scp_role=True) for cx in StoragePresentationContexts]
+        association = self._associate(
+            profile,
+            [context, *(cx.abstract_syntax for cx in StoragePresentationContexts)],
+            ext_neg=ext_neg,
+            evt_handlers=[(evt.EVT_C_STORE, handle_store)],
+        )
+        if not association.is_established:
+            raise PacsDimseError("DIMSE association was rejected or timed out.")
+
+        try:
+            for status, _identifier in association.send_c_get(dataset, context):
+                status_code = self._status_code(status)
+                total = self._suboperation_total(status)
+                if total:
+                    expected_total = max(expected_total, total)
+                    if progress_callback is not None:
+                        progress_callback(received_count, expected_total)
+
+                if status_code in DIMSE_PENDING_STATUSES:
+                    continue
+                if status_code in {DIMSE_SUCCESS_STATUS, *DIMSE_WARNING_STATUSES}:
+                    break
+                raise PacsDimseError(f"DIMSE C-GET returned {self._format_status(status_code)}.")
+        finally:
+            association.release()
+
+        if should_cancel is not None and should_cancel():
+            raise PacsDimseError("PACS download was cancelled.")
+        if received_count <= 0:
+            raise PacsDimseError("DIMSE C-GET returned no instances for this series.")
+        if progress_callback is not None:
+            progress_callback(received_count, max(expected_total, received_count))
+        return received_count
+
     def _send_c_find(
         self,
         profile: PacsDimseProfile,
@@ -101,7 +177,14 @@ class PacsDimseService:
 
         return records
 
-    def _associate(self, profile: PacsDimseProfile, contexts: Iterable[Any]) -> Any:
+    def _associate(
+        self,
+        profile: PacsDimseProfile,
+        contexts: Iterable[Any],
+        *,
+        ext_neg: list[Any] | None = None,
+        evt_handlers: list[Any] | None = None,
+    ) -> Any:
         try:
             ae = self._ae_factory(profile.client_ae_title.strip())
             ae.acse_timeout = profile.timeout_seconds
@@ -109,7 +192,13 @@ class PacsDimseService:
             ae.network_timeout = profile.timeout_seconds
             for context in contexts:
                 ae.add_requested_context(context)
-            return ae.associate(profile.host.strip(), profile.port, ae_title=profile.called_ae_title.strip())
+            return ae.associate(
+                profile.host.strip(),
+                profile.port,
+                ae_title=profile.called_ae_title.strip(),
+                ext_neg=ext_neg,
+                evt_handlers=evt_handlers,
+            )
         except Exception as exc:
             raise PacsDimseError(f"DIMSE association failed: {exc}") from exc
 
@@ -122,6 +211,26 @@ class PacsDimseService:
         if profile.query_model == "patient-root":
             return PatientRootQueryRetrieveInformationModelFind
         return StudyRootQueryRetrieveInformationModelFind
+
+    @staticmethod
+    def _query_model_get_context(profile: PacsDimseProfile) -> Any:
+        if profile.query_model == "patient-root":
+            return PatientRootQueryRetrieveInformationModelGet
+        return StudyRootQueryRetrieveInformationModelGet
+
+    @staticmethod
+    def _store_c_get_dataset(event: Any, output_dir: Path, index: int) -> Path:
+        dataset = event.dataset
+        dataset.file_meta = event.file_meta
+        sop_instance_uid = PacsDimseService._safe_sop_instance_uid(getattr(dataset, "SOPInstanceUID", "unknown"))
+        output_path = output_dir / f"IM_{index:04d}_{sop_instance_uid}.dcm"
+        dataset.save_as(output_path, write_like_original=False)
+        return output_path
+
+    @staticmethod
+    def _safe_sop_instance_uid(value: Any) -> str:
+        safe_uid = re.sub(r"[^\d.]", "_", str(value or "unknown"))
+        return safe_uid[:128] or "unknown"
 
     @staticmethod
     def _study_query_dataset(payload: PacsDimseStudyQueryRequest) -> Dataset:
@@ -274,6 +383,23 @@ class PacsDimseService:
     @staticmethod
     def _format_status(status_code: int | None) -> str:
         return "no status" if status_code is None else f"0x{status_code:04X}"
+
+    @staticmethod
+    def _suboperation_total(status: Any) -> int:
+        if status is None:
+            return 0
+        total = 0
+        for keyword in (
+            "NumberOfRemainingSuboperations",
+            "NumberOfCompletedSuboperations",
+            "NumberOfFailedSuboperations",
+            "NumberOfWarningSuboperations",
+        ):
+            try:
+                total += int(getattr(status, keyword, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
 
 
 pacs_dimse_service = PacsDimseService()

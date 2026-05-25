@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import time
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -8,12 +10,16 @@ from pydicom.dataset import Dataset
 
 from app.api.routes import pacs as pacs_route
 from app.main import fastapi_app
+from app.schemas.dicom import LoadFolderRequest, LoadFolderResponse, SeriesSummary
 from app.schemas.pacs import (
     PacsDimseProfile,
+    PacsDimseSeriesDownloadJobStatusResponse,
+    PacsDimseSeriesDownloadRequest,
     PacsDimseSeriesQueryRequest,
     PacsDimseStudyQueryRequest,
     PacsDicomwebTestResponse,
 )
+from app.services.pacs_dimse_job_service import PacsDimseDownloadJobService
 from app.services.pacs_dimse_service import PacsDimseService
 
 
@@ -88,7 +94,7 @@ class FakeAE:
     def add_requested_context(self, context: Any) -> None:
         self.contexts.append(context)
 
-    def associate(self, host: str, port: int, *, ae_title: str) -> FakeAssociation:
+    def associate(self, host: str, port: int, *, ae_title: str, **_kwargs: Any) -> FakeAssociation:
         self.associate_args = (host, port, ae_title)
         return self.association
 
@@ -197,3 +203,105 @@ def test_dimse_test_connection_endpoint_uses_service(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True, "statusCode": 0, "message": "ok"}
+
+
+def test_dimse_download_job_registers_retrieved_series(monkeypatch, tmp_path: Path) -> None:
+    class FakeDimseService:
+        def retrieve_series(
+            self,
+            profile: PacsDimseProfile,
+            *,
+            study_instance_uid: str,
+            series_instance_uid: str,
+            output_dir: Path,
+            progress_callback: Any,
+            should_cancel: Any,
+        ) -> int:
+            assert profile.id == "dimse-local"
+            assert study_instance_uid == "1.2.3"
+            assert series_instance_uid == "4.5.6"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "IM_0001.dcm").write_bytes(b"DICOM 1")
+            progress_callback(1, 2)
+            (output_dir / "IM_0002.dcm").write_bytes(b"DICOM 2")
+            progress_callback(2, 2)
+            assert should_cancel() is False
+            return 2
+
+    def fake_load_folder(payload: LoadFolderRequest) -> LoadFolderResponse:
+        folder = Path(payload.folder_path)
+        assert (folder / "IM_0001.dcm").read_bytes() == b"DICOM 1"
+        assert (folder / "IM_0002.dcm").read_bytes() == b"DICOM 2"
+        return LoadFolderResponse(
+            seriesId="series-1",
+            seriesList=[
+                SeriesSummary(
+                    seriesId="series-1",
+                    seriesInstanceUid="4.5.6",
+                    instanceCount=2,
+                    folderPath=str(folder),
+                )
+            ],
+        )
+
+    monkeypatch.setattr("app.services.pacs_dimse_job_service.series_registry.load_folder", fake_load_folder)
+    service = PacsDimseDownloadJobService(dimse_service=FakeDimseService(), cache_root=tmp_path)  # type: ignore[arg-type]
+    initial = service.create_job(
+        PacsDimseSeriesDownloadRequest(
+            profile=_profile(),
+            studyInstanceUid="1.2.3",
+            seriesInstanceUid="4.5.6",
+        )
+    )
+
+    status = initial
+    for _ in range(50):
+        status = service.get_status(initial.job_id)
+        if status.status in {"succeeded", "failed"}:
+            break
+        time.sleep(0.02)
+
+    assert status.status == "succeeded"
+    assert status.progress_percent == 100
+    assert status.processed_count == 2
+    assert status.total_count == 2
+    assert status.series_id == "series-1"
+    assert status.series_list[0].series_instance_uid == "4.5.6"
+
+
+def test_dimse_download_job_endpoint_uses_service(monkeypatch) -> None:
+    def fake_create_job(payload: PacsDimseSeriesDownloadRequest) -> PacsDimseSeriesDownloadJobStatusResponse:
+        assert payload.profile.host == "127.0.0.1"
+        assert payload.study_instance_uid == "1.2.3"
+        assert payload.series_instance_uid == "4.5.6"
+        return PacsDimseSeriesDownloadJobStatusResponse(
+            jobId="job-1",
+            status="pending",
+            statusUrl="/api/v1/pacs/dimse/downloadSeries/jobs/job-1",
+            processedCount=0,
+            progressPercent=0,
+            totalCount=0,
+            createdAt="2026-05-25T00:00:00Z",
+        )
+
+    monkeypatch.setattr(pacs_route.pacs_dimse_download_job_service, "create_job", fake_create_job)
+
+    client = TestClient(fastapi_app)
+    response = client.post(
+        "/api/v1/pacs/dimse/downloadSeries/jobs",
+        json={
+            "profile": {
+                "id": "dimse-local",
+                "name": "DIMSE",
+                "host": "127.0.0.1",
+                "port": 4242,
+                "calledAeTitle": "ORTHANC",
+                "clientAeTitle": "DICOMVISION",
+            },
+            "studyInstanceUid": "1.2.3",
+            "seriesInstanceUid": "4.5.6",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["jobId"] == "job-1"

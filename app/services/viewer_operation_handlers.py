@@ -465,8 +465,16 @@ def _build_operation_render_outcome(
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     if render_decision.mode == "broadcast":
+        sized_group_view_ids = tuple(
+            group_view.view_id
+            for group_view in service._get_mpr_group_views(view)
+            if group_view.width and group_view.height
+        )
+        if not sized_group_view_ids:
+            return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
+
         return OperationRenderOutcome(
-            broadcast_view_ids=tuple(group_view.view_id for group_view in service._get_mpr_group_views(view)),
+            broadcast_view_ids=sized_group_view_ids,
             broadcast_image_format=render_decision.image_format,
             broadcast_fast_preview=render_decision.fast_preview,
         )

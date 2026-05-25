@@ -11,6 +11,7 @@ from app.sockets.runtime import view_socket_hub
 from app.services.series_registry import series_registry
 from app.services.view_group_registry import view_group_registry
 from app.services.view_registry import view_registry
+from app.services.viewer_service import viewer_service
 
 
 @pytest.fixture(autouse=True)
@@ -142,3 +143,29 @@ def test_mpr_state_sync_operation_accepts_source_view_alias() -> None:
 
     assert payload.view_id == "target-view"
     assert payload.source_view_id == "source-view"
+
+
+def test_mpr_state_sync_broadcast_skips_unsized_group_views(monkeypatch) -> None:
+    client = TestClient(fastapi_app)
+    series_id = _register_series()
+    source_view_id = _create_view(client, series_id, "AX", "4d:tab:phase-0")
+    target_axial_view_id = _create_view(client, series_id, "AX", "4d:tab:phase-1")
+    target_coronal_view_id = _create_view(client, series_id, "COR", "4d:tab:phase-1")
+
+    target_axial_view = view_registry.get(target_axial_view_id)
+    target_axial_view.width = 320
+    target_axial_view.height = 240
+
+    monkeypatch.setattr(viewer_service, "_sync_mpr_state_from_source_view", lambda target_view, source_view_id: True)
+
+    payload = ViewOperationRequest.model_validate(
+        {
+            "viewId": target_axial_view_id,
+            "opType": "mprStateSync",
+            "sourceViewId": source_view_id,
+        }
+    )
+    result = viewer_service.handle_view_operation(payload)
+
+    assert result.broadcast_view_ids == (target_axial_view_id,)
+    assert target_coronal_view_id not in result.broadcast_view_ids

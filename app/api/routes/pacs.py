@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException, status
 
 from app.schemas.pacs import (
     PacsDimseSeriesQueryRequest,
+    PacsDimseSeriesDownloadJobStatusResponse,
+    PacsDimseSeriesDownloadRequest,
     PacsDimseStudyQueryRequest,
     PacsDimseTestRequest,
     PacsDicomwebTestRequest,
@@ -16,6 +18,7 @@ from app.schemas.pacs import (
     PacsWadoSeriesDownloadRequest,
 )
 from app.services.pacs_dimse_service import PacsDimseError, pacs_dimse_service
+from app.services.pacs_dimse_job_service import pacs_dimse_download_job_service
 from app.services.pacs_dicomweb_service import PacsDicomwebError, pacs_dicomweb_service
 from app.services.pacs_wado_job_service import pacs_wado_download_job_service
 
@@ -56,6 +59,39 @@ def query_dimse_series(payload: PacsDimseSeriesQueryRequest) -> PacsQidoSeriesQu
         return pacs_dimse_service.query_series(payload)
     except PacsDimseError as exc:
         raise _pacs_dimse_gateway_error(exc) from exc
+
+
+@router.post(
+    "/dimse/downloadSeries/jobs",
+    response_model=PacsDimseSeriesDownloadJobStatusResponse,
+    summary="Start a PACS DIMSE series download job",
+    description=(
+        "Retrieves one DIMSE series through C-GET into the server cache, "
+        "then registers the downloaded folder using the same loader as local files."
+    ),
+)
+def create_dimse_series_download_job(
+    payload: PacsDimseSeriesDownloadRequest,
+) -> PacsDimseSeriesDownloadJobStatusResponse:
+    return pacs_dimse_download_job_service.create_job(payload)
+
+
+@router.get(
+    "/dimse/downloadSeries/jobs/{job_id}",
+    response_model=PacsDimseSeriesDownloadJobStatusResponse,
+    summary="Get PACS DIMSE series download job status",
+)
+def get_dimse_series_download_job(job_id: str) -> PacsDimseSeriesDownloadJobStatusResponse:
+    return pacs_dimse_download_job_service.get_status(job_id)
+
+
+@router.post(
+    "/dimse/downloadSeries/jobs/{job_id}/cancel",
+    response_model=PacsDimseSeriesDownloadJobStatusResponse,
+    summary="Cancel a PACS DIMSE series download job",
+)
+def cancel_dimse_series_download_job(job_id: str) -> PacsDimseSeriesDownloadJobStatusResponse:
+    return pacs_dimse_download_job_service.cancel_job(job_id)
 
 
 @router.post("/dicomweb/studies", response_model=PacsQidoStudyQueryResponse)
