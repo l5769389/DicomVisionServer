@@ -352,10 +352,14 @@ https://dicomvision-server-l5769389.fly.dev/health
 
 ## 桌面 bundle
 
-此仓库可构建供 Electron 客户端安装包内置的 Windows 后端 bundle。
+此仓库可构建供 Electron 客户端安装包内置的后端 bundle。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
+```
+
+```bash
+python3 scripts/build_desktop_bundle.py
 ```
 
 默认输出：
@@ -363,7 +367,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
 ```text
 dist/
   DicomVisionServer/
-    DicomVisionServer.exe
+    DicomVisionServer.exe  # Windows
+    DicomVisionServer      # macOS
     ...
 ```
 
@@ -373,7 +378,11 @@ dist/
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1 -OutputRoot .\artifacts
 ```
 
-随后可通过客户端的 `DICOM_VISION_SERVER_BUNDLE_PATH` 或 `npm run release:win` 打入 Electron 安装包。
+```bash
+python3 scripts/build_desktop_bundle.py --output-root ./artifacts
+```
+
+macOS 上客户端的 `npm run release:mac` 会先调用 `scripts/build_desktop_bundle.py` 构建后端 bundle，再打包 Electron 应用。随后也可通过客户端的 `DICOM_VISION_SERVER_BUNDLE_PATH`、`npm run release:win` 或 `npm run release:mac` 打入 Electron 安装包。
 
 ## 测试
 

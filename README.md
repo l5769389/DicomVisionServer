@@ -352,10 +352,14 @@ When using Fly.io's GitHub Deploy page:
 
 ## Desktop Bundle
 
-This repository can build the Windows backend bundle consumed by the Electron client installer.
+This repository can build the backend bundle consumed by the Electron desktop installers.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1
+```
+
+```bash
+python3 scripts/build_desktop_bundle.py
 ```
 
 Default output:
@@ -363,7 +367,8 @@ Default output:
 ```text
 dist/
   DicomVisionServer/
-    DicomVisionServer.exe
+    DicomVisionServer.exe  # Windows
+    DicomVisionServer      # macOS
     ...
 ```
 
@@ -373,7 +378,11 @@ Override the output root when needed:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-desktop-bundle.ps1 -OutputRoot .\artifacts
 ```
 
-The client packaging flow can then consume this directory through `DICOM_VISION_SERVER_BUNDLE_PATH` or `npm run release:win`.
+```bash
+python3 scripts/build_desktop_bundle.py --output-root ./artifacts
+```
+
+On macOS, the client `npm run release:mac` command calls `scripts/build_desktop_bundle.py` before packaging the Electron app. The client packaging flow can also consume an existing bundle through `DICOM_VISION_SERVER_BUNDLE_PATH`, `npm run release:win`, or `npm run release:mac`.
 
 ## Testing
 
