@@ -1,9 +1,14 @@
 import base64
+import io
 import re
 from typing import Any
 from urllib.parse import quote, urljoin
 
 import httpx
+import numpy as np
+import pydicom
+from PIL import Image, ImageOps
+from pydicom.multival import MultiValue
 from pydicom.uid import UID
 
 from app.schemas.pacs import (
@@ -23,6 +28,7 @@ from app.schemas.pacs import (
 DICOMWEB_ACCEPT_HEADER = "application/dicom+json, application/json"
 DICOMWEB_DICOM_ACCEPT_HEADER = 'application/dicom, multipart/related; type="application/dicom"'
 DICOMWEB_RENDERED_ACCEPT_HEADER = "image/png, image/jpeg;q=0.9, image/*;q=0.8"
+PACS_THUMBNAIL_SIZE = (192, 192)
 
 
 class PacsDicomwebError(RuntimeError):
@@ -191,11 +197,36 @@ class PacsDicomwebService:
         path = f"studies/{study_uid}/series/{series_uid}/instances/{sop_uid}/rendered"
         response = self._get(profile, self._wado_url(profile, path), params={}, accept_header=DICOMWEB_RENDERED_ACCEPT_HEADER)
         if not 200 <= response.status_code < 300:
-            raise PacsDicomwebError(f"DICOMweb rendered thumbnail returned HTTP {response.status_code}.", status_code=response.status_code)
+            rendered_error = PacsDicomwebError(f"DICOMweb rendered thumbnail returned HTTP {response.status_code}.", status_code=response.status_code)
+            try:
+                return self.render_downloaded_instance_thumbnail(
+                    profile,
+                    study_instance_uid=study_instance_uid,
+                    series_instance_uid=series_instance_uid,
+                    sop_instance_uid=sop_instance_uid,
+                )
+            except PacsDicomwebError as exc:
+                raise PacsDicomwebError(f"{rendered_error} Local DICOM thumbnail fallback failed: {exc}", status_code=response.status_code) from exc
         media_type = response.headers.get("content-type", "image/png").split(";", 1)[0].strip().lower()
         if not media_type.startswith("image/"):
             media_type = "image/png"
         return media_type, response.content
+
+    def render_downloaded_instance_thumbnail(
+        self,
+        profile: PacsDicomwebProfile,
+        *,
+        study_instance_uid: str,
+        series_instance_uid: str,
+        sop_instance_uid: str,
+    ) -> tuple[str, bytes]:
+        content = self.download_instance(
+            profile,
+            study_instance_uid=study_instance_uid,
+            series_instance_uid=series_instance_uid,
+            sop_instance_uid=sop_instance_uid,
+        )
+        return "image/png", self._render_dicom_thumbnail(content)
 
     def _get_dicom_json(
         self,
@@ -237,6 +268,7 @@ class PacsDicomwebService:
                 auth=auth,
                 timeout=profile.timeout_seconds,
                 follow_redirects=True,
+                trust_env=False,
                 transport=self._transport,
             ) as client:
                 return client.get(url, params=params)
@@ -425,6 +457,105 @@ class PacsDicomwebService:
                 return body.strip(b"\r\n")
 
         raise PacsDicomwebError("DICOMweb WADO multipart response did not contain a DICOM part.")
+
+    @staticmethod
+    def _render_dicom_thumbnail(content: bytes) -> bytes:
+        try:
+            dataset = pydicom.dcmread(io.BytesIO(content), force=True)
+            pixels = dataset.pixel_array
+        except Exception as exc:
+            raise PacsDicomwebError(f"Failed to decode DICOM pixels: {exc}") from exc
+
+        if pixels.ndim == 4:
+            pixels = pixels[0]
+        if pixels.ndim == 3 and pixels.shape[-1] not in (3, 4):
+            pixels = pixels[0]
+
+        if pixels.ndim == 2:
+            image = PacsDicomwebService._render_grayscale_dicom_thumbnail(dataset, np.asarray(pixels, dtype=np.float32))
+        elif pixels.ndim == 3 and pixels.shape[-1] in (3, 4):
+            image = PacsDicomwebService._render_color_dicom_thumbnail(np.asarray(pixels))
+        else:
+            raise PacsDicomwebError("DICOM pixel data is not a renderable 2D image.")
+
+        image = ImageOps.contain(image, PACS_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+        canvas = Image.new(image.mode, PACS_THUMBNAIL_SIZE, 0)
+        canvas.paste(image, ((PACS_THUMBNAIL_SIZE[0] - image.width) // 2, (PACS_THUMBNAIL_SIZE[1] - image.height) // 2))
+
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _render_grayscale_dicom_thumbnail(dataset: Any, pixels: np.ndarray) -> Image.Image:
+        slope = PacsDicomwebService._get_first_number(getattr(dataset, "RescaleSlope", None))
+        intercept = PacsDicomwebService._get_first_number(getattr(dataset, "RescaleIntercept", None))
+        pixels = pixels * (slope if slope is not None else 1.0) + (intercept if intercept is not None else 0.0)
+        if getattr(dataset, "PhotometricInterpretation", "") == "MONOCHROME1":
+            pixels = -pixels
+
+        low, high = PacsDicomwebService._resolve_thumbnail_window(
+            pixels,
+            PacsDicomwebService._get_first_number(getattr(dataset, "WindowWidth", None)),
+            PacsDicomwebService._get_first_number(getattr(dataset, "WindowCenter", None)),
+        )
+        scale = high - low
+        if scale <= 0:
+            raise PacsDicomwebError("DICOM thumbnail window has no display range.")
+
+        clipped = np.clip(pixels, low, high)
+        normalized = ((clipped - low) * (255.0 / scale)).astype(np.uint8)
+        return Image.fromarray(normalized)
+
+    @staticmethod
+    def _render_color_dicom_thumbnail(pixels: np.ndarray) -> Image.Image:
+        if pixels.dtype != np.uint8:
+            finite_values = np.asarray(pixels[np.isfinite(pixels)], dtype=np.float32)
+            if finite_values.size == 0:
+                raise PacsDicomwebError("DICOM color pixel data has no finite values.")
+            low = float(np.min(finite_values))
+            high = float(np.max(finite_values))
+            scale = high - low
+            if scale <= 0:
+                raise PacsDicomwebError("DICOM color pixel data has no display range.")
+            pixels = ((np.clip(pixels, low, high) - low) * (255.0 / scale)).astype(np.uint8)
+        return Image.fromarray(pixels[..., :3])
+
+    @staticmethod
+    def _resolve_thumbnail_window(
+        pixels: np.ndarray,
+        window_width: float | None,
+        window_center: float | None,
+    ) -> tuple[float, float]:
+        if window_width is not None and window_width > 0 and window_center is not None:
+            return (float(window_center - window_width / 2.0), float(window_center + window_width / 2.0))
+
+        finite_values = np.asarray(pixels[np.isfinite(pixels)], dtype=np.float32)
+        if finite_values.size == 0:
+            return (0.0, 1.0)
+
+        low = float(np.percentile(finite_values, 1.0))
+        high = float(np.percentile(finite_values, 99.0))
+        if high <= low:
+            low = float(np.min(finite_values))
+            high = float(np.max(finite_values))
+        if high <= low:
+            high = low + 1.0
+        return (low, high)
+
+    @staticmethod
+    def _get_first_number(value: object) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, MultiValue):
+            if not value:
+                return None
+            value = value[0]
+        try:
+            parsed_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed_value if np.isfinite(parsed_value) else None
 
 
 pacs_dicomweb_service = PacsDicomwebService()

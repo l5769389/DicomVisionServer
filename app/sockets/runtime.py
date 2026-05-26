@@ -1,5 +1,6 @@
 import asyncio
 from collections import defaultdict
+from concurrent.futures import Future
 from dataclasses import dataclass
 
 import socketio
@@ -99,6 +100,21 @@ class ViewSocketHub:
             return target_sids
         return tuple(self._view_sids.get(view_id, ()))
 
+    async def _emit_progress_message(self, view_id: str, sids: tuple[str, ...], payload: dict[str, object]) -> None:
+        if self._server is None or not sids:
+            return
+
+        message = {"viewId": view_id, **payload}
+        for sid in sids:
+            await self._server.emit("view_progress", message, to=sid)
+
+    @staticmethod
+    def _consume_progress_future(future: Future[None]) -> None:
+        try:
+            future.result()
+        except Exception:
+            pass
+
     async def _emit_render_message(self, view_id: str, request: RenderRequest) -> bool:
         if self._server is None:
             return False
@@ -107,15 +123,29 @@ class ViewSocketHub:
         if not sids:
             return False
 
+        await self._emit_progress_message(view_id, sids, {"phase": "queued", "progressPercent": 2})
+        loop = asyncio.get_running_loop()
+
+        def progress_callback(payload: dict[str, object]) -> None:
+            if self._server is None:
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                self._emit_progress_message(view_id, sids, payload),
+                loop,
+            )
+            future.add_done_callback(self._consume_progress_future)
+
         result = await asyncio.to_thread(
             viewer_service.render_view_by_id,
             view_id,
             image_format=request.image_format,
             fast_preview=request.fast_preview,
+            progress_callback=progress_callback,
         )
         message = (result.meta.model_dump(by_alias=True), result.image_bytes)
         for sid in sids:
             await self._server.emit("image_update", message, to=sid)
+        await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
         return True
 
     async def _drain_render_requests(self, view_id: str, initial_request: RenderRequest) -> bool:

@@ -1,10 +1,15 @@
 import os
 import threading
 import time
+from io import BytesIO
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+import numpy as np
 from fastapi.testclient import TestClient
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
 from app.api.routes import pacs as pacs_route
 from app.main import fastapi_app
@@ -29,6 +34,80 @@ def _profile() -> PacsDicomwebProfile:
         qidoPath="/dicom-web",
         authType="none",
     )
+
+
+def _dicom_instance_bytes() -> bytes:
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    file_meta.ImplementationClassUID = generate_uid()
+
+    dataset = FileDataset("", {}, file_meta=file_meta, preamble=b"\0" * 128)
+    dataset.SOPClassUID = SecondaryCaptureImageStorage
+    dataset.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    dataset.StudyInstanceUID = generate_uid()
+    dataset.SeriesInstanceUID = generate_uid()
+    dataset.Modality = "OT"
+    dataset.Rows = 2
+    dataset.Columns = 2
+    dataset.SamplesPerPixel = 1
+    dataset.PhotometricInterpretation = "MONOCHROME2"
+    dataset.PixelRepresentation = 0
+    dataset.BitsStored = 16
+    dataset.BitsAllocated = 16
+    dataset.HighBit = 15
+    dataset.WindowWidth = 4
+    dataset.WindowCenter = 2
+    dataset.PixelData = np.array([[0, 1], [2, 3]], dtype=np.uint16).tobytes()
+
+    buffer = BytesIO()
+    dataset.save_as(buffer, enforce_file_format=True)
+    return buffer.getvalue()
+
+
+def test_qido_requests_ignore_system_proxy_environment(monkeypatch) -> None:
+    class QidoHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = (
+                b'[{"0020000D":{"vr":"UI","Value":["1.2.3"]},'
+                b'"00100010":{"vr":"PN","Value":[{"Alphabetic":"Proxy^Bypass"}]}}]'
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/dicom+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), QidoHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("NO_PROXY", "")
+
+        service = PacsDicomwebService()
+        profile = PacsDicomwebProfile(
+            id="local",
+            name="Local",
+            baseUrl=f"http://127.0.0.1:{server.server_address[1]}",
+            qidoPath="/dicom-web",
+            authType="none",
+        )
+
+        response = service.query_studies(PacsQidoStudyQueryRequest(profile=profile, limit=1))
+
+        assert response.items[0].study_instance_uid == "1.2.3"
+        assert response.items[0].patient_name == "Proxy^Bypass"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_qido_studies_maps_filters_and_dicom_json() -> None:
@@ -212,6 +291,46 @@ def test_series_preview_summarizes_instances_and_thumbnail() -> None:
     assert preview.transfer_syntaxes == ["1.2.840.10008.1.2.4.50"]
     assert preview.is_compressed is True
     assert preview.photometric_interpretations == ["MONOCHROME2"]
+    assert preview.thumbnail_src is not None
+    assert preview.thumbnail_src.startswith("data:image/png;base64,")
+
+
+def test_series_preview_falls_back_to_local_thumbnail_when_rendered_fails() -> None:
+    seen_paths: list[str] = []
+    dicom_bytes = _dicom_instance_bytes()
+    multipart_body = (
+        b"--dicom-boundary\r\n"
+        b"Content-Type: application/dicom\r\n\r\n"
+        + dicom_bytes
+        + b"\r\n--dicom-boundary--\r\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path.endswith("/rendered"):
+            return httpx.Response(400, text="Parameter out of range")
+        if request.url.path.endswith("/instances/1.2.840.1"):
+            return httpx.Response(
+                200,
+                headers={"content-type": 'multipart/related; type="application/dicom"; boundary="dicom-boundary"'},
+                content=multipart_body,
+            )
+        if request.url.path.endswith("/metadata"):
+            return httpx.Response(200, json=[{"00280004": {"vr": "CS", "Value": ["MONOCHROME2"]}}])
+        return httpx.Response(200, json=[{"00080018": {"vr": "UI", "Value": ["1.2.840.1"]}}])
+
+    service = PacsDicomwebService(transport=httpx.MockTransport(handler))
+    preview = service.preview_series(
+        PacsSeriesPreviewRequest(profile=_profile(), studyInstanceUid="1.2.3", seriesInstanceUid="4.5.6")
+    )
+
+    assert seen_paths == [
+        "/dicom-web/studies/1.2.3/series/4.5.6/instances",
+        "/dicom-web/studies/1.2.3/series/4.5.6/instances/1.2.840.1/metadata",
+        "/dicom-web/studies/1.2.3/series/4.5.6/instances/1.2.840.1/rendered",
+        "/dicom-web/studies/1.2.3/series/4.5.6/instances/1.2.840.1",
+    ]
+    assert preview.thumbnail_error is None
     assert preview.thumbnail_src is not None
     assert preview.thumbnail_src.startswith("data:image/png;base64,")
 

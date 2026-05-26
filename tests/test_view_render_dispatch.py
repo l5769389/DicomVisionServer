@@ -42,11 +42,11 @@ class _RenderServiceSpy:
     def _is_3d_view_type(self, view_type: str) -> bool:
         return view_type == "3D"
 
-    def _render_mpr_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool) -> str:
+    def _render_mpr_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, progress_callback=None) -> str:
         self.calls.append(("mpr", view.view_id, image_format, fast_preview))
         return "mpr-result"
 
-    def _render_3d_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool) -> str:
+    def _render_3d_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, progress_callback=None) -> str:
         self.calls.append(("3d", view.view_id, image_format, fast_preview))
         return "3d-result"
 

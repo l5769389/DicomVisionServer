@@ -7,6 +7,7 @@ from app.schemas.dicom import SeriesSummary
 
 DicomwebAuthType = Literal["none", "basic", "bearer"]
 DicomwebProfilePreset = Literal["orthanc", "dcm4chee", "custom"]
+DimseQueryModel = Literal["study-root", "patient-root"]
 PacsWadoDownloadJobState = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 
 
@@ -36,6 +37,62 @@ class PacsDicomwebTestResponse(BaseModel):
     ok: bool
     status_code: int | None = Field(default=None, alias="statusCode")
     message: str
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDimseProfile(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    port: int = Field(default=104, ge=1, le=65535)
+    called_ae_title: str = Field(default="ANY-SCP", alias="calledAeTitle", min_length=1, max_length=16)
+    client_ae_title: str = Field(default="DICOMVISION", alias="clientAeTitle", min_length=1, max_length=16)
+    query_model: DimseQueryModel = Field(default="study-root", alias="queryModel")
+    timeout_seconds: float = Field(default=8.0, ge=1.0, le=60.0, alias="timeoutSeconds")
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDimseTestRequest(BaseModel):
+    profile: PacsDimseProfile
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDimseStudyQueryRequest(BaseModel):
+    profile: PacsDimseProfile
+    study_instance_uid: str | None = Field(default=None, alias="studyInstanceUid")
+    patient_id: str | None = Field(default=None, alias="patientId")
+    patient_name: str | None = Field(default=None, alias="patientName")
+    accession_number: str | None = Field(default=None, alias="accessionNumber")
+    study_description: str | None = Field(default=None, alias="studyDescription")
+    study_date_from: str | None = Field(default=None, alias="studyDateFrom")
+    study_date_to: str | None = Field(default=None, alias="studyDateTo")
+    modality: str | None = None
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDimseSeriesQueryRequest(BaseModel):
+    profile: PacsDimseProfile
+    study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")
+    modality: str | None = None
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+    body_part_examined: str | None = Field(default=None, alias="bodyPartExamined")
+    limit: int = Field(default=100, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
+
+    model_config = {"populate_by_name": True}
+
+
+class PacsDimseSeriesDownloadRequest(BaseModel):
+    profile: PacsDimseProfile
+    study_instance_uid: str = Field(alias="studyInstanceUid", min_length=1)
+    series_instance_uid: str = Field(alias="seriesInstanceUid", min_length=1)
 
     model_config = {"populate_by_name": True}
 
@@ -160,3 +217,7 @@ class PacsWadoSeriesDownloadJobStatusResponse(BaseModel):
     completed_at: str | None = Field(default=None, alias="completedAt")
 
     model_config = {"populate_by_name": True}
+
+
+class PacsDimseSeriesDownloadJobStatusResponse(PacsWadoSeriesDownloadJobStatusResponse):
+    pass
