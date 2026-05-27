@@ -1,4 +1,5 @@
 import io
+from collections.abc import Iterable
 from pathlib import Path
 from threading import RLock
 from urllib.parse import quote
@@ -14,6 +15,7 @@ from app.models.viewer import InstanceRecord, SeriesRecord
 from app.schemas.dicom import LoadFolderRequest, LoadFolderResponse, SeriesSummary
 from app.services.dicom_cache import dicom_cache
 from app.services.dicom_compatibility import build_dicom_compatibility_issues
+from app.services.dicom_gsps_import_service import is_gsps_dataset, parse_gsps_dataset
 from app.services.four_d_service import four_d_service
 
 
@@ -155,7 +157,9 @@ class SeriesRegistry:
 
     @staticmethod
     def _is_readable_dicom(dataset) -> bool:
-        return bool(getattr(dataset, "SeriesInstanceUID", None) or "PixelData" in dataset)
+        if is_gsps_dataset(dataset):
+            return False
+        return bool("PixelData" in dataset or (getattr(dataset, "Rows", None) and getattr(dataset, "Columns", None)))
 
     def _resolve_existing_series_id(self, series_key: str, path: Path) -> str | None:
         return self._series_id_by_key.get(series_key) or self._series_id_by_instance_path.get(
@@ -245,13 +249,21 @@ class SeriesRegistry:
     def _collect_grouped_series(self, folder: Path, scan_paths: list[Path]) -> dict[str, SeriesRecord]:
         grouped: dict[str, SeriesRecord] = {}
         instance_keys_by_series_key: dict[str, set[str]] = {}
+        gsps_datasets: list[tuple[Path, object]] = []
 
         for path in scan_paths:
             if not path.is_file():
                 continue
 
             dataset = self._read_dataset_header(path)
-            if dataset is None or not self._is_readable_dicom(dataset):
+            if dataset is None:
+                continue
+
+            if is_gsps_dataset(dataset):
+                gsps_datasets.append((path, dataset))
+                continue
+
+            if not self._is_readable_dicom(dataset):
                 continue
 
             series_key, series = self._get_or_create_grouped_series(
@@ -275,7 +287,29 @@ class SeriesRegistry:
                 )
             )
 
+        self._attach_presentation_states(grouped.values(), gsps_datasets)
         return grouped
+
+    def _attach_presentation_states(
+        self,
+        series_records: Iterable[SeriesRecord],
+        gsps_datasets: list[tuple[Path, object]],
+    ) -> None:
+        series_by_sop_uid: dict[str, SeriesRecord] = {}
+        for series in series_records:
+            for instance in series.instances:
+                if instance.sop_instance_uid:
+                    series_by_sop_uid[str(instance.sop_instance_uid)] = series
+
+        for path, dataset in gsps_datasets:
+            for presentation_state in parse_gsps_dataset(dataset, path):
+                target_series = series_by_sop_uid.get(presentation_state.referenced_sop_instance_uid)
+                if target_series is None:
+                    continue
+                target_series.presentation_states_by_sop_uid.setdefault(
+                    presentation_state.referenced_sop_instance_uid,
+                    [],
+                ).append(presentation_state)
 
     def _index_series_instances(self, series: SeriesRecord) -> None:
         for instance in series.instances:

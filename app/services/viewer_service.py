@@ -54,6 +54,8 @@ from app.models.viewer import (
     MprMipViewportState,
     MprObliquePlaneState,
     MprRotationDragRecord,
+    PresentationAnnotationRecord,
+    PresentationMeasurementRecord,
     SeriesRecord,
     ViewGroupRecord,
     ViewRecord,
@@ -61,6 +63,7 @@ from app.models.viewer import (
 from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
     ImageFormat,
+    AnnotationOverlayPayload,
     MprCrosshairInfo,
     MprCursorInfo,
     MprFrameInfo,
@@ -798,7 +801,7 @@ class ViewerService:
 
     @staticmethod
     def _serialize_measurements(
-        measurements: tuple[MeasurementRecord, ...],
+        measurements: tuple[Any, ...],
         *,
         image_transform: Any,
         canvas_width: int,
@@ -826,6 +829,70 @@ class ViewerService:
                 labelLines=list(measurement.label_lines),
             )
             for measurement in measurements
+        ]
+
+    def _build_visible_presentation_measurements(
+        self,
+        series: SeriesRecord,
+        instance: InstanceRecord,
+    ) -> tuple[PresentationMeasurementRecord, ...]:
+        if not instance.sop_instance_uid:
+            return ()
+
+        presentation_states = series.presentation_states_by_sop_uid.get(str(instance.sop_instance_uid), [])
+        return tuple(
+            measurement
+            for presentation_state in presentation_states
+            for measurement in presentation_state.measurements
+        )
+
+    def _build_visible_presentation_annotations(
+        self,
+        series: SeriesRecord,
+        instance: InstanceRecord,
+    ) -> tuple[PresentationAnnotationRecord, ...]:
+        if not instance.sop_instance_uid:
+            return ()
+
+        presentation_states = series.presentation_states_by_sop_uid.get(str(instance.sop_instance_uid), [])
+        return tuple(
+            annotation
+            for presentation_state in presentation_states
+            for annotation in presentation_state.annotations
+        )
+
+    @staticmethod
+    def _serialize_annotations(
+        annotations: tuple[PresentationAnnotationRecord, ...],
+        *,
+        image_transform: Any,
+        canvas_width: int,
+        canvas_height: int,
+    ) -> list[AnnotationOverlayPayload]:
+        if canvas_width <= 0 or canvas_height <= 0:
+            return []
+
+        matrix = image_transform.matrix
+        width = max(float(canvas_width), 1.0)
+        height = max(float(canvas_height), 1.0)
+
+        def serialize_point(point: MeasurementPoint) -> dict[str, float]:
+            projected = matrix @ np.asarray([point.x, point.y, 1.0], dtype=np.float64)
+            return {
+                "x": max(0.0, min(1.0, float(projected[0]) / width)),
+                "y": max(0.0, min(1.0, float(projected[1]) / height)),
+            }
+
+        return [
+            AnnotationOverlayPayload(
+                annotationId=annotation.annotation_id,
+                toolType=annotation.tool_type,
+                points=[serialize_point(point) for point in annotation.points],
+                text=annotation.text,
+                color=annotation.color,
+                size=annotation.size,
+            )
+            for annotation in annotations
         ]
 
     def _resolve_current_measurement_slice_index(self, view: ViewRecord) -> int:
@@ -1334,6 +1401,8 @@ class ViewerService:
             orientation=None,
         )
         visible_measurements = self._build_visible_measurements(view)
+        visible_presentation_measurements = self._build_visible_presentation_measurements(series, instance)
+        visible_presentation_annotations = self._build_visible_presentation_annotations(series, instance)
 
         if fast_preview:
             image = self._render_fast_preview(context)
@@ -1366,7 +1435,13 @@ class ViewerService:
                 scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
-                    visible_measurements,
+                    (*visible_measurements, *visible_presentation_measurements),
+                    image_transform=image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
+                annotations=self._serialize_annotations(
+                    visible_presentation_annotations,
                     image_transform=image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,

@@ -2,7 +2,7 @@
 from pathlib import Path
 
 
-from app.models.measurement import MeasurementRecord
+from app.models.measurement import MeasurementPoint, MeasurementRecord
 
 
 Quaternion = tuple[float, float, float, float]
@@ -33,6 +33,33 @@ class InstanceRecord:
     number_of_frames: int | None = None
 
 
+@dataclass(frozen=True)
+class PresentationMeasurementRecord:
+    measurement_id: str
+    tool_type: str
+    points: tuple[MeasurementPoint, ...]
+    label_lines: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class PresentationAnnotationRecord:
+    annotation_id: str
+    tool_type: str
+    points: tuple[MeasurementPoint, ...]
+    text: str = ""
+    color: str = "#ffd166"
+    size: str = "md"
+
+
+@dataclass(frozen=True)
+class PresentationStateRecord:
+    path: Path
+    sop_instance_uid: str | None
+    referenced_sop_instance_uid: str
+    measurements: tuple[PresentationMeasurementRecord, ...] = field(default_factory=tuple)
+    annotations: tuple[PresentationAnnotationRecord, ...] = field(default_factory=tuple)
+
+
 @dataclass
 class SeriesRecord:
     series_id: str
@@ -52,6 +79,7 @@ class SeriesRecord:
     four_d_phase_label_value: str | None = None
     four_d_phase_source: str | None = None
     instances: list[InstanceRecord] = field(default_factory=list)
+    presentation_states_by_sop_uid: dict[str, list[PresentationStateRecord]] = field(default_factory=dict)
 
 
 @dataclass

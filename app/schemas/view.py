@@ -266,6 +266,7 @@ class ViewImageResponse(BaseModel):
     scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
     measurements: list["MeasurementOverlayPayload"] = Field(default_factory=list)
+    annotations: list["AnnotationOverlayPayload"] = Field(default_factory=list)
     orientation: OrientationInfo | None = None
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
@@ -302,6 +303,17 @@ class MeasurementOverlayPayload(BaseModel):
     tool_type: str = Field(alias="toolType")
     points: list[MeasurementPointPayload]
     label_lines: list[str] = Field(alias="labelLines", default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class AnnotationOverlayPayload(BaseModel):
+    annotation_id: str = Field(alias="annotationId")
+    tool_type: str = Field(alias="toolType")
+    points: list[MeasurementPointPayload]
+    text: str = ""
+    color: str = "#ffd166"
+    size: str = "md"
 
     model_config = {"populate_by_name": True}
 
