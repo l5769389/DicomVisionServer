@@ -118,7 +118,7 @@ def analyze_qa_water(payload: ViewQaWaterAnalyzeRequest) -> ViewQaWaterAnalyzeRe
 @router.post(
     "/export",
     summary="Export current view",
-    description="Renders the current view state as PNG/DICOM Secondary Capture, or exports measurements as a DICOM SR attachment.",
+    description="Renders the current view state as PNG/DICOM Secondary Capture, or exports overlays as DICOM SR/GSPS attachments.",
 )
 def export_view(payload: ViewExportRequest) -> Response:
     """Render and package the current view for download/export."""

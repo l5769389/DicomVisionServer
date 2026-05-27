@@ -120,6 +120,7 @@ from app.services.mpr import (
     world_to_ijk_point,
 )
 from app.services import mpr_geometry
+from app.services.dicom_gsps_export_service import build_gsps_dicom_bytes
 from app.services.dicom_sr_export_service import build_measurement_sr_dicom_bytes
 from app.services.mpr_geometry import VolumePatientTransform
 from app.services.mtf_analysis_service import MtfAnalysisService
@@ -261,6 +262,15 @@ class ViewerService:
             return ExportedFileResult(
                 file_bytes=dicom_sr_bytes,
                 file_name=f"{view.view_id}-{safe_view_type}-measurements-sr.dcm",
+                media_type="application/dicom",
+            )
+
+        if export_format == "dicom-gsps":
+            reference_dataset = self._get_export_reference_dataset(view)
+            gsps_bytes = build_gsps_dicom_bytes(view, overlays, reference_dataset)
+            return ExportedFileResult(
+                file_bytes=gsps_bytes,
+                file_name=f"{view.view_id}-{safe_view_type}-presentation-state.dcm",
                 media_type="application/dicom",
             )
 
