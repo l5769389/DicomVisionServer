@@ -73,6 +73,9 @@ class SeriesRecord:
     accession_number: str | None
     modality: str | None
     series_description: str | None
+    is_image_series: bool = True
+    standard_object_type: str | None = None
+    preferred_view_type: str | None = None
     is_virtual: bool = False
     source_series_id: str | None = None
     four_d_phase_sort_value: float | None = None

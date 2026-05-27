@@ -9,6 +9,16 @@ import numpy as np
 import pydicom
 from fastapi import HTTPException
 from PIL import Image, ImageOps
+from pydicom.uid import (
+    BasicTextSRStorage,
+    Comprehensive3DSRStorage,
+    ComprehensiveSRStorage,
+    EnhancedSRStorage,
+    ExtensibleSRStorage,
+    KeyObjectSelectionDocumentStorage,
+    MammographyCADSRStorage,
+    ProcedureLogStorage,
+)
 
 from app.core.logging import get_logger
 from app.models.viewer import InstanceRecord, SeriesRecord
@@ -21,6 +31,16 @@ from app.services.four_d_service import four_d_service
 
 logger = get_logger(__name__)
 SERIES_THUMBNAIL_SIZE = (96, 96)
+DICOM_SR_SOP_CLASS_UIDS = {
+    str(BasicTextSRStorage),
+    str(EnhancedSRStorage),
+    str(ComprehensiveSRStorage),
+    str(Comprehensive3DSRStorage),
+    str(ExtensibleSRStorage),
+    str(ProcedureLogStorage),
+    str(MammographyCADSRStorage),
+    str(KeyObjectSelectionDocumentStorage),
+}
 
 
 class SeriesRegistry:
@@ -156,8 +176,14 @@ class SeriesRegistry:
         )
 
     @staticmethod
-    def _is_readable_dicom(dataset) -> bool:
-        if is_gsps_dataset(dataset):
+    def _is_sr_dataset(dataset) -> bool:
+        sop_class_uid = str(getattr(dataset, "SOPClassUID", "") or "").strip()
+        modality = str(getattr(dataset, "Modality", "") or "").strip().upper()
+        return sop_class_uid in DICOM_SR_SOP_CLASS_UIDS or modality == "SR"
+
+    @classmethod
+    def _is_readable_dicom(cls, dataset) -> bool:
+        if is_gsps_dataset(dataset) or cls._is_sr_dataset(dataset):
             return False
         return bool("PixelData" in dataset or (getattr(dataset, "Rows", None) and getattr(dataset, "Columns", None)))
 
@@ -194,6 +220,42 @@ class SeriesRegistry:
             accession_number=self._safe_header_text(getattr(dataset, "AccessionNumber", None)),
             modality=self._safe_header_text(getattr(dataset, "Modality", None)),
             series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None)),
+        )
+        grouped[series_key] = series
+        instance_keys_by_series_key[series_key] = set()
+        return (series_key, series)
+
+    def _get_or_create_grouped_sr_series(
+        self,
+        *,
+        grouped: dict[str, SeriesRecord],
+        instance_keys_by_series_key: dict[str, set[str]],
+        folder: Path,
+        path: Path,
+        dataset,
+    ) -> tuple[str, SeriesRecord]:
+        series_instance_uid = getattr(dataset, "SeriesInstanceUID", None)
+        series_key = self._build_series_key(folder, series_instance_uid, path, dataset)
+        series = grouped.get(series_key)
+        if series is not None:
+            return (series_key, series)
+
+        existing_series_id = self._resolve_existing_series_id(series_key, path)
+        series = SeriesRecord(
+            series_id=existing_series_id or str(uuid4()),
+            folder_path=str(folder),
+            series_instance_uid=series_instance_uid,
+            study_instance_uid=self._safe_header_text(getattr(dataset, "StudyInstanceUID", None)),
+            patient_id=self._safe_header_text(getattr(dataset, "PatientID", None)),
+            patient_name=self._safe_header_text(getattr(dataset, "PatientName", None)),
+            study_date=self._safe_header_text(getattr(dataset, "StudyDate", None)),
+            study_description=self._safe_header_text(getattr(dataset, "StudyDescription", None)),
+            accession_number=self._safe_header_text(getattr(dataset, "AccessionNumber", None)),
+            modality=self._safe_header_text(getattr(dataset, "Modality", None)) or "SR",
+            series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None)) or "DICOM SR",
+            is_image_series=False,
+            standard_object_type="DICOM_SR",
+            preferred_view_type="Tag",
         )
         grouped[series_key] = series
         instance_keys_by_series_key[series_key] = set()
@@ -261,6 +323,27 @@ class SeriesRegistry:
 
             if is_gsps_dataset(dataset):
                 gsps_datasets.append((path, dataset))
+                continue
+
+            if self._is_sr_dataset(dataset):
+                series_key, series = self._get_or_create_grouped_sr_series(
+                    grouped=grouped,
+                    instance_keys_by_series_key=instance_keys_by_series_key,
+                    folder=folder,
+                    path=path,
+                    dataset=dataset,
+                )
+                instance_key = self._build_series_instance_key(path, dataset)
+                if instance_key in instance_keys_by_series_key[series_key]:
+                    continue
+                instance_keys_by_series_key[series_key].add(instance_key)
+                series.instances.append(
+                    self._build_instance_record(
+                        path,
+                        dataset,
+                        len(series.instances) + 1,
+                    )
+                )
                 continue
 
             if not self._is_readable_dicom(dataset):
@@ -337,9 +420,12 @@ class SeriesRegistry:
             width=first.columns,
             height=first.rows,
             thumbnailSrc="",
-            thumbnailUrl=self._build_series_thumbnail_url(series.series_id),
+            thumbnailUrl=self._build_series_thumbnail_url(series.series_id) if series.is_image_series else "",
             folderPath=series.folder_path,
-            compatibilityIssues=build_dicom_compatibility_issues(series),
+            isImageSeries=series.is_image_series,
+            standardObjectType=series.standard_object_type,
+            preferredViewType=series.preferred_view_type,
+            compatibilityIssues=build_dicom_compatibility_issues(series) if series.is_image_series else [],
         )
 
     @staticmethod
@@ -355,7 +441,7 @@ class SeriesRegistry:
         return thumbnail
 
     def _build_series_thumbnail_png(self, series: SeriesRecord) -> bytes | None:
-        if not series.instances:
+        if not series.is_image_series or not series.instances:
             return None
 
         thumbnail_instance = series.instances[len(series.instances) // 2]
@@ -475,7 +561,7 @@ class SeriesRegistry:
 
             series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
             self._apply_loaded_four_d_metadata(series_list)
-            series_list.sort(key=lambda item: item.series_id)
+            series_list.sort(key=lambda item: (not item.is_image_series, item.series_id))
             return LoadFolderResponse(seriesId=series_list[0].series_id, seriesList=series_list)
 
     def get(self, series_id: str) -> SeriesRecord:
