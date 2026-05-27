@@ -1,12 +1,14 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
+from fastapi import HTTPException
 from pydicom import dcmread
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
 from app.models.viewer import ViewRecord
-from app.schemas.dicom import LoadFolderRequest
+from app.schemas.dicom import DicomTagsRequest, LoadFolderRequest
 from app.schemas.view import (
     ViewExportMeasurementOverlayPayload,
     ViewExportOverlaysPayload,
@@ -15,6 +17,7 @@ from app.schemas.view import (
 from app.services.dicom_cache import dicom_cache
 from app.services.dicom_gsps_export_service import build_gsps_dicom_bytes
 from app.services.dicom_gsps_import_service import is_gsps_dataset, parse_gsps_dataset
+from app.services.dicom_tag_service import dicom_tag_service
 from app.services.series_registry import series_registry
 
 
@@ -96,3 +99,35 @@ def test_load_folder_attaches_gsps_to_source_series_without_extra_series(tmp_pat
     states = series.presentation_states_by_sop_uid[source_dataset.SOPInstanceUID]
     assert len(states) == 1
     assert states[0].measurements[0].label_lines == ("210.2 mm",)
+
+
+def test_load_folder_registers_unattached_gsps_as_dicom_document_series(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    try:
+        source_path = tmp_path / "source.dcm"
+        source_dataset = _create_test_dicom(source_path)
+        source_path.unlink()
+        _create_gsps(tmp_path / "source-presentation-state.dcm", source_dataset)
+
+        load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+
+        assert len(load_response.series_list) == 1
+        summary = load_response.series_list[0]
+        assert summary.modality == "PR"
+        assert summary.is_image_series is False
+        assert summary.standard_object_type == "DICOM_GSPS"
+        assert summary.preferred_view_type == "Tag"
+        assert summary.instance_count == 1
+        assert summary.thumbnail_url == ""
+
+        tags = dicom_tag_service.get_series_tags(DicomTagsRequest(seriesId=summary.series_id, index=0))
+        assert tags.total == 1
+        assert any(item.keyword == "GraphicAnnotationSequence" for item in tags.items)
+
+        with pytest.raises(HTTPException) as exc_info:
+            series_registry.get_series_thumbnail_png(summary.series_id)
+        assert exc_info.value.status_code == 404
+    finally:
+        series_registry.clear()
+        dicom_cache.clear()

@@ -225,7 +225,7 @@ class SeriesRegistry:
         instance_keys_by_series_key[series_key] = set()
         return (series_key, series)
 
-    def _get_or_create_grouped_sr_series(
+    def _get_or_create_grouped_document_series(
         self,
         *,
         grouped: dict[str, SeriesRecord],
@@ -233,6 +233,9 @@ class SeriesRegistry:
         folder: Path,
         path: Path,
         dataset,
+        fallback_modality: str,
+        fallback_series_description: str,
+        standard_object_type: str,
     ) -> tuple[str, SeriesRecord]:
         series_instance_uid = getattr(dataset, "SeriesInstanceUID", None)
         series_key = self._build_series_key(folder, series_instance_uid, path, dataset)
@@ -251,15 +254,37 @@ class SeriesRegistry:
             study_date=self._safe_header_text(getattr(dataset, "StudyDate", None)),
             study_description=self._safe_header_text(getattr(dataset, "StudyDescription", None)),
             accession_number=self._safe_header_text(getattr(dataset, "AccessionNumber", None)),
-            modality=self._safe_header_text(getattr(dataset, "Modality", None)) or "SR",
-            series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None)) or "DICOM SR",
+            modality=self._safe_header_text(getattr(dataset, "Modality", None)) or fallback_modality,
+            series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None))
+            or fallback_series_description,
             is_image_series=False,
-            standard_object_type="DICOM_SR",
+            standard_object_type=standard_object_type,
             preferred_view_type="Tag",
         )
         grouped[series_key] = series
         instance_keys_by_series_key[series_key] = set()
         return (series_key, series)
+
+    def _add_instance_to_grouped_series(
+        self,
+        *,
+        series_key: str,
+        series: SeriesRecord,
+        instance_keys_by_series_key: dict[str, set[str]],
+        path: Path,
+        dataset,
+    ) -> None:
+        instance_key = self._build_series_instance_key(path, dataset)
+        if instance_key in instance_keys_by_series_key[series_key]:
+            return
+        instance_keys_by_series_key[series_key].add(instance_key)
+        series.instances.append(
+            self._build_instance_record(
+                path,
+                dataset,
+                len(series.instances) + 1,
+            )
+        )
 
     @staticmethod
     def _build_instance_record(path: Path, dataset, default_instance_number: int) -> InstanceRecord:
@@ -326,23 +351,22 @@ class SeriesRegistry:
                 continue
 
             if self._is_sr_dataset(dataset):
-                series_key, series = self._get_or_create_grouped_sr_series(
+                series_key, series = self._get_or_create_grouped_document_series(
                     grouped=grouped,
                     instance_keys_by_series_key=instance_keys_by_series_key,
                     folder=folder,
                     path=path,
                     dataset=dataset,
+                    fallback_modality="SR",
+                    fallback_series_description="DICOM SR",
+                    standard_object_type="DICOM_SR",
                 )
-                instance_key = self._build_series_instance_key(path, dataset)
-                if instance_key in instance_keys_by_series_key[series_key]:
-                    continue
-                instance_keys_by_series_key[series_key].add(instance_key)
-                series.instances.append(
-                    self._build_instance_record(
-                        path,
-                        dataset,
-                        len(series.instances) + 1,
-                    )
+                self._add_instance_to_grouped_series(
+                    series_key=series_key,
+                    series=series,
+                    instance_keys_by_series_key=instance_keys_by_series_key,
+                    path=path,
+                    dataset=dataset,
                 )
                 continue
 
@@ -357,42 +381,80 @@ class SeriesRegistry:
                 dataset=dataset,
             )
 
-            instance_key = self._build_series_instance_key(path, dataset)
-            if instance_key in instance_keys_by_series_key[series_key]:
-                continue
-            instance_keys_by_series_key[series_key].add(instance_key)
-
-            series.instances.append(
-                self._build_instance_record(
-                    path,
-                    dataset,
-                    len(series.instances) + 1,
-                )
+            self._add_instance_to_grouped_series(
+                series_key=series_key,
+                series=series,
+                instance_keys_by_series_key=instance_keys_by_series_key,
+                path=path,
+                dataset=dataset,
             )
 
-        self._attach_presentation_states(grouped.values(), gsps_datasets)
+        attached_gsps_paths = self._attach_presentation_states(grouped.values(), gsps_datasets)
+        self._register_unattached_gsps_documents(
+            grouped=grouped,
+            instance_keys_by_series_key=instance_keys_by_series_key,
+            folder=folder,
+            gsps_datasets=gsps_datasets,
+            attached_gsps_paths=attached_gsps_paths,
+        )
         return grouped
 
     def _attach_presentation_states(
         self,
         series_records: Iterable[SeriesRecord],
         gsps_datasets: list[tuple[Path, object]],
-    ) -> None:
+    ) -> set[Path]:
         series_by_sop_uid: dict[str, SeriesRecord] = {}
         for series in series_records:
+            if not series.is_image_series:
+                continue
             for instance in series.instances:
                 if instance.sop_instance_uid:
                     series_by_sop_uid[str(instance.sop_instance_uid)] = series
 
+        attached_paths: set[Path] = set()
         for path, dataset in gsps_datasets:
             for presentation_state in parse_gsps_dataset(dataset, path):
                 target_series = series_by_sop_uid.get(presentation_state.referenced_sop_instance_uid)
                 if target_series is None:
                     continue
+                attached_paths.add(path)
                 target_series.presentation_states_by_sop_uid.setdefault(
                     presentation_state.referenced_sop_instance_uid,
                     [],
                 ).append(presentation_state)
+        return attached_paths
+
+    def _register_unattached_gsps_documents(
+        self,
+        *,
+        grouped: dict[str, SeriesRecord],
+        instance_keys_by_series_key: dict[str, set[str]],
+        folder: Path,
+        gsps_datasets: list[tuple[Path, object]],
+        attached_gsps_paths: set[Path],
+    ) -> None:
+        for path, dataset in gsps_datasets:
+            if path in attached_gsps_paths:
+                continue
+
+            series_key, series = self._get_or_create_grouped_document_series(
+                grouped=grouped,
+                instance_keys_by_series_key=instance_keys_by_series_key,
+                folder=folder,
+                path=path,
+                dataset=dataset,
+                fallback_modality="PR",
+                fallback_series_description="DICOM GSPS",
+                standard_object_type="DICOM_GSPS",
+            )
+            self._add_instance_to_grouped_series(
+                series_key=series_key,
+                series=series,
+                instance_keys_by_series_key=instance_keys_by_series_key,
+                path=path,
+                dataset=dataset,
+            )
 
     def _index_series_instances(self, series: SeriesRecord) -> None:
         for instance in series.instances:
