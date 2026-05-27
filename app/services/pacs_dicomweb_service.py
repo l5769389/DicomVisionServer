@@ -29,6 +29,28 @@ DICOMWEB_ACCEPT_HEADER = "application/dicom+json, application/json"
 DICOMWEB_DICOM_ACCEPT_HEADER = 'application/dicom, multipart/related; type="application/dicom"'
 DICOMWEB_RENDERED_ACCEPT_HEADER = "image/png, image/jpeg;q=0.9, image/*;q=0.8"
 PACS_THUMBNAIL_SIZE = (192, 192)
+TAG_TRANSFER_SYNTAX_UID = "00020010"
+TAG_SOP_INSTANCE_UID = "00080018"
+TAG_MODALITY = "00080060"
+TAG_MODALITIES_IN_STUDY = "00080061"
+TAG_STUDY_DATE = "00080020"
+TAG_STUDY_TIME = "00080030"
+TAG_ACCESSION_NUMBER = "00080050"
+TAG_STUDY_DESCRIPTION = "00081030"
+TAG_SERIES_DESCRIPTION = "0008103E"
+TAG_PATIENT_NAME = "00100010"
+TAG_PATIENT_ID = "00100020"
+TAG_BODY_PART_EXAMINED = "00180015"
+TAG_STUDY_INSTANCE_UID = "0020000D"
+TAG_SERIES_INSTANCE_UID = "0020000E"
+TAG_SERIES_NUMBER = "00200011"
+TAG_STUDY_RELATED_SERIES = "00201206"
+TAG_STUDY_RELATED_INSTANCES = "00201208"
+TAG_SERIES_RELATED_INSTANCES = "00201209"
+TAG_NUMBER_OF_FRAMES = "00280008"
+TAG_ROWS = "00280010"
+TAG_COLUMNS = "00280011"
+TAG_PHOTOMETRIC_INTERPRETATION = "00280004"
 
 
 class PacsDicomwebError(RuntimeError):
@@ -73,7 +95,7 @@ class PacsDicomwebService:
             series_instance_uid=payload.series_instance_uid,
         )
         first_record = records[0] if records else {}
-        sop_instance_uid = self._value(first_record, "00080018")
+        sop_instance_uid = self._value(first_record, TAG_SOP_INSTANCE_UID)
         metadata_record: dict[str, Any] = {}
         if sop_instance_uid:
             try:
@@ -88,10 +110,10 @@ class PacsDicomwebService:
 
         summary_record = {**first_record, **metadata_record}
         summary_records = records + ([metadata_record] if metadata_record else [])
-        frame_counts = [frame_count for record in summary_records if (frame_count := self._int_value(record, "00280008")) is not None]
+        frame_counts = [frame_count for record in summary_records if (frame_count := self._int_value(record, TAG_NUMBER_OF_FRAMES)) is not None]
         number_of_frames = max(frame_counts) if frame_counts else None
-        transfer_syntaxes = self._unique_values(summary_records, "00020010")
-        photometric_interpretations = self._unique_values(summary_records, "00280004")
+        transfer_syntaxes = self._unique_values(summary_records, TAG_TRANSFER_SYNTAX_UID)
+        photometric_interpretations = self._unique_values(summary_records, TAG_PHOTOMETRIC_INTERPRETATION)
         thumbnail_src: str | None = None
         thumbnail_error: str | None = None
 
@@ -113,8 +135,8 @@ class PacsDicomwebService:
             studyInstanceUid=payload.study_instance_uid,
             seriesInstanceUid=payload.series_instance_uid,
             instanceCount=len(records),
-            rows=self._int_value(summary_record, "00280010"),
-            columns=self._int_value(summary_record, "00280011"),
+            rows=self._int_value(summary_record, TAG_ROWS),
+            columns=self._int_value(summary_record, TAG_COLUMNS),
             numberOfFrames=number_of_frames,
             hasMultiFrameInstances=any(frame_count > 1 for frame_count in frame_counts),
             transferSyntaxes=transfer_syntaxes,
@@ -137,7 +159,7 @@ class PacsDicomwebService:
             study_instance_uid=study_instance_uid,
             series_instance_uid=series_instance_uid,
         )
-        return [uid for record in records if (uid := self._value(record, "00080018"))]
+        return [uid for record in records if (uid := self._value(record, TAG_SOP_INSTANCE_UID))]
 
     def query_instance_records(
         self,
@@ -348,29 +370,29 @@ class PacsDicomwebService:
     @staticmethod
     def _parse_study(record: dict[str, Any]) -> PacsStudyItem:
         return PacsStudyItem(
-            studyInstanceUid=PacsDicomwebService._value(record, "0020000D") or "",
-            patientName=PacsDicomwebService._value(record, "00100010"),
-            patientId=PacsDicomwebService._value(record, "00100020"),
-            studyDate=PacsDicomwebService._value(record, "00080020"),
-            studyTime=PacsDicomwebService._value(record, "00080030"),
-            accessionNumber=PacsDicomwebService._value(record, "00080050"),
-            studyDescription=PacsDicomwebService._value(record, "00081030"),
-            modalitiesInStudy=PacsDicomwebService._values(record, "00080061"),
-            numberOfStudyRelatedSeries=PacsDicomwebService._int_value(record, "00201206"),
-            numberOfStudyRelatedInstances=PacsDicomwebService._int_value(record, "00201208"),
+            studyInstanceUid=PacsDicomwebService._value(record, TAG_STUDY_INSTANCE_UID) or "",
+            patientName=PacsDicomwebService._value(record, TAG_PATIENT_NAME),
+            patientId=PacsDicomwebService._value(record, TAG_PATIENT_ID),
+            studyDate=PacsDicomwebService._value(record, TAG_STUDY_DATE),
+            studyTime=PacsDicomwebService._value(record, TAG_STUDY_TIME),
+            accessionNumber=PacsDicomwebService._value(record, TAG_ACCESSION_NUMBER),
+            studyDescription=PacsDicomwebService._value(record, TAG_STUDY_DESCRIPTION),
+            modalitiesInStudy=PacsDicomwebService._values(record, TAG_MODALITIES_IN_STUDY),
+            numberOfStudyRelatedSeries=PacsDicomwebService._int_value(record, TAG_STUDY_RELATED_SERIES),
+            numberOfStudyRelatedInstances=PacsDicomwebService._int_value(record, TAG_STUDY_RELATED_INSTANCES),
             raw=record,
         )
 
     @staticmethod
     def _parse_series(record: dict[str, Any], fallback_study_uid: str) -> PacsSeriesItem:
         return PacsSeriesItem(
-            studyInstanceUid=PacsDicomwebService._value(record, "0020000D") or fallback_study_uid,
-            seriesInstanceUid=PacsDicomwebService._value(record, "0020000E") or "",
-            seriesNumber=PacsDicomwebService._value(record, "00200011"),
-            modality=PacsDicomwebService._value(record, "00080060"),
-            seriesDescription=PacsDicomwebService._value(record, "0008103E"),
-            bodyPartExamined=PacsDicomwebService._value(record, "00180015"),
-            numberOfSeriesRelatedInstances=PacsDicomwebService._int_value(record, "00201209"),
+            studyInstanceUid=PacsDicomwebService._value(record, TAG_STUDY_INSTANCE_UID) or fallback_study_uid,
+            seriesInstanceUid=PacsDicomwebService._value(record, TAG_SERIES_INSTANCE_UID) or "",
+            seriesNumber=PacsDicomwebService._value(record, TAG_SERIES_NUMBER),
+            modality=PacsDicomwebService._value(record, TAG_MODALITY),
+            seriesDescription=PacsDicomwebService._value(record, TAG_SERIES_DESCRIPTION),
+            bodyPartExamined=PacsDicomwebService._value(record, TAG_BODY_PART_EXAMINED),
+            numberOfSeriesRelatedInstances=PacsDicomwebService._int_value(record, TAG_SERIES_RELATED_INSTANCES),
             raw=record,
         )
 
