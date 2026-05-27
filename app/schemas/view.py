@@ -7,7 +7,7 @@ from app.schemas.dicom import CornerInfoPayload
 
 ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
-ExportFormat = Literal["png", "dicom"]
+ExportFormat = Literal["png", "dicom", "dicom-sr"]
 ViewSetSizeOperationType = Literal["setSize"]
 ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "mprOblique", "mprStateSync", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
@@ -169,7 +169,7 @@ class ViewExportOverlaysPayload(BaseModel):
 
 class ViewExportRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="Server-side view ID to render for export.")
-    export_format: ExportFormat = Field(alias="exportFormat", description="Export container format: png or dicom.")
+    export_format: ExportFormat = Field(alias="exportFormat", description="Export container format: png, dicom, or dicom-sr.")
     overlays: ViewExportOverlaysPayload = Field(
         default_factory=ViewExportOverlaysPayload,
         description="Frontend overlay geometry to burn into the exported image.",

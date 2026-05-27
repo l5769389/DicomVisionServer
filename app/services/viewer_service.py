@@ -120,6 +120,7 @@ from app.services.mpr import (
     world_to_ijk_point,
 )
 from app.services import mpr_geometry
+from app.services.dicom_sr_export_service import build_measurement_sr_dicom_bytes
 from app.services.mpr_geometry import VolumePatientTransform
 from app.services.mtf_analysis_service import MtfAnalysisService
 from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor, normalize_pseudocolor_preset
@@ -253,6 +254,15 @@ class ViewerService:
     ) -> ExportedFileResult:
         view = view_registry.get(view_id)
         safe_view_type = str(view.view_type or "view").lower()
+
+        if export_format == "dicom-sr":
+            reference_dataset = self._get_export_reference_dataset(view)
+            dicom_sr_bytes = build_measurement_sr_dicom_bytes(view, overlays, reference_dataset)
+            return ExportedFileResult(
+                file_bytes=dicom_sr_bytes,
+                file_name=f"{view.view_id}-{safe_view_type}-measurements-sr.dcm",
+                media_type="application/dicom",
+            )
 
         if export_format == "png":
             rendered = self._render_by_view_type(view, image_format="png", fast_preview=False)
