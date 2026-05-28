@@ -2,7 +2,7 @@ FROM python:3.13-slim
 
 ARG DEBIAN_MIRROR=http://mirrors.jdcloudcs.com/debian
 ARG DEBIAN_SECURITY_MIRROR=http://mirrors.jdcloudcs.com/debian-security
-ARG PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
