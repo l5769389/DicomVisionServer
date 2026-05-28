@@ -1,8 +1,13 @@
 FROM python:3.13-slim
 
+ARG DEBIAN_MIRROR=http://mirrors.jdcloudcs.com/debian
+ARG DEBIAN_SECURITY_MIRROR=http://mirrors.jdcloudcs.com/debian-security
+ARG PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_INDEX_URL=${PYPI_INDEX_URL} \
     PATH="/opt/venv/bin:${PATH}" \
     APP_ENV=production \
     APP_HOST=0.0.0.0 \
@@ -10,7 +15,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN sed -i \
+      -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+      -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+      /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
       libegl1 \
@@ -24,7 +33,7 @@ RUN apt-get update \
       libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv
+RUN pip install --no-cache-dir -i "${PYPI_INDEX_URL}" uv
 
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-dev --no-cache --compile-bytecode
