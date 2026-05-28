@@ -23,11 +23,11 @@ RUN sed -i \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
       libegl1 \
-      libext6 \
       libgl1 \
       libglib2.0-0 \
       libgomp1 \
       libsm6 \
+      libxt6 \
       libx11-6 \
       libxext6 \
       libxrender1 \
