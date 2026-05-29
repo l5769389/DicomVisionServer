@@ -161,10 +161,13 @@ APP_ENV=development
 APP_HOST=0.0.0.0
 APP_PORT=8000
 CORS_ORIGINS=["*"]
+EXPOSE_API_DOCS=
 WEB_SAMPLE_DICOM_PATH=
 WEB_UPLOAD_DICOM_ROOT=
 WEB_UPLOAD_MAX_FILES=5000
 WEB_UPLOAD_MAX_BYTES=2147483648
+WEB_UPLOAD_MAX_AGE_SECONDS=1800
+WEB_UPLOAD_CLEANUP_INTERVAL_SECONDS=1800
 ```
 
 Key settings:
@@ -173,9 +176,12 @@ Key settings:
 - `APP_HOST`: bind host.
 - `APP_PORT`: listening port, default `8000`.
 - `CORS_ORIGINS`: allowed frontend origins for HTTP and Socket.IO.
+- `EXPOSE_API_DOCS`: set to `false` to hide `/docs`, `/redoc`, and `/openapi.json`; by default docs are hidden in production and exposed in development.
 - `WEB_SAMPLE_DICOM_PATH`: server-side sample DICOM directory used by `POST /api/v1/dicom/loadSample`.
 - `WEB_UPLOAD_DICOM_ROOT`: optional temporary storage root for browser-uploaded DICOM files.
 - `WEB_UPLOAD_MAX_FILES` / `WEB_UPLOAD_MAX_BYTES`: upload limits for real web deployments.
+- `WEB_UPLOAD_MAX_AGE_SECONDS`: maximum age for browser upload sessions before cleanup, default `1800`.
+- `WEB_UPLOAD_CLEANUP_INTERVAL_SECONDS`: background upload cleanup interval, default `1800`.
 
 ## HTTP API
 
