@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL
+from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
 from app.models.viewer import MprFrameState, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
 from app.services.render_layers.render_context import MprCrosshairOverlay
@@ -19,6 +19,7 @@ from app.services.mpr import (
     ijk_to_world_point,
     legacy_frame_to_cursor,
     reslice_plane,
+    world_to_ijk_point,
 )
 from app.services.mpr_geometry import VolumePatientTransform
 from app.services.viewer_service import ViewerService
@@ -258,6 +259,43 @@ def test_mpr_model_rotation_uses_fixed_pivot_when_crosshair_center_moves() -> No
 
     assert not np.allclose(next_center_world, active_plane.cursor_center_world, atol=1e-6)
     assert np.allclose(rotated_after, rotated_before, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("view_type", "expected_viewport", "expected_center"),
+    [
+        ("AX", MPR_VIEWPORT_AXIAL, (3.0, 3.0, 3.0)),
+        ("COR", MPR_VIEWPORT_CORONAL, (2.0, 4.0, 3.0)),
+        ("SAG", MPR_VIEWPORT_SAGITTAL, (2.0, 3.0, 4.0)),
+    ],
+)
+def test_mpr_scroll_moves_crosshair_center_slice(
+    monkeypatch,
+    view_type: str,
+    expected_viewport: str,
+    expected_center: tuple[float, float, float],
+) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type=view_type, view_group=group)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+
+    service._handle_scroll(view, series, 1)
+    pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
+    center_ijk = world_to_ijk_point(pose_context.geometry, pose_context.cursor.center_world)
+
+    assert service._resolve_mpr_viewport(view) == expected_viewport
+    assert np.allclose(center_ijk, expected_center, atol=1e-6)
+    assert (group.axial_index, group.coronal_index, group.sagittal_index) == (
+        round(expected_center[0]),
+        round(expected_center[1]),
+        round(expected_center[2]),
+    )
 
 
 def test_mpr_rotate3d_drag_updates_model_rotation_without_rotating_cursor(monkeypatch) -> None:

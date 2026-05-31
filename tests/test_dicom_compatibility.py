@@ -1,7 +1,11 @@
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from app.main import app as fastapi_app
 from app.models.viewer import InstanceRecord, SeriesRecord
 from app.services.dicom_compatibility import build_dicom_compatibility_issues
+from app.services.series_registry import SeriesRegistry, series_registry
 
 
 def _build_complete_instance(**overrides: object) -> InstanceRecord:
@@ -80,3 +84,30 @@ def test_build_compatibility_issues_accepts_complete_monochrome_series() -> None
     issues = build_dicom_compatibility_issues(_build_series([_build_complete_instance()]))
 
     assert issues == []
+
+
+def test_series_summary_defers_compatibility_issues_until_explicit_check() -> None:
+    registry = SeriesRegistry()
+    series = _build_series([_build_complete_instance(pixel_spacing=None)])
+
+    summary = registry._build_series_summary("series-key", series)
+
+    assert summary.compatibility_issues == []
+    assert [issue.code for issue in registry.check_compatibility(series.series_id)] == ["missing-pixel-spacing"]
+
+
+def test_check_compatibility_api_returns_on_demand_details() -> None:
+    series_registry.clear()
+    series = _build_series([_build_complete_instance(pixel_spacing=None)])
+    series_registry._series_by_id[series.series_id] = series
+
+    try:
+        client = TestClient(fastapi_app)
+        response = client.post("/api/v1/dicom/compatibility", json={"seriesId": series.series_id})
+    finally:
+        series_registry.clear()
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["seriesId"] == series.series_id
+    assert [issue["code"] for issue in data["issues"]] == ["missing-pixel-spacing"]

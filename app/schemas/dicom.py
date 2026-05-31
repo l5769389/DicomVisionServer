@@ -27,6 +27,19 @@ class DicomCompatibilityIssue(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class DicomCompatibilityRequest(BaseModel):
+    series_id: str = Field(alias="seriesId", description="Registered series ID to check.")
+
+    model_config = {"populate_by_name": True}
+
+
+class DicomCompatibilityResponse(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    issues: list[DicomCompatibilityIssue] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
 class SeriesSummary(BaseModel):
     series_id: str = Field(alias="seriesId")
     series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")

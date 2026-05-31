@@ -9,10 +9,11 @@ ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "mprMipConfig", "mprOblique", "mprStateSync", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprStateSync", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
+Render3DMode = Literal["volume", "surface"]
 MprMipAlgorithm = Literal["maximum", "minimum", "average", "sum"]
 MprCrosshairLine = Literal["horizontal", "vertical"]
 
@@ -234,6 +235,20 @@ class VolumeRenderConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SurfaceRenderConfig(BaseModel):
+    preset: str = "bone"
+    iso_value: float = Field(default=300.0, ge=-2000.0, le=4000.0, alias="isoValue")
+    smoothing: float = Field(default=0.28, ge=0.0, le=1.0)
+    decimation: float = Field(default=0.12, ge=0.0, le=0.9)
+    color: str = "#f0eadc"
+    ambient: float = Field(default=0.18, ge=0.0, le=1.0)
+    diffuse: float = Field(default=0.78, ge=0.0, le=1.0)
+    specular: float = Field(default=0.28, ge=0.0, le=1.0)
+    roughness: float = Field(default=0.42, ge=0.0, le=1.0)
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewTransformPayload(BaseModel):
     rotation_degrees: int = Field(default=0, alias="rotationDegrees")
     hor_flip: bool = Field(default=False, alias="horFlip")
@@ -273,6 +288,8 @@ class ViewImageResponse(BaseModel):
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
+    render_3d_mode: Render3DMode | None = Field(default=None, alias="render3dMode")
+    surface_config: SurfaceRenderConfig | None = Field(default=None, alias="surfaceConfig")
 
     model_config = {"populate_by_name": True}
 
@@ -340,6 +357,8 @@ class ViewOperationRequest(BaseModel):
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
     ver_flip: bool | None = Field(default=None, alias="ver_flip")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig", description="3D transfer-function and lighting settings.")
+    render_3d_mode: Render3DMode | None = Field(default=None, alias="render3dMode", description="3D renderer mode: volume or surface.")
+    surface_config: SurfaceRenderConfig | None = Field(default=None, alias="surfaceConfig", description="3D surface extraction and material settings.")
 
     model_config = {"populate_by_name": True}
 

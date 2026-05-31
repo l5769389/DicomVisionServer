@@ -22,7 +22,7 @@ from pydicom.uid import (
 
 from app.core.logging import get_logger
 from app.models.viewer import InstanceRecord, SeriesRecord
-from app.schemas.dicom import LoadFolderRequest, LoadFolderResponse, SeriesSummary
+from app.schemas.dicom import DicomCompatibilityIssue, LoadFolderRequest, LoadFolderResponse, SeriesSummary
 from app.services.dicom_cache import dicom_cache
 from app.services.dicom_compatibility import build_dicom_compatibility_issues
 from app.services.dicom_gsps_import_service import is_gsps_dataset, parse_gsps_dataset
@@ -487,7 +487,7 @@ class SeriesRegistry:
             isImageSeries=series.is_image_series,
             standardObjectType=series.standard_object_type,
             preferredViewType=series.preferred_view_type,
-            compatibilityIssues=build_dicom_compatibility_issues(series) if series.is_image_series else [],
+            compatibilityIssues=[],
         )
 
     @staticmethod
@@ -511,6 +511,16 @@ class SeriesRegistry:
 
         try:
             cached = dicom_cache.get(cache_key, thumbnail_instance.path)
+            if cached.source_pixels.ndim == 3 and cached.source_pixels.shape[-1] in (3, 4):
+                image = Image.fromarray(np.asarray(cached.source_pixels[..., :3], dtype=np.uint8))
+                image = ImageOps.contain(image, SERIES_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", SERIES_THUMBNAIL_SIZE, (0, 0, 0))
+                canvas.paste(image, ((SERIES_THUMBNAIL_SIZE[0] - image.width) // 2, (SERIES_THUMBNAIL_SIZE[1] - image.height) // 2))
+
+                buffer = io.BytesIO()
+                canvas.save(buffer, format="PNG", optimize=True)
+                return buffer.getvalue()
+
             pixels = np.asarray(cached.source_pixels, dtype=np.float32)
             if pixels.ndim != 2:
                 return None
@@ -636,6 +646,12 @@ class SeriesRegistry:
     def list_all(self) -> list[SeriesRecord]:
         with self._lock:
             return list(self._series_by_id.values())
+
+    def check_compatibility(self, series_id: str) -> list[DicomCompatibilityIssue]:
+        series = self.get(series_id)
+        if not series.is_image_series:
+            return []
+        return build_dicom_compatibility_issues(series)
 
     def clear(self) -> None:
         with self._lock:

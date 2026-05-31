@@ -86,7 +86,11 @@ def create_default_volume_render_config(preset_value: str) -> dict[str, object]:
         "roughness": 0.78,
     }
 
-    if preset == "aaa":
+    if preset == "bone":
+        layers["bone"].update({"enabled": True, "ww": 820.0, "wl": 360.0, "opacity": 0.96, "colorStart": "#e8dcc8", "colorEnd": "#ffffff"})
+        layers["softTissue"].update({"enabled": True, "ww": 430.0, "wl": 55.0, "opacity": 0.075, "colorStart": "#d6a18a", "colorEnd": "#f0d8c9"})
+        lighting.update({"shading": True, "interpolation": "linear", "ambient": 0.08, "diffuse": 0.9, "specular": 0.32, "roughness": 0.52})
+    elif preset == "aaa":
         layers["bone"].update({"enabled": True, "ww": 500.0, "wl": 400.0, "opacity": 1.0, "colorStart": "#ffffff", "colorEnd": "#ffffff"})
         layers["blood"].update({"enabled": True, "ww": 200.0, "wl": 220.0, "opacity": 0.2, "colorStart": "#d31b1b", "colorEnd": "#ffd54a"})
         lighting.update({"shading": True, "interpolation": "linear", "ambient": 0.12, "diffuse": 0.9, "specular": 0.2, "roughness": 0.74})
@@ -165,11 +169,16 @@ def normalize_volume_render_config(
 
 
 def normalize_volume_preset_name(value: str) -> str:
-    preset_value = str(value or "aaa").strip().lower()
+    preset_value = str(value or "bone").strip().lower()
     if ":" in preset_value:
         preset_value = preset_value.split(":", 1)[1]
 
     preset_aliases = {
+        "bone": "bone",
+        "bones": "bone",
+        "ct-bone": "bone",
+        "ct_bone": "bone",
+        "ct bone": "bone",
         "aaa": "aaa",
         "red": "red",
         "cardiac": "cardiac",
@@ -179,7 +188,7 @@ def normalize_volume_preset_name(value: str) -> str:
         "muscle": "muscle",
         "mip": "mip",
     }
-    return preset_aliases.get(preset_value, "aaa")
+    return preset_aliases.get(preset_value, "bone")
 
 
 def _normalize_hex_color(value: str, fallback: str) -> str:

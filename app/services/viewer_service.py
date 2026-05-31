@@ -119,6 +119,7 @@ from app.services.mpr import (
     legacy_frame_to_cursor,
     orthonormalize_matrix,
     reslice_plane,
+    spacing_along_world_direction,
     translate_cursor,
     world_to_ijk_point,
 )
@@ -142,7 +143,8 @@ from app.services.volume_render_config import (
     normalize_volume_preset_name,
     normalize_volume_render_config,
 )
-from app.services.volume_rendering import VolumeRenderRequest, vtk_volume_renderer
+from app.services.surface_render_config import create_default_surface_render_config, normalize_surface_render_config
+from app.services.volume_rendering import SurfaceRenderRequest, VolumeRenderRequest, vtk_surface_renderer, vtk_volume_renderer
 
 
 logger = get_logger(__name__)
@@ -151,6 +153,7 @@ CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
+REPRESENTATIVE_SLICE_SAMPLE_LIMIT = 48
 
 
 @dataclass(frozen=True)
@@ -191,6 +194,7 @@ class ViewerService:
         self._volume_build_locks: dict[str, Any] = {}
         self._series_patient_transform_cache: dict[str, VolumePatientTransform | None] = {}
         self._series_volume_geometry_cache: dict[str, VolumeGeometry] = {}
+        self._series_representative_slice_cache: dict[str, tuple[int, int]] = {}
         self._mtf_analysis_service = MtfAnalysisService(self)
         self._water_phantom_qa_service = WaterPhantomQaService(self)
         self._logger = logger
@@ -244,6 +248,7 @@ class ViewerService:
         view = view_registry.delete(view_id)
         if self._is_3d_view_type(view.view_type):
             vtk_volume_renderer.drop_session(view.view_id)
+            vtk_surface_renderer.drop_session(view.view_id)
         group = view.view_group
         if group is not None and not view_registry.list_view_group(group.group_id):
             view_group_registry.delete(group.group_id)
@@ -1041,6 +1046,7 @@ class ViewerService:
         ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
+        view.current_index = self._resolve_representative_stack_index(series)
         instance = series.instances[view.current_index]
         if not instance.sop_instance_uid:
             raise HTTPException(status_code=400, detail="DICOM instance does not contain SOPInstanceUID")
@@ -1141,7 +1147,7 @@ class ViewerService:
 
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
-        view.current_index = max(0, min(volume.shape[0] // 2, len(series.instances) - 1)) if series.instances else 0
+        view.current_index = self._resolve_representative_stack_index(series)
 
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
@@ -1159,8 +1165,10 @@ class ViewerService:
         view.offset_y = 0.0
         view.rotation_quaternion = vtk_volume_renderer.get_default_rotation_quaternion()
         view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
-        view.volume_preset = "aaa"
-        view.volume_render_config = create_default_volume_render_config("aaa")
+        view.volume_preset = "bone"
+        view.volume_render_config = create_default_volume_render_config("bone")
+        view.render_3d_mode = "volume"
+        view.surface_render_config = create_default_surface_render_config("bone")
         self._reset_drag_state(view)
         logger.info(
             "3d viewport initialized view_id=%s volume=%s zoom=%.4f ww=%s wl=%s",
@@ -1290,8 +1298,32 @@ class ViewerService:
             offset_x=float(view.offset_x),
             offset_y=float(view.offset_y),
             rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
-            volume_preset=str(view.volume_preset or "aaa"),
+            volume_preset=str(view.volume_preset or "bone"),
             volume_config=view.volume_render_config,
+            fast_preview=fast_preview,
+        )
+
+    def _build_surface_render_request(
+        self,
+        view: ViewRecord,
+        *,
+        volume: np.ndarray,
+        spacing_xyz: tuple[float, float, float],
+        fast_preview: bool,
+    ) -> SurfaceRenderRequest:
+        """Build the shared VTK request payload used by 3D surface render and drag paths."""
+
+        return SurfaceRenderRequest(
+            view_id=view.view_id,
+            volume=volume,
+            spacing_xyz=spacing_xyz,
+            canvas_width=view.width or 0,
+            canvas_height=view.height or 0,
+            zoom=float(view.zoom),
+            offset_x=float(view.offset_x),
+            offset_y=float(view.offset_y),
+            rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
+            surface_config=view.surface_render_config,
             fast_preview=fast_preview,
         )
 
@@ -1315,14 +1347,28 @@ class ViewerService:
 
         spacing_xyz = self._get_3d_spacing_xyz(series)
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
-        image = vtk_volume_renderer.render(
-            self._build_volume_render_request(
+        render_3d_mode = self._normalize_render_3d_mode(view.render_3d_mode)
+        if render_3d_mode == "surface":
+            surface_request = self._build_surface_render_request(
                 view,
                 volume=volume,
                 spacing_xyz=spacing_xyz,
                 fast_preview=fast_preview,
             )
-        )
+            image = vtk_surface_renderer.render(surface_request)
+            if not fast_preview:
+                self._warm_surface_preview_session(surface_request)
+            viewport_label = "3D SR"
+        else:
+            image = vtk_volume_renderer.render(
+                self._build_volume_render_request(
+                    view,
+                    volume=volume,
+                    spacing_xyz=spacing_xyz,
+                    fast_preview=fast_preview,
+                )
+            )
+            viewport_label = "3D VR"
 
         corner_info = self._build_slice_corner_info_overlay(
             view,
@@ -1330,7 +1376,7 @@ class ViewerService:
             None,
             current_index=view.current_index,
             total_slices=max(1, volume.shape[0]),
-            viewport_label="3D VR",
+            viewport_label=viewport_label,
         )
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
@@ -1346,11 +1392,19 @@ class ViewerService:
                 cornerInfo=self._serialize_corner_info_overlay(corner_info),
                 orientation=self._build_3d_orientation_overlay(view),
                 transform=self._build_view_transform_payload(view),
-                volumePreset=str(view.volume_preset or "aaa"),
+                volumePreset=str(view.volume_preset or "bone"),
                 volumeConfig=view.volume_render_config,
+                render3dMode=render_3d_mode,
+                surfaceConfig=view.surface_render_config,
             ),
             image_bytes=image_bytes,
         )
+
+    def _warm_surface_preview_session(self, request: SurfaceRenderRequest) -> None:
+        try:
+            vtk_surface_renderer.warm_preview_session(request)
+        except Exception:
+            logger.debug("failed to schedule surface preview warmup view_id=%s", request.view_id, exc_info=True)
 
     def _render_view(
         self,
@@ -1933,6 +1987,136 @@ class ViewerService:
     def _clamp_3d_zoom(zoom: float) -> float:
         return min(max(float(zoom), ZOOM_MIN_3D), ZOOM_MAX_3D)
 
+    @staticmethod
+    def _normalize_render_3d_mode(value: object) -> str:
+        return "surface" if str(value or "").strip().lower() == "surface" else "volume"
+
+    def _resolve_representative_stack_index(self, series: SeriesRecord) -> int:
+        instance_count = len(series.instances)
+        if instance_count <= 1:
+            return 0
+
+        cached_entry = self._series_representative_slice_cache.get(series.series_id)
+        if cached_entry is not None and cached_entry[0] == instance_count:
+            return max(0, min(int(cached_entry[1]), instance_count - 1))
+
+        sample_indexes = self._build_representative_sample_indexes(instance_count)
+        midpoint = (instance_count - 1) / 2.0
+        best_index = int(round(midpoint))
+        best_score = -1.0
+        readable_indexes: list[int] = []
+
+        for index in sample_indexes:
+            instance = series.instances[index]
+            if not instance.sop_instance_uid:
+                continue
+            readable_indexes.append(index)
+            try:
+                cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
+            except HTTPException:
+                readable_indexes.pop()
+                continue
+
+            score = self._score_representative_pixels(cached.source_pixels)
+            if score > best_score or (abs(score - best_score) <= 1e-6 and abs(index - midpoint) < abs(best_index - midpoint)):
+                best_score = score
+                best_index = index
+
+        if best_score <= 1e-6 and readable_indexes:
+            best_index = min(readable_indexes, key=lambda index: abs(index - midpoint))
+
+        best_index = max(0, min(best_index, instance_count - 1))
+        self._series_representative_slice_cache[series.series_id] = (instance_count, best_index)
+        logger.info(
+            "representative stack slice resolved series_id=%s index=%s total=%s score=%.4f",
+            series.series_id,
+            best_index,
+            instance_count,
+            max(best_score, 0.0),
+        )
+        return best_index
+
+    @staticmethod
+    def _build_representative_sample_indexes(count: int) -> list[int]:
+        if count <= REPRESENTATIVE_SLICE_SAMPLE_LIMIT:
+            return list(range(count))
+        indexes = np.linspace(0, count - 1, REPRESENTATIVE_SLICE_SAMPLE_LIMIT)
+        return sorted({int(round(float(index))) for index in indexes})
+
+    @staticmethod
+    def _to_content_luminance(pixels: np.ndarray) -> np.ndarray:
+        array = np.asarray(pixels)
+        if array.ndim >= 3 and array.shape[-1] in (3, 4):
+            rgb = array[..., :3].astype(np.float32, copy=False)
+            return (
+                rgb[..., 0] * np.float32(0.299)
+                + rgb[..., 1] * np.float32(0.587)
+                + rgb[..., 2] * np.float32(0.114)
+            )
+        if array.ndim > 2:
+            array = np.squeeze(array)
+            if array.ndim > 2:
+                array = array.reshape(array.shape[0], -1)
+        return array.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _estimate_background_value(image: np.ndarray) -> float:
+        if image.ndim < 2 or image.size == 0:
+            finite = image[np.isfinite(image)]
+            return float(np.median(finite)) if finite.size else 0.0
+
+        border = np.concatenate(
+            [
+                image[0, :].ravel(),
+                image[-1, :].ravel(),
+                image[:, 0].ravel(),
+                image[:, -1].ravel(),
+            ]
+        )
+        finite_border = border[np.isfinite(border)]
+        if finite_border.size:
+            return float(np.median(finite_border))
+        finite = image[np.isfinite(image)]
+        return float(np.median(finite)) if finite.size else 0.0
+
+    @staticmethod
+    def _build_content_threshold(values: np.ndarray, robust_span: float) -> float:
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size == 0 or not np.isfinite(robust_span) or robust_span <= 1e-6:
+            return float("inf")
+        low = float(np.min(finite_values))
+        high = float(np.max(finite_values))
+        intensity_floor = 1.0 if 0.0 <= low and high <= 255.0 else 8.0
+        return max(float(robust_span) * 0.06, intensity_floor)
+
+    @classmethod
+    def _score_representative_pixels(cls, pixels: np.ndarray) -> float:
+        image = cls._to_content_luminance(pixels)
+        if image.size == 0:
+            return 0.0
+
+        finite = image[np.isfinite(image)]
+        if finite.size < 16:
+            return 0.0
+
+        low, high = np.percentile(finite, [1.0, 99.0])
+        robust_span = float(high - low)
+        threshold = cls._build_content_threshold(finite, robust_span)
+        if not np.isfinite(threshold):
+            return 0.0
+
+        background = cls._estimate_background_value(image)
+        foreground = np.abs(image - background) > threshold
+        foreground_count = int(np.count_nonzero(foreground))
+        if foreground_count <= 0:
+            return 0.0
+
+        foreground_ratio = foreground_count / float(image.size)
+        foreground_values = image[foreground]
+        foreground_low, foreground_high = np.percentile(foreground_values, [5.0, 95.0])
+        foreground_span = float(max(0.0, foreground_high - foreground_low))
+        return float(min(foreground_ratio, 0.72) * max(robust_span, foreground_span))
+
     def _get_3d_spacing_xyz(self, series: SeriesRecord) -> tuple[float, float, float]:
         transform = self._get_series_patient_transform(series)
         if transform is not None:
@@ -2086,6 +2270,7 @@ class ViewerService:
             self._volume_cache_bytes = max(0, self._volume_cache_bytes - int(evicted_volume.nbytes))
             self._series_volume_geometry_cache.pop(evicted_series_id, None)
             self._series_patient_transform_cache.pop(evicted_series_id, None)
+            self._series_representative_slice_cache.pop(evicted_series_id, None)
             logger.debug("volume cache evict series_id=%s bytes=%s", evicted_series_id, int(evicted_volume.nbytes))
 
     @staticmethod
@@ -2249,31 +2434,58 @@ class ViewerService:
         series = series_registry.get(view.series_id)
         volume = self._get_series_volume(series)
         spacing_xyz = self._get_3d_spacing_xyz(series)
-        view.rotation_quaternion = vtk_volume_renderer.apply_trackball_camera_delta(
-            self._build_volume_render_request(
-                view,
-                volume=volume,
-                spacing_xyz=spacing_xyz,
-                fast_preview=True,
-            ),
-            delta_x_pixels=delta_x_pixels,
-            delta_y_pixels=delta_y_pixels,
-        )
+        if self._normalize_render_3d_mode(view.render_3d_mode) == "surface":
+            view.rotation_quaternion = vtk_surface_renderer.apply_trackball_camera_delta(
+                self._build_surface_render_request(
+                    view,
+                    volume=volume,
+                    spacing_xyz=spacing_xyz,
+                    fast_preview=True,
+                ),
+                delta_x_pixels=delta_x_pixels,
+                delta_y_pixels=delta_y_pixels,
+            )
+        else:
+            view.rotation_quaternion = vtk_volume_renderer.apply_trackball_camera_delta(
+                self._build_volume_render_request(
+                    view,
+                    volume=volume,
+                    spacing_xyz=spacing_xyz,
+                    fast_preview=True,
+                ),
+                delta_x_pixels=delta_x_pixels,
+                delta_y_pixels=delta_y_pixels,
+            )
         view.is_initialized = True
 
     def _handle_volume_config(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
             return
         view.volume_render_config = normalize_volume_render_config(payload.volume_config, view.volume_preset)
-        view.volume_preset = str(view.volume_render_config.get("preset", view.volume_preset or "aaa"))
+        view.volume_preset = str(view.volume_render_config.get("preset", view.volume_preset or "bone"))
         view.is_initialized = True
 
     def _handle_volume_preset(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
             return
 
-        view.volume_preset = normalize_volume_preset_name(payload.sub_op_type or "aaa")
+        view.volume_preset = normalize_volume_preset_name(payload.sub_op_type or "bone")
         view.volume_render_config = create_default_volume_render_config(view.volume_preset)
+        view.is_initialized = True
+
+    def _handle_render_3d_mode(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        if not self._is_3d_view_type(view.view_type):
+            return
+        view.render_3d_mode = self._normalize_render_3d_mode(payload.render_3d_mode or payload.sub_op_type)
+        if view.surface_render_config is None:
+            view.surface_render_config = create_default_surface_render_config("bone")
+        view.is_initialized = True
+
+    def _handle_surface_config(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        if not self._is_3d_view_type(view.view_type):
+            return
+        view.surface_render_config = normalize_surface_render_config(payload.surface_config, "bone")
+        view.render_3d_mode = "surface"
         view.is_initialized = True
 
     def _handle_drag_zoom(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
@@ -3951,6 +4163,12 @@ class ViewerService:
         pixel_min: float | None = None,
         pixel_max: float | None = None,
     ) -> np.ndarray:
+        if pixels.ndim == 3 and pixels.shape[-1] in (3, 4):
+            color_pixels = pixels[..., :3]
+            if color_pixels.dtype == np.uint8:
+                return color_pixels
+            return np.clip(color_pixels, 0, 255).astype(np.uint8)
+
         lower_bound = float(np.min(pixels)) if pixel_min is None else float(pixel_min)
         upper_bound = float(np.max(pixels)) if pixel_max is None else float(pixel_max)
 

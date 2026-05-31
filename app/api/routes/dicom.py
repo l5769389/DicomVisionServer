@@ -7,6 +7,8 @@ from app.core.config import get_settings
 from app.schemas.dicom import (
     CornerInfoRequest,
     CornerInfoResponse,
+    DicomCompatibilityRequest,
+    DicomCompatibilityResponse,
     DicomDeidentifyRequest,
     DicomTagsRequest,
     DicomTagsResponse,
@@ -158,6 +160,20 @@ def get_corner_info(payload: CornerInfoRequest) -> CornerInfoResponse:
 def get_series_thumbnail(seriesId: str) -> Response:
     """Return a small PNG preview for sidebar series cards."""
     return Response(content=series_registry.get_series_thumbnail_png(seriesId), media_type="image/png")
+
+
+@router.post(
+    "/compatibility",
+    response_model=DicomCompatibilityResponse,
+    summary="Check DICOM series compatibility",
+    description="Runs compatibility checks for a registered series on demand.",
+)
+def check_dicom_compatibility(payload: DicomCompatibilityRequest) -> DicomCompatibilityResponse:
+    """Return on-demand compatibility notices for a registered series."""
+    return DicomCompatibilityResponse(
+        seriesId=payload.series_id,
+        issues=series_registry.check_compatibility(payload.series_id),
+    )
 
 
 @router.post(

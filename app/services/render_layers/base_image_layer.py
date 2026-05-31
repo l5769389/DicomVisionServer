@@ -9,6 +9,12 @@ class BaseImageLayer:
 
     def render_pixels(self, context: RenderContext) -> np.ndarray:
         pixels = context.source_pixels
+        if pixels.ndim == 3 and pixels.shape[-1] in (3, 4):
+            color_pixels = pixels[..., :3]
+            if color_pixels.dtype == np.uint8:
+                return color_pixels
+            return np.clip(color_pixels, 0, 255).astype(np.uint8)
+
         ww = context.view.window_width or (context.cached.window_width if context.cached is not None else None)
         wl = context.view.window_center or (context.cached.window_center if context.cached is not None else None)
 

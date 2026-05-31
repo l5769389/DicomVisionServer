@@ -16,6 +16,8 @@ from app.core import (
     VIEW_OP_TYPE_RESET,
     VIEW_OP_TYPE_VOLUME_PRESET,
     VIEW_OP_TYPE_VOLUME_CONFIG,
+    VIEW_OP_TYPE_RENDER_3D_MODE,
+    VIEW_OP_TYPE_SURFACE_CONFIG,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_MPR_OBLIQUE,
     VIEW_OP_TYPE_MPR_STATE_SYNC,
@@ -307,6 +309,30 @@ def _handle_volume_config_operation(
     return _render_single()
 
 
+def _handle_render_3d_mode_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    service._handle_render_3d_mode(view, payload)
+    return _render_single()
+
+
+def _handle_surface_config_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    service._handle_surface_config(view, payload)
+    return _render_single()
+
+
 def _handle_measurement_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -405,6 +431,8 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_RESET: _handle_reset_operation,
     VIEW_OP_TYPE_VOLUME_PRESET: _handle_volume_preset_operation,
     VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
+    VIEW_OP_TYPE_RENDER_3D_MODE: _handle_render_3d_mode_operation,
+    VIEW_OP_TYPE_SURFACE_CONFIG: _handle_surface_config_operation,
     VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
     VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
     VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
@@ -479,13 +507,15 @@ def _build_operation_render_outcome(
             broadcast_fast_preview=render_decision.fast_preview,
         )
 
-    if service._is_3d_view_type(view.view_type) and render_decision.fast_preview:
-        # 3D drag interactions first schedule a quick preview frame and let the
-        # socket runtime follow up with the heavier render path asynchronously.
+    if service._is_3d_view_type(view.view_type):
+        # 3D interactions are routed through the socket render hub so rapid
+        # preview frames and the final settled frame can be coalesced by view.
+        # This prevents a stale low-quality preview from overtaking the final
+        # frame after drag end on expensive surface renders.
         return OperationRenderOutcome(
             deferred_view_ids=(view.view_id,),
             deferred_image_format=render_decision.image_format,
-            deferred_fast_preview=True,
+            deferred_fast_preview=render_decision.fast_preview,
         )
 
     return OperationRenderOutcome(

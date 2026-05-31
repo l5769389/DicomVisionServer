@@ -94,8 +94,10 @@ class ViewTransformState:
     rotation_quaternion: Quaternion = (0.0, 0.0, 0.0, 1.0)
     hor_flip: bool = False
     ver_flip: bool = False
-    volume_preset: str = "aaa"
+    volume_preset: str = "bone"
     volume_render_config: dict[str, object] | None = None
+    render_3d_mode: str = "volume"
+    surface_render_config: dict[str, object] | None = None
 
 
 @dataclass
@@ -277,6 +279,22 @@ class ViewRecord:
     @volume_render_config.setter
     def volume_render_config(self, value: dict[str, object] | None) -> None:
         self.transform.volume_render_config = value
+
+    @property
+    def render_3d_mode(self) -> str:
+        return self.transform.render_3d_mode
+
+    @render_3d_mode.setter
+    def render_3d_mode(self, value: str) -> None:
+        self.transform.render_3d_mode = value
+
+    @property
+    def surface_render_config(self) -> dict[str, object] | None:
+        return self.transform.surface_render_config
+
+    @surface_render_config.setter
+    def surface_render_config(self, value: dict[str, object] | None) -> None:
+        self.transform.surface_render_config = value
 
     @property
     def hor_flip(self) -> bool:

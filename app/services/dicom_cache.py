@@ -8,6 +8,7 @@ import pydicom
 from fastapi import HTTPException
 from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
+from pydicom.pixels import convert_color_space
 
 from app.core.logging import get_logger
 
@@ -95,14 +96,31 @@ class DicomCache:
             raise HTTPException(status_code=400, detail="DICOM file does not contain pixel data")
 
         try:
-            pixels = dataset.pixel_array.astype(np.float32)
+            pixels = dataset.pixel_array
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to decode pixel data: {exc}") from exc
 
         # The viewer currently treats enhanced/multi-frame files as a single 2D frame.
         # Keep this choice explicit so adding true multi-frame support has one obvious branch.
+        if pixels.ndim == 4:
+            pixels = pixels[0]
+
+        if pixels.ndim == 3 and pixels.shape[-1] in (3, 4):
+            pixels = self._normalize_color_pixels(dataset, pixels)
+            logger.debug(
+                "color source pixels extracted rows=%s cols=%s channels=%s min=%.3f max=%.3f",
+                pixels.shape[0],
+                pixels.shape[1],
+                pixels.shape[2],
+                float(np.min(pixels)),
+                float(np.max(pixels)),
+            )
+            return pixels
+
         if pixels.ndim == 3:
             pixels = pixels[0]
+
+        pixels = pixels.astype(np.float32)
 
         slope = float(getattr(dataset, "RescaleSlope", 1.0))
         intercept = float(getattr(dataset, "RescaleIntercept", 0.0))
@@ -122,6 +140,29 @@ class DicomCache:
             float(np.max(pixels)),
         )
         return pixels
+
+    @staticmethod
+    def _normalize_color_pixels(dataset: Dataset, pixels: np.ndarray) -> np.ndarray:
+        photometric = str(getattr(dataset, "PhotometricInterpretation", "") or "").upper()
+        color_pixels = pixels
+        if photometric.startswith("YBR"):
+            try:
+                color_pixels = convert_color_space(color_pixels, photometric, "RGB")
+            except Exception as exc:
+                logger.debug("failed to convert color space %s to RGB: %s", photometric, exc)
+
+        if color_pixels.shape[-1] == 4:
+            color_pixels = color_pixels[..., :3]
+
+        if color_pixels.dtype == np.uint8:
+            return np.ascontiguousarray(color_pixels)
+
+        color_pixels = np.asarray(color_pixels, dtype=np.float32)
+        bits_stored = DicomCache._get_first_number(getattr(dataset, "BitsStored", None))
+        upper = (2.0 ** bits_stored - 1.0) if bits_stored is not None and bits_stored > 0 else float(np.max(color_pixels))
+        if upper > 0:
+            color_pixels = color_pixels * (255.0 / upper)
+        return np.ascontiguousarray(np.clip(color_pixels, 0.0, 255.0).astype(np.uint8))
 
     @staticmethod
     def _build_cache_key(instance_uid: str | None, path: Path) -> str:

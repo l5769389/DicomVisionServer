@@ -28,8 +28,10 @@ BACKGROUND_RGB = (0.0, 0.0, 0.0)
 TRACKBALL_MOTION_FACTOR = 36.0
 TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
 TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = 20.0
-FAST_PREVIEW_SAMPLE_DISTANCE = 2.6
-FINAL_RENDER_SAMPLE_DISTANCE = 1.4
+FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.9
+FINAL_RENDER_IMAGE_SAMPLE_DISTANCE = 1.0
+FAST_PREVIEW_RAY_SAMPLE_FACTOR = 1.45
+FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.72
 
 
 @dataclass(frozen=True)
@@ -45,7 +47,7 @@ class VolumeRenderRequest:
     offset_x: float
     offset_y: float
     rotation_quaternion: tuple[float, float, float, float]
-    volume_preset: str = "aaa"
+    volume_preset: str = "bone"
     volume_config: dict[str, Any] | None = None
     fast_preview: bool = False
 
@@ -165,9 +167,9 @@ class VtkVolumeRenderer:
         if hasattr(mapper, "SetRequestedRenderModeToGPU"):
             mapper.SetRequestedRenderModeToGPU()
         if hasattr(mapper, "SetInteractiveAdjustSampleDistances"):
-            mapper.SetInteractiveAdjustSampleDistances(1)
+            mapper.SetInteractiveAdjustSampleDistances(0)
         if hasattr(mapper, "SetAutoAdjustSampleDistances"):
-            mapper.SetAutoAdjustSampleDistances(1)
+            mapper.SetAutoAdjustSampleDistances(0)
 
         color_func = vtkColorTransferFunction()
         opacity_func = vtkPiecewiseFunction()
@@ -235,7 +237,7 @@ class VtkVolumeRenderer:
             session.canvas_size = (request.canvas_width, request.canvas_height)
 
         self._update_transfer_functions(session, request.window_width, request.window_center, request.volume_preset, request.volume_config)
-        self._update_sampling(session, request.fast_preview)
+        self._update_sampling(session, request)
         self._update_camera(session, request)
 
     @staticmethod
@@ -279,13 +281,18 @@ class VtkVolumeRenderer:
         return image_data
 
     @staticmethod
-    def _update_sampling(session: VolumeRenderSession, fast_preview: bool) -> None:
+    def _update_sampling(session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
         if hasattr(session.mapper, "SetImageSampleDistance"):
             # Drag previews intentionally sample more coarsely. The final frame
             # is queued separately by the operation handler after interaction ends.
             session.mapper.SetImageSampleDistance(
-                FAST_PREVIEW_SAMPLE_DISTANCE if fast_preview else FINAL_RENDER_SAMPLE_DISTANCE
+                FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE if request.fast_preview else FINAL_RENDER_IMAGE_SAMPLE_DISTANCE
             )
+        if hasattr(session.mapper, "SetSampleDistance"):
+            min_spacing = max(1e-3, min(abs(float(value)) for value in request.spacing_xyz))
+            factor = FAST_PREVIEW_RAY_SAMPLE_FACTOR if request.fast_preview else FINAL_RENDER_RAY_SAMPLE_FACTOR
+            sample_distance = max(0.24, min(1.25, min_spacing * factor))
+            session.mapper.SetSampleDistance(sample_distance)
 
     def _update_transfer_functions(
         self,
@@ -296,7 +303,7 @@ class VtkVolumeRenderer:
         volume_config: dict[str, Any] | None,
     ) -> None:
         config = volume_config or {}
-        preset = str(config.get("preset") or volume_preset or "aaa").strip().lower()
+        preset = str(config.get("preset") or volume_preset or "bone").strip().lower()
         blend_mode = str(config.get("blendMode") or "composite").strip().lower()
         raw_layers = config.get("layers") if isinstance(config.get("layers"), list) else []
         layers = [layer for layer in raw_layers if isinstance(layer, dict) and layer.get("enabled")]
@@ -324,7 +331,7 @@ class VtkVolumeRenderer:
             session.volume_property.ShadeOn()
         else:
             session.volume_property.ShadeOff()
-        session.volume_property.SetAmbient(ambient * 10.0)
+        session.volume_property.SetAmbient(ambient)
         session.volume_property.SetDiffuse(diffuse)
         session.volume_property.SetSpecular(specular)
         session.volume_property.SetSpecularPower(max(1.0, 1.0 + (1.0 - roughness) * 59.0))
@@ -409,6 +416,7 @@ class VtkVolumeRenderer:
             return color_points, opacity_points
 
         strength_scale = {
+            'bone': 0.58,
             'aaa': 0.75,
             'red': 0.92,
             'cardiac': 0.82,
@@ -444,8 +452,8 @@ class VtkVolumeRenderer:
 
         if key == 'bone':
             highlight_rgb = (1.0, 1.0, 1.0)
-            rise = center - width * 0.15
-            shoulder = center + width * 0.18
+            rise = center - width * 0.12
+            shoulder = center + width * 0.16
             color_points = [
                 (low, *start_rgb),
                 (rise, *mid_rgb),
@@ -455,9 +463,9 @@ class VtkVolumeRenderer:
             ]
             opacity_points = [
                 (low, 0.0),
-                (rise, opacity * 0.08),
-                (center, opacity * 0.45),
-                (shoulder, opacity * 0.82),
+                (rise, 0.0),
+                (center, opacity * 0.34),
+                (shoulder, opacity * 0.86),
                 (high, opacity),
             ]
             return color_points, opacity_points
@@ -575,6 +583,15 @@ class VtkVolumeRenderer:
             return [
                 (0.0, 0.0),
                 (255.0, 0.0),
+            ]
+
+        if preset == 'bone':
+            return [
+                (0.0, 0.0),
+                (18.0, 0.0),
+                (54.0, 0.12 if not overlay_active else 0.18),
+                (110.0, 0.34 if not overlay_active else 0.48),
+                (210.0, 0.74 if not overlay_active else 0.86),
             ]
 
         if preset == 'aaa':
