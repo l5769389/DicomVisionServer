@@ -270,3 +270,93 @@ def test_surface_preview_warm_failure_does_not_fail_render(monkeypatch) -> None:
     result = service._render_3d_view(view, fast_preview=False)
 
     assert result.image_bytes
+
+
+def _build_surface_request(view_id: str = "surface-view", *, fast_preview: bool = False) -> SurfaceRenderRequest:
+    return SurfaceRenderRequest(
+        view_id=view_id,
+        volume=np.zeros((4, 5, 6), dtype=np.float32),
+        spacing_xyz=(0.7, 0.8, 1.2),
+        canvas_width=200,
+        canvas_height=100,
+        zoom=1.0,
+        offset_x=0.0,
+        offset_y=0.0,
+        rotation_quaternion=(0.0, 0.0, 0.0, 1.0),
+        surface_config=create_default_surface_render_config("bone"),
+        fast_preview=fast_preview,
+    )
+
+
+def test_surface_preview_warm_deduplicates_pending_requests() -> None:
+    renderer = VtkSurfaceRenderer()
+    submitted = []
+
+    class FakeFuture:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def add_done_callback(self, callback) -> None:
+            self.callbacks.append(callback)
+
+        def result(self) -> None:
+            return None
+
+    def fake_submit(fn, request):
+        future = FakeFuture()
+        submitted.append((fn, request, future))
+        return future
+
+    renderer._executor = SimpleNamespace(submit=fake_submit)
+    request = _build_surface_request()
+
+    renderer.warm_preview_session(request)
+    renderer.warm_preview_session(request)
+
+    assert len(submitted) == 1
+    assert submitted[0][1].fast_preview is True
+
+    submitted[0][2].callbacks[0](submitted[0][2])
+    renderer.warm_preview_session(request)
+    assert len(submitted) == 2
+
+
+def test_surface_session_lru_finalizes_oldest_session(monkeypatch) -> None:
+    renderer = VtkSurfaceRenderer()
+    finalized = []
+
+    def fake_create_session(volume, spacing_xyz, volume_token, config, config_token, fast_preview):
+        render_window = SimpleNamespace(Finalize=lambda: finalized.append(len(finalized)))
+        return SimpleNamespace(
+            volume_token=volume_token,
+            config_token=config_token,
+            render_window=render_window,
+        )
+
+    monkeypatch.setattr(renderer, "_create_session", fake_create_session)
+
+    for index in range(9):
+        request = _build_surface_request(view_id=f"surface-view-{index}")
+        renderer._get_or_create_session(request, request.volume)
+
+    assert len(renderer._sessions) == 8
+    assert len(finalized) == 1
+    assert ("surface-view-0", "final") not in renderer._sessions
+
+
+def test_surface_drop_session_cleans_final_preview_and_warm_keys() -> None:
+    renderer = VtkSurfaceRenderer()
+    finalized = []
+    renderer._sessions[("view-a", "final")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("a-final")))
+    renderer._sessions[("view-a", "preview")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("a-preview")))
+    renderer._sessions[("view-b", "final")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("b-final")))
+    renderer._warm_preview_keys = {
+        ("view-a", "warm"),
+        ("view-b", "warm"),
+    }
+
+    renderer._drop_session_in_executor("view-a")
+
+    assert sorted(finalized) == ["a-final", "a-preview"]
+    assert list(renderer._sessions.keys()) == [("view-b", "final")]
+    assert renderer._warm_preview_keys == {("view-b", "warm")}

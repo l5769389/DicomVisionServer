@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from math import radians, tan
@@ -23,6 +24,12 @@ from vtkmodules.vtkRenderingCore import (
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 
 from app.services.volume_rendering.contracts import VolumeRenderRequest
+from app.services.volume_rendering.camera_math import (
+    normalize_quaternion,
+    normalize_vector,
+    quaternion_to_rotation_matrix,
+    rotation_matrix_to_quaternion,
+)
 
 
 vtkObject.GlobalWarningDisplayOff()
@@ -34,6 +41,7 @@ FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.9
 FINAL_RENDER_IMAGE_SAMPLE_DISTANCE = 1.0
 FAST_PREVIEW_RAY_SAMPLE_FACTOR = 1.45
 FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.72
+VOLUME_SESSION_LIMIT = 8
 
 
 @dataclass
@@ -59,7 +67,7 @@ class VolumeRenderSession:
 
 class VtkVolumeRenderer:
     def __init__(self) -> None:
-        self._sessions: dict[str, VolumeRenderSession] = {}
+        self._sessions: OrderedDict[str, VolumeRenderSession] = OrderedDict()
         self._lock = RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vtk-render")
 
@@ -133,9 +141,19 @@ class VtkVolumeRenderer:
         volume_token = self._build_volume_token(volume, request.spacing_xyz)
         session = self._sessions.get(request.view_id)
         if session is None or session.volume_token != volume_token:
+            if session is not None:
+                session.render_window.Finalize()
             session = self._create_session(volume, request.spacing_xyz, volume_token)
             self._sessions[request.view_id] = session
+            self._evict_sessions_if_needed()
+            return session
+        self._sessions.move_to_end(request.view_id)
         return session
+
+    def _evict_sessions_if_needed(self) -> None:
+        while len(self._sessions) > VOLUME_SESSION_LIMIT:
+            _, session = self._sessions.popitem(last=False)
+            session.render_window.Finalize()
 
     def _create_session(
         self,
@@ -663,67 +681,19 @@ class VtkVolumeRenderer:
 
     @staticmethod
     def _normalize_quaternion(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
-        vector = np.asarray(quaternion, dtype=np.float64)
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-12:
-            return (0.0, 0.0, 0.0, 1.0)
-        vector /= norm
-        return tuple(float(value) for value in vector)
+        return normalize_quaternion(quaternion)
 
     @staticmethod
     def _normalize_vector(vector: np.ndarray) -> np.ndarray:
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-12:
-            return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-        return vector / norm
+        return normalize_vector(vector)
 
-    def _rotation_matrix_to_quaternion(self, matrix: np.ndarray) -> tuple[float, float, float, float]:
-        trace = float(matrix[0, 0] + matrix[1, 1] + matrix[2, 2])
-        if trace > 0.0:
-            scale = np.sqrt(trace + 1.0) * 2.0
-            w = 0.25 * scale
-            x = (matrix[2, 1] - matrix[1, 2]) / scale
-            y = (matrix[0, 2] - matrix[2, 0]) / scale
-            z = (matrix[1, 0] - matrix[0, 1]) / scale
-        elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
-            scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
-            w = (matrix[2, 1] - matrix[1, 2]) / scale
-            x = 0.25 * scale
-            y = (matrix[0, 1] + matrix[1, 0]) / scale
-            z = (matrix[0, 2] + matrix[2, 0]) / scale
-        elif matrix[1, 1] > matrix[2, 2]:
-            scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
-            w = (matrix[0, 2] - matrix[2, 0]) / scale
-            x = (matrix[0, 1] + matrix[1, 0]) / scale
-            y = 0.25 * scale
-            z = (matrix[1, 2] + matrix[2, 1]) / scale
-        else:
-            scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
-            w = (matrix[1, 0] - matrix[0, 1]) / scale
-            x = (matrix[0, 2] + matrix[2, 0]) / scale
-            y = (matrix[1, 2] + matrix[2, 1]) / scale
-            z = 0.25 * scale
-        return self._normalize_quaternion((float(x), float(y), float(z), float(w)))
+    @staticmethod
+    def _rotation_matrix_to_quaternion(matrix: np.ndarray) -> tuple[float, float, float, float]:
+        return rotation_matrix_to_quaternion(matrix)
 
-    def _quaternion_to_rotation_matrix(self, quaternion: tuple[float, float, float, float]) -> np.ndarray:
-        x, y, z, w = self._normalize_quaternion(quaternion)
-        xx = x * x
-        yy = y * y
-        zz = z * z
-        xy = x * y
-        xz = x * z
-        yz = y * z
-        wx = w * x
-        wy = w * y
-        wz = w * z
-        return np.asarray(
-            [
-                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
-                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
-                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
-            ],
-            dtype=np.float64,
-        )
+    @staticmethod
+    def _quaternion_to_rotation_matrix(quaternion: tuple[float, float, float, float]) -> np.ndarray:
+        return quaternion_to_rotation_matrix(quaternion)
 
     @staticmethod
     def _apply_pan(camera, renderer: vtkRenderer, request: VolumeRenderRequest) -> None:

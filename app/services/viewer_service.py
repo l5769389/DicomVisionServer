@@ -1,10 +1,8 @@
 import io
-from collections import OrderedDict
 from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from importlib import import_module
-from threading import Lock, RLock
 from time import perf_counter
 from typing import Any, Callable
 from uuid import uuid4
@@ -131,6 +129,11 @@ from app.services.mpr_geometry import VolumePatientTransform
 from app.services.mtf_analysis_service import MtfAnalysisService
 from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor, normalize_pseudocolor_preset
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
+from app.services.representative_slice_selector import (
+    build_representative_sample_indexes,
+    score_representative_pixels,
+)
+from app.services.series_volume_cache import SeriesVolumeCache
 from app.services.series_registry import series_registry
 from app.services.viewport_transformer import viewport_transformer
 from app.services.view_group_registry import view_group_registry
@@ -154,7 +157,6 @@ CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
-REPRESENTATIVE_SLICE_SAMPLE_LIMIT = 48
 
 
 class _LazyRendererProxy:
@@ -228,14 +230,13 @@ ViewRenderProgressCallback = Callable[[dict[str, object]], None]
 
 class ViewerService:
     def __init__(self) -> None:
-        self._volume_cache: OrderedDict[str, np.ndarray] = OrderedDict()
-        self._volume_cache_bytes = 0
-        self._volume_cache_max_bytes = VOLUME_CACHE_MAX_BYTES
-        self._volume_cache_lock = RLock()
-        self._volume_build_locks: dict[str, Any] = {}
         self._series_patient_transform_cache: dict[str, VolumePatientTransform | None] = {}
         self._series_volume_geometry_cache: dict[str, VolumeGeometry] = {}
         self._series_representative_slice_cache: dict[str, tuple[int, int]] = {}
+        self._series_volume_cache = SeriesVolumeCache(
+            max_bytes=VOLUME_CACHE_MAX_BYTES,
+            on_evict=self._handle_series_volume_cache_evict,
+        )
         self._mtf_analysis_service = MtfAnalysisService(self)
         self._water_phantom_qa_service = WaterPhantomQaService(self)
         self._logger = logger
@@ -2041,7 +2042,7 @@ class ViewerService:
         if cached_entry is not None and cached_entry[0] == instance_count:
             return max(0, min(int(cached_entry[1]), instance_count - 1))
 
-        sample_indexes = self._build_representative_sample_indexes(instance_count)
+        sample_indexes = build_representative_sample_indexes(instance_count)
         midpoint = (instance_count - 1) / 2.0
         best_index = int(round(midpoint))
         best_score = -1.0
@@ -2058,7 +2059,7 @@ class ViewerService:
                 readable_indexes.pop()
                 continue
 
-            score = self._score_representative_pixels(cached.source_pixels)
+            score = score_representative_pixels(cached.source_pixels)
             if score > best_score or (abs(score - best_score) <= 1e-6 and abs(index - midpoint) < abs(best_index - midpoint)):
                 best_score = score
                 best_index = index
@@ -2076,87 +2077,6 @@ class ViewerService:
             max(best_score, 0.0),
         )
         return best_index
-
-    @staticmethod
-    def _build_representative_sample_indexes(count: int) -> list[int]:
-        if count <= REPRESENTATIVE_SLICE_SAMPLE_LIMIT:
-            return list(range(count))
-        indexes = np.linspace(0, count - 1, REPRESENTATIVE_SLICE_SAMPLE_LIMIT)
-        return sorted({int(round(float(index))) for index in indexes})
-
-    @staticmethod
-    def _to_content_luminance(pixels: np.ndarray) -> np.ndarray:
-        array = np.asarray(pixels)
-        if array.ndim >= 3 and array.shape[-1] in (3, 4):
-            rgb = array[..., :3].astype(np.float32, copy=False)
-            return (
-                rgb[..., 0] * np.float32(0.299)
-                + rgb[..., 1] * np.float32(0.587)
-                + rgb[..., 2] * np.float32(0.114)
-            )
-        if array.ndim > 2:
-            array = np.squeeze(array)
-            if array.ndim > 2:
-                array = array.reshape(array.shape[0], -1)
-        return array.astype(np.float32, copy=False)
-
-    @staticmethod
-    def _estimate_background_value(image: np.ndarray) -> float:
-        if image.ndim < 2 or image.size == 0:
-            finite = image[np.isfinite(image)]
-            return float(np.median(finite)) if finite.size else 0.0
-
-        border = np.concatenate(
-            [
-                image[0, :].ravel(),
-                image[-1, :].ravel(),
-                image[:, 0].ravel(),
-                image[:, -1].ravel(),
-            ]
-        )
-        finite_border = border[np.isfinite(border)]
-        if finite_border.size:
-            return float(np.median(finite_border))
-        finite = image[np.isfinite(image)]
-        return float(np.median(finite)) if finite.size else 0.0
-
-    @staticmethod
-    def _build_content_threshold(values: np.ndarray, robust_span: float) -> float:
-        finite_values = values[np.isfinite(values)]
-        if finite_values.size == 0 or not np.isfinite(robust_span) or robust_span <= 1e-6:
-            return float("inf")
-        low = float(np.min(finite_values))
-        high = float(np.max(finite_values))
-        intensity_floor = 1.0 if 0.0 <= low and high <= 255.0 else 8.0
-        return max(float(robust_span) * 0.06, intensity_floor)
-
-    @classmethod
-    def _score_representative_pixels(cls, pixels: np.ndarray) -> float:
-        image = cls._to_content_luminance(pixels)
-        if image.size == 0:
-            return 0.0
-
-        finite = image[np.isfinite(image)]
-        if finite.size < 16:
-            return 0.0
-
-        low, high = np.percentile(finite, [1.0, 99.0])
-        robust_span = float(high - low)
-        threshold = cls._build_content_threshold(finite, robust_span)
-        if not np.isfinite(threshold):
-            return 0.0
-
-        background = cls._estimate_background_value(image)
-        foreground = np.abs(image - background) > threshold
-        foreground_count = int(np.count_nonzero(foreground))
-        if foreground_count <= 0:
-            return 0.0
-
-        foreground_ratio = foreground_count / float(image.size)
-        foreground_values = image[foreground]
-        foreground_low, foreground_high = np.percentile(foreground_values, [5.0, 95.0])
-        foreground_span = float(max(0.0, foreground_high - foreground_low))
-        return float(min(foreground_ratio, 0.72) * max(robust_span, foreground_span))
 
     def _get_3d_spacing_xyz(self, series: SeriesRecord) -> tuple[float, float, float]:
         transform = self._get_series_patient_transform(series)
@@ -2278,41 +2198,19 @@ class ViewerService:
         return self._build_standardized_volume(slice_entries)
 
     def _get_series_volume_build_lock(self, series_id: str) -> Any:
-        with self._volume_cache_lock:
-            lock = self._volume_build_locks.get(series_id)
-            if lock is None:
-                lock = Lock()
-                self._volume_build_locks[series_id] = lock
-            return lock
+        return self._series_volume_cache.get_build_lock(series_id)
 
     def _get_cached_series_volume(self, series_id: str) -> np.ndarray | None:
-        with self._volume_cache_lock:
-            cached_volume = self._volume_cache.get(series_id)
-            if cached_volume is None:
-                return None
-            self._volume_cache.move_to_end(series_id)
-            return cached_volume
+        return self._series_volume_cache.get(series_id)
 
     def _store_series_volume(self, series_id: str, volume: np.ndarray) -> np.ndarray:
-        with self._volume_cache_lock:
-            existing = self._volume_cache.get(series_id)
-            if existing is not None:
-                self._volume_cache.move_to_end(series_id)
-                return existing
+        return self._series_volume_cache.store(series_id, volume)
 
-            self._volume_cache[series_id] = volume
-            self._volume_cache_bytes += int(volume.nbytes)
-            self._evict_series_volume_cache()
-            return volume
-
-    def _evict_series_volume_cache(self) -> None:
-        while self._volume_cache_bytes > self._volume_cache_max_bytes and len(self._volume_cache) > 1:
-            evicted_series_id, evicted_volume = self._volume_cache.popitem(last=False)
-            self._volume_cache_bytes = max(0, self._volume_cache_bytes - int(evicted_volume.nbytes))
-            self._series_volume_geometry_cache.pop(evicted_series_id, None)
-            self._series_patient_transform_cache.pop(evicted_series_id, None)
-            self._series_representative_slice_cache.pop(evicted_series_id, None)
-            logger.debug("volume cache evict series_id=%s bytes=%s", evicted_series_id, int(evicted_volume.nbytes))
+    def _handle_series_volume_cache_evict(self, series_id: str, volume: np.ndarray) -> None:
+        self._series_volume_geometry_cache.pop(series_id, None)
+        self._series_patient_transform_cache.pop(series_id, None)
+        self._series_representative_slice_cache.pop(series_id, None)
+        logger.debug("volume cache evict series_id=%s bytes=%s", series_id, int(volume.nbytes))
 
     @staticmethod
     def _get_dataset_orientation(dataset) -> np.ndarray | None:

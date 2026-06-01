@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from math import ceil, radians, tan
 from threading import RLock
@@ -30,6 +31,12 @@ from vtkmodules.vtkRenderingCore import (
 from app.core.logging import get_logger
 from app.services.surface_render_config import normalize_surface_render_config
 from app.services.volume_rendering.contracts import SurfaceRenderRequest
+from app.services.volume_rendering.camera_math import (
+    normalize_quaternion,
+    normalize_vector,
+    quaternion_to_rotation_matrix,
+    rotation_matrix_to_quaternion,
+)
 
 
 vtkObject.GlobalWarningDisplayOff()
@@ -42,6 +49,7 @@ FAST_PREVIEW_VOLUME_MAX_DIMENSION = 144
 FAST_PREVIEW_RENDER_SCALE = 0.5
 FAST_PREVIEW_RENDER_MAX_DIMENSION = 720
 FAST_PREVIEW_DECIMATION_FLOOR = 0.78
+SURFACE_SESSION_LIMIT = 8
 
 
 @dataclass
@@ -64,7 +72,8 @@ class SurfaceRenderSession:
 
 class VtkSurfaceRenderer:
     def __init__(self) -> None:
-        self._sessions: dict[tuple[str, str], SurfaceRenderSession] = {}
+        self._sessions: OrderedDict[tuple[str, str], SurfaceRenderSession] = OrderedDict()
+        self._warm_preview_keys: set[tuple[object, ...]] = set()
         self._lock = RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vtk-surface-render")
 
@@ -75,8 +84,14 @@ class VtkSurfaceRenderer:
         if request.fast_preview or request.canvas_width <= 0 or request.canvas_height <= 0 or not request.view_id:
             return
 
+        warm_key = self._build_warm_preview_key(request)
+        with self._lock:
+            if warm_key in self._warm_preview_keys:
+                return
+            self._warm_preview_keys.add(warm_key)
+
         future = self._executor.submit(self._warm_preview_session_in_executor, replace(request, fast_preview=True))
-        future.add_done_callback(self._consume_warm_preview_result)
+        future.add_done_callback(lambda done_future, key=warm_key: self._consume_warm_preview_result(key, done_future))
 
     def apply_trackball_camera_delta(
         self,
@@ -122,8 +137,9 @@ class VtkSurfaceRenderer:
             session = self._get_or_create_session(request, volume)
             self._configure_session(session, request)
 
-    @staticmethod
-    def _consume_warm_preview_result(future) -> None:
+    def _consume_warm_preview_result(self, warm_key: tuple[object, ...], future) -> None:
+        with self._lock:
+            self._warm_preview_keys.discard(warm_key)
         try:
             future.result()
         except Exception:
@@ -158,6 +174,7 @@ class VtkSurfaceRenderer:
                 if session is None:
                     continue
                 session.render_window.Finalize()
+            self._warm_preview_keys = {key for key in self._warm_preview_keys if key[0] != view_id}
 
     def _get_or_create_session(self, request: SurfaceRenderRequest, volume: np.ndarray) -> SurfaceRenderSession:
         volume_token = self._build_volume_token(volume, request.spacing_xyz)
@@ -166,9 +183,19 @@ class VtkSurfaceRenderer:
         session_key = self._build_session_key(request.view_id, request.fast_preview)
         session = self._sessions.get(session_key)
         if session is None or session.volume_token != volume_token or session.config_token != config_token:
+            if session is not None:
+                session.render_window.Finalize()
             session = self._create_session(volume, request.spacing_xyz, volume_token, config, config_token, request.fast_preview)
             self._sessions[session_key] = session
+            self._evict_sessions_if_needed()
+            return session
+        self._sessions.move_to_end(session_key)
         return session
+
+    def _evict_sessions_if_needed(self) -> None:
+        while len(self._sessions) > SURFACE_SESSION_LIMIT:
+            _, session = self._sessions.popitem(last=False)
+            session.render_window.Finalize()
 
     def _create_session(
         self,
@@ -302,6 +329,18 @@ class VtkSurfaceRenderer:
     @staticmethod
     def _build_session_key(view_id: str, fast_preview: bool) -> tuple[str, str]:
         return (view_id, "preview" if fast_preview else "final")
+
+    @classmethod
+    def _build_warm_preview_key(cls, request: SurfaceRenderRequest) -> tuple[object, ...]:
+        volume = np.asarray(request.volume)
+        config = normalize_surface_render_config(request.surface_config)
+        preview_request = replace(request, fast_preview=True)
+        return (
+            request.view_id,
+            cls._build_volume_token(volume, request.spacing_xyz),
+            cls._build_config_token(config, True),
+            cls._resolve_render_size(preview_request),
+        )
 
     @staticmethod
     def _build_volume_token(
@@ -438,19 +477,11 @@ class VtkSurfaceRenderer:
 
     @staticmethod
     def _normalize_quaternion(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
-        vector = np.asarray(quaternion, dtype=np.float64)
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-12:
-            return (0.0, 0.0, 0.0, 1.0)
-        vector /= norm
-        return tuple(float(value) for value in vector)
+        return normalize_quaternion(quaternion)
 
     @staticmethod
     def _normalize_vector(vector: np.ndarray) -> np.ndarray:
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-12:
-            return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-        return vector / norm
+        return normalize_vector(vector)
 
     @staticmethod
     def _hex_to_rgb(color: str, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -462,53 +493,13 @@ class VtkSurfaceRenderer:
                 return fallback
         return fallback
 
-    def _rotation_matrix_to_quaternion(self, matrix: np.ndarray) -> tuple[float, float, float, float]:
-        trace = float(matrix[0, 0] + matrix[1, 1] + matrix[2, 2])
-        if trace > 0.0:
-            scale = np.sqrt(trace + 1.0) * 2.0
-            w = 0.25 * scale
-            x = (matrix[2, 1] - matrix[1, 2]) / scale
-            y = (matrix[0, 2] - matrix[2, 0]) / scale
-            z = (matrix[1, 0] - matrix[0, 1]) / scale
-        elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
-            scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
-            w = (matrix[2, 1] - matrix[1, 2]) / scale
-            x = 0.25 * scale
-            y = (matrix[0, 1] + matrix[1, 0]) / scale
-            z = (matrix[0, 2] + matrix[2, 0]) / scale
-        elif matrix[1, 1] > matrix[2, 2]:
-            scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
-            w = (matrix[0, 2] - matrix[2, 0]) / scale
-            x = (matrix[0, 1] + matrix[1, 0]) / scale
-            y = 0.25 * scale
-            z = (matrix[1, 2] + matrix[2, 1]) / scale
-        else:
-            scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
-            w = (matrix[1, 0] - matrix[0, 1]) / scale
-            x = (matrix[0, 2] + matrix[2, 0]) / scale
-            y = (matrix[1, 2] + matrix[2, 1]) / scale
-            z = 0.25 * scale
-        return self._normalize_quaternion((float(x), float(y), float(z), float(w)))
+    @staticmethod
+    def _rotation_matrix_to_quaternion(matrix: np.ndarray) -> tuple[float, float, float, float]:
+        return rotation_matrix_to_quaternion(matrix)
 
-    def _quaternion_to_rotation_matrix(self, quaternion: tuple[float, float, float, float]) -> np.ndarray:
-        x, y, z, w = self._normalize_quaternion(quaternion)
-        xx = x * x
-        yy = y * y
-        zz = z * z
-        xy = x * y
-        xz = x * z
-        yz = y * z
-        wx = w * x
-        wy = w * y
-        wz = w * z
-        return np.asarray(
-            [
-                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
-                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
-                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
-            ],
-            dtype=np.float64,
-        )
+    @staticmethod
+    def _quaternion_to_rotation_matrix(quaternion: tuple[float, float, float, float]) -> np.ndarray:
+        return quaternion_to_rotation_matrix(quaternion)
 
     @staticmethod
     def _apply_pan(camera, renderer: vtkRenderer, request: SurfaceRenderRequest) -> None:
