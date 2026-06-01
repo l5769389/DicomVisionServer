@@ -1,7 +1,7 @@
 FROM python:3.13-slim
 
-ARG DEBIAN_MIRROR=http://mirrors.jdcloudcs.com/debian
-ARG DEBIAN_SECURITY_MIRROR=http://mirrors.jdcloudcs.com/debian-security
+ARG DEBIAN_MIRROR=http://mirrors.aliyun.com/debian
+ARG DEBIAN_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 ARG PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -36,10 +36,10 @@ RUN sed -i \
 RUN pip install --no-cache-dir -i "${PYPI_INDEX_URL}" uv
 
 COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --frozen --no-dev --no-cache --compile-bytecode
+RUN uv export --frozen --no-dev --no-hashes -o requirements.txt \
+    && pip install --no-cache-dir -i "${PYPI_INDEX_URL}" -r requirements.txt
 
 COPY app ./app
-COPY sample-data ./sample-data
 COPY run.py ./
 
 EXPOSE 8000
