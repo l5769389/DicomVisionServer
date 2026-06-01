@@ -29,6 +29,7 @@ from vtkmodules.vtkRenderingCore import (
 
 from app.core.logging import get_logger
 from app.services.surface_render_config import normalize_surface_render_config
+from app.services.volume_rendering.contracts import SurfaceRenderRequest
 
 
 vtkObject.GlobalWarningDisplayOff()
@@ -41,21 +42,6 @@ FAST_PREVIEW_VOLUME_MAX_DIMENSION = 144
 FAST_PREVIEW_RENDER_SCALE = 0.5
 FAST_PREVIEW_RENDER_MAX_DIMENSION = 720
 FAST_PREVIEW_DECIMATION_FLOOR = 0.78
-
-
-@dataclass(frozen=True)
-class SurfaceRenderRequest:
-    view_id: str
-    volume: np.ndarray
-    spacing_xyz: tuple[float, float, float]
-    canvas_width: int
-    canvas_height: int
-    zoom: float
-    offset_x: float
-    offset_y: float
-    rotation_quaternion: tuple[float, float, float, float]
-    surface_config: dict[str, Any] | None = None
-    fast_preview: bool = False
 
 
 @dataclass

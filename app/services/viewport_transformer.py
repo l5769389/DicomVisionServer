@@ -2,13 +2,18 @@ from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import affine_transform
 
 from app.core import ZOOM_MAX, ZOOM_MIN
 from app.models.viewer import ViewRecord
 
 
 MIN_PIXEL_ASPECT = 1e-6
+
+
+def _get_affine_transform():
+    from scipy.ndimage import affine_transform
+
+    return affine_transform
 
 
 @dataclass(frozen=True)
@@ -133,6 +138,7 @@ class ViewportTransformer:
         cval: float = 0.0,
     ) -> np.ndarray:
         affine_matrix, offset = transform.inverse_components()
+        affine_transform = _get_affine_transform()
         # scipy.ndimage.affine_transform indexes 2D arrays in row/col (y/x) order,
         # so convert the inverse transform from x/y into array coordinates.
         array_matrix = affine_matrix[[1, 0]][:, [1, 0]]

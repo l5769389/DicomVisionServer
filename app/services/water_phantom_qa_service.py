@@ -4,7 +4,6 @@ from typing import Any, Protocol
 
 import numpy as np
 from fastapi import HTTPException
-from scipy import ndimage
 
 from app.models.viewer import ViewRecord
 from app.schemas.view import (
@@ -29,6 +28,12 @@ class WaterPhantomQaContext(Protocol):
 
 
 RoiSource = tuple[str, str, str, float, float, float]
+
+
+def _get_ndimage():
+    from scipy import ndimage
+
+    return ndimage
 
 
 class WaterPhantomQaService:
@@ -327,6 +332,7 @@ class WaterPhantomQaService:
 
     @staticmethod
     def _find_largest_mask_component(mask: np.ndarray) -> tuple[int, int, int, int, int, float, float] | None:
+        ndimage = _get_ndimage()
         structure = np.array(((0, 1, 0), (1, 1, 1), (0, 1, 0)), dtype=bool)
         labels, label_count = ndimage.label(np.asarray(mask, dtype=bool), structure=structure)
         if label_count <= 0:

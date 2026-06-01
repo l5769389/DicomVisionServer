@@ -3,8 +3,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from math import radians, tan
-from typing import Any
 from threading import RLock
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -22,6 +22,8 @@ from vtkmodules.vtkRenderingCore import (
 )
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 
+from app.services.volume_rendering.contracts import VolumeRenderRequest
+
 
 vtkObject.GlobalWarningDisplayOff()
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
@@ -32,24 +34,6 @@ FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.9
 FINAL_RENDER_IMAGE_SAMPLE_DISTANCE = 1.0
 FAST_PREVIEW_RAY_SAMPLE_FACTOR = 1.45
 FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.72
-
-
-@dataclass(frozen=True)
-class VolumeRenderRequest:
-    view_id: str
-    volume: np.ndarray
-    spacing_xyz: tuple[float, float, float]
-    canvas_width: int
-    canvas_height: int
-    window_width: float
-    window_center: float
-    zoom: float
-    offset_x: float
-    offset_y: float
-    rotation_quaternion: tuple[float, float, float, float]
-    volume_preset: str = "bone"
-    volume_config: dict[str, Any] | None = None
-    fast_preview: bool = False
 
 
 @dataclass

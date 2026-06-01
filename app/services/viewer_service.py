@@ -3,6 +3,7 @@ from collections import OrderedDict
 from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from importlib import import_module
 from threading import Lock, RLock
 from time import perf_counter
 from typing import Any, Callable
@@ -144,7 +145,7 @@ from app.services.volume_render_config import (
     normalize_volume_render_config,
 )
 from app.services.surface_render_config import create_default_surface_render_config, normalize_surface_render_config
-from app.services.volume_rendering import SurfaceRenderRequest, VolumeRenderRequest, vtk_surface_renderer, vtk_volume_renderer
+from app.services.volume_rendering.contracts import SurfaceRenderRequest, VolumeRenderRequest
 
 
 logger = get_logger(__name__)
@@ -154,6 +155,46 @@ MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
 REPRESENTATIVE_SLICE_SAMPLE_LIMIT = 48
+
+
+class _LazyRendererProxy:
+    def __init__(self, module_name: str, renderer_name: str) -> None:
+        self._module_name = module_name
+        self._renderer_name = renderer_name
+        self._target: Any | None = None
+
+    def _resolve(self) -> Any:
+        if self._target is None:
+            module = import_module(self._module_name)
+            self._target = getattr(module, self._renderer_name)
+        return self._target
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_module_name", "_renderer_name", "_target"}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._resolve(), name, value)
+
+
+vtk_volume_renderer = _LazyRendererProxy(
+    "app.services.volume_rendering.vtk_volume_renderer",
+    "vtk_volume_renderer",
+)
+vtk_surface_renderer = _LazyRendererProxy(
+    "app.services.volume_rendering.vtk_surface_renderer",
+    "vtk_surface_renderer",
+)
+
+
+def _get_vtk_volume_renderer():
+    return vtk_volume_renderer
+
+
+def _get_vtk_surface_renderer():
+    return vtk_surface_renderer
 
 
 @dataclass(frozen=True)
@@ -247,8 +288,8 @@ class ViewerService:
     def close_view_by_id(self, view_id: str) -> OperationAcceptedResponse:
         view = view_registry.delete(view_id)
         if self._is_3d_view_type(view.view_type):
-            vtk_volume_renderer.drop_session(view.view_id)
-            vtk_surface_renderer.drop_session(view.view_id)
+            _get_vtk_volume_renderer().drop_session(view.view_id)
+            _get_vtk_surface_renderer().drop_session(view.view_id)
         group = view.view_group
         if group is not None and not view_registry.list_view_group(group.group_id):
             view_group_registry.delete(group.group_id)
@@ -1163,7 +1204,7 @@ class ViewerService:
         view.zoom = 1.0
         view.offset_x = 0.0
         view.offset_y = 0.0
-        view.rotation_quaternion = vtk_volume_renderer.get_default_rotation_quaternion()
+        view.rotation_quaternion = _get_vtk_volume_renderer().get_default_rotation_quaternion()
         view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
         view.volume_preset = "bone"
         view.volume_render_config = create_default_volume_render_config("bone")
@@ -1355,12 +1396,12 @@ class ViewerService:
                 spacing_xyz=spacing_xyz,
                 fast_preview=fast_preview,
             )
-            image = vtk_surface_renderer.render(surface_request)
+            image = _get_vtk_surface_renderer().render(surface_request)
             if not fast_preview:
                 self._warm_surface_preview_session(surface_request)
             viewport_label = "3D SR"
         else:
-            image = vtk_volume_renderer.render(
+            image = _get_vtk_volume_renderer().render(
                 self._build_volume_render_request(
                     view,
                     volume=volume,
@@ -1402,7 +1443,7 @@ class ViewerService:
 
     def _warm_surface_preview_session(self, request: SurfaceRenderRequest) -> None:
         try:
-            vtk_surface_renderer.warm_preview_session(request)
+            _get_vtk_surface_renderer().warm_preview_session(request)
         except Exception:
             logger.debug("failed to schedule surface preview warmup view_id=%s", request.view_id, exc_info=True)
 
@@ -2435,7 +2476,7 @@ class ViewerService:
         volume = self._get_series_volume(series)
         spacing_xyz = self._get_3d_spacing_xyz(series)
         if self._normalize_render_3d_mode(view.render_3d_mode) == "surface":
-            view.rotation_quaternion = vtk_surface_renderer.apply_trackball_camera_delta(
+            view.rotation_quaternion = _get_vtk_surface_renderer().apply_trackball_camera_delta(
                 self._build_surface_render_request(
                     view,
                     volume=volume,
@@ -2446,7 +2487,7 @@ class ViewerService:
                 delta_y_pixels=delta_y_pixels,
             )
         else:
-            view.rotation_quaternion = vtk_volume_renderer.apply_trackball_camera_delta(
+            view.rotation_quaternion = _get_vtk_volume_renderer().apply_trackball_camera_delta(
                 self._build_volume_render_request(
                     view,
                     volume=volume,

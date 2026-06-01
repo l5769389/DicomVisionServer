@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import ndimage
 
 from .geometry import VolumeGeometry, spacing_along_world_direction
 from .planes import PlanePose
@@ -25,6 +24,12 @@ SLAB_REDUCERS = {
     "sum": np.sum,
     DEFAULT_MIP_ALGORITHM: np.max,
 }
+
+
+def _get_ndimage():
+    from scipy import ndimage
+
+    return ndimage
 
 
 def _reduce_slab(slab: np.ndarray, algorithm: str) -> np.ndarray:
@@ -63,6 +68,7 @@ def reslice_plane(
     row_world = np.asarray(plane.row_world, dtype=np.float64)
     col_world = np.asarray(plane.col_world, dtype=np.float64)
     normal_world = np.asarray(plane.normal_world, dtype=np.float64)
+    ndimage = _get_ndimage()
 
     for slab_offset_mm in slab_offsets_mm:
         world_points = (

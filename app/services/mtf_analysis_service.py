@@ -13,7 +13,6 @@ from app.schemas.view import (
     ViewMtfAnalyzeRequest,
     ViewMtfAnalyzeResponse,
 )
-from app.services.mtf import MtfAnalyzer
 from app.services.view_registry import view_registry
 
 
@@ -56,6 +55,8 @@ class MtfAnalysisService:
 
         sample_count = int(roi.size)
         try:
+            from app.services.mtf import MtfAnalyzer
+
             analysis = MtfAnalyzer.analyze_roi(roi, spacing_xy=spacing_xy)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
