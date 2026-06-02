@@ -1,4 +1,5 @@
 import io
+import hashlib
 from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -157,6 +158,14 @@ CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
+MPR_FAST_PREVIEW_SCALE = 0.33
+MPR_FAST_PREVIEW_MIN_SIDE = 96
+MPR_CROSSHAIR_MODE_ORTHOGONAL = "orthogonal"
+MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE = "double-oblique"
+MPR_CROSSHAIR_MODES = {
+    MPR_CROSSHAIR_MODE_ORTHOGONAL,
+    MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE,
+}
 
 
 class _LazyRendererProxy:
@@ -249,11 +258,15 @@ class ViewerService:
     def _is_3d_view_type(view_type: str) -> bool:
         return view_type == "3D"
 
-    def set_view_size(self, payload: ViewSetSizeRequest) -> OperationAcceptedResponse:
+    def set_view_size(
+        self,
+        payload: ViewSetSizeRequest,
+        workspace_id: str | None = None,
+    ) -> OperationAcceptedResponse:
         if payload.op_type != VIEW_OP_TYPE_SET_SIZE:
             raise HTTPException(status_code=400, detail="opType must be setSize")
 
-        view = view_registry.get(payload.view_id)
+        view = view_registry.get(payload.view_id, workspace_id=workspace_id)
         view.width = payload.size.width
         view.height = payload.size.height
         logger.info(
@@ -277,8 +290,9 @@ class ViewerService:
         image_format: ImageFormat = "png",
         fast_preview: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
+        workspace_id: str | None = None,
     ) -> RenderedImageResult:
-        view = view_registry.get(view_id)
+        view = view_registry.get(view_id, workspace_id=workspace_id)
         return self._render_by_view_type(
             view,
             image_format=image_format,
@@ -286,13 +300,13 @@ class ViewerService:
             progress_callback=progress_callback,
         )
 
-    def close_view_by_id(self, view_id: str) -> OperationAcceptedResponse:
-        view = view_registry.delete(view_id)
+    def close_view_by_id(self, view_id: str, workspace_id: str | None = None) -> OperationAcceptedResponse:
+        view = view_registry.delete(view_id, workspace_id=workspace_id)
         if self._is_3d_view_type(view.view_type):
             _get_vtk_volume_renderer().drop_session(view.view_id)
             _get_vtk_surface_renderer().drop_session(view.view_id)
         group = view.view_group
-        if group is not None and not view_registry.list_view_group(group.group_id):
+        if group is not None and not view_registry.list_view_group(group.group_id, workspace_id=workspace_id):
             view_group_registry.delete(group.group_id)
         return OperationAcceptedResponse(message="View closed", viewId=view.view_id)
 
@@ -302,8 +316,9 @@ class ViewerService:
         export_format: str,
         *,
         overlays: ViewExportOverlaysPayload | None = None,
+        workspace_id: str | None = None,
     ) -> ExportedFileResult:
-        view = view_registry.get(view_id)
+        view = view_registry.get(view_id, workspace_id=workspace_id)
         safe_view_type = str(view.view_type or "view").lower()
 
         if export_format == "dicom-sr":
@@ -522,16 +537,28 @@ class ViewerService:
             return (255, 209, 102, 255)
         return (red, green, blue, 255)
 
-    def handle_view_operation(self, payload: ViewOperationRequest) -> OperationRenderOutcome:
-        return handle_view_operation(self, payload)
+    def handle_view_operation(
+        self,
+        payload: ViewOperationRequest,
+        workspace_id: str | None = None,
+    ) -> OperationRenderOutcome:
+        return handle_view_operation(self, payload, workspace_id=workspace_id)
 
-    def handle_view_hover(self, payload: ViewHoverRequest) -> ViewHoverResponse:
-        view = view_registry.get(payload.view_id)
+    def handle_view_hover(
+        self,
+        payload: ViewHoverRequest,
+        workspace_id: str | None = None,
+    ) -> ViewHoverResponse:
+        view = view_registry.get(payload.view_id, workspace_id=workspace_id)
         row, col = self._resolve_hover_row_col(view, payload.x, payload.y)
         return ViewHoverResponse(viewId=view.view_id, row=row, col=col)
 
-    def get_series_corner_info(self, payload: CornerInfoRequest) -> CornerInfoResponse:
-        series = series_registry.get(payload.series_id)
+    def get_series_corner_info(
+        self,
+        payload: CornerInfoRequest,
+        workspace_id: str | None = None,
+    ) -> CornerInfoResponse:
+        series = series_registry.get(payload.series_id, workspace_id=workspace_id)
         _, reference_cached = self._get_reference_instance_and_cache(series)
         overlay = self._build_series_corner_info_overlay(
             series,
@@ -539,10 +566,20 @@ class ViewerService:
         )
         return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(overlay))
 
-    def analyze_mtf(self, payload: ViewMtfAnalyzeRequest) -> ViewMtfAnalyzeResponse:
+    def analyze_mtf(
+        self,
+        payload: ViewMtfAnalyzeRequest,
+        workspace_id: str | None = None,
+    ) -> ViewMtfAnalyzeResponse:
+        view_registry.get(payload.view_id, workspace_id=workspace_id)
         return self._mtf_analysis_service.analyze(payload)
 
-    def analyze_qa_water(self, payload: ViewQaWaterAnalyzeRequest) -> ViewQaWaterAnalyzeResponse:
+    def analyze_qa_water(
+        self,
+        payload: ViewQaWaterAnalyzeRequest,
+        workspace_id: str | None = None,
+    ) -> ViewQaWaterAnalyzeResponse:
+        view_registry.get(payload.view_id, workspace_id=workspace_id)
         return self._water_phantom_qa_service.analyze(payload)
 
     def _resolve_hover_row_col(self, view: ViewRecord, normalized_x: float, normalized_y: float) -> tuple[int, int]:
@@ -1144,18 +1181,35 @@ class ViewerService:
             view.zoom,
         )
 
-    def _sync_mpr_state_from_source_view(self, target_view: ViewRecord, source_view_id: str) -> bool:
+    def _sync_mpr_state_from_source_view(
+        self,
+        target_view: ViewRecord,
+        source_view_id: str,
+        workspace_id: str | None = None,
+    ) -> bool:
         if not self._is_mpr_view_type(target_view.view_type) or target_view.view_group is None:
             return False
 
-        source_view = view_registry.get(source_view_id)
+        source_view = (
+            view_registry.get(source_view_id)
+            if workspace_id is None
+            else view_registry.get(source_view_id, workspace_id=workspace_id)
+        )
         if not self._is_mpr_view_type(source_view.view_type) or source_view.view_group is None:
             return False
         if source_view.view_group.group_id == target_view.view_group.group_id:
             return False
 
-        source_series = series_registry.get(source_view.series_id)
-        target_series = series_registry.get(target_view.series_id)
+        source_series = (
+            series_registry.get(source_view.series_id)
+            if workspace_id is None
+            else series_registry.get(source_view.series_id, workspace_id=workspace_id)
+        )
+        target_series = (
+            series_registry.get(target_view.series_id)
+            if workspace_id is None
+            else series_registry.get(target_view.series_id, workspace_id=workspace_id)
+        )
         logger.info(
             "mpr state sync source_view_id=%s source_series_id=%s target_view_id=%s target_series_id=%s",
             source_view.view_id,
@@ -1176,6 +1230,8 @@ class ViewerService:
         target_group.crosshair_drag_origin_image = None
         target_group.rotation_drag = None
         target_group.mpr_crosshair_angles = deepcopy(source_group.mpr_crosshair_angles)
+        target_group.mpr_crosshair_mode = self._normalize_mpr_crosshair_mode(source_group.mpr_crosshair_mode)
+        target_group.mpr_independent_plane_normals = deepcopy(source_group.mpr_independent_plane_normals)
         target_group.mpr_mip = deepcopy(source_group.mpr_mip)
         target_group.mpr_model_rotation_world = deepcopy(source_group.mpr_model_rotation_world)
         target_group.mpr_model_rotation_pivot_world = deepcopy(source_group.mpr_model_rotation_pivot_world)
@@ -1270,6 +1326,8 @@ class ViewerService:
         group.crosshair_drag_origin_image = None
         group.rotation_drag = None
         group.mpr_crosshair_angles.clear()
+        group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_ORTHOGONAL
+        group.mpr_independent_plane_normals.clear()
         group.mpr_mip = self._create_default_mpr_mip_state()
         self._set_mpr_model_rotation_matrix(group, np.eye(3, dtype=np.float64))
         group.mpr_model_rotation_pivot_world = None
@@ -1558,11 +1616,14 @@ class ViewerService:
         fast_preview: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
+        render_started_at = perf_counter()
         ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
         self._emit_render_progress(progress_callback, "volume", progress_percent=6)
+        volume_started_at = perf_counter()
         volume = self._get_series_volume(series, progress_callback=progress_callback)
+        volume_ms = (perf_counter() - volume_started_at) * 1000.0
         if not view.is_initialized:
             self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_mpr_viewport(view)
@@ -1570,20 +1631,51 @@ class ViewerService:
 
         target_viewport = self._resolve_mpr_viewport(view)
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
-        plane_pixels, current, total = self._extract_mpr_plane(view, volume, target_viewport)
+        preview_plane_shape = (
+            self._get_mpr_fast_preview_plane_shape(
+                volume.shape,
+                target_viewport,
+                viewport_size=(view.height or 0, view.width or 0),
+            )
+            if fast_preview
+            else None
+        )
+        reslice_started_at = perf_counter()
+        plane_pixels, current, total = self._extract_mpr_plane(
+            view,
+            volume,
+            target_viewport,
+            output_shape=preview_plane_shape,
+            interpolation_order=0 if fast_preview else 1,
+        )
+        reslice_ms = (perf_counter() - reslice_started_at) * 1000.0
+        metadata_started_at = perf_counter()
         payload_pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
         target_plane_pose = payload_pose_context.poses[target_viewport]
         plane_state = self._plane_state_from_pose(target_plane_pose) if view.view_group is not None else None
         pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(target_plane_pose)
+        full_plane_height, full_plane_width = target_plane_pose.output_shape
+        source_plane_height, source_plane_width = plane_pixels.shape[:2]
+        render_pixel_aspect_x = pixel_aspect_x * float(full_plane_width) / float(max(1, source_plane_width))
+        render_pixel_aspect_y = pixel_aspect_y * float(full_plane_height) / float(max(1, source_plane_height))
         render_plan = self._build_render_plan_for_shape(
             view,
             *plane_pixels.shape[:2],
-            pixel_aspect_x=pixel_aspect_x,
-            pixel_aspect_y=pixel_aspect_y,
+            pixel_aspect_x=render_pixel_aspect_x,
+            pixel_aspect_y=render_pixel_aspect_y,
         )
-        image_transform = viewport_transformer.build_image_to_canvas_transform(
+        render_image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_pixels.shape[1],
             image_height=plane_pixels.shape[0],
+            canvas_width=render_plan.render_view.width or 0,
+            canvas_height=render_plan.render_view.height or 0,
+            view=render_plan.render_view,
+            pixel_aspect_x=render_pixel_aspect_x,
+            pixel_aspect_y=render_pixel_aspect_y,
+        )
+        metadata_image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=full_plane_width,
+            image_height=full_plane_height,
             canvas_width=render_plan.render_view.width or 0,
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
@@ -1592,7 +1684,7 @@ class ViewerService:
         )
         scale_bar = self._build_scale_bar_info(
             render_plan.render_view,
-            image_transform,
+            metadata_image_transform,
             self._get_mpr_spacing_xy_from_pose(target_plane_pose),
         )
         plane_min = float(np.min(plane_pixels))
@@ -1600,8 +1692,8 @@ class ViewerService:
         mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(
             render_plan.render_view,
             volume.shape,
-            plane_pixels.shape,
-            image_transform,
+            target_plane_pose.output_shape,
+            metadata_image_transform,
         )
         reference_instance, reference_cached = self._get_reference_instance_and_cache(series)
         slice_corner_info = self._build_slice_corner_info_overlay(
@@ -1620,7 +1712,7 @@ class ViewerService:
             source_pixels=plane_pixels,
             pixel_min=plane_min,
             pixel_max=plane_max,
-            image_transform=image_transform,
+            image_transform=render_image_transform,
             instance=reference_instance,
             cached=reference_cached,
             mpr_viewport=target_viewport,
@@ -1630,13 +1722,32 @@ class ViewerService:
             orientation=None,
         )
         visible_measurements = self._build_visible_measurements(view)
+        metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
+        image_started_at = perf_counter()
         if fast_preview:
             image = self._render_fast_mpr_preview(context)
         else:
             image = layered_renderer.render(context)
+        image_ms = (perf_counter() - image_started_at) * 1000.0
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
+        encode_started_at = perf_counter()
         image_bytes = self._encode_image(image, image_format)
+        encode_ms = (perf_counter() - encode_started_at) * 1000.0
+        logger.debug(
+            "mpr render timing view_id=%s viewport=%s fast_preview=%s source_shape=%s full_shape=%s volume_ms=%.1f reslice_ms=%.1f metadata_ms=%.1f image_ms=%.1f encode_ms=%.1f total_ms=%.1f",
+            view.view_id,
+            target_viewport,
+            fast_preview,
+            plane_pixels.shape,
+            target_plane_pose.output_shape,
+            volume_ms,
+            reslice_ms,
+            metadata_ms,
+            image_ms,
+            encode_ms,
+            (perf_counter() - render_started_at) * 1000.0,
+        )
 
         return RenderedImageResult(
             meta=ViewImageResponse(
@@ -1653,12 +1764,13 @@ class ViewerService:
                     plane_pose=target_plane_pose,
                 ),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
+                mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=self._serialize_measurements(
                     visible_measurements,
-                    image_transform=image_transform,
+                    image_transform=metadata_image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
                 ),
@@ -1795,8 +1907,126 @@ class ViewerService:
         return height, width
 
     @staticmethod
+    def _get_mpr_fast_preview_plane_shape(
+        volume_shape: tuple[int, int, int],
+        viewport_key: str,
+        viewport_size: tuple[int, int] | None = None,
+    ) -> tuple[int, int]:
+        full_height, full_width = ViewerService._get_mpr_plane_shape(volume_shape, viewport_key)
+        viewport_height = int(viewport_size[0]) if viewport_size is not None else 0
+        viewport_width = int(viewport_size[1]) if viewport_size is not None else 0
+
+        def preview_dimension(value: int, viewport_value: int) -> int:
+            if value <= MPR_FAST_PREVIEW_MIN_SIDE:
+                return max(1, int(value))
+            volume_scaled = max(MPR_FAST_PREVIEW_MIN_SIDE, int(round(float(value) * MPR_FAST_PREVIEW_SCALE)))
+            if viewport_value > 0:
+                viewport_scaled = max(
+                    MPR_FAST_PREVIEW_MIN_SIDE,
+                    int(round(float(viewport_value) * MPR_FAST_PREVIEW_SCALE)),
+                )
+                volume_scaled = min(volume_scaled, viewport_scaled)
+            return min(
+                int(value),
+                volume_scaled,
+            )
+
+        return preview_dimension(full_height, viewport_height), preview_dimension(full_width, viewport_width)
+
+    @staticmethod
     def _create_default_mpr_mip_state() -> MprMipState:
         return MprMipState()
+
+    @staticmethod
+    def _normalize_mpr_crosshair_mode(value: object) -> str:
+        mode = str(value or "").strip().lower()
+        return mode if mode in MPR_CROSSHAIR_MODES else MPR_CROSSHAIR_MODE_ORTHOGONAL
+
+    @staticmethod
+    def _get_mpr_crosshair_mode(group: ViewGroupRecord | None) -> str:
+        return ViewerService._normalize_mpr_crosshair_mode(
+            group.mpr_crosshair_mode if group is not None else MPR_CROSSHAIR_MODE_ORTHOGONAL
+        )
+
+    @staticmethod
+    def _normalize_plane_normal_record(value: object) -> tuple[float, float, float] | None:
+        try:
+            vector = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if vector.shape != (3,):
+            return None
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm) or norm <= 1e-6:
+            return None
+        return tuple(float(component) for component in vector / norm)
+
+    def _get_independent_plane_normal_overrides(
+        self,
+        group: ViewGroupRecord | None,
+    ) -> dict[str, tuple[float, float, float]]:
+        if self._get_mpr_crosshair_mode(group) != MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE or group is None:
+            return {}
+        return {
+            viewport_key: normal
+            for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+            if (normal := self._normalize_plane_normal_record(group.mpr_independent_plane_normals.get(viewport_key))) is not None
+        }
+
+    def _derive_mpr_plane_pose(
+        self,
+        cursor: MprCursorState,
+        viewport_key: str,
+        geometry: VolumeGeometry,
+        shape_policy: OutputShapePolicy,
+        normal_overrides: dict[str, tuple[float, float, float]] | None = None,
+        use_display_basis_for_cursor_offsets: bool = False,
+    ) -> PlanePose:
+        return derive_plane_pose(
+            cursor,
+            viewport_key,
+            geometry,
+            shape_policy,
+            normal_world_override=(normal_overrides or {}).get(viewport_key),
+            use_display_basis_for_cursor_offsets=use_display_basis_for_cursor_offsets,
+        )
+
+    def _build_mpr_plane_poses(
+        self,
+        cursor: MprCursorState,
+        geometry: VolumeGeometry,
+        volume_shape: tuple[int, int, int],
+        *,
+        normal_overrides: dict[str, tuple[float, float, float]] | None = None,
+        use_display_basis_for_cursor_offsets: bool = False,
+    ) -> dict[str, PlanePose]:
+        shape_policy = OutputShapePolicy(
+            viewport_shapes={
+                viewport_key: self._get_mpr_plane_shape(volume_shape, viewport_key)
+                for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+            }
+        )
+        return {
+            viewport_key: self._derive_mpr_plane_pose(
+                cursor,
+                viewport_key,
+                geometry,
+                shape_policy,
+                normal_overrides,
+                use_display_basis_for_cursor_offsets=use_display_basis_for_cursor_offsets,
+            )
+            for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+        }
+
+    @staticmethod
+    def _normal_records_from_poses(poses: dict[str, PlanePose]) -> dict[str, tuple[float, float, float]]:
+        return {
+            viewport_key: tuple(float(value) for value in mpr_geometry.normalize_oblique_vector(
+                pose.normal_world,
+                fallback=(1.0, 0.0, 0.0),
+            ))
+            for viewport_key, pose in poses.items()
+        }
 
     @staticmethod
     def _serialize_mpr_mip_config(state: MprMipState) -> MprMipConfig:
@@ -1832,25 +2062,129 @@ class ViewerService:
             view.view_group.mpr_mip = next_state
         return True
 
+    def _handle_mpr_crosshair_mode(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_mpr_view_type(view.view_type) or view.view_group is None:
+            return False
+        if payload.mpr_crosshair_mode is None:
+            return False
+        next_mode = self._normalize_mpr_crosshair_mode(payload.mpr_crosshair_mode)
+        group = view.view_group
+        current_mode = self._get_mpr_crosshair_mode(group)
+        if next_mode == current_mode:
+            return False
+
+        series = series_registry.get(view.series_id)
+        volume_shape = self._get_series_volume(series).shape
+        pose_context = self._build_mpr_pose_context(view, volume_shape, series=series)
+        group.active_viewport = self._resolve_mpr_viewport(view)
+        group.rotation_drag = None
+
+        if next_mode == MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE:
+            group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE
+            self._ensure_mpr_independent_plane_normals(group, pose_context.poses)
+            group.mpr_crosshair_angles.clear()
+            self._ensure_mpr_crosshair_angle_cache(group, pose_context.poses)
+            view.is_initialized = True
+            return True
+
+        self._reorthogonalize_mpr_group_from_pose_context(group, pose_context, volume_shape)
+        group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_ORTHOGONAL
+        group.mpr_independent_plane_normals.clear()
+        group.mpr_crosshair_angles.clear()
+        group.rotation_drag = None
+        view.is_initialized = True
+        return True
+
+    def _ensure_mpr_independent_plane_normals(
+        self,
+        group: ViewGroupRecord,
+        poses: dict[str, PlanePose],
+    ) -> None:
+        next_normals = self._normal_records_from_poses(poses)
+        for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL):
+            existing_normal = self._normalize_plane_normal_record(group.mpr_independent_plane_normals.get(viewport_key))
+            if existing_normal is not None:
+                next_normals[viewport_key] = existing_normal
+        group.mpr_independent_plane_normals = next_normals
+
+    def _reorthogonalize_mpr_group_from_pose_context(
+        self,
+        group: ViewGroupRecord,
+        pose_context: MprPoseContext,
+        volume_shape: tuple[int, int, int],
+    ) -> None:
+        active_viewport = (
+            group.active_viewport
+            if group.active_viewport in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+            else MPR_VIEWPORT_AXIAL
+        )
+        active_plane = pose_context.poses[active_viewport]
+        active_normal = np.asarray(active_plane.normal_world, dtype=np.float64)
+        horizontal_angle, _ = self._get_mpr_visible_crosshair_line_angles(
+            group,
+            pose_context.poses,
+            active_viewport,
+        )
+        horizontal_line_world = mpr_geometry.direction_from_screen_angle(
+            np.asarray(active_plane.row_world, dtype=np.float64),
+            np.asarray(active_plane.col_world, dtype=np.float64),
+            horizontal_angle,
+        )
+        vertical_line_world = mpr_geometry.direction_from_screen_angle(
+            np.asarray(active_plane.row_world, dtype=np.float64),
+            np.asarray(active_plane.col_world, dtype=np.float64),
+            horizontal_angle + float(np.pi / 2.0),
+        )
+
+        normal_updates: dict[str, np.ndarray] = {
+            active_viewport: active_normal,
+        }
+        for line, line_world in (("horizontal", horizontal_line_world), ("vertical", vertical_line_world)):
+            target_viewport = self._resolve_mpr_oblique_target_viewport(active_viewport, line)
+            target_plane = pose_context.poses[target_viewport]
+            next_normal = mpr_geometry.normalize_oblique_vector(
+                np.cross(line_world, active_normal),
+                fallback=tuple(target_plane.normal_world),
+            )
+            if float(np.dot(next_normal, np.asarray(target_plane.normal_world, dtype=np.float64))) < 0.0:
+                next_normal = -next_normal
+            normal_updates[target_viewport] = next_normal
+
+        next_cursor = self._replace_mpr_cursor_plane_normals(pose_context.cursor, normal_updates)
+        self._sync_group_from_mpr_cursor(group, next_cursor, pose_context.geometry, volume_shape)
+
     def _extract_mpr_plane(
         self,
         view: ViewRecord,
         volume: np.ndarray,
         viewport_key: str | None = None,
+        output_shape: tuple[int, int] | None = None,
+        interpolation_order: int = 1,
     ) -> tuple[np.ndarray, int, int]:
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
+        full_plane_shape = self._get_mpr_plane_shape(volume.shape, target_viewport)
         try:
             series = series_registry.get(view.series_id)
         except Exception:
             series = None
         geometry = self._get_series_volume_geometry(series, volume.shape) if series is not None else build_identity_geometry(volume.shape)
         cursor = self._get_mpr_cursor_state(view, geometry, volume.shape)
-        plane_pose = derive_plane_pose(
+        plane_pose = self._derive_mpr_plane_pose(
             cursor,
             target_viewport,
             geometry,
-            OutputShapePolicy(viewport_shapes={target_viewport: self._get_mpr_plane_shape(volume.shape, target_viewport)}),
+            OutputShapePolicy(viewport_shapes={target_viewport: full_plane_shape}),
+            self._get_independent_plane_normal_overrides(view.view_group),
         )
+        if output_shape is not None and tuple(output_shape) != full_plane_shape:
+            sample_height = max(1, int(output_shape[0]))
+            sample_width = max(1, int(output_shape[1]))
+            plane_pose = replace(
+                plane_pose,
+                output_shape=(sample_height, sample_width),
+                pixel_spacing_row_mm=float(plane_pose.pixel_spacing_row_mm) * float(full_plane_shape[0]) / float(sample_height),
+                pixel_spacing_col_mm=float(plane_pose.pixel_spacing_col_mm) * float(full_plane_shape[1]) / float(sample_width),
+            )
         sampling_geometry = self._build_mpr_model_sampling_geometry(
             view,
             geometry,
@@ -1861,6 +2195,7 @@ class ViewerService:
             sampling_geometry,
             plane_pose,
             self._build_reslice_mip_config(view.mpr_mip, target_viewport),
+            interpolation_order=interpolation_order,
         )
         current, total = self._get_mpr_viewport_index_info(view, volume.shape, target_viewport, cursor=cursor, geometry=geometry)
         if target_viewport == MPR_VIEWPORT_AXIAL:
@@ -2102,7 +2437,8 @@ class ViewerService:
         *,
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> np.ndarray:
-        cached_volume = self._get_cached_series_volume(series.series_id)
+        volume_cache_key = self._build_series_volume_cache_key(series)
+        cached_volume = self._get_cached_series_volume(volume_cache_key)
         if cached_volume is not None:
             self._emit_render_progress(
                 progress_callback,
@@ -2113,12 +2449,12 @@ class ViewerService:
             )
             return cached_volume
 
-        build_lock = self._get_series_volume_build_lock(series.series_id)
+        build_lock = self._get_series_volume_build_lock(volume_cache_key)
         if build_lock.locked():
             self._emit_render_progress(progress_callback, "waiting", progress_percent=8)
 
         with build_lock:
-            cached_volume = self._get_cached_series_volume(series.series_id)
+            cached_volume = self._get_cached_series_volume(volume_cache_key)
             if cached_volume is not None:
                 self._emit_render_progress(
                     progress_callback,
@@ -2131,7 +2467,7 @@ class ViewerService:
 
             started_at = perf_counter()
             volume = self._build_series_volume(series, progress_callback=progress_callback)
-            stored_volume = self._store_series_volume(series.series_id, volume)
+            stored_volume = self._store_series_volume(volume_cache_key, volume)
             self._emit_render_progress(
                 progress_callback,
                 "volume",
@@ -2140,13 +2476,24 @@ class ViewerService:
                 total_count=len(series.instances),
             )
             logger.info(
-                "series volume built series_id=%s shape=%s bytes=%s elapsed_ms=%.1f",
+                "series volume built series_id=%s cache_key=%s shape=%s bytes=%s elapsed_ms=%.1f",
                 series.series_id,
+                volume_cache_key,
                 stored_volume.shape,
                 int(stored_volume.nbytes),
                 (perf_counter() - started_at) * 1000.0,
             )
             return stored_volume
+
+    @staticmethod
+    def _build_series_volume_cache_key(series: SeriesRecord) -> str:
+        content_keys = [
+            dicom_cache.build_instance_content_key(instance.sop_instance_uid, instance.path)
+            for instance in series.instances
+            if instance.sop_instance_uid
+        ]
+        digest = hashlib.sha256("\n".join(content_keys).encode("utf-8")).hexdigest()
+        return f"volume::{digest}"
 
     def _build_series_volume(
         self,
@@ -2211,6 +2558,9 @@ class ViewerService:
         self._series_patient_transform_cache.pop(series_id, None)
         self._series_representative_slice_cache.pop(series_id, None)
         logger.debug("volume cache evict series_id=%s bytes=%s", series_id, int(volume.nbytes))
+
+    def get_volume_cache_stats(self) -> dict[str, int]:
+        return self._series_volume_cache.stats()
 
     @staticmethod
     def _get_dataset_orientation(dataset) -> np.ndarray | None:
@@ -2516,15 +2866,9 @@ class ViewerService:
                     view.view_group.crosshair_drag_origin_image = None
             return False
 
-        if payload.action_type == DRAG_ACTION_END:
-            was_dragging = view.mpr_crosshair_drag_active
-            view.mpr_crosshair_drag_active = False
-            if view.view_group is not None:
-                view.view_group.crosshair_drag_origin_center = None
-                view.view_group.crosshair_drag_origin_image = None
-            return was_dragging
-
-        if payload.action_type != DRAG_ACTION_MOVE or not view.mpr_crosshair_drag_active:
+        is_drag_end = payload.action_type == DRAG_ACTION_END
+        was_dragging = view.mpr_crosshair_drag_active
+        if (payload.action_type != DRAG_ACTION_MOVE and not is_drag_end) or not was_dragging:
             return False
 
         image_x = min(max(float(payload.x), 0.0), 1.0) * image_width
@@ -2553,19 +2897,27 @@ class ViewerService:
                 next_center[2] = float(max(0.0, min(image_x - 0.5, width - 1)))
                 next_center[1] = float(max(0.0, min(image_y - 0.5, height - 1)))
 
-        if np.allclose(next_center, np.asarray(previous_center, dtype=np.float64), atol=1e-6):
-            return False
+        center_changed = not np.allclose(next_center, np.asarray(previous_center, dtype=np.float64), atol=1e-6)
 
-        if view.view_group is not None:
-            next_cursor = replace(pose_context.cursor, center_world=np.asarray(next_center_world, dtype=np.float64))
-            self._sync_group_from_mpr_cursor(view.view_group, next_cursor, pose_context.geometry, volume.shape)
-        else:
-            view.mpr_axial_index = int(np.round(next_center[0]))
-            view.mpr_coronal_index = int(np.round(next_center[1]))
-            view.mpr_sagittal_index = int(np.round(next_center[2]))
-        view.current_index = view.mpr_axial_index
-        view.is_initialized = True
-        return True
+        if center_changed:
+            if view.view_group is not None:
+                next_cursor = replace(pose_context.cursor, center_world=np.asarray(next_center_world, dtype=np.float64))
+                self._sync_group_from_mpr_cursor(view.view_group, next_cursor, pose_context.geometry, volume.shape)
+            else:
+                view.mpr_axial_index = int(np.round(next_center[0]))
+                view.mpr_coronal_index = int(np.round(next_center[1]))
+                view.mpr_sagittal_index = int(np.round(next_center[2]))
+            view.current_index = view.mpr_axial_index
+            view.is_initialized = True
+
+        if is_drag_end:
+            view.mpr_crosshair_drag_active = False
+            if view.view_group is not None:
+                view.view_group.crosshair_drag_origin_center = None
+                view.view_group.crosshair_drag_origin_image = None
+            return was_dragging or center_changed
+
+        return center_changed
 
     def _resolve_mpr_center_from_image_point(
         self,
@@ -2648,6 +3000,8 @@ class ViewerService:
             return False
 
         if payload.action_type == DRAG_ACTION_START:
+            if self._get_mpr_crosshair_mode(group) == MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE:
+                self._ensure_mpr_independent_plane_normals(group, pose_context.poses)
             self._ensure_mpr_crosshair_angle_cache(group, pose_context.poses)
             start_horizontal_angle, start_vertical_angle = self._get_mpr_visible_crosshair_line_angles(
                 group,
@@ -2660,6 +3014,7 @@ class ViewerService:
                 start_cursor=self._serialize_mpr_cursor_record(pose_context.cursor),
                 start_pointer_angle_rad=pointer_angle_rad,
                 start_line_angle_rad=start_horizontal_angle if payload.line == "horizontal" else start_vertical_angle,
+                start_independent_plane_normals=deepcopy(group.mpr_independent_plane_normals),
             )
             return False
 
@@ -2722,17 +3077,18 @@ class ViewerService:
         geometry: VolumeGeometry,
         volume_shape: tuple[int, int, int],
     ) -> None:
+        if self._get_mpr_crosshair_mode(group) == MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE:
+            self._apply_mpr_double_oblique_rotation_pointer_drag(
+                group,
+                drag,
+                pointer_angle_rad,
+                geometry,
+                volume_shape,
+            )
+            return
+
         start_cursor = self._deserialize_mpr_cursor_record(drag.start_cursor)
-        shape_policy = OutputShapePolicy(
-            viewport_shapes={
-                viewport_key: self._get_mpr_plane_shape(volume_shape, viewport_key)
-                for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
-            }
-        )
-        start_poses = {
-            viewport_key: derive_plane_pose(start_cursor, viewport_key, geometry, shape_policy)
-            for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
-        }
+        start_poses = self._build_mpr_plane_poses(start_cursor, geometry, volume_shape)
         start_active_plane = start_poses[drag.viewport]
         active_normal = np.asarray(start_active_plane.normal_world, dtype=np.float64)
         active_row = np.asarray(start_active_plane.row_world, dtype=np.float64)
@@ -2771,6 +3127,47 @@ class ViewerService:
 
         next_cursor = self._replace_mpr_cursor_plane_normals(start_cursor, normal_updates)
         self._sync_group_from_mpr_cursor(group, next_cursor, geometry, volume_shape)
+
+    def _apply_mpr_double_oblique_rotation_pointer_drag(
+        self,
+        group: ViewGroupRecord,
+        drag: MprRotationDragRecord,
+        pointer_angle_rad: float,
+        geometry: VolumeGeometry,
+        volume_shape: tuple[int, int, int],
+    ) -> None:
+        start_cursor = self._deserialize_mpr_cursor_record(drag.start_cursor)
+        start_poses = self._build_mpr_plane_poses(
+            start_cursor,
+            geometry,
+            volume_shape,
+            normal_overrides=drag.start_independent_plane_normals,
+        )
+        start_active_plane = start_poses[drag.viewport]
+        active_normal = np.asarray(start_active_plane.normal_world, dtype=np.float64)
+        active_row = np.asarray(start_active_plane.row_world, dtype=np.float64)
+        active_col = np.asarray(start_active_plane.col_world, dtype=np.float64)
+        target_line_angle_rad = float(drag.start_line_angle_rad) + self._normalize_screen_full_turn_delta(
+            float(pointer_angle_rad) - float(drag.start_pointer_angle_rad)
+        )
+        self._set_mpr_independent_visible_crosshair_line_angle(group, drag.viewport, drag.line, target_line_angle_rad)
+        target_line_world = mpr_geometry.direction_from_screen_angle(
+            active_row,
+            active_col,
+            target_line_angle_rad,
+        )
+        target_viewport = self._resolve_mpr_oblique_target_viewport(drag.viewport, drag.line)
+        start_target_plane = start_poses[target_viewport]
+        next_target_normal = mpr_geometry.normalize_oblique_vector(
+            np.cross(target_line_world, active_normal),
+            fallback=tuple(start_target_plane.normal_world),
+        )
+        if float(np.dot(next_target_normal, np.asarray(start_target_plane.normal_world, dtype=np.float64))) < 0.0:
+            next_target_normal = -next_target_normal
+
+        next_normals = self._normal_records_from_poses(start_poses)
+        next_normals[target_viewport] = tuple(float(value) for value in next_target_normal)
+        group.mpr_independent_plane_normals = next_normals
 
     @staticmethod
     def _replace_mpr_cursor_plane_normals(
@@ -2836,6 +3233,26 @@ class ViewerService:
             vertical_angle = self._normalize_screen_half_turn_angle(line_angle_rad)
             horizontal_angle = self._normalize_screen_half_turn_angle(line_angle_rad - float(np.pi / 2.0))
         group.mpr_crosshair_angles[viewport_key] = (horizontal_angle, vertical_angle)
+
+    def _set_mpr_independent_visible_crosshair_line_angle(
+        self,
+        group: ViewGroupRecord,
+        viewport_key: str,
+        line: str,
+        line_angle_rad: float,
+    ) -> None:
+        cached_angles = group.mpr_crosshair_angles.get(viewport_key) or (0.0, float(np.pi / 2.0))
+        if line == "horizontal":
+            group.mpr_crosshair_angles[viewport_key] = (
+                self._normalize_screen_half_turn_angle(line_angle_rad),
+                self._normalize_screen_half_turn_angle(float(cached_angles[1])),
+            )
+            return
+
+        group.mpr_crosshair_angles[viewport_key] = (
+            self._normalize_screen_half_turn_angle(float(cached_angles[0])),
+            self._normalize_screen_half_turn_angle(line_angle_rad),
+        )
 
     @staticmethod
     def _normalize_screen_full_turn_delta(angle_rad: float) -> float:
@@ -3646,19 +4063,18 @@ class ViewerService:
             else build_identity_geometry(normalized_shape)
         )
         cursor = self._get_mpr_cursor_state(view, geometry, normalized_shape)
-        shape_policy = OutputShapePolicy(
-            viewport_shapes={
-                viewport_key: self._get_mpr_plane_shape(normalized_shape, viewport_key)
-                for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
-            }
-        )
         return MprPoseContext(
             geometry=geometry,
             cursor=cursor,
-            poses={
-                viewport_key: derive_plane_pose(cursor, viewport_key, geometry, shape_policy)
-                for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
-            },
+            poses=self._build_mpr_plane_poses(
+                cursor,
+                geometry,
+                normalized_shape,
+                normal_overrides=self._get_independent_plane_normal_overrides(view.view_group),
+                use_display_basis_for_cursor_offsets=bool(
+                    view.view_group is not None and view.view_group.crosshair_drag_active
+                ),
+            ),
         )
 
     @staticmethod

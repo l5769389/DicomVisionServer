@@ -1,8 +1,9 @@
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
+from app.api.workspace import get_request_workspace_id
 from app.core.config import get_settings
 from app.schemas.dicom import (
     CornerInfoRequest,
@@ -96,9 +97,12 @@ def _dicom_tag_artifact_headers(
         "Pixel data is decoded later on demand by rendering APIs."
     ),
 )
-def load_folder(payload: LoadFolderRequest) -> LoadFolderResponse:
+def load_folder(
+    payload: LoadFolderRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> LoadFolderResponse:
     """Register DICOM files without decoding all pixel data up front."""
-    return series_registry.load_folder(payload)
+    return series_registry.load_folder(payload, workspace_id=workspace_id)
 
 
 @router.post(
@@ -116,9 +120,10 @@ async def upload_dicom_files(
         default=None,
         description="Optional browser-relative paths, used to preserve folder structure for webkitdirectory uploads.",
     ),
+    workspace_id: str = Depends(get_request_workspace_id),
 ) -> LoadFolderResponse:
     """Upload browser-selected files and register discovered DICOM series."""
-    return await dicom_upload_service.upload_and_load(files, relativePaths)
+    return await dicom_upload_service.upload_and_load(files, relativePaths, workspace_id=workspace_id)
 
 
 @router.post(
@@ -127,13 +132,15 @@ async def upload_dicom_files(
     summary="Load configured sample DICOM data",
     description="Loads the sample folder configured by WEB_SAMPLE_DICOM_PATH and returns the same series summary shape as loadFolder.",
 )
-def load_sample_folder() -> LoadSampleResponse:
+def load_sample_folder(
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> LoadSampleResponse:
     """Load the demo dataset used by the web preview mode."""
     sample_path = settings.web_sample_dicom_path
     if not sample_path:
         raise HTTPException(status_code=400, detail="WEB_SAMPLE_DICOM_PATH is not configured")
 
-    response = series_registry.load_folder(LoadFolderRequest(folderPath=sample_path))
+    response = series_registry.load_folder(LoadFolderRequest(folderPath=sample_path), workspace_id=workspace_id)
     return LoadSampleResponse(
         seriesId=response.series_id,
         seriesList=response.series_list,
@@ -147,9 +154,12 @@ def load_sample_folder() -> LoadSampleResponse:
     summary="Build series corner information",
     description="Returns patient, study, series, image, and display metadata used by viewport corner overlays.",
 )
-def get_corner_info(payload: CornerInfoRequest) -> CornerInfoResponse:
+def get_corner_info(
+    payload: CornerInfoRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> CornerInfoResponse:
     """Return corner overlay metadata for the selected series."""
-    return viewer_service.get_series_corner_info(payload)
+    return viewer_service.get_series_corner_info(payload, workspace_id=workspace_id)
 
 
 @router.get(
@@ -157,9 +167,15 @@ def get_corner_info(payload: CornerInfoRequest) -> CornerInfoResponse:
     summary="Get a series thumbnail",
     description="Returns a PNG thumbnail generated from the middle slice of a registered series.",
 )
-def get_series_thumbnail(seriesId: str) -> Response:
+def get_series_thumbnail(
+    seriesId: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> Response:
     """Return a small PNG preview for sidebar series cards."""
-    return Response(content=series_registry.get_series_thumbnail_png(seriesId), media_type="image/png")
+    return Response(
+        content=series_registry.get_series_thumbnail_png(seriesId, workspace_id=workspace_id),
+        media_type="image/png",
+    )
 
 
 @router.post(
@@ -168,11 +184,14 @@ def get_series_thumbnail(seriesId: str) -> Response:
     summary="Check DICOM series compatibility",
     description="Runs compatibility checks for a registered series on demand.",
 )
-def check_dicom_compatibility(payload: DicomCompatibilityRequest) -> DicomCompatibilityResponse:
+def check_dicom_compatibility(
+    payload: DicomCompatibilityRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> DicomCompatibilityResponse:
     """Return on-demand compatibility notices for a registered series."""
     return DicomCompatibilityResponse(
         seriesId=payload.series_id,
-        issues=series_registry.check_compatibility(payload.series_id),
+        issues=series_registry.check_compatibility(payload.series_id, workspace_id=workspace_id),
     )
 
 
@@ -185,14 +204,18 @@ def check_dicom_compatibility(payload: DicomCompatibilityRequest) -> DicomCompat
         "For single-series 4D data, this also materializes virtual phase series IDs."
     ),
 )
-def get_four_d_phases(payload: FourDPhasesRequest) -> FourDPhasesResponse:
+def get_four_d_phases(
+    payload: FourDPhasesRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> FourDPhasesResponse:
     """Return the phase list needed by the frontend 4D timeline."""
-    series_registry.ensure_four_d_phase_series(payload.series_id)
+    series_registry.ensure_four_d_phase_series(payload.series_id, workspace_id=workspace_id)
     return four_d_service.get_four_d_phases(
         payload.series_id,
-        series_registry.list_all(),
+        series_registry.list_all(workspace_id=workspace_id),
         include_preview_images=payload.include_preview_images,
         preview_phase_index=payload.preview_phase_index,
+        workspace_id=workspace_id,
     )
 
 
@@ -201,13 +224,18 @@ def get_four_d_phases(payload: FourDPhasesRequest) -> FourDPhasesResponse:
     summary="Get a 4D phase preview",
     description="Returns a PNG preview for one phase and MPR viewport in a registered 4D series.",
 )
-def get_four_d_preview(seriesId: str, phaseIndex: int, viewportKey: str) -> Response:
+def get_four_d_preview(
+    seriesId: str,
+    phaseIndex: int,
+    viewportKey: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> Response:
     """Return a preview image for a phase selector item."""
-    series_registry.ensure_four_d_phase_series(seriesId)
+    series_registry.ensure_four_d_phase_series(seriesId, workspace_id=workspace_id)
     return Response(
         content=four_d_service.get_four_d_preview_png(
             seriesId,
-            series_registry.list_all(),
+            series_registry.list_all(workspace_id=workspace_id),
             phase_index=phaseIndex,
             viewport_key=viewportKey,
         ),
@@ -221,9 +249,12 @@ def get_four_d_preview(seriesId: str, phaseIndex: int, viewportKey: str) -> Resp
     summary="Read DICOM tags",
     description="Returns formatted DICOM tags for a specific instance index in a registered series.",
 )
-def get_dicom_tags(payload: DicomTagsRequest) -> DicomTagsResponse:
+def get_dicom_tags(
+    payload: DicomTagsRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> DicomTagsResponse:
     """Return metadata rows for the DICOM tag viewer."""
-    return dicom_tag_service.get_series_tags(payload)
+    return dicom_tag_service.get_series_tags(payload, workspace_id=workspace_id)
 
 
 @router.post(
@@ -241,9 +272,12 @@ def get_dicom_tags(payload: DicomTagsRequest) -> DicomTagsResponse:
         }
     },
 )
-def deidentify_dicom_series(payload: DicomDeidentifyRequest) -> Response:
+def deidentify_dicom_series(
+    payload: DicomDeidentifyRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> Response:
     """Return a ZIP artifact with de-identified DICOM copies for the series."""
-    artifact = dicom_deidentify_service.deidentify_series(payload)
+    artifact = dicom_deidentify_service.deidentify_series(payload, workspace_id=workspace_id)
     return Response(
         content=artifact.content,
         media_type=artifact.media_type,
@@ -268,9 +302,12 @@ def deidentify_dicom_series(payload: DicomDeidentifyRequest) -> Response:
         "Use the returned statusUrl to poll progress until the ZIP artifact is ready."
     ),
 )
-def create_deidentify_dicom_series_job(payload: DicomDeidentifyRequest) -> DicomTagModifyJobStatusResponse:
+def create_deidentify_dicom_series_job(
+    payload: DicomDeidentifyRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> DicomTagModifyJobStatusResponse:
     """Start a background DICOM de-identification job."""
-    return dicom_deidentify_job_service.create_job(payload)
+    return dicom_deidentify_job_service.create_job(payload, workspace_id=workspace_id)
 
 
 @router.get(
@@ -278,9 +315,12 @@ def create_deidentify_dicom_series_job(payload: DicomDeidentifyRequest) -> Dicom
     response_model=DicomTagModifyJobStatusResponse,
     summary="Get asynchronous DICOM de-identification job status",
 )
-def get_deidentify_dicom_series_job(job_id: str) -> DicomTagModifyJobStatusResponse:
+def get_deidentify_dicom_series_job(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> DicomTagModifyJobStatusResponse:
     """Return current status for a background DICOM de-identification job."""
-    return dicom_deidentify_job_service.get_status(job_id)
+    return dicom_deidentify_job_service.get_status(job_id, workspace_id=workspace_id)
 
 
 @router.get(
@@ -293,9 +333,12 @@ def get_deidentify_dicom_series_job(job_id: str) -> DicomTagModifyJobStatusRespo
         }
     },
 )
-def get_deidentify_dicom_series_job_artifact(job_id: str) -> FileResponse:
+def get_deidentify_dicom_series_job_artifact(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> FileResponse:
     """Download the artifact produced by a completed background DICOM de-identification job."""
-    artifact = dicom_deidentify_job_service.get_completed_artifact(job_id)
+    artifact = dicom_deidentify_job_service.get_completed_artifact(job_id, workspace_id=workspace_id)
     return FileResponse(
         artifact.path,
         media_type=artifact.media_type,
@@ -329,9 +372,12 @@ def get_deidentify_dicom_series_job_artifact(job_id: str) -> FileResponse:
         }
     },
 )
-def modify_dicom_tag(payload: DicomTagModifyRequest) -> Response:
+def modify_dicom_tag(
+    payload: DicomTagModifyRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> Response:
     """Return modified DICOM bytes for the requested tag edit."""
-    artifact = dicom_tag_service.modify_series_tag(payload)
+    artifact = dicom_tag_service.modify_series_tag(payload, workspace_id=workspace_id)
     return Response(
         content=artifact.content,
         media_type=artifact.media_type,
@@ -357,9 +403,12 @@ def modify_dicom_tag(payload: DicomTagModifyRequest) -> Response:
         "in a registered series. Use the returned statusUrl to poll until the artifact is ready."
     ),
 )
-def create_modify_dicom_tag_job(payload: DicomTagModifyRequest) -> DicomTagModifyJobStatusResponse:
+def create_modify_dicom_tag_job(
+    payload: DicomTagModifyRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> DicomTagModifyJobStatusResponse:
     """Start a background DICOM tag edit job."""
-    return dicom_tag_job_service.create_job(payload)
+    return dicom_tag_job_service.create_job(payload, workspace_id=workspace_id)
 
 
 @router.get(
@@ -367,9 +416,12 @@ def create_modify_dicom_tag_job(payload: DicomTagModifyRequest) -> DicomTagModif
     response_model=DicomTagModifyJobStatusResponse,
     summary="Get asynchronous DICOM tag edit job status",
 )
-def get_modify_dicom_tag_job(job_id: str) -> DicomTagModifyJobStatusResponse:
+def get_modify_dicom_tag_job(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> DicomTagModifyJobStatusResponse:
     """Return current status for a background DICOM tag edit job."""
-    return dicom_tag_job_service.get_status(job_id)
+    return dicom_tag_job_service.get_status(job_id, workspace_id=workspace_id)
 
 
 @router.get(
@@ -385,9 +437,12 @@ def get_modify_dicom_tag_job(job_id: str) -> DicomTagModifyJobStatusResponse:
         }
     },
 )
-def get_modify_dicom_tag_job_artifact(job_id: str) -> FileResponse:
+def get_modify_dicom_tag_job_artifact(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> FileResponse:
     """Download the artifact produced by a completed background DICOM tag edit job."""
-    artifact = dicom_tag_job_service.get_completed_artifact(job_id)
+    artifact = dicom_tag_job_service.get_completed_artifact(job_id, workspace_id=workspace_id)
     return FileResponse(
         artifact.path,
         media_type=artifact.media_type,

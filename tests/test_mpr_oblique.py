@@ -180,6 +180,204 @@ def test_mpr_oblique_request_contract_no_longer_accepts_frontend_angle_delta() -
     assert "angle_rad" not in ViewOperationRequest.model_fields
 
 
+def test_mpr_crosshair_mode_defaults_to_orthogonal_and_keeps_lines_perpendicular(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, view = _build_axial_view(service, series, volume)
+
+    assert group.mpr_crosshair_mode == "orthogonal"
+    start_horizontal_angle, _ = _visible_line_angles(service, view, series, volume)
+    start_x, start_y = _screen_point_for_angle(service, view, series, volume, start_horizontal_angle)
+    move_x, move_y = _screen_point_for_angle(service, view, series, volume, start_horizontal_angle + 0.3)
+
+    service._handle_mpr_oblique(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprOblique",
+            actionType="start",
+            line="horizontal",
+            x=start_x,
+            y=start_y,
+        ),
+    )
+    service._handle_mpr_oblique(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprOblique",
+            actionType="move",
+            line="horizontal",
+            x=move_x,
+            y=move_y,
+        ),
+    )
+
+    horizontal_angle, vertical_angle = _visible_line_angles(service, view, series, volume)
+    assert _undirected_angle_delta(horizontal_angle, vertical_angle) == pytest.approx(math.pi / 2.0)
+
+
+def test_mpr_double_oblique_drag_updates_only_dragged_target_plane(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, view = _build_axial_view(service, series, volume)
+
+    assert service._handle_mpr_crosshair_mode(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprCrosshairMode",
+            mprCrosshairMode="double-oblique",
+        ),
+    )
+    before_planes = {
+        viewport_key: _get_plane(service, view, series, volume, viewport_key)
+        for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+    }
+
+    start_horizontal_angle, _ = _visible_line_angles(service, view, series, volume)
+    start_x, start_y = _screen_point_for_angle(service, view, series, volume, start_horizontal_angle)
+    move_x, move_y = _screen_point_for_angle(service, view, series, volume, start_horizontal_angle + 0.35)
+    service._handle_mpr_oblique(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprOblique",
+            actionType="start",
+            line="horizontal",
+            x=start_x,
+            y=start_y,
+        ),
+    )
+    service._handle_mpr_oblique(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprOblique",
+            actionType="move",
+            line="horizontal",
+            x=move_x,
+            y=move_y,
+        ),
+    )
+
+    after_coronal = _get_plane(service, view, series, volume, MPR_VIEWPORT_CORONAL)
+    after_sagittal = _get_plane(service, view, series, volume, MPR_VIEWPORT_SAGITTAL)
+    assert not np.allclose(after_coronal.normal_world, before_planes[MPR_VIEWPORT_CORONAL].normal_world)
+    assert np.allclose(after_sagittal.normal_world, before_planes[MPR_VIEWPORT_SAGITTAL].normal_world)
+    horizontal_angle, vertical_angle = _visible_line_angles(service, view, series, volume)
+    assert abs(_undirected_angle_delta(horizontal_angle, vertical_angle) - math.pi / 2.0) > 0.05
+    assert group.mpr_crosshair_mode == "double-oblique"
+
+
+def test_mpr_double_oblique_relock_reorthogonalizes_planes(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, view = _build_axial_view(service, series, volume)
+
+    service._handle_mpr_crosshair_mode(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprCrosshairMode",
+            mprCrosshairMode="double-oblique",
+        ),
+    )
+    start_horizontal_angle, _ = _visible_line_angles(service, view, series, volume)
+    start_x, start_y = _screen_point_for_angle(service, view, series, volume, start_horizontal_angle)
+    move_x, move_y = _screen_point_for_angle(service, view, series, volume, start_horizontal_angle + 0.3)
+    service._handle_mpr_oblique(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprOblique",
+            actionType="start",
+            line="horizontal",
+            x=start_x,
+            y=start_y,
+        ),
+    )
+    service._handle_mpr_oblique(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprOblique",
+            actionType="move",
+            line="horizontal",
+            x=move_x,
+            y=move_y,
+        ),
+    )
+
+    assert service._handle_mpr_crosshair_mode(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprCrosshairMode",
+            mprCrosshairMode="orthogonal",
+        ),
+    )
+    pose_context = _get_pose_context(service, view, series, volume)
+    normals = [pose_context.poses[viewport_key].normal_world for viewport_key in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)]
+    assert abs(float(np.dot(normals[0], normals[1]))) < 1e-6
+    assert abs(float(np.dot(normals[0], normals[2]))) < 1e-6
+    assert abs(float(np.dot(normals[1], normals[2]))) < 1e-6
+    assert group.mpr_crosshair_mode == "orthogonal"
+    assert group.mpr_independent_plane_normals == {}
+
+
+def test_mpr_reset_restores_orthogonal_crosshair_mode(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, view = _build_axial_view(service, series, volume)
+
+    service._handle_mpr_crosshair_mode(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="mprCrosshairMode",
+            mprCrosshairMode="double-oblique",
+        ),
+    )
+    assert group.mpr_crosshair_mode == "double-oblique"
+    assert group.mpr_independent_plane_normals
+
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    assert group.mpr_crosshair_mode == "orthogonal"
+    assert group.mpr_independent_plane_normals == {}
+
+
+def test_mpr_state_sync_copies_double_oblique_mode_and_independent_normals(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    source_group, source_view = _build_axial_view(service, series, volume)
+    target_group = ViewGroupRecord(group_id="g-target", group_type="MPR", series_id=series.series_id)
+    target_view = ViewRecord(view_id="v-target-ax", series_id=series.series_id, view_type="AX", view_group=target_group)
+    target_view.width = 240
+    target_view.height = 240
+    service._reset_mpr_group_geometry(target_group, volume.shape, series=series)
+
+    def get_view(view_id: str) -> ViewRecord:
+        if view_id == source_view.view_id:
+            return source_view
+        if view_id == target_view.view_id:
+            return target_view
+        raise KeyError(view_id)
+
+    monkeypatch.setattr(view_registry, "get", get_view)
+    assert service._handle_mpr_crosshair_mode(
+        source_view,
+        ViewOperationRequest(
+            viewId=source_view.view_id,
+            opType="mprCrosshairMode",
+            mprCrosshairMode="double-oblique",
+        ),
+    )
+    source_group.mpr_independent_plane_normals[MPR_VIEWPORT_CORONAL] = (0.0, 0.70710678, 0.70710678)
+
+    assert target_group.mpr_crosshair_mode == "orthogonal"
+    assert service._sync_mpr_state_from_source_view(target_view, source_view.view_id)
+
+    assert target_group.mpr_crosshair_mode == "double-oblique"
+    assert target_group.mpr_independent_plane_normals == source_group.mpr_independent_plane_normals
+    assert target_group.mpr_independent_plane_normals is not source_group.mpr_independent_plane_normals
+
+
 @pytest.mark.parametrize(
     ("line", "dragged_target_viewport", "paired_target_viewport"),
     [
@@ -746,7 +944,162 @@ def test_mpr_oblique_move_broadcasts_all_group_viewports(monkeypatch) -> None:
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
+    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_fast_preview is True
+
+
+def test_mpr_crosshair_move_uses_fast_preview_broadcast(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (coronal_view, sagittal_view):
+        candidate_view.width = axial_view.width
+        candidate_view.height = axial_view.height
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="crosshair",
+                actionType="start",
+                x=0.5,
+                y=0.5,
+            )
+        )
+        outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="crosshair",
+                actionType="move",
+                x=0.55,
+                y=0.55,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_image_format == "jpeg"
+    assert outcome.broadcast_fast_preview is True
+
+
+def test_mpr_crosshair_end_broadcasts_full_quality_to_all_mpr_views(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (coronal_view, sagittal_view):
+        candidate_view.width = axial_view.width
+        candidate_view.height = axial_view.height
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="crosshair",
+                actionType="start",
+                x=0.5,
+                y=0.5,
+            )
+        )
+        outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="crosshair",
+                actionType="end",
+                x=0.55,
+                y=0.55,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
     assert set(outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_image_format == "png"
+    assert outcome.broadcast_fast_preview is False
+
+
+def test_mpr_double_oblique_move_broadcasts_only_changed_target_view(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (coronal_view, sagittal_view):
+        candidate_view.width = axial_view.width
+        candidate_view.height = axial_view.height
+
+    assert service._handle_mpr_crosshair_mode(
+        axial_view,
+        ViewOperationRequest(
+            viewId=axial_view.view_id,
+            opType="mprCrosshairMode",
+            mprCrosshairMode="double-oblique",
+        ),
+    )
+    start_horizontal_angle, _ = _visible_line_angles(service, axial_view, series, volume)
+    start_x, start_y = _screen_point_for_angle(service, axial_view, series, volume, start_horizontal_angle)
+    move_x, move_y = _screen_point_for_angle(service, axial_view, series, volume, start_horizontal_angle + 0.25)
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="mprOblique",
+                actionType="start",
+                line="horizontal",
+                x=start_x,
+                y=start_y,
+            )
+        )
+        outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="mprOblique",
+                actionType="move",
+                line="horizontal",
+                x=move_x,
+                y=move_y,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert outcome.broadcast_view_ids == (coronal_view.view_id,)
+    assert outcome.broadcast_image_format == "jpeg"
     assert outcome.broadcast_fast_preview is True
 
 

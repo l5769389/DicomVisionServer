@@ -60,8 +60,12 @@ class DicomTagService:
     _UI_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
     _SAFE_FILE_NAME_PATTERN = re.compile(r'[\\/:*?"<>|\s]+')
 
-    def get_series_tags(self, payload: DicomTagsRequest) -> DicomTagsResponse:
-        series = series_registry.get(payload.series_id)
+    def get_series_tags(
+        self,
+        payload: DicomTagsRequest,
+        workspace_id: str | None = None,
+    ) -> DicomTagsResponse:
+        series = series_registry.get(payload.series_id, workspace_id=workspace_id)
         if not series.instances:
             raise HTTPException(status_code=404, detail="No instances found for seriesId")
 
@@ -147,8 +151,9 @@ class DicomTagService:
         self,
         payload: DicomTagModifyRequest,
         progress_callback: DicomTagModifyProgressCallback | None = None,
+        workspace_id: str | None = None,
     ) -> DicomTagModifyArtifact:
-        series = series_registry.get(payload.series_id)
+        series = series_registry.get(payload.series_id, workspace_id=workspace_id)
         if not series.instances:
             raise HTTPException(status_code=404, detail="No instances found for seriesId")
 

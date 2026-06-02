@@ -9,13 +9,14 @@ ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprStateSync", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
 Render3DMode = Literal["volume", "surface"]
 MprMipAlgorithm = Literal["maximum", "minimum", "average", "sum"]
 MprCrosshairLine = Literal["horizontal", "vertical"]
+MprCrosshairMode = Literal["orthogonal", "double-oblique"]
 
 
 class ViewCreateRequest(BaseModel):
@@ -286,6 +287,7 @@ class ViewImageResponse(BaseModel):
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    mpr_crosshair_mode: MprCrosshairMode = Field(default="orthogonal", alias="mprCrosshairMode")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
     render_3d_mode: Render3DMode | None = Field(default=None, alias="render3dMode")
@@ -352,6 +354,7 @@ class ViewOperationRequest(BaseModel):
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")

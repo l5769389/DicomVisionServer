@@ -25,6 +25,14 @@ class SeriesVolumeCache:
     def max_bytes(self) -> int:
         return self._max_bytes
 
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._cache),
+                "current_bytes": self._bytes,
+                "max_bytes": self._max_bytes,
+            }
+
     def get_build_lock(self, series_id: str) -> Lock:
         with self._lock:
             lock = self._build_locks.get(series_id)

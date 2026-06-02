@@ -7,10 +7,12 @@ from pathlib import Path
 import tempfile
 import threading
 from typing import Literal
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import HTTPException
 
+from app.core.workspace import DEFAULT_WORKSPACE_ID, WORKSPACE_QUERY_PARAM, normalize_workspace_id
 from app.schemas.dicom import DicomDeidentifyRequest, DicomTagModifyJobStatusResponse
 from app.services.dicom_deidentify_service import DicomDeidentifyArtifact, dicom_deidentify_service
 from app.services.dicom_job_utils import (
@@ -38,6 +40,7 @@ class DicomDeidentifyJobArtifact:
 @dataclass
 class DicomDeidentifyJob:
     job_id: str
+    workspace_id: str
     status: DicomDeidentifyJobState
     created_at: datetime
     processed_count: int = 0
@@ -60,26 +63,44 @@ class DicomDeidentifyJobService:
         self._temp_root.mkdir(parents=True, exist_ok=True)
         self._delete_stale_temp_files()
 
-    def create_job(self, payload: DicomDeidentifyRequest) -> DicomTagModifyJobStatusResponse:
+    def create_job(
+        self,
+        payload: DicomDeidentifyRequest,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> DicomTagModifyJobStatusResponse:
         job_id = uuid4().hex
-        job = DicomDeidentifyJob(job_id=job_id, status="pending", created_at=utc_now())
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        job = DicomDeidentifyJob(
+            job_id=job_id,
+            workspace_id=normalized_workspace_id,
+            status="pending",
+            created_at=utc_now(),
+        )
         with self._lock:
             self._jobs[job_id] = job
             self._prune_locked()
 
         self._executor.submit(self._run_job, job_id, payload)
-        return self.get_status(job_id)
+        return self.get_status(job_id, workspace_id=normalized_workspace_id)
 
-    def get_status(self, job_id: str) -> DicomTagModifyJobStatusResponse:
+    def get_status(
+        self,
+        job_id: str,
+        workspace_id: str | None = None,
+    ) -> DicomTagModifyJobStatusResponse:
         with self._lock:
-            job = self._jobs.get(job_id)
+            job = self._get_job_locked(job_id, workspace_id=workspace_id)
             if job is None:
                 raise HTTPException(status_code=404, detail="DICOM de-identification job was not found")
             return self._to_response(job)
 
-    def get_completed_artifact(self, job_id: str) -> DicomDeidentifyJobArtifact:
+    def get_completed_artifact(
+        self,
+        job_id: str,
+        workspace_id: str | None = None,
+    ) -> DicomDeidentifyJobArtifact:
         with self._lock:
-            job = self._jobs.get(job_id)
+            job = self._get_job_locked(job_id, workspace_id=workspace_id)
             if job is None:
                 raise HTTPException(status_code=404, detail="DICOM de-identification job was not found")
             if job.status != "succeeded" or job.artifact is None:
@@ -107,6 +128,7 @@ class DicomDeidentifyJobService:
                     processed_count,
                     total_count,
                 ),
+                workspace_id=self._get_job_workspace_id(job_id),
             )
             stored_artifact = self._store_artifact(job_id, artifact)
         except HTTPException as exc:
@@ -166,11 +188,15 @@ class DicomDeidentifyJobService:
 
     def _to_response(self, job: DicomDeidentifyJob) -> DicomTagModifyJobStatusResponse:
         artifact = job.artifact
-        artifact_url = self._artifact_url(job.job_id) if artifact is not None and job.status == "succeeded" else None
+        artifact_url = (
+            self._artifact_url(job.job_id, job.workspace_id)
+            if artifact is not None and job.status == "succeeded"
+            else None
+        )
         return DicomTagModifyJobStatusResponse(
             jobId=job.job_id,
             status=job.status,
-            statusUrl=self._status_url(job.job_id),
+            statusUrl=self._status_url(job.job_id, job.workspace_id),
             artifactUrl=artifact_url,
             error=job.error,
             artifactKind=artifact.artifact_kind if artifact is not None else None,
@@ -212,13 +238,32 @@ class DicomDeidentifyJobService:
         if job.artifact is not None:
             self._delete_artifact(job.artifact)
 
-    @staticmethod
-    def _status_url(job_id: str) -> str:
-        return f"/api/v1/dicom/deidentify/jobs/{job_id}"
+    def _get_job_locked(self, job_id: str, workspace_id: str | None = None) -> DicomDeidentifyJob | None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if workspace_id is not None and job.workspace_id != normalize_workspace_id(workspace_id):
+            return None
+        return job
+
+    def _get_job_workspace_id(self, job_id: str) -> str:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job.workspace_id if job is not None else DEFAULT_WORKSPACE_ID
 
     @staticmethod
-    def _artifact_url(job_id: str) -> str:
-        return f"/api/v1/dicom/deidentify/jobs/{job_id}/artifact"
+    def _workspace_query(workspace_id: str) -> str:
+        if normalize_workspace_id(workspace_id) == DEFAULT_WORKSPACE_ID:
+            return ""
+        return f"?{WORKSPACE_QUERY_PARAM}={quote(workspace_id, safe='')}"
+
+    @classmethod
+    def _status_url(cls, job_id: str, workspace_id: str) -> str:
+        return f"/api/v1/dicom/deidentify/jobs/{job_id}{cls._workspace_query(workspace_id)}"
+
+    @classmethod
+    def _artifact_url(cls, job_id: str, workspace_id: str) -> str:
+        return f"/api/v1/dicom/deidentify/jobs/{job_id}/artifact{cls._workspace_query(workspace_id)}"
 
     @staticmethod
     def _delete_artifact(artifact: DicomDeidentifyJobArtifact) -> None:

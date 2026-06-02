@@ -135,14 +135,15 @@ def derive_plane_pose(
     viewport: str,
     geometry: VolumeGeometry,
     output_shape_policy: OutputShapePolicy | None = None,
+    normal_world_override: np.ndarray | tuple[float, float, float] | None = None,
+    use_display_basis_for_cursor_offsets: bool = False,
 ) -> PlanePose:
     policy = output_shape_policy or OutputShapePolicy()
     convention = DEFAULT_MPR_CONVENTION.get(viewport, DEFAULT_MPR_CONVENTION[MPR_VIEWPORT_AXIAL])
     orientation = np.asarray(cursor.orientation_world, dtype=np.float64)
-    normal_world = _normalize_world_vector(
-        orientation[:, convention.normal_axis_index] * convention.normal_sign,
-        np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
-    )
+    cursor_normal_world = orientation[:, convention.normal_axis_index] * convention.normal_sign
+    normal_source = cursor_normal_world if normal_world_override is None else np.asarray(normal_world_override, dtype=np.float64)
+    normal_world = _normalize_world_vector(normal_source, cursor_normal_world)
     default_orientation = create_default_cursor(geometry).orientation_world
     default_row_world = _normalize_world_vector(
         default_orientation[:, convention.row_axis_index] * convention.row_sign,
@@ -173,8 +174,8 @@ def derive_plane_pose(
     row_offset_px, col_offset_px = _resolve_cursor_image_offsets(
         cursor_center_world,
         default_center_world,
-        default_row_world,
-        default_col_world,
+        row_world if use_display_basis_for_cursor_offsets else default_row_world,
+        col_world if use_display_basis_for_cursor_offsets else default_col_world,
         geometry,
     )
     row_spacing_mm = spacing_along_world_direction(geometry, row_world)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -37,6 +38,19 @@ def _reduce_slab(slab: np.ndarray, algorithm: str) -> np.ndarray:
     return reducer(slab, axis=0)
 
 
+@lru_cache(maxsize=16)
+def _plane_offset_grids(
+    height: int,
+    width: int,
+    row_spacing_mm: float,
+    col_spacing_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    row_offsets_mm = (np.arange(height, dtype=np.float64) - (float(height) - 1.0) / 2.0) * float(row_spacing_mm)
+    col_offsets_mm = (np.arange(width, dtype=np.float64) - (float(width) - 1.0) / 2.0) * float(col_spacing_mm)
+    col_grid_mm, row_grid_mm = np.meshgrid(col_offsets_mm, row_offsets_mm)
+    return col_grid_mm, row_grid_mm
+
+
 def _slab_offsets_mm(geometry: VolumeGeometry, plane: PlanePose, mip: MipConfig | None) -> np.ndarray:
     if mip is None or not mip.enabled:
         return np.asarray([0.0], dtype=np.float64)
@@ -54,11 +68,15 @@ def reslice_plane(
     geometry: VolumeGeometry,
     plane: PlanePose,
     mip: MipConfig | None,
+    interpolation_order: int = 1,
 ) -> np.ndarray:
     height, width = plane.output_shape
-    row_offsets_mm = (np.arange(height, dtype=np.float64) - (float(height) - 1.0) / 2.0) * float(plane.pixel_spacing_row_mm)
-    col_offsets_mm = (np.arange(width, dtype=np.float64) - (float(width) - 1.0) / 2.0) * float(plane.pixel_spacing_col_mm)
-    col_grid_mm, row_grid_mm = np.meshgrid(col_offsets_mm, row_offsets_mm)
+    col_grid_mm, row_grid_mm = _plane_offset_grids(
+        int(height),
+        int(width),
+        float(plane.pixel_spacing_row_mm),
+        float(plane.pixel_spacing_col_mm),
+    )
     slab_offsets_mm = _slab_offsets_mm(geometry, plane, mip)
 
     sampled_planes: list[np.ndarray] = []
@@ -68,17 +86,25 @@ def reslice_plane(
     row_world = np.asarray(plane.row_world, dtype=np.float64)
     col_world = np.asarray(plane.col_world, dtype=np.float64)
     normal_world = np.asarray(plane.normal_world, dtype=np.float64)
+    center_ijk = world_to_ijk @ center_world + world_origin
+    row_ijk_per_mm = world_to_ijk @ row_world
+    col_ijk_per_mm = world_to_ijk @ col_world
+    normal_ijk_per_mm = world_to_ijk @ normal_world
     ndimage = _get_ndimage()
 
     for slab_offset_mm in slab_offsets_mm:
-        world_points = (
-            center_world[:, None, None]
-            + col_world[:, None, None] * col_grid_mm[None, :, :]
-            + row_world[:, None, None] * row_grid_mm[None, :, :]
-            + normal_world[:, None, None] * float(slab_offset_mm)
+        coords = (
+            center_ijk[:, None, None]
+            + col_ijk_per_mm[:, None, None] * col_grid_mm[None, :, :]
+            + row_ijk_per_mm[:, None, None] * row_grid_mm[None, :, :]
+            + normal_ijk_per_mm[:, None, None] * float(slab_offset_mm)
         )
-        coords = np.tensordot(world_to_ijk, world_points, axes=([1], [0])) + world_origin[:, None, None]
-        sampled = ndimage.map_coordinates(volume, coords, order=1, mode="nearest")
+        sampled = ndimage.map_coordinates(
+            volume,
+            coords,
+            order=max(0, min(int(interpolation_order), 1)),
+            mode="nearest",
+        )
         sampled_planes.append(sampled.astype(np.float32, copy=False))
 
     slab = np.stack(sampled_planes, axis=0)

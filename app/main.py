@@ -6,6 +6,7 @@ from app.api.routes.dicom import router as dicom_router
 from app.api.routes.health import router as health_router
 from app.api.routes.pacs import router as pacs_router
 from app.api.routes.view import router as view_router
+from app.api.routes.workspace import router as workspace_router
 from app.core.config import get_settings
 from app.core.logging import get_logger, setup_logging
 from app.sockets.handlers import register_socket_handlers
@@ -44,6 +45,7 @@ fastapi_app.include_router(health_router)
 fastapi_app.include_router(dicom_router, prefix="/api/v1")
 fastapi_app.include_router(pacs_router, prefix="/api/v1")
 fastapi_app.include_router(view_router, prefix="/api/v1")
+fastapi_app.include_router(workspace_router, prefix="/api/v1")
 
 sio = socketio.AsyncServer(
     async_mode="asgi",

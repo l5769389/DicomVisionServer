@@ -9,6 +9,7 @@ from fastapi import HTTPException, UploadFile
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
 from app.schemas.dicom import LoadFolderRequest, LoadFolderResponse
 from app.services.series_registry import series_registry
 
@@ -179,6 +180,7 @@ class DicomUploadService:
         self,
         files: list[UploadFile],
         relative_paths: list[str] | None = None,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
     ) -> LoadFolderResponse:
         settings = get_settings()
         if not files:
@@ -189,7 +191,8 @@ class DicomUploadService:
         upload_root = self._resolve_upload_root()
         self.cleanup_uploads()
         session_id = uuid4().hex
-        session_dir = upload_root / session_id
+        normalized_workspace_id = normalize_workspace_id(workspace_id)
+        session_dir = upload_root / f"{normalized_workspace_id.replace(':', '_')}-{session_id}"
         session_dir.mkdir(parents=True, exist_ok=True)
 
         total_bytes = 0
@@ -215,7 +218,10 @@ class DicomUploadService:
                 total_bytes,
                 session_dir,
             )
-            response = series_registry.load_folder(LoadFolderRequest(folderPath=str(session_dir)))
+            response = series_registry.load_folder(
+                LoadFolderRequest(folderPath=str(session_dir)),
+                workspace_id=normalized_workspace_id,
+            )
             session_dir.touch()
             return response
         except Exception:

@@ -16,6 +16,7 @@ VIEW_OP_TYPE_RENDER_3D_MODE: Final = "render3dMode"
 VIEW_OP_TYPE_SURFACE_CONFIG: Final = "surfaceConfig"
 VIEW_OP_TYPE_MPR_MIP_CONFIG: Final = "mprMipConfig"
 VIEW_OP_TYPE_MPR_OBLIQUE: Final = "mprOblique"
+VIEW_OP_TYPE_MPR_CROSSHAIR_MODE: Final = "mprCrosshairMode"
 VIEW_OP_TYPE_MPR_STATE_SYNC: Final = "mprStateSync"
 VIEW_OP_TYPE_MEASUREMENT: Final = "measurement"
 

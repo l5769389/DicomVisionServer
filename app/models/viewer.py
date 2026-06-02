@@ -2,6 +2,7 @@
 from pathlib import Path
 
 
+from app.core.workspace import DEFAULT_WORKSPACE_ID
 from app.models.measurement import MeasurementPoint, MeasurementRecord
 
 
@@ -73,6 +74,7 @@ class SeriesRecord:
     accession_number: str | None
     modality: str | None
     series_description: str | None
+    workspace_id: str = DEFAULT_WORKSPACE_ID
     is_image_series: bool = True
     standard_object_type: str | None = None
     preferred_view_type: str | None = None
@@ -168,6 +170,7 @@ class MprRotationDragRecord:
     start_cursor: MprCursorRecord
     start_pointer_angle_rad: float = 0.0
     start_line_angle_rad: float = 0.0
+    start_independent_plane_normals: dict[str, Vec3] = field(default_factory=dict)
 
 
 def create_default_mpr_frame_state() -> MprFrameState:
@@ -184,6 +187,7 @@ class ViewGroupRecord:
     group_id: str
     group_type: str
     series_id: str
+    workspace_id: str = DEFAULT_WORKSPACE_ID
     active_viewport: str = "mpr-ax"
     axial_index: int = 0
     coronal_index: int = 0
@@ -198,6 +202,8 @@ class ViewGroupRecord:
     mpr_mip: MprMipState = field(default_factory=MprMipState)
     mpr_cursor: MprCursorRecord | None = None
     mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
+    mpr_crosshair_mode: str = "orthogonal"
+    mpr_independent_plane_normals: dict[str, Vec3] = field(default_factory=dict)
     rotation_drag: MprRotationDragRecord | None = None
     mpr_reference_center: tuple[float, float, float] | None = None
     mpr_model_rotation_world: Mat3 = (
@@ -213,6 +219,7 @@ class ViewRecord:
     view_id: str
     series_id: str
     view_type: str
+    workspace_id: str = DEFAULT_WORKSPACE_ID
     pseudocolor_preset: str = "bw"
     width: int | None = None
     height: int | None = None

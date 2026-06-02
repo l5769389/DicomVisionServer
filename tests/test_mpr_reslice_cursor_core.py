@@ -3,11 +3,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
 from app.models.viewer import MprFrameState, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
-from app.services.render_layers.render_context import MprCrosshairOverlay
+from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay
 from app.services import viewer_service as viewer_service_module
 from app.services.mpr import (
     axis_angle_rotation_matrix,
@@ -109,6 +110,92 @@ def test_reslice_plane_matches_legacy_orthogonal_default_planes() -> None:
     assert np.allclose(sagittal, np.flipud(volume[:, :, 4]), atol=1e-6)
 
 
+def test_mpr_fast_preview_extracts_lower_resolution_plane(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.zeros((32, 320, 300), dtype=np.float32)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id=series.series_id)
+    view = ViewRecord(
+        view_id="v",
+        series_id=series.series_id,
+        view_type="MPR",
+        view_group=group,
+        width=300,
+        height=300,
+        is_initialized=True,
+    )
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    captured_shapes: list[tuple[int, int] | None] = []
+    captured_interpolation_orders: list[int] = []
+
+    def fake_extract_mpr_plane(
+        view_arg,
+        volume_arg,
+        viewport_key=None,
+        output_shape=None,
+        interpolation_order=1,
+    ):
+        del view_arg
+        captured_shapes.append(output_shape)
+        captured_interpolation_orders.append(int(interpolation_order))
+        target_viewport = viewport_key or MPR_VIEWPORT_AXIAL
+        plane_shape = output_shape or service._get_mpr_plane_shape(volume_arg.shape, target_viewport)
+        return np.zeros(plane_shape, dtype=np.float32), 1, 10
+
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series, progress_callback=None: volume)
+    monkeypatch.setattr(service, "_extract_mpr_plane", fake_extract_mpr_plane)
+    monkeypatch.setattr(service, "_get_reference_instance_and_cache", lambda resolved_series: (None, None))
+    monkeypatch.setattr(service, "_build_slice_corner_info_overlay", lambda *args, **kwargs: CornerInfoOverlay())
+    monkeypatch.setattr(
+        service,
+        "_build_mpr_crosshair_overlay",
+        lambda *args, **kwargs: MprCrosshairOverlay(
+            width=300,
+            height=300,
+            image_left=0.0,
+            image_top=0.0,
+            image_width=300.0,
+            image_height=300.0,
+            horizontal_position=150.0,
+            horizontal_color=(255, 255, 255, 255),
+            vertical_position=150.0,
+            vertical_color=(255, 255, 255, 255),
+            center_x=150.0,
+            center_y=150.0,
+        ),
+    )
+    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context: Image.new("L", (300, 300)))
+    monkeypatch.setattr(service, "_encode_image", lambda image, image_format: b"image")
+
+    service._render_mpr_view(view, image_format="jpeg", fast_preview=True)
+    service._render_mpr_view(view, image_format="png", fast_preview=False)
+
+    assert captured_shapes[0] == service._get_mpr_fast_preview_plane_shape(
+        volume.shape,
+        MPR_VIEWPORT_AXIAL,
+        viewport_size=(view.height, view.width),
+    )
+    assert captured_shapes[1] is None
+    assert captured_interpolation_orders == [0, 1]
+
+
+def test_mpr_fast_preview_shape_respects_viewport_size() -> None:
+    service = ViewerService()
+
+    assert service._get_mpr_fast_preview_plane_shape(
+        (64, 1024, 1024),
+        MPR_VIEWPORT_AXIAL,
+        viewport_size=(360, 480),
+    ) == (119, 158)
+
+    assert service._get_mpr_fast_preview_plane_shape(
+        (64, 1024, 1024),
+        MPR_VIEWPORT_AXIAL,
+        viewport_size=(120, 120),
+    ) == (96, 96)
+
+
 def test_derive_plane_pose_uses_stable_display_axes_after_large_axial_rotation() -> None:
     geometry = build_identity_geometry((5, 6, 7))
     frame = MprFrameState(
@@ -128,6 +215,48 @@ def test_derive_plane_pose_uses_stable_display_axes_after_large_axial_rotation()
     assert np.isclose(float(np.dot(sagittal.row_world, sagittal.col_world)), 0.0, atol=1e-6)
     assert np.isclose(float(np.dot(sagittal.col_world, sagittal.normal_world)), 0.0, atol=1e-6)
     assert np.isclose(float(np.linalg.norm(sagittal.col_world)), 1.0, atol=1e-6)
+
+
+def test_oblique_plane_pose_keeps_dragged_cursor_projection_near_target_image_point() -> None:
+    service = ViewerService()
+    geometry = build_identity_geometry((7, 8, 9))
+    cursor = create_default_cursor(geometry)
+    normal_world = np.asarray([2.0, -2.0, 1.0], dtype=np.float64)
+    normal_world = normal_world / float(np.linalg.norm(normal_world))
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    initial_pose = derive_plane_pose(
+        cursor,
+        MPR_VIEWPORT_AXIAL,
+        geometry,
+        normal_world_override=normal_world,
+        use_display_basis_for_cursor_offsets=True,
+    )
+    origin_x, origin_y = service._project_world_point_to_plane_image(initial_pose, cursor.center_world)
+    group.crosshair_drag_origin_center = tuple(
+        float(value) for value in world_to_ijk_point(geometry, cursor.center_world)
+    )
+    group.crosshair_drag_origin_image = (origin_x, origin_y)
+
+    target_x = origin_x + 1.0
+    target_y = origin_y + 1.0
+    next_center_world = service._resolve_mpr_center_from_image_point(
+        group,
+        initial_pose,
+        geometry,
+        target_x,
+        target_y,
+    )
+    next_pose = derive_plane_pose(
+        replace(cursor, center_world=np.asarray(next_center_world, dtype=np.float64)),
+        MPR_VIEWPORT_AXIAL,
+        geometry,
+        normal_world_override=normal_world,
+        use_display_basis_for_cursor_offsets=True,
+    )
+    next_x, next_y = service._project_world_point_to_plane_image(next_pose, next_pose.cursor_center_world)
+
+    assert next_x == pytest.approx(target_x, abs=0.12)
+    assert next_y == pytest.approx(target_y, abs=0.12)
 
 
 def test_mpr_display_aspect_uses_plane_pose_physical_spacing() -> None:
@@ -399,6 +528,50 @@ def test_mpr_crosshair_move_uses_image_normalized_coordinates_when_canvas_has_le
         next_pose_context.cursor.center_world,
     )
 
+    assert next_center_image_x / float(next_plane.output_shape[1]) == pytest.approx(target_x, abs=1e-6)
+    assert next_center_image_y / float(next_plane.output_shape[0]) == pytest.approx(target_y, abs=1e-6)
+
+
+def test_mpr_crosshair_end_applies_final_pointer_position(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group, width=320, height=240)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
+    active_plane = pose_context.poses[MPR_VIEWPORT_AXIAL]
+    center_image_x, center_image_y = service._project_world_point_to_plane_image(
+        active_plane,
+        active_plane.cursor_center_world,
+    )
+    start_x = float(center_image_x) / float(active_plane.output_shape[1])
+    start_y = float(center_image_y) / float(active_plane.output_shape[0])
+    target_x = min(1.0, start_x + 0.12)
+    target_y = min(1.0, start_y + 0.08)
+
+    assert not service._handle_mpr_crosshair(
+        view,
+        ViewOperationRequest(viewId="v", opType="crosshair", actionType="start", x=start_x, y=start_y),
+    )
+    assert service._handle_mpr_crosshair(
+        view,
+        ViewOperationRequest(viewId="v", opType="crosshair", actionType="end", x=target_x, y=target_y),
+    )
+
+    next_pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
+    next_plane = next_pose_context.poses[MPR_VIEWPORT_AXIAL]
+    next_center_image_x, next_center_image_y = service._project_world_point_to_plane_image(
+        next_plane,
+        next_pose_context.cursor.center_world,
+    )
+
+    assert not group.crosshair_drag_active
+    assert group.crosshair_drag_origin_center is None
+    assert group.crosshair_drag_origin_image is None
     assert next_center_image_x / float(next_plane.output_shape[1]) == pytest.approx(target_x, abs=1e-6)
     assert next_center_image_y / float(next_plane.output_shape[0]) == pytest.approx(target_y, abs=1e-6)
 

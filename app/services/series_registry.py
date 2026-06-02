@@ -21,6 +21,7 @@ from pydicom.uid import (
 )
 
 from app.core.logging import get_logger
+from app.core.workspace import DEFAULT_WORKSPACE_ID, WORKSPACE_QUERY_PARAM, normalize_workspace_id
 from app.models.viewer import InstanceRecord, SeriesRecord
 from app.schemas.dicom import DicomCompatibilityIssue, LoadFolderRequest, LoadFolderResponse, SeriesSummary
 from app.services.dicom_cache import dicom_cache
@@ -79,7 +80,6 @@ class SeriesRegistry:
 
     @classmethod
     def _build_series_key(cls, folder: Path, series_instance_uid: str | None, fallback_path: Path, dataset) -> str:
-        normalized_folder = folder.as_posix()
         if series_instance_uid:
             folder_partition_key = cls._build_series_folder_partition_key(folder, fallback_path)
             phase_partition_key = cls._build_series_phase_partition_key(folder, fallback_path, dataset)
@@ -88,14 +88,19 @@ class SeriesRegistry:
                 partition_tokens.append(f"dir={folder_partition_key}")
             if phase_partition_key:
                 partition_tokens.append(f"phase={phase_partition_key}")
+            base_key = f"uid={series_instance_uid}"
             if partition_tokens:
-                return f"{normalized_folder}::{series_instance_uid}::{'::'.join(partition_tokens)}"
-            return f"{normalized_folder}::{series_instance_uid}"
-        return f"{normalized_folder}::{fallback_path.parent.as_posix()}"
+                return f"{base_key}::{'::'.join(partition_tokens)}"
+            return base_key
+        return f"path::{fallback_path.parent.resolve().as_posix()}"
 
     @staticmethod
     def _build_instance_path_key(path: Path) -> str:
         return path.resolve().as_posix()
+
+    @staticmethod
+    def _build_workspace_scoped_key(workspace_id: str, key: str) -> str:
+        return f"{normalize_workspace_id(workspace_id)}::{key}"
 
     @staticmethod
     def _resolve_scan_target(folder_path: str) -> tuple[Path, list[Path]]:
@@ -187,14 +192,17 @@ class SeriesRegistry:
             return False
         return bool("PixelData" in dataset or (getattr(dataset, "Rows", None) and getattr(dataset, "Columns", None)))
 
-    def _resolve_existing_series_id(self, series_key: str, path: Path) -> str | None:
-        return self._series_id_by_key.get(series_key) or self._series_id_by_instance_path.get(
-            self._build_instance_path_key(path)
+    def _resolve_existing_series_id(self, workspace_id: str, series_key: str, path: Path) -> str | None:
+        return self._series_id_by_key.get(
+            self._build_workspace_scoped_key(workspace_id, series_key)
+        ) or self._series_id_by_instance_path.get(
+            self._build_workspace_scoped_key(workspace_id, self._build_instance_path_key(path))
         )
 
     def _get_or_create_grouped_series(
         self,
         *,
+        workspace_id: str,
         grouped: dict[str, SeriesRecord],
         instance_keys_by_series_key: dict[str, set[str]],
         folder: Path,
@@ -207,7 +215,7 @@ class SeriesRegistry:
         if series is not None:
             return (series_key, series)
 
-        existing_series_id = self._resolve_existing_series_id(series_key, path)
+        existing_series_id = self._resolve_existing_series_id(workspace_id, series_key, path)
         series = SeriesRecord(
             series_id=existing_series_id or str(uuid4()),
             folder_path=str(folder),
@@ -220,6 +228,7 @@ class SeriesRegistry:
             accession_number=self._safe_header_text(getattr(dataset, "AccessionNumber", None)),
             modality=self._safe_header_text(getattr(dataset, "Modality", None)),
             series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None)),
+            workspace_id=workspace_id,
         )
         grouped[series_key] = series
         instance_keys_by_series_key[series_key] = set()
@@ -228,6 +237,7 @@ class SeriesRegistry:
     def _get_or_create_grouped_document_series(
         self,
         *,
+        workspace_id: str,
         grouped: dict[str, SeriesRecord],
         instance_keys_by_series_key: dict[str, set[str]],
         folder: Path,
@@ -243,7 +253,7 @@ class SeriesRegistry:
         if series is not None:
             return (series_key, series)
 
-        existing_series_id = self._resolve_existing_series_id(series_key, path)
+        existing_series_id = self._resolve_existing_series_id(workspace_id, series_key, path)
         series = SeriesRecord(
             series_id=existing_series_id or str(uuid4()),
             folder_path=str(folder),
@@ -257,6 +267,7 @@ class SeriesRegistry:
             modality=self._safe_header_text(getattr(dataset, "Modality", None)) or fallback_modality,
             series_description=self._safe_header_text(getattr(dataset, "SeriesDescription", None))
             or fallback_series_description,
+            workspace_id=workspace_id,
             is_image_series=False,
             standard_object_type=standard_object_type,
             preferred_view_type="Tag",
@@ -333,7 +344,7 @@ class SeriesRegistry:
         sop_instance_uid = getattr(dataset, "SOPInstanceUID", None)
         return str(sop_instance_uid or self._build_instance_path_key(path))
 
-    def _collect_grouped_series(self, folder: Path, scan_paths: list[Path]) -> dict[str, SeriesRecord]:
+    def _collect_grouped_series(self, folder: Path, scan_paths: list[Path], workspace_id: str) -> dict[str, SeriesRecord]:
         grouped: dict[str, SeriesRecord] = {}
         instance_keys_by_series_key: dict[str, set[str]] = {}
         gsps_datasets: list[tuple[Path, object]] = []
@@ -352,6 +363,7 @@ class SeriesRegistry:
 
             if self._is_sr_dataset(dataset):
                 series_key, series = self._get_or_create_grouped_document_series(
+                    workspace_id=workspace_id,
                     grouped=grouped,
                     instance_keys_by_series_key=instance_keys_by_series_key,
                     folder=folder,
@@ -374,6 +386,7 @@ class SeriesRegistry:
                 continue
 
             series_key, series = self._get_or_create_grouped_series(
+                workspace_id=workspace_id,
                 grouped=grouped,
                 instance_keys_by_series_key=instance_keys_by_series_key,
                 folder=folder,
@@ -391,6 +404,7 @@ class SeriesRegistry:
 
         attached_gsps_paths = self._attach_presentation_states(grouped.values(), gsps_datasets)
         self._register_unattached_gsps_documents(
+            workspace_id=workspace_id,
             grouped=grouped,
             instance_keys_by_series_key=instance_keys_by_series_key,
             folder=folder,
@@ -428,6 +442,7 @@ class SeriesRegistry:
     def _register_unattached_gsps_documents(
         self,
         *,
+        workspace_id: str,
         grouped: dict[str, SeriesRecord],
         instance_keys_by_series_key: dict[str, set[str]],
         folder: Path,
@@ -439,6 +454,7 @@ class SeriesRegistry:
                 continue
 
             series_key, series = self._get_or_create_grouped_document_series(
+                workspace_id=workspace_id,
                 grouped=grouped,
                 instance_keys_by_series_key=instance_keys_by_series_key,
                 folder=folder,
@@ -458,12 +474,14 @@ class SeriesRegistry:
 
     def _index_series_instances(self, series: SeriesRecord) -> None:
         for instance in series.instances:
-            self._series_id_by_instance_path[self._build_instance_path_key(instance.path)] = series.series_id
+            self._series_id_by_instance_path[
+                self._build_workspace_scoped_key(series.workspace_id, self._build_instance_path_key(instance.path))
+            ] = series.series_id
 
     def _build_series_summary(self, series_key: str, series: SeriesRecord) -> SeriesSummary:
         series.instances.sort(key=lambda item: item.instance_number)
         self._series_by_id[series.series_id] = series
-        self._series_id_by_key[series_key] = series.series_id
+        self._series_id_by_key[self._build_workspace_scoped_key(series.workspace_id, series_key)] = series.series_id
         self._index_series_instances(series)
 
         first = series.instances[0]
@@ -482,7 +500,11 @@ class SeriesRegistry:
             width=first.columns,
             height=first.rows,
             thumbnailSrc="",
-            thumbnailUrl=self._build_series_thumbnail_url(series.series_id) if series.is_image_series else "",
+            thumbnailUrl=(
+                self._build_series_thumbnail_url(series.series_id, series.workspace_id)
+                if series.is_image_series
+                else ""
+            ),
             folderPath=series.folder_path,
             isImageSeries=series.is_image_series,
             standardObjectType=series.standard_object_type,
@@ -491,12 +513,15 @@ class SeriesRegistry:
         )
 
     @staticmethod
-    def _build_series_thumbnail_url(series_id: str) -> str:
-        return f"/api/v1/dicom/thumbnail?seriesId={quote(series_id, safe='')}"
+    def _build_series_thumbnail_url(series_id: str, workspace_id: str = DEFAULT_WORKSPACE_ID) -> str:
+        query = f"seriesId={quote(series_id, safe='')}"
+        if normalize_workspace_id(workspace_id) != DEFAULT_WORKSPACE_ID:
+            query = f"{query}&{WORKSPACE_QUERY_PARAM}={quote(workspace_id, safe='')}"
+        return f"/api/v1/dicom/thumbnail?{query}"
 
-    def get_series_thumbnail_png(self, series_id: str) -> bytes:
+    def get_series_thumbnail_png(self, series_id: str, workspace_id: str | None = None) -> bytes:
         with self._lock:
-            series = self.get(series_id)
+            series = self.get(series_id, workspace_id=workspace_id)
         thumbnail = self._build_series_thumbnail_png(series)
         if thumbnail is None:
             raise HTTPException(status_code=404, detail="Series thumbnail is not available")
@@ -597,6 +622,7 @@ class SeriesRegistry:
                     accession_number=series.accession_number,
                     modality=series.modality,
                     series_description=series.series_description,
+                    workspace_id=series.workspace_id,
                     is_virtual=True,
                     source_series_id=series.series_id,
                     four_d_phase_sort_value=phase.sort_value,
@@ -609,52 +635,94 @@ class SeriesRegistry:
 
         return virtual_series_records
 
-    def _list_real_series_records(self) -> list[SeriesRecord]:
-        return [series for series in self._series_by_id.values() if not series.is_virtual]
+    def _list_real_series_records(self, workspace_id: str | None = None) -> list[SeriesRecord]:
+        normalized_workspace_id = normalize_workspace_id(workspace_id) if workspace_id is not None else None
+        return [
+            series
+            for series in self._series_by_id.values()
+            if not series.is_virtual
+            and (normalized_workspace_id is None or series.workspace_id == normalized_workspace_id)
+        ]
 
-    def _apply_loaded_four_d_metadata(self, series_list: list[SeriesSummary]) -> None:
-        real_series_records = self._list_real_series_records()
+    def _apply_loaded_four_d_metadata(self, series_list: list[SeriesSummary], workspace_id: str) -> None:
+        real_series_records = self._list_real_series_records(workspace_id)
         virtual_series_records = self._register_virtual_four_d_phase_series(real_series_records)
         four_d_service.apply_four_d_metadata(series_list, [*real_series_records, *virtual_series_records])
 
-    def ensure_four_d_phase_series(self, series_id: str) -> SeriesRecord:
+    def ensure_four_d_phase_series(self, series_id: str, workspace_id: str | None = None) -> SeriesRecord:
         with self._lock:
-            series = self.get(series_id)
-            source_series = self.get(series.source_series_id) if series.is_virtual and series.source_series_id else series
+            series = self.get(series_id, workspace_id=workspace_id)
+            source_series = (
+                self.get(series.source_series_id, workspace_id=workspace_id)
+                if series.is_virtual and series.source_series_id
+                else series
+            )
             self._register_virtual_four_d_phase_series([source_series])
             return series
 
-    def load_folder(self, payload: LoadFolderRequest) -> LoadFolderResponse:
+    def load_folder(self, payload: LoadFolderRequest, workspace_id: str | None = None) -> LoadFolderResponse:
         with self._lock:
+            normalized_workspace_id = normalize_workspace_id(workspace_id)
             folder, scan_paths = self._resolve_scan_target(payload.folder_path)
-            grouped = self._collect_grouped_series(folder, scan_paths)
+            grouped = self._collect_grouped_series(folder, scan_paths, normalized_workspace_id)
             if not grouped:
                 raise HTTPException(status_code=404, detail="No readable DICOM series found in path")
 
             series_list = [self._build_series_summary(series_key, series) for series_key, series in grouped.items()]
-            self._apply_loaded_four_d_metadata(series_list)
+            self._apply_loaded_four_d_metadata(series_list, normalized_workspace_id)
             series_list.sort(key=lambda item: (not item.is_image_series, item.series_id))
             return LoadFolderResponse(seriesId=series_list[0].series_id, seriesList=series_list)
 
-    def get(self, series_id: str) -> SeriesRecord:
+    def get(self, series_id: str, workspace_id: str | None = None) -> SeriesRecord:
         with self._lock:
             series = self._series_by_id.get(series_id)
-            if series is None:
+            normalized_workspace_id = normalize_workspace_id(workspace_id) if workspace_id is not None else None
+            if series is None or (
+                normalized_workspace_id is not None and series.workspace_id != normalized_workspace_id
+            ):
                 raise HTTPException(status_code=404, detail="seriesId not found")
             return series
 
-    def list_all(self) -> list[SeriesRecord]:
+    def list_all(self, workspace_id: str | None = None) -> list[SeriesRecord]:
         with self._lock:
-            return list(self._series_by_id.values())
+            normalized_workspace_id = normalize_workspace_id(workspace_id) if workspace_id is not None else None
+            return [
+                series
+                for series in self._series_by_id.values()
+                if normalized_workspace_id is None or series.workspace_id == normalized_workspace_id
+            ]
 
-    def check_compatibility(self, series_id: str) -> list[DicomCompatibilityIssue]:
-        series = self.get(series_id)
+    def check_compatibility(self, series_id: str, workspace_id: str | None = None) -> list[DicomCompatibilityIssue]:
+        series = self.get(series_id, workspace_id=workspace_id)
         if not series.is_image_series:
             return []
         return build_dicom_compatibility_issues(series)
 
-    def clear(self) -> None:
+    def clear(self, workspace_id: str | None = None) -> None:
         with self._lock:
+            if workspace_id is not None:
+                normalized_workspace_id = normalize_workspace_id(workspace_id)
+                series_ids = {
+                    series.series_id
+                    for series in self._series_by_id.values()
+                    if series.workspace_id == normalized_workspace_id
+                }
+                self._series_by_id = {
+                    series_id: series
+                    for series_id, series in self._series_by_id.items()
+                    if series_id not in series_ids
+                }
+                self._series_id_by_key = {
+                    key: series_id
+                    for key, series_id in self._series_id_by_key.items()
+                    if series_id not in series_ids
+                }
+                self._series_id_by_instance_path = {
+                    key: series_id
+                    for key, series_id in self._series_id_by_instance_path.items()
+                    if series_id not in series_ids
+                }
+                return
             self._series_by_id.clear()
             self._series_id_by_key.clear()
             self._series_id_by_instance_path.clear()

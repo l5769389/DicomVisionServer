@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Callable, Literal
 
 from app.core import (
     DRAG_ACTION_MOVE,
+    MPR_VIEWPORT_AXIAL,
+    MPR_VIEWPORT_CORONAL,
+    MPR_VIEWPORT_SAGITTAL,
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_PSEUDOCOLOR,
@@ -20,6 +23,7 @@ from app.core import (
     VIEW_OP_TYPE_SURFACE_CONFIG,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_MPR_OBLIQUE,
+    VIEW_OP_TYPE_MPR_CROSSHAIR_MODE,
     VIEW_OP_TYPE_MPR_STATE_SYNC,
     VIEW_OP_TYPE_MEASUREMENT,
 )
@@ -53,6 +57,7 @@ class RenderDecision:
     image_format: ImageFormat = "png"
     fast_preview: bool = False
     draft_measurement: dict[str, object] | None = None
+    broadcast_viewports: tuple[str, ...] | None = None
 
 
 OperationHandler = Callable[
@@ -61,9 +66,26 @@ OperationHandler = Callable[
 ]
 
 
-def handle_view_operation(service: ViewerService, payload: ViewOperationRequest) -> OperationRenderOutcome:
-    view = view_registry.get(payload.view_id)
-    series = series_registry.get(view.series_id)
+def handle_view_operation(
+    service: ViewerService,
+    payload: ViewOperationRequest,
+    workspace_id: str | None = None,
+) -> OperationRenderOutcome:
+    view = (
+        view_registry.get(payload.view_id)
+        if workspace_id is None
+        else view_registry.get(payload.view_id, workspace_id=workspace_id)
+    )
+    series = (
+        series_registry.get(view.series_id)
+        if workspace_id is None
+        else series_registry.get(view.series_id, workspace_id=workspace_id)
+    )
+    if payload.op_type == VIEW_OP_TYPE_MPR_STATE_SYNC and payload.source_view_id:
+        if workspace_id is None:
+            view_registry.get(payload.source_view_id)
+        else:
+            view_registry.get(payload.source_view_id, workspace_id=workspace_id)
     is_mpr_view = service._is_mpr_view_type(view.view_type)
 
     active_viewport_changed = _sync_mpr_active_viewport(service, view) if is_mpr_view else False
@@ -89,8 +111,18 @@ def _render_single(image_format: ImageFormat = "png", *, fast_preview: bool = Fa
     return RenderDecision(mode="single", image_format=image_format, fast_preview=fast_preview)
 
 
-def _render_broadcast(image_format: ImageFormat = "png", *, fast_preview: bool = False) -> RenderDecision:
-    return RenderDecision(mode="broadcast", image_format=image_format, fast_preview=fast_preview)
+def _render_broadcast(
+    image_format: ImageFormat = "png",
+    *,
+    fast_preview: bool = False,
+    viewports: tuple[str, ...] | None = None,
+) -> RenderDecision:
+    return RenderDecision(
+        mode="broadcast",
+        image_format=image_format,
+        fast_preview=fast_preview,
+        broadcast_viewports=viewports,
+    )
 
 
 def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> RenderDecision:
@@ -100,7 +132,29 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
         mode="broadcast",
         image_format=render_decision.image_format,
         fast_preview=render_decision.fast_preview,
+        broadcast_viewports=render_decision.broadcast_viewports,
     )
+
+
+MPR_VIEWPORT_ORDER = (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+
+
+def _reference_mpr_viewports(service: ViewerService, view: ViewRecord) -> tuple[str, ...]:
+    active_viewport = service._resolve_mpr_viewport(view)
+    return tuple(viewport_key for viewport_key in MPR_VIEWPORT_ORDER if viewport_key != active_viewport)
+
+
+def _target_mpr_oblique_preview_viewports(
+    service: ViewerService,
+    view: ViewRecord,
+    payload: ViewOperationRequest,
+) -> tuple[str, ...]:
+    if payload.line not in {"horizontal", "vertical"}:
+        return _reference_mpr_viewports(service, view)
+    if service._get_mpr_crosshair_mode(view.view_group) != "double-oblique":
+        return _reference_mpr_viewports(service, view)
+    active_viewport = service._resolve_mpr_viewport(view)
+    return (service._resolve_mpr_oblique_target_viewport(active_viewport, payload.line),)
 
 
 def _get_operation_handler(payload: ViewOperationRequest) -> OperationHandler:
@@ -156,7 +210,7 @@ def _handle_crosshair_operation(
     if not should_broadcast_group:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_broadcast("jpeg")
+        return _render_broadcast("jpeg", fast_preview=True, viewports=_reference_mpr_viewports(service, view))
     return _render_broadcast()
 
 
@@ -382,7 +436,26 @@ def _handle_mpr_oblique_operation(
     if not service._handle_mpr_oblique(view, payload):
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_broadcast("jpeg", fast_preview=True)
+        return _render_broadcast(
+            "jpeg",
+            fast_preview=True,
+            viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
+        )
+    return _render_broadcast()
+
+
+def _handle_mpr_crosshair_mode_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series
+    if not is_mpr_view:
+        return _render_none()
+    if not service._handle_mpr_crosshair_mode(view, payload):
+        return _render_none()
     return _render_broadcast()
 
 
@@ -435,6 +508,7 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_SURFACE_CONFIG: _handle_surface_config_operation,
     VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
     VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
+    VIEW_OP_TYPE_MPR_CROSSHAIR_MODE: _handle_mpr_crosshair_mode_operation,
     VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
     VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
 }
@@ -496,7 +570,12 @@ def _build_operation_render_outcome(
         sized_group_view_ids = tuple(
             group_view.view_id
             for group_view in service._get_mpr_group_views(view)
-            if group_view.width and group_view.height
+            if group_view.width
+            and group_view.height
+            and (
+                render_decision.broadcast_viewports is None
+                or service._resolve_mpr_viewport(group_view) in render_decision.broadcast_viewports
+            )
         )
         if not sized_group_view_ids:
             return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)

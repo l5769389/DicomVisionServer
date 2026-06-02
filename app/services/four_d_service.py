@@ -16,6 +16,7 @@ from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
 
 from app.core.logging import get_logger
+from app.core.workspace import DEFAULT_WORKSPACE_ID, WORKSPACE_QUERY_PARAM, normalize_workspace_id
 from app.models.viewer import InstanceRecord, SeriesRecord
 from app.schemas.dicom import FourDPhaseItem, FourDPhasesResponse, SeriesSummary
 from app.services.dicom_cache import dicom_cache
@@ -34,8 +35,11 @@ _PERCENT_PHASE_RE = re.compile(
     r"(?<!\d)(100(?:\.0+)?|[0-9]{1,2}(?:\.\d+)?)[\s_-]*(?:[%\uFF05\uFE6A]|pct\b|percent\b)",
     re.IGNORECASE,
 )
-_NAMED_PHASE_RE = re.compile(r"\b(?:phase|ph)[\s_:#-]*(\d{1,3}(?:\.\d+)?)\b", re.IGNORECASE)
-_SHORT_PHASE_RE = re.compile(r"\bp[\s_-]*(\d{1,3})(?![a-zA-Z0-9])", re.IGNORECASE)
+_NAMED_PHASE_RE = re.compile(
+    r"(?<![a-zA-Z0-9])(?:phase|ph)[\s_:#-]*(\d{1,3}(?:\.\d+)?)(?![a-zA-Z0-9])",
+    re.IGNORECASE,
+)
+_SHORT_PHASE_RE = re.compile(r"(?<![a-zA-Z0-9])p[\s_-]*(\d{1,3})(?![a-zA-Z0-9])", re.IGNORECASE)
 _FIRST_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
 
@@ -67,6 +71,7 @@ class FourDService:
         *,
         include_preview_images: bool = False,
         preview_phase_index: int | None = None,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
     ) -> FourDPhasesResponse:
         target_series = next((series for series in series_records if series.series_id == series_id), None)
         if target_series is None:
@@ -81,6 +86,7 @@ class FourDService:
             phase_entries,
             include_preview_images=include_preview_images,
             preview_phase_index=preview_phase_index,
+            workspace_id=workspace_id,
         )
         logger.info(
             "4D phase manifest series_id=%s phase_count=%s phase_series_ids=%s",
@@ -147,8 +153,9 @@ class FourDService:
             for group_key in self._build_multi_series_group_keys(series):
                 candidates_by_key[group_key].append(candidate)
 
+        preferred_series_ids = set(summaries_by_id)
         for candidates in candidates_by_key.values():
-            candidates = self._dedupe_phase_candidates(candidates)
+            candidates = self._dedupe_phase_candidates(candidates, preferred_series_ids=preferred_series_ids)
             if len(candidates) < 2:
                 continue
             if len({candidate.phase.sort_value for candidate in candidates}) < 2:
@@ -209,6 +216,11 @@ class FourDService:
                 continue
             candidates.append(PhaseCandidate(series=series, phase=phase))
 
+        candidates = self._dedupe_phase_candidates(
+            candidates,
+            preferred_series_ids={target_series.series_id},
+            preferred_folder_path=target_series.folder_path,
+        )
         if len(candidates) < 2 or len({candidate.phase.sort_value for candidate in candidates}) < 2:
             return []
 
@@ -313,6 +325,7 @@ class FourDService:
         *,
         include_preview_images: bool = False,
         preview_phase_index: int | None = None,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
     ) -> list[FourDPhaseItem]:
         phase_items: list[FourDPhaseItem] = []
         preview_phase_indexes: set[int] = set()
@@ -324,7 +337,7 @@ class FourDService:
 
         for phase_index, entry in enumerate(phase_entries):
             if phase_index in preview_phase_indexes:
-                viewport_images = self._build_phase_preview_image_urls(entry, phase_index)
+                viewport_images = self._build_phase_preview_image_urls(entry, phase_index, workspace_id)
                 status = "ready" if viewport_images else "error"
             else:
                 viewport_images, status = {}, "pending"
@@ -340,25 +353,38 @@ class FourDService:
             )
         return phase_items
 
-    def _build_phase_preview_image_urls(self, entry: PhaseEntry, phase_index: int) -> dict[str, str]:
+    def _build_phase_preview_image_urls(
+        self,
+        entry: PhaseEntry,
+        phase_index: int,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> dict[str, str]:
         if not entry.instances:
             return {}
         series_id = entry.series_id or ""
         if not series_id:
             return {}
         return {
-            viewport_key: self._build_phase_preview_url(series_id, phase_index, viewport_key)
+            viewport_key: self._build_phase_preview_url(series_id, phase_index, viewport_key, workspace_id)
             for viewport_key in (MPR_AXIAL, MPR_CORONAL, MPR_SAGITTAL)
         }
 
     @staticmethod
-    def _build_phase_preview_url(series_id: str, phase_index: int, viewport_key: str) -> str:
-        return (
+    def _build_phase_preview_url(
+        series_id: str,
+        phase_index: int,
+        viewport_key: str,
+        workspace_id: str = DEFAULT_WORKSPACE_ID,
+    ) -> str:
+        url = (
             "/api/v1/dicom/fourD/preview"
             f"?seriesId={quote(series_id, safe='')}"
             f"&phaseIndex={int(phase_index)}"
             f"&viewportKey={quote(viewport_key, safe='')}"
         )
+        if normalize_workspace_id(workspace_id) != DEFAULT_WORKSPACE_ID:
+            url = f"{url}&{WORKSPACE_QUERY_PARAM}={quote(workspace_id, safe='')}"
+        return url
 
     def _group_instances_by_dataset_phase(
         self,
@@ -395,15 +421,27 @@ class FourDService:
         return self._extract_phase_from_dataset(first_header)
 
     @staticmethod
-    def _dedupe_phase_candidates(candidates: list[PhaseCandidate]) -> list[PhaseCandidate]:
-        seen_series_ids: set[str] = set()
-        unique_candidates: list[PhaseCandidate] = []
+    def _dedupe_phase_candidates(
+        candidates: list[PhaseCandidate],
+        *,
+        preferred_series_ids: set[str] | None = None,
+        preferred_folder_path: str | None = None,
+    ) -> list[PhaseCandidate]:
+        preferred_series_ids = preferred_series_ids or set()
+        candidates_by_phase: dict[float, PhaseCandidate] = {}
+        best_scores_by_phase: dict[float, tuple[int, int, str]] = {}
         for candidate in candidates:
-            if candidate.series.series_id in seen_series_ids:
+            score = (
+                0 if candidate.series.series_id in preferred_series_ids else 1,
+                0 if preferred_folder_path and candidate.series.folder_path == preferred_folder_path else 1,
+                candidate.series.series_id,
+            )
+            current_score = best_scores_by_phase.get(candidate.phase.sort_value)
+            if current_score is not None and current_score <= score:
                 continue
-            seen_series_ids.add(candidate.series.series_id)
-            unique_candidates.append(candidate)
-        return unique_candidates
+            candidates_by_phase[candidate.phase.sort_value] = candidate
+            best_scores_by_phase[candidate.phase.sort_value] = score
+        return sorted(candidates_by_phase.values(), key=lambda item: (item.phase.sort_value, item.series.series_id))
 
     def _build_multi_series_group_keys(self, series: SeriesRecord) -> set[tuple[Any, ...]]:
         first = series.instances[0] if series.instances else None
@@ -417,16 +455,24 @@ class FourDService:
 
     def _build_multi_series_group_label_keys(self, series: SeriesRecord) -> set[str]:
         texts = self._series_phase_texts(series)
-        description_key = self._normalize_phase_group_text(series.series_description)
-        folder_key = self._normalize_phase_group_text(self._relative_parent_text(series))
-        group_label_keys = {description_key or folder_key}
-
+        phase_group_label_keys: set[str] = set()
+        has_phase_text = False
         for text in texts:
             if self._extract_phase_from_text(text) is None:
                 continue
-            group_label_keys.add(self._normalize_phase_group_text(text))
+            has_phase_text = True
+            normalized_text = self._normalize_phase_group_text(text)
+            if normalized_text:
+                phase_group_label_keys.add(normalized_text)
 
-        return group_label_keys
+        if phase_group_label_keys:
+            return phase_group_label_keys
+        if has_phase_text:
+            return {""}
+
+        description_key = self._normalize_phase_group_text(series.series_description)
+        folder_key = self._normalize_phase_group_text(self._relative_parent_text(series))
+        return {key for key in (description_key, folder_key) if key} or {""}
 
     def _series_phase_texts(self, series: SeriesRecord) -> tuple[str | None, ...]:
         first_instance = series.instances[0] if series.instances else None

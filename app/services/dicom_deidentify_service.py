@@ -110,8 +110,9 @@ class DicomDeidentifyService:
         self,
         payload: DicomDeidentifyRequest,
         progress_callback: DicomDeidentifyProgressCallback | None = None,
+        workspace_id: str | None = None,
     ) -> DicomDeidentifyArtifact:
-        series = series_registry.get(payload.series_id)
+        series = series_registry.get(payload.series_id, workspace_id=workspace_id)
         if not series.instances:
             raise HTTPException(status_code=404, detail="No instances found for seriesId")
 

@@ -175,6 +175,68 @@ def test_reload_parent_folder_reuses_preloaded_phase_series_id(tmp_path: Path) -
     assert [phase.label for phase in phase_zero_summary.four_d_phases] == ["Phase 0%", "Phase 10%", "Phase 20%"]
 
 
+def test_loading_separate_motion_phase_groups_does_not_accumulate_phase_count(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for motion_group in ("MP1", "MP2", "MP3"):
+        for phase_index in range(3):
+            series_uid = generate_uid()
+            for slice_index in range(2):
+                _create_test_dicom(
+                    tmp_path / motion_group / f"ph{phase_index}" / f"slice-{slice_index}.dcm",
+                    study_uid=study_uid,
+                    series_uid=series_uid,
+                    series_description=f"{motion_group}_ph{phase_index}",
+                    instance_number=slice_index + 1,
+                    slice_index=slice_index,
+                    pixel_value=100 * (phase_index + 1),
+                )
+
+    for motion_group in ("MP1", "MP2", "MP3"):
+        response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path / motion_group)))
+
+        assert len(response.series_list) == 3
+        for summary in response.series_list:
+            assert summary.is_four_d_series is True
+            assert summary.four_d_phase_count == 3
+            assert summary.four_d_phases is not None
+            assert [phase.label for phase in summary.four_d_phases] == ["Phase 00", "Phase 01", "Phase 02"]
+            assert len({phase.series_id for phase in summary.four_d_phases}) == 3
+
+
+def test_reuploading_same_motion_phase_group_reuses_series_ids(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+    phase_series_uids = [generate_uid() for _ in range(3)]
+
+    for session_name in ("session-a", "session-b"):
+        for phase_index, series_uid in enumerate(phase_series_uids):
+            for slice_index in range(2):
+                _create_test_dicom(
+                    tmp_path / session_name / "MP1" / f"ph{phase_index}" / f"slice-{slice_index}.dcm",
+                    study_uid=study_uid,
+                    series_uid=series_uid,
+                    series_description=f"MP1_ph{phase_index}",
+                    instance_number=slice_index + 1,
+                    slice_index=slice_index,
+                    pixel_value=100 * (phase_index + 1),
+                )
+
+    first_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path / "session-a")))
+    first_series_ids = {summary.series_id for summary in first_response.series_list}
+    assert len(first_response.series_list) == 3
+
+    second_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path / "session-b")))
+    second_series_ids = {summary.series_id for summary in second_response.series_list}
+
+    assert second_series_ids == first_series_ids
+    assert len([series for series in series_registry.list_all() if not series.is_virtual]) == 3
+    for summary in second_response.series_list:
+        assert summary.is_four_d_series is True
+        assert summary.four_d_phase_count == 3
+        assert summary.four_d_phases is not None
+        assert {phase.series_id for phase in summary.four_d_phases} == first_series_ids
+
+
 def test_load_folder_recognizes_percent_only_series_description_as_phase(tmp_path: Path) -> None:
     study_uid = generate_uid()
 
@@ -415,3 +477,87 @@ def test_four_d_phases_api_returns_virtual_series_ids_for_single_series_phases(t
         phase_series = series_registry.get(str(phase_series_id))
         assert phase_series.is_virtual is True
         assert phase_series.source_series_id == selected_series_id
+
+
+def test_load_folder_keeps_same_path_series_separate_by_workspace(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for phase_index in range(2):
+        series_uid = generate_uid()
+        for slice_index in range(2):
+            _create_test_dicom(
+                tmp_path / f"ph{phase_index}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=f"MP1 ph{phase_index}",
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                pixel_value=100 * (phase_index + 1),
+            )
+
+    first_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)), workspace_id="tab-a")
+    second_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)), workspace_id="tab-b")
+    first_series_ids = {summary.series_id for summary in first_response.series_list}
+    second_series_ids = {summary.series_id for summary in second_response.series_list}
+
+    assert first_series_ids
+    assert second_series_ids
+    assert first_series_ids.isdisjoint(second_series_ids)
+    assert len([series for series in series_registry.list_all("tab-a") if not series.is_virtual]) == 2
+    assert len([series for series in series_registry.list_all("tab-b") if not series.is_virtual]) == 2
+
+    with pytest.raises(Exception):
+        series_registry.get(next(iter(first_series_ids)), workspace_id="tab-b")
+
+
+def test_four_d_phases_api_uses_current_workspace_series_only(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    workspace_a_root = tmp_path / "workspace-a"
+    workspace_b_root = tmp_path / "workspace-b"
+    for workspace_root, phase_count in ((workspace_a_root, 2), (workspace_b_root, 3)):
+        for phase_index in range(phase_count):
+            series_uid = generate_uid()
+            for slice_index in range(2):
+                _create_test_dicom(
+                    workspace_root / f"ph{phase_index}" / f"slice-{slice_index}.dcm",
+                    study_uid=study_uid,
+                    series_uid=series_uid,
+                    series_description=f"Shared Lung ph{phase_index}",
+                    instance_number=slice_index + 1,
+                    slice_index=slice_index,
+                    pixel_value=100 * (phase_index + 1),
+                )
+
+    response_a = series_registry.load_folder(
+        LoadFolderRequest(folderPath=str(workspace_a_root)),
+        workspace_id="tab-a",
+    )
+    response_b = series_registry.load_folder(
+        LoadFolderRequest(folderPath=str(workspace_b_root)),
+        workspace_id="tab-b",
+    )
+    client = TestClient(fastapi_app)
+
+    phase_response_a = client.post(
+        "/api/v1/dicom/fourD/phases",
+        headers={"X-DicomVision-Workspace-Id": "tab-a"},
+        json={"seriesId": response_a.series_list[0].series_id},
+    )
+    phase_response_b = client.post(
+        "/api/v1/dicom/fourD/phases",
+        headers={"X-DicomVision-Workspace-Id": "tab-b"},
+        json={"seriesId": response_b.series_list[0].series_id},
+    )
+    cross_workspace_response = client.post(
+        "/api/v1/dicom/fourD/phases",
+        headers={"X-DicomVision-Workspace-Id": "tab-b"},
+        json={"seriesId": response_a.series_list[0].series_id},
+    )
+
+    assert phase_response_a.status_code == 200
+    assert phase_response_a.json()["fourDPhaseCount"] == 2
+    assert [phase["label"] for phase in phase_response_a.json()["fourDPhases"]] == ["Phase 00", "Phase 01"]
+    assert phase_response_b.status_code == 200
+    assert phase_response_b.json()["fourDPhaseCount"] == 3
+    assert cross_workspace_response.status_code == 404

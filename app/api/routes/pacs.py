@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.api.workspace import get_request_workspace_id
+from app.core.workspace import DEFAULT_WORKSPACE_ID
 from app.schemas.pacs import (
-    PacsDimseSeriesQueryRequest,
     PacsDimseSeriesDownloadJobStatusResponse,
     PacsDimseSeriesDownloadRequest,
+    PacsDimseSeriesQueryRequest,
     PacsDimseStudyQueryRequest,
     PacsDimseTestRequest,
     PacsDicomwebTestRequest,
@@ -17,8 +19,8 @@ from app.schemas.pacs import (
     PacsWadoSeriesDownloadJobStatusResponse,
     PacsWadoSeriesDownloadRequest,
 )
-from app.services.pacs_dimse_service import PacsDimseError, pacs_dimse_service
 from app.services.pacs_dimse_job_service import pacs_dimse_download_job_service
+from app.services.pacs_dimse_service import PacsDimseError, pacs_dimse_service
 from app.services.pacs_dicomweb_service import PacsDicomwebError, pacs_dicomweb_service
 from app.services.pacs_wado_job_service import pacs_wado_download_job_service
 
@@ -72,8 +74,11 @@ def query_dimse_series(payload: PacsDimseSeriesQueryRequest) -> PacsQidoSeriesQu
 )
 def create_dimse_series_download_job(
     payload: PacsDimseSeriesDownloadRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
 ) -> PacsDimseSeriesDownloadJobStatusResponse:
-    return pacs_dimse_download_job_service.create_job(payload)
+    if workspace_id == DEFAULT_WORKSPACE_ID:
+        return pacs_dimse_download_job_service.create_job(payload)
+    return pacs_dimse_download_job_service.create_job(payload, workspace_id=workspace_id)
 
 
 @router.get(
@@ -81,8 +86,11 @@ def create_dimse_series_download_job(
     response_model=PacsDimseSeriesDownloadJobStatusResponse,
     summary="Get PACS DIMSE series download job status",
 )
-def get_dimse_series_download_job(job_id: str) -> PacsDimseSeriesDownloadJobStatusResponse:
-    return pacs_dimse_download_job_service.get_status(job_id)
+def get_dimse_series_download_job(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> PacsDimseSeriesDownloadJobStatusResponse:
+    return pacs_dimse_download_job_service.get_status(job_id, workspace_id=workspace_id)
 
 
 @router.post(
@@ -90,8 +98,11 @@ def get_dimse_series_download_job(job_id: str) -> PacsDimseSeriesDownloadJobStat
     response_model=PacsDimseSeriesDownloadJobStatusResponse,
     summary="Cancel a PACS DIMSE series download job",
 )
-def cancel_dimse_series_download_job(job_id: str) -> PacsDimseSeriesDownloadJobStatusResponse:
-    return pacs_dimse_download_job_service.cancel_job(job_id)
+def cancel_dimse_series_download_job(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> PacsDimseSeriesDownloadJobStatusResponse:
+    return pacs_dimse_download_job_service.cancel_job(job_id, workspace_id=workspace_id)
 
 
 @router.post("/dicomweb/studies", response_model=PacsQidoStudyQueryResponse)
@@ -129,8 +140,11 @@ def preview_dicomweb_series(payload: PacsSeriesPreviewRequest) -> PacsSeriesPrev
 )
 def create_dicomweb_series_download_job(
     payload: PacsWadoSeriesDownloadRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
 ) -> PacsWadoSeriesDownloadJobStatusResponse:
-    return pacs_wado_download_job_service.create_job(payload)
+    if workspace_id == DEFAULT_WORKSPACE_ID:
+        return pacs_wado_download_job_service.create_job(payload)
+    return pacs_wado_download_job_service.create_job(payload, workspace_id=workspace_id)
 
 
 @router.get(
@@ -138,8 +152,11 @@ def create_dicomweb_series_download_job(
     response_model=PacsWadoSeriesDownloadJobStatusResponse,
     summary="Get PACS WADO series download job status",
 )
-def get_dicomweb_series_download_job(job_id: str) -> PacsWadoSeriesDownloadJobStatusResponse:
-    return pacs_wado_download_job_service.get_status(job_id)
+def get_dicomweb_series_download_job(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> PacsWadoSeriesDownloadJobStatusResponse:
+    return pacs_wado_download_job_service.get_status(job_id, workspace_id=workspace_id)
 
 
 @router.post(
@@ -147,5 +164,8 @@ def get_dicomweb_series_download_job(job_id: str) -> PacsWadoSeriesDownloadJobSt
     response_model=PacsWadoSeriesDownloadJobStatusResponse,
     summary="Cancel a PACS WADO series download job",
 )
-def cancel_dicomweb_series_download_job(job_id: str) -> PacsWadoSeriesDownloadJobStatusResponse:
-    return pacs_wado_download_job_service.cancel_job(job_id)
+def cancel_dicomweb_series_download_job(
+    job_id: str,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> PacsWadoSeriesDownloadJobStatusResponse:
+    return pacs_wado_download_job_service.cancel_job(job_id, workspace_id=workspace_id)
