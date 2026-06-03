@@ -79,7 +79,6 @@ def reslice_plane(
     )
     slab_offsets_mm = _slab_offsets_mm(geometry, plane, mip)
 
-    sampled_planes: list[np.ndarray] = []
     world_to_ijk = geometry.world_to_ijk[:3, :3]
     world_origin = geometry.world_to_ijk[:3, 3]
     center_world = np.asarray(plane.center_world, dtype=np.float64)
@@ -92,23 +91,26 @@ def reslice_plane(
     normal_ijk_per_mm = world_to_ijk @ normal_world
     ndimage = _get_ndimage()
 
-    for slab_offset_mm in slab_offsets_mm:
+    def sample_at_offset(slab_offset_mm: float) -> np.ndarray:
         coords = (
             center_ijk[:, None, None]
             + col_ijk_per_mm[:, None, None] * col_grid_mm[None, :, :]
             + row_ijk_per_mm[:, None, None] * row_grid_mm[None, :, :]
             + normal_ijk_per_mm[:, None, None] * float(slab_offset_mm)
         )
-        sampled = ndimage.map_coordinates(
+        return ndimage.map_coordinates(
             volume,
             coords,
             order=max(0, min(int(interpolation_order), 1)),
             mode="nearest",
-        )
-        sampled_planes.append(sampled.astype(np.float32, copy=False))
+        ).astype(np.float32, copy=False)
+
+    if slab_offsets_mm.size == 1:
+        return sample_at_offset(float(slab_offsets_mm[0]))
+
+    sampled_planes: list[np.ndarray] = []
+    for slab_offset_mm in slab_offsets_mm:
+        sampled_planes.append(sample_at_offset(float(slab_offset_mm)))
 
     slab = np.stack(sampled_planes, axis=0)
-    if mip is None or not mip.enabled:
-        return slab[0].astype(np.float32, copy=False)
-
     return _reduce_slab(slab, str(mip.algorithm or DEFAULT_MIP_ALGORITHM)).astype(np.float32, copy=False)

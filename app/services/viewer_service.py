@@ -1,5 +1,6 @@
 import io
 import hashlib
+from collections import OrderedDict
 from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -160,6 +161,7 @@ VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
 MPR_FAST_PREVIEW_SCALE = 0.33
 MPR_FAST_PREVIEW_MIN_SIDE = 96
+MPR_PLANE_CACHE_MAX_ITEMS = 48
 MPR_CROSSHAIR_MODE_ORTHOGONAL = "orthogonal"
 MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE = "double-oblique"
 MPR_CROSSHAIR_MODES = {
@@ -246,6 +248,7 @@ class ViewerService:
             max_bytes=VOLUME_CACHE_MAX_BYTES,
             on_evict=self._handle_series_volume_cache_evict,
         )
+        self._mpr_plane_cache: OrderedDict[tuple[object, ...], tuple[np.ndarray, int, int]] = OrderedDict()
         self._mtf_analysis_service = MtfAnalysisService(self)
         self._water_phantom_qa_service = WaterPhantomQaService(self)
         self._logger = logger
@@ -289,16 +292,27 @@ class ViewerService:
         *,
         image_format: ImageFormat = "png",
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
         workspace_id: str | None = None,
     ) -> RenderedImageResult:
         view = view_registry.get(view_id, workspace_id=workspace_id)
+        if self._is_mpr_view_type(view.view_type):
+            view = self._snapshot_mpr_view_for_render(view)
         return self._render_by_view_type(
             view,
             image_format=image_format,
             fast_preview=fast_preview,
+            fast_preview_full_resolution=fast_preview_full_resolution,
             progress_callback=progress_callback,
         )
+
+    def _snapshot_mpr_view_for_render(self, view: ViewRecord) -> ViewRecord:
+        ensure_view_size(view)
+        if not view.is_initialized:
+            self._initialize_mpr_viewport(view)
+            view.is_initialized = True
+        return deepcopy(view)
 
     def close_view_by_id(self, view_id: str, workspace_id: str | None = None) -> OperationAcceptedResponse:
         view = view_registry.delete(view_id, workspace_id=workspace_id)
@@ -1057,6 +1071,7 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         return render_by_view_type(
@@ -1064,6 +1079,7 @@ class ViewerService:
             view,
             image_format=image_format,
             fast_preview=fast_preview,
+            fast_preview_full_resolution=fast_preview_full_resolution,
             progress_callback=progress_callback,
         )
 
@@ -1614,6 +1630,7 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         render_started_at = perf_counter()
@@ -1637,7 +1654,7 @@ class ViewerService:
                 target_viewport,
                 viewport_size=(view.height or 0, view.width or 0),
             )
-            if fast_preview
+            if fast_preview and not fast_preview_full_resolution
             else None
         )
         reslice_started_at = perf_counter()
@@ -1682,10 +1699,14 @@ class ViewerService:
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
-        scale_bar = self._build_scale_bar_info(
-            render_plan.render_view,
-            metadata_image_transform,
-            self._get_mpr_spacing_xy_from_pose(target_plane_pose),
+        scale_bar = (
+            None
+            if fast_preview
+            else self._build_scale_bar_info(
+                render_plan.render_view,
+                metadata_image_transform,
+                self._get_mpr_spacing_xy_from_pose(target_plane_pose),
+            )
         )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
@@ -1695,18 +1716,27 @@ class ViewerService:
             target_plane_pose.output_shape,
             metadata_image_transform,
         )
-        reference_instance, reference_cached = self._get_reference_instance_and_cache(series)
-        slice_corner_info = self._build_slice_corner_info_overlay(
-            view,
-            series,
-            reference_cached.dataset if reference_cached is not None else None,
-            current_index=current,
-            total_slices=total,
-            viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
-            plane_state=plane_state,
-            plane_pose=target_plane_pose,
-            cursor=payload_pose_context.cursor,
+        reference_instance, reference_cached = (
+            (None, None)
+            if fast_preview
+            else self._get_reference_instance_and_cache(series)
         )
+        slice_corner_info = (
+            None
+            if fast_preview
+            else self._build_slice_corner_info_overlay(
+                view,
+                series,
+                reference_cached.dataset if reference_cached is not None else None,
+                current_index=current,
+                total_slices=total,
+                viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
+                plane_state=plane_state,
+                plane_pose=target_plane_pose,
+                cursor=payload_pose_context.cursor,
+            )
+        )
+        visible_measurements = [] if fast_preview else self._build_visible_measurements(view)
         context = RenderContext(
             view=render_plan.render_view,
             source_pixels=plane_pixels,
@@ -1716,12 +1746,11 @@ class ViewerService:
             instance=reference_instance,
             cached=reference_cached,
             mpr_viewport=target_viewport,
-            measurements=self._build_visible_measurements(view),
+            measurements=visible_measurements,
             mpr_crosshair=None,
             corner_info=None,
             orientation=None,
         )
-        visible_measurements = self._build_visible_measurements(view)
         metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
         image_started_at = perf_counter()
         if fast_preview:
@@ -1758,6 +1787,7 @@ class ViewerService:
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 mprFrame=self._build_mpr_frame_payload(payload_pose_context.cursor, payload_pose_context.geometry),
                 mprCursor=self._build_mpr_cursor_payload(payload_pose_context.cursor),
+                mprRevision=self._get_mpr_revision(view.view_group),
                 mprPlane=self._build_mpr_plane_payload(
                     view,
                     target_viewport,
@@ -1767,15 +1797,15 @@ class ViewerService:
                 mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
-                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
-                measurements=self._serialize_measurements(
+                cornerInfo=None if fast_preview else self._serialize_corner_info_overlay(slice_corner_info),
+                measurements=[] if fast_preview else self._serialize_measurements(
                     visible_measurements,
                     image_transform=metadata_image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
                 ),
                 transform=self._build_view_transform_payload(view),
-                orientation=self._serialize_orientation_overlay(
+                orientation=None if fast_preview else self._serialize_orientation_overlay(
                     self._build_mpr_orientation_overlay(
                         render_plan.render_view,
                         target_viewport,
@@ -1789,7 +1819,14 @@ class ViewerService:
 
     @staticmethod
     def _render_fast_mpr_preview(context: RenderContext) -> Image.Image:
-        return ViewerService._render_fast_preview(context)
+        return ViewerService._render_fast_base_image(
+            source_pixels=context.source_pixels,
+            pixel_min=context.pixel_min,
+            pixel_max=context.pixel_max,
+            render_view=context.view,
+            image_transform=context.image_transform,
+            order=0,
+        )
 
     @staticmethod
     def _render_fast_preview(context: RenderContext) -> Image.Image:
@@ -1809,6 +1846,8 @@ class ViewerService:
         pixel_max: float,
         render_view: ViewRecord,
         image_transform,
+        *,
+        order: int = 1,
     ) -> Image.Image:
         base_pixels = ViewerService._window_array(
             source_pixels,
@@ -1822,7 +1861,7 @@ class ViewerService:
             render_view.width or 0,
             render_view.height or 0,
             image_transform,
-            order=1,
+            order=order,
             cval=0.0,
         )
         if render_view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
@@ -1947,6 +1986,17 @@ class ViewerService:
         return ViewerService._normalize_mpr_crosshair_mode(
             group.mpr_crosshair_mode if group is not None else MPR_CROSSHAIR_MODE_ORTHOGONAL
         )
+
+    @staticmethod
+    def _get_mpr_revision(group: ViewGroupRecord | None) -> int | None:
+        return int(group.mpr_revision) if group is not None else None
+
+    @staticmethod
+    def _bump_mpr_revision(group: ViewGroupRecord | None) -> int | None:
+        if group is None:
+            return None
+        group.mpr_revision = max(0, int(group.mpr_revision)) + 1
+        return group.mpr_revision
 
     @staticmethod
     def _normalize_plane_normal_record(value: object) -> tuple[float, float, float] | None:
@@ -2163,6 +2213,21 @@ class ViewerService:
     ) -> tuple[np.ndarray, int, int]:
         target_viewport = viewport_key or self._resolve_mpr_viewport(view)
         full_plane_shape = self._get_mpr_plane_shape(volume.shape, target_viewport)
+        effective_output_shape = tuple(int(value) for value in output_shape) if output_shape is not None else full_plane_shape
+        cache_key = self._get_mpr_plane_cache_key(
+            view,
+            target_viewport,
+            effective_output_shape,
+            interpolation_order,
+        )
+        cached_plane = self._mpr_plane_cache.get(cache_key)
+        if cached_plane is not None:
+            self._mpr_plane_cache.move_to_end(cache_key)
+            plane_pixels, current, total = cached_plane
+            if target_viewport == MPR_VIEWPORT_AXIAL:
+                view.current_index = current
+            return plane_pixels, current, total
+
         try:
             series = series_registry.get(view.series_id)
         except Exception:
@@ -2190,17 +2255,75 @@ class ViewerService:
             geometry,
             pivot_world=cursor.center_world,
         )
+        mip_config = self._build_reslice_mip_config(view.mpr_mip, target_viewport)
+        if output_shape is not None and mip_config.enabled:
+            mip_config = replace(mip_config, thickness=min(max(1, int(mip_config.thickness)), 3))
         plane = reslice_plane(
             volume,
             sampling_geometry,
             plane_pose,
-            self._build_reslice_mip_config(view.mpr_mip, target_viewport),
+            mip_config,
             interpolation_order=interpolation_order,
         )
         current, total = self._get_mpr_viewport_index_info(view, volume.shape, target_viewport, cursor=cursor, geometry=geometry)
         if target_viewport == MPR_VIEWPORT_AXIAL:
             view.current_index = current
-        return plane.astype(np.float32, copy=False), current, total
+        plane_pixels = plane.astype(np.float32, copy=False)
+        self._store_mpr_plane_cache(cache_key, plane_pixels, current, total)
+        return plane_pixels, current, total
+
+    def _get_mpr_plane_cache_key(
+        self,
+        view: ViewRecord,
+        viewport_key: str,
+        output_shape: tuple[int, int],
+        interpolation_order: int,
+    ) -> tuple[object, ...]:
+        group = view.view_group
+        mip_state = view.mpr_mip.viewports.get(viewport_key, MprMipViewportState())
+        model_rotation = (
+            tuple(tuple(float(value) for value in row) for row in group.mpr_model_rotation_world)
+            if group is not None
+            else None
+        )
+        independent_normals = (
+            tuple(
+                (key, tuple(float(value) for value in group.mpr_independent_plane_normals[key]))
+                for key in sorted(group.mpr_independent_plane_normals)
+            )
+            if group is not None
+            else None
+        )
+        return (
+            view.workspace_id,
+            view.series_id,
+            group.group_id if group is not None else view.view_id,
+            self._get_mpr_revision(group),
+            None if group is not None else int(view.mpr_axial_index),
+            None if group is not None else int(view.mpr_coronal_index),
+            None if group is not None else int(view.mpr_sagittal_index),
+            viewport_key,
+            int(output_shape[0]),
+            int(output_shape[1]),
+            int(interpolation_order),
+            bool(view.mpr_mip.enabled),
+            str(view.mpr_mip.algorithm or "maximum"),
+            max(1, int(mip_state.thickness)),
+            model_rotation,
+            independent_normals,
+        )
+
+    def _store_mpr_plane_cache(
+        self,
+        cache_key: tuple[object, ...],
+        plane_pixels: np.ndarray,
+        current: int,
+        total: int,
+    ) -> None:
+        self._mpr_plane_cache[cache_key] = (plane_pixels, int(current), int(total))
+        self._mpr_plane_cache.move_to_end(cache_key)
+        while len(self._mpr_plane_cache) > MPR_PLANE_CACHE_MAX_ITEMS:
+            self._mpr_plane_cache.popitem(last=False)
 
     def _extract_oblique_mpr_plane(
         self,
@@ -3400,36 +3523,34 @@ class ViewerService:
         if overlay.center_x is None or overlay.center_y is None:
             return None
 
-        image_width = float(overlay.image_width)
-        image_height = float(overlay.image_height)
-        image_left = float(overlay.image_left)
-        image_top = float(overlay.image_top)
-        min_image_dimension = min(image_width, image_height)
+        canvas_width = float(overlay.width)
+        canvas_height = float(overlay.height)
+        min_canvas_dimension = min(canvas_width, canvas_height)
         normalized_radius = (
-            CROSSHAIR_HIT_RADIUS / min_image_dimension
-            if min_image_dimension > 0
+            CROSSHAIR_HIT_RADIUS / min_canvas_dimension
+            if min_canvas_dimension > 0
             else 0.0
         )
         return MprCrosshairInfo(
             centerX=(
-                (float(overlay.center_x) - image_left) / image_width
-                if image_width > 0
+                float(overlay.center_x) / canvas_width
+                if canvas_width > 0
                 else 0.0
             ),
             centerY=(
-                (float(overlay.center_y) - image_top) / image_height
-                if image_height > 0
+                float(overlay.center_y) / canvas_height
+                if canvas_height > 0
                 else 0.0
             ),
             hitRadius=normalized_radius,
             horizontalPosition=(
-                (float(overlay.horizontal_position) - image_top) / image_height
-                if overlay.horizontal_position is not None and image_height > 0
+                float(overlay.horizontal_position) / canvas_height
+                if overlay.horizontal_position is not None and canvas_height > 0
                 else None
             ),
             verticalPosition=(
-                (float(overlay.vertical_position) - image_left) / image_width
-                if overlay.vertical_position is not None and image_width > 0
+                float(overlay.vertical_position) / canvas_width
+                if overlay.vertical_position is not None and canvas_width > 0
                 else None
             ),
             horizontalAngleRad=float(overlay.horizontal_angle_rad),
@@ -4241,6 +4362,9 @@ class ViewerService:
             rotationDegrees=viewport_transformer.normalize_rotation_degrees(view.rotation_degrees),
             horFlip=bool(view.hor_flip),
             verFlip=bool(view.ver_flip),
+            zoom=float(view.zoom),
+            offsetX=float(view.offset_x),
+            offsetY=float(view.offset_y),
         )
 
     @staticmethod

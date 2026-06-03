@@ -1,4 +1,6 @@
 import asyncio
+from types import SimpleNamespace
+from time import perf_counter
 
 from app.sockets.runtime import RenderRequest, ViewSocketHub
 
@@ -22,6 +24,17 @@ def test_merge_render_request_keeps_full_quality_when_preview_arrives_later() ->
     assert merged.target_sids == ("sid-1", "sid-2")
 
 
+def test_merge_render_request_replaces_stale_final_with_newer_preview() -> None:
+    merged = ViewSocketHub._merge_render_request(
+        RenderRequest(image_format="png", fast_preview=False, target_sids=("sid-1",), mpr_revision=5),
+        RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",), mpr_revision=6),
+    )
+
+    assert merged.image_format == "jpeg"
+    assert merged.fast_preview is True
+    assert merged.mpr_revision == 6
+
+
 def test_merge_render_request_promotes_pending_preview_to_full_quality() -> None:
     merged = ViewSocketHub._merge_render_request(
         RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",)),
@@ -42,6 +55,26 @@ def test_merge_render_request_keeps_broadcast_target_when_either_request_broadca
     assert merged.image_format == "png"
     assert merged.fast_preview is False
     assert merged.target_sids is None
+
+
+def test_merge_render_request_keeps_latest_mpr_revision() -> None:
+    merged = ViewSocketHub._merge_render_request(
+        RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",), mpr_revision=3),
+        RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",), mpr_revision=5),
+    )
+
+    assert merged.mpr_revision == 5
+
+
+def test_merge_render_request_preserves_full_resolution_preview_flag() -> None:
+    merged = ViewSocketHub._merge_render_request(
+        RenderRequest(image_format="jpeg", fast_preview=True, fast_preview_full_resolution=False),
+        RenderRequest(image_format="jpeg", fast_preview=True, fast_preview_full_resolution=True),
+    )
+
+    assert merged.image_format == "jpeg"
+    assert merged.fast_preview is True
+    assert merged.fast_preview_full_resolution is True
 
 
 def test_emit_progress_message_targets_bound_sids() -> None:
@@ -89,7 +122,7 @@ def test_mpr_group_queue_drains_latest_pending_requests(monkeypatch) -> None:
         await first_render_started.wait()
 
         assert await hub.emit_render_for_view("v-cor", image_format="jpeg", fast_preview=True) is False
-        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is False
+        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is True
         assert await hub.emit_render_for_view("v-sag", image_format="jpeg", fast_preview=True) is False
 
         release_first_render.set()
@@ -152,7 +185,308 @@ def test_mpr_group_queue_renders_pending_batch_in_parallel(monkeypatch) -> None:
     assert asyncio.run(run()) == ["v-ax", "v-cor", "v-sag"]
 
 
-def test_drain_promotes_current_preview_when_final_is_pending(monkeypatch) -> None:
+def test_mpr_group_final_request_discards_pending_previews(monkeypatch) -> None:
+    async def run() -> dict[str, RenderRequest]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+
+        first_render_started = asyncio.Event()
+        release_first_render = asyncio.Event()
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            if view_id == "v-ax" and request.fast_preview:
+                first_render_started.set()
+                await release_first_render.wait()
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        first_task = asyncio.create_task(
+            hub.emit_render_for_view("v-ax", image_format="jpeg", fast_preview=True)
+        )
+        await first_render_started.wait()
+
+        assert await hub.emit_render_for_view("v-cor", image_format="jpeg", fast_preview=True) is False
+        assert await hub.emit_render_for_view("v-sag", image_format="jpeg", fast_preview=True) is False
+        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is True
+
+        pending = dict(hub._pending_render_requests.get("mpr-group:g", {}))
+        release_first_render.set()
+        await first_task
+        return pending
+
+    pending = asyncio.run(run())
+    assert pending == {}
+
+
+def test_mpr_preview_older_than_current_revision_is_emitted_during_drag(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, object, str | None]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+
+        class _Meta:
+            mpr_revision: int | None = 3
+
+            def model_dump(self, *, by_alias: bool = False):
+                del by_alias
+                return {"viewId": "v-cor", "imageFormat": "jpeg", "mprRevision": self.mpr_revision}
+
+        monkeypatch.setattr(
+            "app.sockets.runtime.view_registry.get",
+            lambda view_id: SimpleNamespace(
+                view_id=view_id,
+                view_group=SimpleNamespace(group_id="g", group_type="MPR", mpr_revision=3),
+            ),
+        )
+        monkeypatch.setattr(
+            "app.sockets.runtime.viewer_service.render_view_by_id",
+            lambda *args, **kwargs: SimpleNamespace(meta=_Meta(), image_bytes=b"old-preview"),
+        )
+
+        emitted = await hub.emit_render_for_view(
+            "v-cor",
+            image_format="jpeg",
+            fast_preview=True,
+            target_sids=("sid-1",),
+            mpr_revision=2,
+        )
+        return emitted, server.events
+
+    emitted, events = asyncio.run(run())
+    assert emitted is True
+    image_updates = [payload for event_name, payload, _ in events if event_name == "image_update"]
+    assert len(image_updates) == 1
+    assert image_updates[0][0]["mprRevision"] == 3
+
+
+def test_mpr_preview_is_not_emitted_when_final_is_waiting(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, object, str | None]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub._pending_render_requests["mpr-group:g"] = {
+            "v-cor": RenderRequest(image_format="png", fast_preview=False, target_sids=("sid-1",), mpr_revision=6)
+        }
+
+        class _Meta:
+            mpr_revision: int | None = 5
+
+            def model_dump(self, *, by_alias: bool = False):
+                del by_alias
+                return {"viewId": "v-cor", "imageFormat": "jpeg", "mprRevision": self.mpr_revision}
+
+        monkeypatch.setattr(
+            "app.sockets.runtime.view_registry.get",
+            lambda view_id: SimpleNamespace(
+                view_id=view_id,
+                view_group=SimpleNamespace(group_id="g", group_type="MPR", mpr_revision=6),
+            ),
+        )
+        monkeypatch.setattr(
+            "app.sockets.runtime.viewer_service.render_view_by_id",
+            lambda *args, **kwargs: SimpleNamespace(meta=_Meta(), image_bytes=b"old-preview"),
+        )
+
+        emitted = await hub._emit_render_message(
+            "v-cor",
+            RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",), mpr_revision=5),
+        )
+        return emitted, server.events
+
+    emitted, events = asyncio.run(run())
+    assert emitted is False
+    image_updates = [payload for event_name, payload, _ in events if event_name == "image_update"]
+    assert image_updates == []
+
+
+def test_mpr_final_preempts_locked_preview_and_suppresses_preview_emit(monkeypatch) -> None:
+    async def run() -> tuple[list[tuple[str, str]], list[tuple[str, object, str | None]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+
+        preview_started = asyncio.Event()
+        release_preview = asyncio.Event()
+        render_calls: list[tuple[str, str]] = []
+
+        class _Meta:
+            def __init__(self, image_format: str, revision: int):
+                self.image_format = image_format
+                self.mpr_revision = revision
+
+            def model_dump(self, *, by_alias: bool = False):
+                del by_alias
+                return {
+                    "viewId": "v-cor",
+                    "imageFormat": self.image_format,
+                    "mprRevision": self.mpr_revision,
+                }
+
+        async def fake_to_thread(func, view_id: str, **kwargs):
+            del func
+            image_format = kwargs["image_format"]
+            render_calls.append((view_id, image_format))
+            if image_format == "jpeg":
+                preview_started.set()
+                await release_preview.wait()
+                return SimpleNamespace(meta=_Meta("jpeg", 5), image_bytes=b"preview")
+            return SimpleNamespace(meta=_Meta("png", 6), image_bytes=b"final")
+
+        monkeypatch.setattr("app.sockets.runtime.asyncio.to_thread", fake_to_thread)
+
+        preview_task = asyncio.create_task(
+            hub.emit_render_for_view(
+                "v-cor",
+                image_format="jpeg",
+                fast_preview=True,
+                target_sids=("sid-1",),
+                mpr_revision=5,
+            )
+        )
+        await preview_started.wait()
+
+        final_result = await hub.emit_render_for_view(
+            "v-cor",
+            image_format="png",
+            fast_preview=False,
+            target_sids=("sid-1",),
+            mpr_revision=6,
+        )
+        release_preview.set()
+        preview_result = await preview_task
+
+        assert final_result is True
+        assert preview_result is False
+        return render_calls, server.events
+
+    render_calls, events = asyncio.run(run())
+    assert render_calls == [("v-cor", "jpeg"), ("v-cor", "png")]
+    image_updates = [payload for event_name, payload, _ in events if event_name == "image_update"]
+    assert len(image_updates) == 1
+    assert image_updates[0][0]["imageFormat"] == "png"
+
+
+def test_mpr_preview_at_or_before_final_revision_is_dropped_before_render(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, str]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+        render_calls: list[tuple[str, str]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            render_calls.append((view_id, request.image_format))
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        assert await hub.emit_render_for_view(
+            "v-cor",
+            image_format="png",
+            fast_preview=False,
+            target_sids=("sid-1",),
+            mpr_revision=8,
+        ) is True
+        preview_result = await hub.emit_render_for_view(
+            "v-cor",
+            image_format="jpeg",
+            fast_preview=True,
+            target_sids=("sid-1",),
+            mpr_revision=8,
+        )
+        return preview_result, render_calls
+
+    preview_result, render_calls = asyncio.run(run())
+    assert preview_result is False
+    assert render_calls == [("v-cor", "png")]
+
+
+def test_mpr_preview_after_final_revision_starts_new_interaction(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, str]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+        render_calls: list[tuple[str, str]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            render_calls.append((view_id, request.image_format))
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        assert await hub.emit_render_for_view(
+            "v-cor",
+            image_format="png",
+            fast_preview=False,
+            target_sids=("sid-1",),
+            mpr_revision=8,
+        ) is True
+        preview_result = await hub.emit_render_for_view(
+            "v-cor",
+            image_format="jpeg",
+            fast_preview=True,
+            target_sids=("sid-1",),
+            mpr_revision=9,
+        )
+        return preview_result, render_calls
+
+    preview_result, render_calls = asyncio.run(run())
+    assert preview_result is True
+    assert render_calls == [("v-cor", "png"), ("v-cor", "jpeg")]
+
+
+def test_mpr_group_queue_coalesces_sibling_initial_requests(monkeypatch) -> None:
+    async def run() -> tuple[list[str], bool, bool]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+
+        coronal_started = asyncio.Event()
+        sagittal_started = asyncio.Event()
+        release_renders = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            del request
+            calls.append(view_id)
+            if view_id == "v-cor":
+                coronal_started.set()
+            if view_id == "v-sag":
+                sagittal_started.set()
+            await release_renders.wait()
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        coronal_task = asyncio.create_task(
+            hub.emit_render_for_view("v-cor", image_format="jpeg", fast_preview=True)
+        )
+        sagittal_task = asyncio.create_task(
+            hub.emit_render_for_view("v-sag", image_format="jpeg", fast_preview=True)
+        )
+
+        await asyncio.wait_for(coronal_started.wait(), timeout=1.0)
+        await asyncio.wait_for(sagittal_started.wait(), timeout=1.0)
+        coronal_done_before_release = coronal_task.done()
+        sagittal_done_before_release = sagittal_task.done()
+        release_renders.set()
+        assert await coronal_task is True
+        assert await sagittal_task is False
+        return calls, coronal_done_before_release, sagittal_done_before_release
+
+    calls, coronal_done_before_release, sagittal_done_before_release = asyncio.run(run())
+    assert calls == ["v-cor", "v-sag"]
+    assert coronal_done_before_release is False
+    assert sagittal_done_before_release is True
+
+
+def test_drain_skips_current_preview_when_final_is_pending(monkeypatch) -> None:
     async def run() -> list[tuple[str, str, bool]]:
         hub = ViewSocketHub()
         calls: list[tuple[str, str, bool]] = []
@@ -174,3 +508,165 @@ def test_drain_promotes_current_preview_when_final_is_pending(monkeypatch) -> No
         return calls
 
     assert asyncio.run(run()) == [("v-cor", "png", False)]
+
+
+def test_drain_replaces_current_preview_with_latest_pending_preview(monkeypatch) -> None:
+    async def run() -> list[tuple[str, int | None]]:
+        hub = ViewSocketHub()
+        calls: list[tuple[str, int | None]] = []
+        hub._pending_render_requests["mpr-group:g"] = {
+            "v-cor": RenderRequest(
+                image_format="jpeg",
+                fast_preview=True,
+                target_sids=("sid-1",),
+                mpr_revision=5,
+            )
+        }
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            calls.append((view_id, request.mpr_revision))
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        assert await hub._drain_render_requests(
+            "mpr-group:g",
+            "v-cor",
+            RenderRequest(
+                image_format="jpeg",
+                fast_preview=True,
+                target_sids=("sid-1",),
+                mpr_revision=3,
+            ),
+        ) is True
+        return calls
+
+    assert asyncio.run(run()) == [("v-cor", 5)]
+
+
+def test_schedule_mpr_preview_batch_keeps_only_latest_pending(monkeypatch) -> None:
+    async def run() -> list[tuple[str, int | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+
+        first_batch_started_count = 0
+        first_batch_started = asyncio.Event()
+        release_first_batch = asyncio.Event()
+        latest_batch_started = asyncio.Event()
+        calls: list[tuple[str, int | None]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            nonlocal first_batch_started_count
+            calls.append((view_id, request.mpr_revision))
+            if request.mpr_revision == 1:
+                first_batch_started_count += 1
+                if first_batch_started_count == 2:
+                    first_batch_started.set()
+                await release_first_batch.wait()
+            if request.mpr_revision == 3:
+                latest_batch_started.set()
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        assert await hub.schedule_render_batch(
+            ("v-cor", "v-sag"),
+            image_format="jpeg",
+            fast_preview=True,
+            mpr_revision=1,
+        ) is False
+        await asyncio.wait_for(first_batch_started.wait(), timeout=1.0)
+
+        assert await hub.schedule_render_batch(
+            ("v-cor", "v-sag"),
+            image_format="jpeg",
+            fast_preview=True,
+            mpr_revision=2,
+        ) is False
+        assert await hub.schedule_render_batch(
+            ("v-cor", "v-sag"),
+            image_format="jpeg",
+            fast_preview=True,
+            mpr_revision=3,
+        ) is False
+
+        release_first_batch.set()
+        await asyncio.wait_for(latest_batch_started.wait(), timeout=1.0)
+        worker = hub._mpr_preview_worker_tasks.get("mpr-group:g")
+        if worker is not None:
+            await asyncio.wait_for(worker, timeout=1.0)
+        return calls
+
+    assert asyncio.run(run()) == [
+        ("v-cor", 1),
+        ("v-sag", 1),
+        ("v-cor", 3),
+        ("v-sag", 3),
+    ]
+
+
+def test_schedule_mpr_final_cancels_sleeping_preview_worker(monkeypatch) -> None:
+    async def run() -> list[tuple[str, str, int | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+
+        calls: list[tuple[str, str, int | None]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            calls.append((view_id, request.image_format, request.mpr_revision))
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+        hub._last_mpr_preview_batch_started_at["mpr-group:g"] = perf_counter()
+
+        assert await hub.schedule_render_batch(
+            ("v-cor",),
+            image_format="jpeg",
+            fast_preview=True,
+            mpr_revision=5,
+        ) is False
+        await asyncio.sleep(0)
+        assert await hub.schedule_render_batch(
+            ("v-cor", "v-sag"),
+            image_format="png",
+            fast_preview=False,
+            mpr_revision=6,
+        ) is True
+        await asyncio.sleep(0)
+        return calls
+
+    assert asyncio.run(run()) == [
+        ("v-cor", "png", 6),
+        ("v-sag", "png", 6),
+    ]
+
+
+def test_schedule_mpr_final_batch_failure_does_not_block_siblings(monkeypatch) -> None:
+    async def run() -> list[tuple[str, str]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+
+        calls: list[tuple[str, str]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            calls.append((view_id, request.image_format))
+            if view_id == "v-cor":
+                raise RuntimeError("render failed")
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        assert await hub.schedule_render_batch(
+            ("v-cor", "v-sag"),
+            image_format="png",
+            fast_preview=False,
+        ) is True
+        return calls
+
+    assert asyncio.run(run()) == [("v-cor", "png"), ("v-sag", "png")]

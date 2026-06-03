@@ -16,12 +16,18 @@ class _SocketServerStub:
             self.render_error_emitted.set()
 
 
-def test_handle_operation_schedules_mpr_broadcast_without_waiting(monkeypatch) -> None:
-    async def run() -> list[tuple[str, str, bool, tuple[str, ...] | None]]:
+async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError("condition was not met")
+        await asyncio.sleep(0)
+
+
+def test_handle_operation_schedules_mpr_broadcast_batch_without_waiting(monkeypatch) -> None:
+    async def run() -> list[tuple[tuple[str, ...], str, bool, tuple[str, ...] | None]]:
         server = _SocketServerStub()
-        render_started = asyncio.Event()
-        release_render = asyncio.Event()
-        render_calls: list[tuple[str, str, bool, tuple[str, ...] | None]] = []
+        render_calls: list[tuple[tuple[str, ...], str, bool, tuple[str, ...] | None]] = []
 
         monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
         monkeypatch.setattr(
@@ -40,19 +46,20 @@ def test_handle_operation_schedules_mpr_broadcast_without_waiting(monkeypatch) -
             ),
         )
 
-        async def fake_emit_render_for_view(
-            view_id: str,
+        async def fake_schedule_render_batch(
+            view_ids: tuple[str, ...],
             *,
             image_format: str = "png",
             fast_preview: bool = False,
+            fast_preview_full_resolution: bool = False,
             target_sids: tuple[str, ...] | None = None,
+            mpr_revision: int | None = None,
         ) -> bool:
-            render_calls.append((view_id, image_format, fast_preview, target_sids))
-            render_started.set()
-            await release_render.wait()
-            return True
+            del fast_preview_full_resolution, mpr_revision
+            render_calls.append((view_ids, image_format, fast_preview, target_sids))
+            return False
 
-        monkeypatch.setattr(handlers.view_socket_hub, "emit_render_for_view", fake_emit_render_for_view)
+        monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", fake_schedule_render_batch)
 
         response_task = asyncio.create_task(
             handlers._handle_operation(
@@ -63,16 +70,11 @@ def test_handle_operation_schedules_mpr_broadcast_without_waiting(monkeypatch) -
         )
         response = await asyncio.wait_for(response_task, timeout=0.2)
         assert response == {"ok": True}
-
-        await asyncio.wait_for(render_started.wait(), timeout=1.0)
-        release_render.set()
-        await asyncio.sleep(0)
+        await _wait_for(lambda: len(render_calls) == 1)
         return render_calls
 
     assert asyncio.run(run()) == [
-        ("v-ax", "jpeg", True, None),
-        ("v-cor", "jpeg", True, None),
-        ("v-sag", "jpeg", True, None),
+        (("v-ax", "v-cor", "v-sag"), "jpeg", True, None),
     ]
 
 
@@ -106,13 +108,220 @@ def test_mpr_drag_operations_bypass_default_threadpool(monkeypatch) -> None:
                 {"viewId": "v-ax", "opType": "mprOblique", "actionType": action_type, "x": 0.5, "y": 0.5},
             )
             assert response == {"ok": True}
+        await _wait_for(lambda: calls == [("workspace-a", "start"), ("workspace-a", "end")])
         return calls
 
     assert asyncio.run(run()) == [
         ("workspace-a", "start"),
-        ("workspace-a", "move"),
         ("workspace-a", "end"),
     ]
+
+
+def test_mpr_operation_queue_keeps_latest_move_when_worker_is_busy(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float | None]]:
+        handlers._mpr_operation_queues.clear()
+        server = _SocketServerStub()
+        calls: list[tuple[str, float | None]] = []
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        def fake_handle_view_operation(payload, workspace_id=None):
+            del workspace_id
+            calls.append((str(payload.action_type), payload.x))
+            if payload.action_type == "start":
+                start_entered.set()
+                raise RuntimeError("start should be blocked through async wrapper")
+            return OperationRenderOutcome()
+
+        async def fake_process(operation):
+            if operation.payload.action_type == "start":
+                calls.append(("start", operation.payload.x))
+                start_entered.set()
+                await release_start.wait()
+                return
+            calls.append((str(operation.payload.action_type), operation.payload.x))
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(handlers.viewer_service, "handle_view_operation", fake_handle_view_operation)
+        monkeypatch.setattr(handlers, "_process_queued_mpr_operation", fake_process)
+
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "crosshair", "actionType": "start", "x": 0.1, "y": 0.1},
+        ) == {"ok": True}
+        await _wait_for(start_entered.is_set)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "crosshair", "actionType": "move", "x": 0.2, "y": 0.2},
+        ) == {"ok": True}
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "crosshair", "actionType": "move", "x": 0.8, "y": 0.8},
+        ) == {"ok": True}
+        release_start.set()
+        await _wait_for(lambda: calls == [("start", 0.1), ("move", 0.8)])
+        return calls
+
+    assert asyncio.run(run()) == [("start", 0.1), ("move", 0.8)]
+
+
+def test_mpr_operation_queue_end_drops_pending_move(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float | None]]:
+        handlers._mpr_operation_queues.clear()
+        server = _SocketServerStub()
+        calls: list[tuple[str, float | None]] = []
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def fake_process(operation):
+            calls.append((str(operation.payload.action_type), operation.payload.x))
+            if operation.payload.action_type == "start":
+                start_entered.set()
+                await release_start.wait()
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(handlers, "_process_queued_mpr_operation", fake_process)
+
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "mprOblique", "actionType": "start", "line": "horizontal", "x": 0.1, "y": 0.1},
+        ) == {"ok": True}
+        await _wait_for(start_entered.is_set)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "mprOblique", "actionType": "move", "line": "horizontal", "x": 0.2, "y": 0.2},
+        ) == {"ok": True}
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "mprOblique", "actionType": "end", "line": "horizontal", "x": 0.9, "y": 0.9},
+        ) == {"ok": True}
+        release_start.set()
+        await _wait_for(lambda: calls == [("start", 0.1), ("end", 0.9)])
+        return calls
+
+    assert asyncio.run(run()) == [("start", 0.1), ("end", 0.9)]
+
+
+def test_handle_operation_returns_revision_and_schedules_preview_options(monkeypatch) -> None:
+    async def run() -> tuple[dict[str, object], list[tuple[int | None, bool]], list[tuple[str, object, str | None]]]:
+        server = _SocketServerStub()
+        scheduled_options: list[tuple[tuple[str, ...], int | None, bool]] = []
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: OperationRenderOutcome(
+                mpr_revision=7,
+                broadcast_view_ids=("v-cor",),
+                broadcast_image_format="jpeg",
+                broadcast_fast_preview=True,
+                broadcast_fast_preview_full_resolution=True,
+            ),
+        )
+
+        async def fake_schedule_render_batch(
+            view_ids: tuple[str, ...],
+            *,
+            image_format: str = "png",
+            fast_preview: bool = False,
+            fast_preview_full_resolution: bool = False,
+            target_sids: tuple[str, ...] | None = None,
+            mpr_revision: int | None = None,
+        ) -> bool:
+            del image_format, fast_preview, target_sids
+            scheduled_options.append((view_ids, mpr_revision, fast_preview_full_resolution))
+            return False
+
+        monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", fake_schedule_render_batch)
+
+        response = await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "mprOblique", "actionType": "move", "x": 0.5, "y": 0.5},
+        )
+        await _wait_for(lambda: len(scheduled_options) == 1)
+        return response, scheduled_options, server.events
+
+    response, scheduled_options, events = asyncio.run(run())
+    assert response == {"ok": True}
+    assert scheduled_options == [(("v-cor",), 7, True)]
+    assert not any(event_name == "mpr_state_update" for event_name, _, _ in events)
+
+
+def test_handle_operation_routes_mpr_deferred_preview_through_batch_scheduler(monkeypatch) -> None:
+    async def run() -> tuple[dict[str, object], list[tuple[tuple[str, ...], tuple[str, ...] | None, int | None]]]:
+        server = _SocketServerStub()
+        scheduled_batches: list[tuple[tuple[str, ...], tuple[str, ...] | None, int | None]] = []
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: OperationRenderOutcome(
+                mpr_revision=9,
+                deferred_view_ids=("v-ax",),
+                deferred_image_format="jpeg",
+                deferred_fast_preview=True,
+            ),
+        )
+
+        async def fake_schedule_render_batch(
+            view_ids: tuple[str, ...],
+            *,
+            image_format: str = "png",
+            fast_preview: bool = False,
+            fast_preview_full_resolution: bool = False,
+            target_sids: tuple[str, ...] | None = None,
+            mpr_revision: int | None = None,
+        ) -> bool:
+            del image_format, fast_preview, fast_preview_full_resolution
+            scheduled_batches.append((view_ids, target_sids, mpr_revision))
+            return False
+
+        monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", fake_schedule_render_batch)
+
+        response = await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "pan", "actionType": "move", "x": 2, "y": 3},
+        )
+        await _wait_for(lambda: len(scheduled_batches) == 1)
+        return response, scheduled_batches
+
+    response, scheduled_batches = asyncio.run(run())
+    assert response == {"ok": True}
+    assert scheduled_batches == [(("v-ax",), ("sid-1",), 9)]
 
 
 def test_background_render_error_is_reported_to_socket(monkeypatch) -> None:
@@ -124,9 +333,11 @@ def test_background_render_error_is_reported_to_socket(monkeypatch) -> None:
             *,
             image_format: str = "png",
             fast_preview: bool = False,
+            fast_preview_full_resolution: bool = False,
             target_sids: tuple[str, ...] | None = None,
+            mpr_revision: int | None = None,
         ) -> bool:
-            del view_id, image_format, fast_preview, target_sids
+            del view_id, image_format, fast_preview, fast_preview_full_resolution, target_sids, mpr_revision
             raise RuntimeError("render failed")
 
         monkeypatch.setattr(handlers.view_socket_hub, "emit_render_for_view", fake_emit_render_for_view)

@@ -254,6 +254,9 @@ class ViewTransformPayload(BaseModel):
     rotation_degrees: int = Field(default=0, alias="rotationDegrees")
     hor_flip: bool = Field(default=False, alias="horFlip")
     ver_flip: bool = Field(default=False, alias="verFlip")
+    zoom: float = 1.0
+    offset_x: float = Field(default=0.0, alias="offsetX")
+    offset_y: float = Field(default=0.0, alias="offsetY")
 
     model_config = {"populate_by_name": True}
 
@@ -278,6 +281,7 @@ class ViewImageResponse(BaseModel):
     mpr_crosshair: MprCrosshairInfo | None = Field(default=None, alias="mpr_crosshair")
     mpr_cursor: MprCursorInfo | None = Field(default=None, alias="mprCursor")
     mpr_frame: MprFrameInfo | None = Field(default=None, alias="mprFrame")
+    mpr_revision: int | None = Field(default=None, alias="mprRevision")
     mpr_plane: MprPlaneInfo | None = Field(default=None, alias="mprPlane")
     scale_bar: ScaleBarInfo | None = Field(default=None, alias="scaleBar")
     corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")

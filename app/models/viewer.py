@@ -204,6 +204,7 @@ class ViewGroupRecord:
     mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
     mpr_crosshair_mode: str = "orthogonal"
     mpr_independent_plane_normals: dict[str, Vec3] = field(default_factory=dict)
+    mpr_revision: int = 0
     rotation_drag: MprRotationDragRecord | None = None
     mpr_reference_center: tuple[float, float, float] | None = None
     mpr_model_rotation_world: Mat3 = (

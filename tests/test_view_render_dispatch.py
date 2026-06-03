@@ -34,7 +34,7 @@ def test_ensure_view_size_accepts_concrete_dimensions() -> None:
 
 class _RenderServiceSpy:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str, bool]] = []
+        self.calls: list[tuple[str, str, str, bool, bool | None]] = []
 
     def _is_mpr_view_type(self, view_type: str) -> bool:
         return view_type in {"AX", "COR", "SAG"}
@@ -42,28 +42,45 @@ class _RenderServiceSpy:
     def _is_3d_view_type(self, view_type: str) -> bool:
         return view_type == "3D"
 
-    def _render_mpr_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, progress_callback=None) -> str:
-        self.calls.append(("mpr", view.view_id, image_format, fast_preview))
+    def _render_mpr_view(
+        self,
+        view: ViewRecord,
+        *,
+        image_format: str,
+        fast_preview: bool,
+        fast_preview_full_resolution: bool = False,
+        progress_callback=None,
+    ) -> str:
+        self.calls.append(("mpr", view.view_id, image_format, fast_preview, fast_preview_full_resolution))
         return "mpr-result"
 
     def _render_3d_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, progress_callback=None) -> str:
-        self.calls.append(("3d", view.view_id, image_format, fast_preview))
+        self.calls.append(("3d", view.view_id, image_format, fast_preview, None))
         return "3d-result"
 
     def _render_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool) -> str:
-        self.calls.append(("stack", view.view_id, image_format, fast_preview))
+        self.calls.append(("stack", view.view_id, image_format, fast_preview, None))
         return "stack-result"
 
 
 def test_render_by_view_type_dispatches_to_matching_renderer() -> None:
     service = _RenderServiceSpy()
 
-    assert render_by_view_type(service, _view("AX"), image_format="jpeg", fast_preview=True) == "mpr-result"
+    assert (
+        render_by_view_type(
+            service,
+            _view("AX"),
+            image_format="jpeg",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+        )
+        == "mpr-result"
+    )
     assert render_by_view_type(service, _view("3D"), image_format="png", fast_preview=False) == "3d-result"
     assert render_by_view_type(service, _view("Stack"), image_format="webp", fast_preview=True) == "stack-result"
 
     assert service.calls == [
-        ("mpr", "ax-view", "jpeg", True),
-        ("3d", "3d-view", "png", False),
-        ("stack", "stack-view", "webp", True),
+        ("mpr", "ax-view", "jpeg", True, True),
+        ("3d", "3d-view", "png", False, None),
+        ("stack", "stack-view", "webp", True, None),
     ]

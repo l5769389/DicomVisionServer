@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 
 from app.core import (
     DRAG_ACTION_MOVE,
+    DRAG_ACTION_START,
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
@@ -43,12 +44,15 @@ RenderMode = Literal["none", "single", "broadcast"]
 class OperationRenderOutcome:
     primary_result: RenderedImageResult | None = None
     draft_measurement: dict[str, object] | None = None
+    mpr_revision: int | None = None
     broadcast_view_ids: tuple[str, ...] = ()
     broadcast_image_format: ImageFormat = "png"
     broadcast_fast_preview: bool = False
+    broadcast_fast_preview_full_resolution: bool = False
     deferred_view_ids: tuple[str, ...] = ()
     deferred_image_format: ImageFormat = "png"
     deferred_fast_preview: bool = False
+    deferred_fast_preview_full_resolution: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,8 @@ class RenderDecision:
     mode: RenderMode
     image_format: ImageFormat = "png"
     fast_preview: bool = False
+    fast_preview_full_resolution: bool = False
+    defer_single: bool = False
     draft_measurement: dict[str, object] | None = None
     broadcast_viewports: tuple[str, ...] | None = None
 
@@ -93,34 +99,49 @@ def handle_view_operation(
     render_decision = operation_handler(service, view, series, payload, is_mpr_view)
     _apply_shared_view_mutations(view, payload)
 
-    if is_mpr_view and active_viewport_changed:
+    if is_mpr_view and active_viewport_changed and render_decision.mode != "none":
         render_decision = _promote_render_decision_to_broadcast(render_decision)
 
     if render_decision.mode == "none":
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     _log_view_operation_state(service, view, payload)
-    return _build_operation_render_outcome(service, view, render_decision)
+    mpr_revision = _resolve_mpr_revision_for_render(service, view, payload, is_mpr_view)
+    return _build_operation_render_outcome(service, view, render_decision, mpr_revision=mpr_revision)
 
 
 def _render_none() -> RenderDecision:
     return RenderDecision(mode="none")
 
 
-def _render_single(image_format: ImageFormat = "png", *, fast_preview: bool = False) -> RenderDecision:
-    return RenderDecision(mode="single", image_format=image_format, fast_preview=fast_preview)
+def _render_single(
+    image_format: ImageFormat = "png",
+    *,
+    fast_preview: bool = False,
+    fast_preview_full_resolution: bool = False,
+    defer: bool = False,
+) -> RenderDecision:
+    return RenderDecision(
+        mode="single",
+        image_format=image_format,
+        fast_preview=fast_preview,
+        fast_preview_full_resolution=fast_preview_full_resolution,
+        defer_single=defer,
+    )
 
 
 def _render_broadcast(
     image_format: ImageFormat = "png",
     *,
     fast_preview: bool = False,
+    fast_preview_full_resolution: bool = False,
     viewports: tuple[str, ...] | None = None,
 ) -> RenderDecision:
     return RenderDecision(
         mode="broadcast",
         image_format=image_format,
         fast_preview=fast_preview,
+        fast_preview_full_resolution=fast_preview_full_resolution,
         broadcast_viewports=viewports,
     )
 
@@ -132,8 +153,46 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
         mode="broadcast",
         image_format=render_decision.image_format,
         fast_preview=render_decision.fast_preview,
+        fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
         broadcast_viewports=render_decision.broadcast_viewports,
     )
+
+
+MPR_GEOMETRY_REVISION_OPERATION_TYPES = {
+    VIEW_OP_TYPE_SCROLL,
+    VIEW_OP_TYPE_CROSSHAIR,
+    VIEW_OP_TYPE_ROTATE_3D,
+    VIEW_OP_TYPE_RESET,
+    VIEW_OP_TYPE_MPR_OBLIQUE,
+    VIEW_OP_TYPE_MPR_CROSSHAIR_MODE,
+    VIEW_OP_TYPE_MPR_STATE_SYNC,
+}
+
+
+def _resolve_mpr_revision_for_render(
+    service: ViewerService,
+    view: ViewRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> int | None:
+    if not is_mpr_view:
+        return None
+
+    if _should_bump_mpr_geometry_revision(payload):
+        return service._bump_mpr_revision(view.view_group)
+
+    return service._get_mpr_revision(view.view_group)
+
+
+def _should_bump_mpr_geometry_revision(payload: ViewOperationRequest) -> bool:
+    if payload.op_type not in MPR_GEOMETRY_REVISION_OPERATION_TYPES:
+        return False
+
+    if payload.op_type == VIEW_OP_TYPE_RESET:
+        reset_target = str(payload.sub_op_type or "view").strip().lower()
+        return reset_target not in {"measurements", "mtf", "annotations"}
+
+    return True
 
 
 MPR_VIEWPORT_ORDER = (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
@@ -211,6 +270,8 @@ def _handle_crosshair_operation(
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
         return _render_broadcast("jpeg", fast_preview=True, viewports=_reference_mpr_viewports(service, view))
+    if payload.action_type == "end":
+        return _render_broadcast(viewports=_reference_mpr_viewports(service, view))
     return _render_broadcast()
 
 
@@ -224,6 +285,12 @@ def _handle_zoom_operation(
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
     service._handle_drag_zoom(view, payload)
+    if is_mpr_view:
+        if payload.action_type == DRAG_ACTION_START:
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_single("jpeg", fast_preview=True, fast_preview_full_resolution=True, defer=True)
+        return _render_single(defer=True)
     return _resolve_drag_single_render_decision(service, view, payload)
 
 
@@ -247,7 +314,7 @@ def _handle_window_operation(
     service._handle_drag_window(view, payload)
     if is_mpr_view:
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_broadcast("jpeg", fast_preview=True)
+            return _render_broadcast("jpeg", fast_preview=True, fast_preview_full_resolution=True)
         return _render_broadcast()
     return _resolve_drag_single_render_decision(service, view, payload)
 
@@ -262,6 +329,12 @@ def _handle_pan_operation(
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
     service._handle_drag_pan(view, payload)
+    if is_mpr_view:
+        if payload.action_type == DRAG_ACTION_START:
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_single("jpeg", fast_preview=True, fast_preview_full_resolution=True, defer=True)
+        return _render_single(defer=True)
     return _resolve_drag_single_render_decision(service, view, payload)
 
 
@@ -441,6 +514,8 @@ def _handle_mpr_oblique_operation(
             fast_preview=True,
             viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
         )
+    if payload.action_type == "end":
+        return _render_broadcast(viewports=_target_mpr_oblique_preview_viewports(service, view, payload))
     return _render_broadcast()
 
 
@@ -534,7 +609,20 @@ def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest
 
 
 def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload: ViewOperationRequest) -> None:
-    service._logger.info(
+    log_method = (
+        service._logger.debug
+        if payload.action_type == DRAG_ACTION_MOVE
+        and payload.op_type in {
+            VIEW_OP_TYPE_CROSSHAIR,
+            VIEW_OP_TYPE_MPR_OBLIQUE,
+            VIEW_OP_TYPE_ZOOM,
+            VIEW_OP_TYPE_WINDOW,
+            VIEW_OP_TYPE_PAN,
+            VIEW_OP_TYPE_ROTATE_3D,
+        }
+        else service._logger.info
+    )
+    log_method(
         "view operation view_id=%s series_id=%s group_id=%s view_type=%s op_type=%s action_type=%s sub_op_type=%s index=%s zoom=%.4f offset_x=%.2f offset_y=%.2f rotation=%s hor_flip=%s ver_flip=%s ww=%s wl=%s axial=%s coronal=%s sagittal=%s",
         view.view_id,
         view.series_id,
@@ -562,6 +650,8 @@ def _build_operation_render_outcome(
     service: ViewerService,
     view: ViewRecord,
     render_decision: RenderDecision,
+    *,
+    mpr_revision: int | None = None,
 ) -> OperationRenderOutcome:
     if render_decision.mode == "none":
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
@@ -581,28 +671,33 @@ def _build_operation_render_outcome(
             return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
         return OperationRenderOutcome(
+            mpr_revision=mpr_revision,
             broadcast_view_ids=sized_group_view_ids,
             broadcast_image_format=render_decision.image_format,
             broadcast_fast_preview=render_decision.fast_preview,
+            broadcast_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
         )
 
-    if service._is_3d_view_type(view.view_type):
-        # 3D interactions are routed through the socket render hub so rapid
-        # preview frames and the final settled frame can be coalesced by view.
-        # This prevents a stale low-quality preview from overtaking the final
-        # frame after drag end on expensive surface renders.
+    if service._is_3d_view_type(view.view_type) or render_decision.defer_single:
+        # Expensive settled frames are routed through the socket render hub so
+        # rapid previews and final frames can be coalesced without blocking the
+        # interactive operation path.
         return OperationRenderOutcome(
+            mpr_revision=mpr_revision,
             deferred_view_ids=(view.view_id,),
             deferred_image_format=render_decision.image_format,
             deferred_fast_preview=render_decision.fast_preview,
+            deferred_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
         )
 
     return OperationRenderOutcome(
         draft_measurement=render_decision.draft_measurement,
+        mpr_revision=mpr_revision,
         primary_result=service._render_by_view_type(
             view,
             image_format=render_decision.image_format,
             fast_preview=render_decision.fast_preview,
+            fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
         )
     )
 

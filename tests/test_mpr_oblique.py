@@ -53,6 +53,61 @@ def _build_axial_view(service: ViewerService, series, volume: np.ndarray) -> tup
     return group, view
 
 
+def test_mpr_render_by_id_uses_view_state_snapshot(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, view = _build_axial_view(service, series, volume)
+    view.is_initialized = True
+    group.mpr_revision = 7
+    captured_views: list[ViewRecord] = []
+
+    def fake_render_by_view_type(render_view: ViewRecord, **kwargs):
+        del kwargs
+        captured_views.append(render_view)
+        return SimpleNamespace(meta=None, image_bytes=b"")
+
+    monkeypatch.setattr(service, "_render_by_view_type", fake_render_by_view_type)
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        service.render_view_by_id(view.view_id)
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert captured_views
+    snapshot = captured_views[0]
+    assert snapshot is not view
+    assert snapshot.view_group is not group
+    assert snapshot.view_group is not None
+    assert snapshot.view_group.mpr_revision == 7
+    group.mpr_revision = 9
+    assert snapshot.view_group.mpr_revision == 7
+
+
+def test_mpr_plane_cache_reuses_reslice_when_only_pan_zoom_changes(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    _, view = _build_axial_view(service, series, volume)
+    reslice_calls = 0
+
+    def fake_reslice_plane(*args, **kwargs):
+        nonlocal reslice_calls
+        del args, kwargs
+        reslice_calls += 1
+        return np.ones((6, 7), dtype=np.float32) * reslice_calls
+
+    monkeypatch.setattr(viewer_service_module, "reslice_plane", fake_reslice_plane)
+
+    first_plane, _, _ = service._extract_mpr_plane(view, volume)
+    view.offset_x = 18
+    view.offset_y = -7
+    view.zoom = 1.2
+    second_plane, _, _ = service._extract_mpr_plane(view, volume)
+
+    assert reslice_calls == 1
+    assert np.array_equal(first_plane, second_plane)
+
+
 def _get_pose_context(service: ViewerService, view: ViewRecord, series, volume: np.ndarray):
     return service._build_mpr_pose_context(view, volume.shape, series=series)
 
@@ -326,6 +381,7 @@ def test_mpr_double_oblique_relock_reorthogonalizes_planes(monkeypatch) -> None:
 def test_mpr_reset_restores_orthogonal_crosshair_mode(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, view = _build_axial_view(service, series, volume)
+    group.mpr_revision = 42
 
     service._handle_mpr_crosshair_mode(
         view,
@@ -341,6 +397,7 @@ def test_mpr_reset_restores_orthogonal_crosshair_mode(monkeypatch) -> None:
     service._reset_mpr_group_geometry(group, volume.shape, series=series)
     assert group.mpr_crosshair_mode == "orthogonal"
     assert group.mpr_independent_plane_normals == {}
+    assert group.mpr_revision == 42
 
 
 def test_mpr_state_sync_copies_double_oblique_mode_and_independent_normals(monkeypatch) -> None:
@@ -993,9 +1050,191 @@ def test_mpr_crosshair_move_uses_fast_preview_broadcast(monkeypatch) -> None:
     assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
     assert outcome.broadcast_image_format == "jpeg"
     assert outcome.broadcast_fast_preview is True
+    assert outcome.broadcast_fast_preview_full_resolution is False
 
 
-def test_mpr_crosshair_end_broadcasts_full_quality_to_all_mpr_views(monkeypatch) -> None:
+def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (coronal_view, sagittal_view):
+        candidate_view.width = axial_view.width
+        candidate_view.height = axial_view.height
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="crosshair",
+                actionType="start",
+                x=0.5,
+                y=0.5,
+            )
+        )
+        crosshair_outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="crosshair",
+                actionType="move",
+                x=0.55,
+                y=0.55,
+            )
+        )
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="window",
+                actionType="start",
+            )
+        )
+        window_outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="window",
+                actionType="move",
+                x=12,
+                y=-8,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert crosshair_outcome.mpr_revision == 1
+    assert window_outcome.mpr_revision == 1
+    assert group.mpr_revision == 1
+
+
+def test_mpr_pan_move_schedules_deferred_preview(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    _, axial_view = _build_axial_view(service, series, volume)
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[axial_view.view_id] = axial_view
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=axial_view.view_id, opType="pan", actionType="start", x=0, y=0)
+        )
+        move_outcome = service.handle_view_operation(
+            ViewOperationRequest(viewId=axial_view.view_id, opType="pan", actionType="move", x=18, y=-7)
+        )
+        end_outcome = service.handle_view_operation(
+            ViewOperationRequest(viewId=axial_view.view_id, opType="pan", actionType="end", x=0, y=0)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert axial_view.offset_x == 18
+    assert axial_view.offset_y == -7
+    assert move_outcome.primary_result is None
+    assert move_outcome.broadcast_view_ids == ()
+    assert move_outcome.deferred_view_ids == (axial_view.view_id,)
+    assert move_outcome.deferred_image_format == "jpeg"
+    assert move_outcome.deferred_fast_preview is True
+    assert move_outcome.deferred_fast_preview_full_resolution is True
+    assert end_outcome.primary_result is None
+    assert end_outcome.deferred_view_ids == (axial_view.view_id,)
+    assert end_outcome.deferred_image_format == "png"
+    assert end_outcome.deferred_fast_preview is False
+
+
+def test_mpr_zoom_move_schedules_deferred_preview(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    _, axial_view = _build_axial_view(service, series, volume)
+    axial_view.zoom = 1.0
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[axial_view.view_id] = axial_view
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=axial_view.view_id, opType="zoom", actionType="start", x=0, y=0)
+        )
+        move_outcome = service.handle_view_operation(
+            ViewOperationRequest(viewId=axial_view.view_id, opType="zoom", actionType="move", x=0, y=-10)
+        )
+        end_outcome = service.handle_view_operation(
+            ViewOperationRequest(viewId=axial_view.view_id, opType="zoom", actionType="end", x=0, y=0)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert axial_view.zoom == pytest.approx(1.1)
+    assert move_outcome.primary_result is None
+    assert move_outcome.broadcast_view_ids == ()
+    assert move_outcome.deferred_view_ids == (axial_view.view_id,)
+    assert move_outcome.deferred_image_format == "jpeg"
+    assert move_outcome.deferred_fast_preview is True
+    assert move_outcome.deferred_fast_preview_full_resolution is True
+    assert end_outcome.primary_result is None
+    assert end_outcome.deferred_view_ids == (axial_view.view_id,)
+    assert end_outcome.deferred_image_format == "png"
+    assert end_outcome.deferred_fast_preview is False
+
+
+def test_mpr_window_move_uses_full_resolution_fast_preview(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (coronal_view, sagittal_view):
+        candidate_view.width = axial_view.width
+        candidate_view.height = axial_view.height
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="window",
+                actionType="start",
+            )
+        )
+        outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="window",
+                actionType="move",
+                x=12,
+                y=-8,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert set(outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_image_format == "jpeg"
+    assert outcome.broadcast_fast_preview is True
+    assert outcome.broadcast_fast_preview_full_resolution is True
+
+
+def test_mpr_crosshair_end_broadcasts_full_quality_to_reference_views(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, axial_view = _build_axial_view(service, series, volume)
     coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
@@ -1037,7 +1276,60 @@ def test_mpr_crosshair_end_broadcasts_full_quality_to_all_mpr_views(monkeypatch)
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert set(outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id, sagittal_view.view_id}
+    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_image_format == "png"
+    assert outcome.broadcast_fast_preview is False
+
+
+def test_mpr_oblique_end_broadcasts_full_quality_to_reference_views(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (coronal_view, sagittal_view):
+        candidate_view.width = axial_view.width
+        candidate_view.height = axial_view.height
+
+    start_horizontal_angle, _ = _visible_line_angles(service, axial_view, series, volume)
+    start_x, start_y = _screen_point_for_angle(service, axial_view, series, volume, start_horizontal_angle)
+    end_x, end_y = _screen_point_for_angle(service, axial_view, series, volume, start_horizontal_angle + 0.25)
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="mprOblique",
+                actionType="start",
+                line="horizontal",
+                x=start_x,
+                y=start_y,
+            )
+        )
+        outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="mprOblique",
+                actionType="end",
+                line="horizontal",
+                x=end_x,
+                y=end_y,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
     assert outcome.broadcast_image_format == "png"
     assert outcome.broadcast_fast_preview is False
 
@@ -1094,6 +1386,16 @@ def test_mpr_double_oblique_move_broadcasts_only_changed_target_view(monkeypatch
                 y=move_y,
             )
         )
+        end_outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="mprOblique",
+                actionType="end",
+                line="horizontal",
+                x=move_x,
+                y=move_y,
+            )
+        )
     finally:
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
@@ -1101,6 +1403,9 @@ def test_mpr_double_oblique_move_broadcasts_only_changed_target_view(monkeypatch
     assert outcome.broadcast_view_ids == (coronal_view.view_id,)
     assert outcome.broadcast_image_format == "jpeg"
     assert outcome.broadcast_fast_preview is True
+    assert end_outcome.broadcast_view_ids == (coronal_view.view_id,)
+    assert end_outcome.broadcast_image_format == "png"
+    assert end_outcome.broadcast_fast_preview is False
 
 
 def test_mpr_oblique_end_applies_final_pointer_position_and_clears_drag(monkeypatch) -> None:
