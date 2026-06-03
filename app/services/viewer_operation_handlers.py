@@ -203,6 +203,15 @@ def _reference_mpr_viewports(service: ViewerService, view: ViewRecord) -> tuple[
     return tuple(viewport_key for viewport_key in MPR_VIEWPORT_ORDER if viewport_key != active_viewport)
 
 
+def _viewports_with_active(
+    service: ViewerService,
+    view: ViewRecord,
+    viewports: tuple[str, ...],
+) -> tuple[str, ...]:
+    active_viewport = service._resolve_mpr_viewport(view)
+    return tuple(dict.fromkeys((active_viewport, *viewports)))
+
+
 def _target_mpr_oblique_preview_viewports(
     service: ViewerService,
     view: ViewRecord,
@@ -271,7 +280,7 @@ def _handle_crosshair_operation(
     if payload.action_type == DRAG_ACTION_MOVE:
         return _render_broadcast("jpeg", fast_preview=True, viewports=_reference_mpr_viewports(service, view))
     if payload.action_type == "end":
-        return _render_broadcast(viewports=_reference_mpr_viewports(service, view))
+        return _render_broadcast(viewports=_viewports_with_active(service, view, _reference_mpr_viewports(service, view)))
     return _render_broadcast()
 
 
@@ -515,7 +524,13 @@ def _handle_mpr_oblique_operation(
             viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
         )
     if payload.action_type == "end":
-        return _render_broadcast(viewports=_target_mpr_oblique_preview_viewports(service, view, payload))
+        return _render_broadcast(
+            viewports=_viewports_with_active(
+                service,
+                view,
+                _target_mpr_oblique_preview_viewports(service, view, payload),
+            )
+        )
     return _render_broadcast()
 
 

@@ -10,7 +10,7 @@ from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 
-MPR_PREVIEW_BATCH_MIN_INTERVAL_SECONDS = 0.06
+MPR_PREVIEW_BATCH_MIN_INTERVAL_SECONDS = 0.0
 
 
 @dataclass
@@ -271,11 +271,14 @@ class ViewSocketHub:
         if not self._is_mpr_group_queue(queue_key) or not self._is_preview_render_request(request):
             return False
         final_revision = self._mpr_final_preemption_revisions.get(queue_key)
-        return (
-            final_revision is not None
-            and request.mpr_revision is not None
-            and int(request.mpr_revision) <= int(final_revision)
-        )
+        if final_revision is None or request.mpr_revision is None:
+            return False
+        request_revision = int(request.mpr_revision)
+        final_revision_value = int(final_revision)
+        if request.fast_preview_full_resolution:
+            # Pan/zoom/window previews update display state without changing the MPR geometry revision.
+            return request_revision < final_revision_value
+        return request_revision <= final_revision_value
 
     def _resolve_target_sids(self, view_id: str, target_sids: tuple[str, ...] | None) -> tuple[str, ...]:
         if target_sids is not None:

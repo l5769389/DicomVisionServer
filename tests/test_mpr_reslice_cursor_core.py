@@ -24,6 +24,7 @@ from app.services.mpr import (
 )
 from app.services.mpr_geometry import VolumePatientTransform
 from app.services.viewer_service import ViewerService
+from app.services.viewport_transformer import viewport_transformer
 
 
 def test_legacy_frame_round_trips_through_cursor_with_identity_geometry() -> None:
@@ -190,7 +191,67 @@ def test_mpr_fast_preview_extracts_lower_resolution_plane(monkeypatch) -> None:
     )
     assert captured_shapes[1] is None
     assert captured_shapes[2] is None
-    assert captured_interpolation_orders == [0, 0, 1]
+    assert captured_interpolation_orders == [0, 1, 1]
+
+
+def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.zeros((32, 320, 300), dtype=np.float32)
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id=series.series_id)
+    view = ViewRecord(
+        view_id="v",
+        series_id=series.series_id,
+        view_type="MPR",
+        view_group=group,
+        width=300,
+        height=300,
+        is_initialized=True,
+    )
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    reslice_calls = 0
+
+    def fake_reslice_plane(*args, **kwargs):
+        nonlocal reslice_calls
+        del kwargs
+        reslice_calls += 1
+        plane_pose = args[2]
+        return np.ones(plane_pose.output_shape, dtype=np.float32) * reslice_calls
+
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series, progress_callback=None: volume)
+    monkeypatch.setattr(viewer_service_module, "reslice_plane", fake_reslice_plane)
+    monkeypatch.setattr(service, "_get_reference_instance_and_cache", lambda resolved_series: (None, None))
+    monkeypatch.setattr(service, "_build_slice_corner_info_overlay", lambda *args, **kwargs: CornerInfoOverlay())
+    monkeypatch.setattr(
+        service,
+        "_build_mpr_crosshair_overlay",
+        lambda *args, **kwargs: MprCrosshairOverlay(
+            width=300,
+            height=300,
+            image_left=0.0,
+            image_top=0.0,
+            image_width=300.0,
+            image_height=300.0,
+            horizontal_position=150.0,
+            horizontal_color=(255, 255, 255, 255),
+            vertical_position=150.0,
+            vertical_color=(255, 255, 255, 255),
+            center_x=150.0,
+            center_y=150.0,
+        ),
+    )
+    monkeypatch.setattr(viewer_service_module.layered_renderer, "render", lambda context: Image.new("L", (300, 300)))
+    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context: Image.new("L", (300, 300)))
+    monkeypatch.setattr(service, "_encode_image", lambda image, image_format: b"image")
+
+    service._render_mpr_view(view, image_format="png", fast_preview=False)
+    view.offset_x = 18.0
+    view.offset_y = -7.0
+    view.zoom = 1.2
+    service._render_mpr_view(view, image_format="jpeg", fast_preview=True, fast_preview_full_resolution=True)
+
+    assert reslice_calls == 1
 
 
 def test_mpr_fast_preview_shape_respects_viewport_size() -> None:
@@ -503,7 +564,38 @@ def test_mpr_crosshair_move_uses_screen_plane_direction_after_model_rotation() -
     )
 
 
-def test_mpr_crosshair_move_uses_image_normalized_coordinates_when_canvas_has_letterbox(monkeypatch) -> None:
+def _plane_image_point_to_canvas_normalized(
+    service: ViewerService,
+    view: ViewRecord,
+    plane,
+    image_x: float,
+    image_y: float,
+) -> tuple[float, float]:
+    pixel_aspect_x, pixel_aspect_y = service._get_mpr_display_aspect_xy_from_pose(plane)
+    image_transform = viewport_transformer.build_image_to_canvas_transform(
+        image_width=int(plane.output_shape[1]),
+        image_height=int(plane.output_shape[0]),
+        canvas_width=int(view.width or 0),
+        canvas_height=int(view.height or 0),
+        view=view,
+        pixel_aspect_x=pixel_aspect_x,
+        pixel_aspect_y=pixel_aspect_y,
+    )
+    point = image_transform.matrix @ np.asarray([image_x, image_y, 1.0], dtype=np.float64)
+    return float(point[0]) / float(view.width or 1), float(point[1]) / float(view.height or 1)
+
+
+def _cursor_center_to_canvas_normalized(
+    service: ViewerService,
+    view: ViewRecord,
+    plane,
+    point_world: np.ndarray,
+) -> tuple[float, float]:
+    image_x, image_y = service._project_world_point_to_plane_image(plane, point_world)
+    return _plane_image_point_to_canvas_normalized(service, view, plane, image_x, image_y)
+
+
+def test_mpr_crosshair_move_uses_canvas_normalized_coordinates(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
     volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape((5, 6, 7))
@@ -520,10 +612,10 @@ def test_mpr_crosshair_move_uses_image_normalized_coordinates_when_canvas_has_le
         active_plane,
         active_plane.cursor_center_world,
     )
-    start_x = float(center_image_x) / float(active_plane.output_shape[1])
-    start_y = float(center_image_y) / float(active_plane.output_shape[0])
-    target_x = min(1.0, start_x + 0.15)
-    target_y = min(1.0, start_y + 0.1)
+    start_x, start_y = _plane_image_point_to_canvas_normalized(service, view, active_plane, center_image_x, center_image_y)
+    target_image_x = min(float(active_plane.output_shape[1]), center_image_x + 1.0)
+    target_image_y = min(float(active_plane.output_shape[0]), center_image_y + 1.0)
+    target_x, target_y = _plane_image_point_to_canvas_normalized(service, view, active_plane, target_image_x, target_image_y)
 
     assert not service._handle_mpr_crosshair(
         view,
@@ -536,13 +628,15 @@ def test_mpr_crosshair_move_uses_image_normalized_coordinates_when_canvas_has_le
 
     next_pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
     next_plane = next_pose_context.poses[MPR_VIEWPORT_AXIAL]
-    next_center_image_x, next_center_image_y = service._project_world_point_to_plane_image(
+    next_center_x, next_center_y = _cursor_center_to_canvas_normalized(
+        service,
+        view,
         next_plane,
         next_pose_context.cursor.center_world,
     )
 
-    assert next_center_image_x / float(next_plane.output_shape[1]) == pytest.approx(target_x, abs=1e-6)
-    assert next_center_image_y / float(next_plane.output_shape[0]) == pytest.approx(target_y, abs=1e-6)
+    assert next_center_x == pytest.approx(target_x, abs=1e-6)
+    assert next_center_y == pytest.approx(target_y, abs=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -574,10 +668,10 @@ def test_mpr_crosshair_move_projects_backend_cursor_for_each_active_viewport(
         active_plane,
         active_plane.cursor_center_world,
     )
-    start_x = float(center_image_x) / float(active_plane.output_shape[1])
-    start_y = float(center_image_y) / float(active_plane.output_shape[0])
-    target_x = min(0.9, max(0.1, start_x + 0.1))
-    target_y = min(0.9, max(0.1, start_y + 0.08))
+    start_x, start_y = _plane_image_point_to_canvas_normalized(service, view, active_plane, center_image_x, center_image_y)
+    target_image_x = min(float(active_plane.output_shape[1]), max(0.0, center_image_x + 1.0))
+    target_image_y = min(float(active_plane.output_shape[0]), max(0.0, center_image_y + 1.0))
+    target_x, target_y = _plane_image_point_to_canvas_normalized(service, view, active_plane, target_image_x, target_image_y)
 
     assert not service._handle_mpr_crosshair(
         view,
@@ -590,13 +684,15 @@ def test_mpr_crosshair_move_projects_backend_cursor_for_each_active_viewport(
 
     next_pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
     next_plane = next_pose_context.poses[viewport_key]
-    next_center_image_x, next_center_image_y = service._project_world_point_to_plane_image(
+    next_center_x, next_center_y = _cursor_center_to_canvas_normalized(
+        service,
+        view,
         next_plane,
         next_pose_context.cursor.center_world,
     )
 
-    assert next_center_image_x / float(next_plane.output_shape[1]) == pytest.approx(target_x, abs=1e-6)
-    assert next_center_image_y / float(next_plane.output_shape[0]) == pytest.approx(target_y, abs=1e-6)
+    assert next_center_x == pytest.approx(target_x, abs=1e-6)
+    assert next_center_y == pytest.approx(target_y, abs=1e-6)
 
 
 def test_mpr_crosshair_end_applies_final_pointer_position(monkeypatch) -> None:
@@ -615,10 +711,10 @@ def test_mpr_crosshair_end_applies_final_pointer_position(monkeypatch) -> None:
         active_plane,
         active_plane.cursor_center_world,
     )
-    start_x = float(center_image_x) / float(active_plane.output_shape[1])
-    start_y = float(center_image_y) / float(active_plane.output_shape[0])
-    target_x = min(1.0, start_x + 0.12)
-    target_y = min(1.0, start_y + 0.08)
+    start_x, start_y = _plane_image_point_to_canvas_normalized(service, view, active_plane, center_image_x, center_image_y)
+    target_image_x = min(float(active_plane.output_shape[1]), center_image_x + 1.0)
+    target_image_y = min(float(active_plane.output_shape[0]), center_image_y + 1.0)
+    target_x, target_y = _plane_image_point_to_canvas_normalized(service, view, active_plane, target_image_x, target_image_y)
 
     assert not service._handle_mpr_crosshair(
         view,
@@ -631,7 +727,9 @@ def test_mpr_crosshair_end_applies_final_pointer_position(monkeypatch) -> None:
 
     next_pose_context = service._build_mpr_pose_context(view, volume.shape, series=series)
     next_plane = next_pose_context.poses[MPR_VIEWPORT_AXIAL]
-    next_center_image_x, next_center_image_y = service._project_world_point_to_plane_image(
+    next_center_x, next_center_y = _cursor_center_to_canvas_normalized(
+        service,
+        view,
         next_plane,
         next_pose_context.cursor.center_world,
     )
@@ -639,8 +737,79 @@ def test_mpr_crosshair_end_applies_final_pointer_position(monkeypatch) -> None:
     assert not group.crosshair_drag_active
     assert group.crosshair_drag_origin_center is None
     assert group.crosshair_drag_origin_image is None
-    assert next_center_image_x / float(next_plane.output_shape[1]) == pytest.approx(target_x, abs=1e-6)
-    assert next_center_image_y / float(next_plane.output_shape[0]) == pytest.approx(target_y, abs=1e-6)
+    assert next_center_x == pytest.approx(target_x, abs=1e-6)
+    assert next_center_y == pytest.approx(target_y, abs=1e-6)
+
+
+def test_mpr_crosshair_end_keeps_reference_view_centers_after_oblique_move(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.arange(9 * 10 * 11, dtype=np.float32).reshape((9, 10, 11))
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series, **kwargs: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    axial_view = ViewRecord(view_id="v-ax", series_id="s", view_type="MPR", view_group=group, width=320, height=240)
+    coronal_view = ViewRecord(view_id="v-cor", series_id="s", view_type="COR", view_group=group, width=320, height=240)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id="s", view_type="SAG", view_group=group, width=320, height=240)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    oblique_normal = np.asarray([1.0, 0.35, 0.45], dtype=np.float64)
+    oblique_normal = oblique_normal / float(np.linalg.norm(oblique_normal))
+    group.mpr_crosshair_mode = "double-oblique"
+    group.mpr_independent_plane_normals[MPR_VIEWPORT_AXIAL] = tuple(float(value) for value in oblique_normal)
+
+    pose_context = service._build_mpr_pose_context(axial_view, volume.shape, series=series)
+    active_plane = pose_context.poses[MPR_VIEWPORT_AXIAL]
+    center_image_x, center_image_y = service._project_world_point_to_plane_image(
+        active_plane,
+        active_plane.cursor_center_world,
+    )
+    start_x, start_y = _plane_image_point_to_canvas_normalized(service, axial_view, active_plane, center_image_x, center_image_y)
+    target_image_x = min(float(active_plane.output_shape[1]), center_image_x + 1.0)
+    target_image_y = min(float(active_plane.output_shape[0]), center_image_y + 1.0)
+    target_x, target_y = _plane_image_point_to_canvas_normalized(
+        service,
+        axial_view,
+        active_plane,
+        target_image_x,
+        target_image_y,
+    )
+
+    assert not service._handle_mpr_crosshair(
+        axial_view,
+        ViewOperationRequest(viewId="v-ax", opType="crosshair", actionType="start", x=start_x, y=start_y),
+    )
+    assert service._handle_mpr_crosshair(
+        axial_view,
+        ViewOperationRequest(viewId="v-ax", opType="crosshair", actionType="move", x=target_x, y=target_y),
+    )
+    assert group.crosshair_drag_active
+    assert group.mpr_use_display_basis_for_cursor_offsets
+
+    def render_crosshair_center(view: ViewRecord, *, image_format: str, fast_preview: bool) -> tuple[float, float]:
+        result = service._render_mpr_view(view, image_format=image_format, fast_preview=fast_preview)
+        assert result.meta.mpr_crosshair is not None
+        return result.meta.mpr_crosshair.center_x, result.meta.mpr_crosshair.center_y
+
+    preview_centers = {
+        view.view_id: render_crosshair_center(view, image_format="jpeg", fast_preview=True)
+        for view in (coronal_view, sagittal_view)
+    }
+
+    assert service._handle_mpr_crosshair(
+        axial_view,
+        ViewOperationRequest(viewId="v-ax", opType="crosshair", actionType="end", x=target_x, y=target_y),
+    )
+    assert not group.crosshair_drag_active
+
+    final_centers = {
+        view.view_id: render_crosshair_center(view, image_format="png", fast_preview=False)
+        for view in (coronal_view, sagittal_view)
+    }
+
+    for view_id, preview_center in preview_centers.items():
+        assert final_centers[view_id][0] == pytest.approx(preview_center[0], abs=1e-6)
+        assert final_centers[view_id][1] == pytest.approx(preview_center[1], abs=1e-6)
 
 
 def test_build_mpr_crosshair_info_normalizes_against_rendered_canvas() -> None:

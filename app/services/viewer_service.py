@@ -1249,6 +1249,7 @@ class ViewerService:
         target_group.mpr_crosshair_mode = self._normalize_mpr_crosshair_mode(source_group.mpr_crosshair_mode)
         target_group.mpr_independent_plane_normals = deepcopy(source_group.mpr_independent_plane_normals)
         target_group.mpr_mip = deepcopy(source_group.mpr_mip)
+        target_group.mpr_use_display_basis_for_cursor_offsets = bool(source_group.mpr_use_display_basis_for_cursor_offsets)
         target_group.mpr_model_rotation_world = deepcopy(source_group.mpr_model_rotation_world)
         target_group.mpr_model_rotation_pivot_world = deepcopy(source_group.mpr_model_rotation_pivot_world)
         self._sync_group_from_mpr_cursor(target_group, source_context.cursor, target_geometry, target_volume.shape)
@@ -1345,6 +1346,7 @@ class ViewerService:
         group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_ORTHOGONAL
         group.mpr_independent_plane_normals.clear()
         group.mpr_mip = self._create_default_mpr_mip_state()
+        group.mpr_use_display_basis_for_cursor_offsets = False
         self._set_mpr_model_rotation_matrix(group, np.eye(3, dtype=np.float64))
         group.mpr_model_rotation_pivot_world = None
         default_frame = self._build_default_mpr_frame_state(volume_shape)
@@ -1663,7 +1665,7 @@ class ViewerService:
             volume,
             target_viewport,
             output_shape=preview_plane_shape,
-            interpolation_order=0 if fast_preview else 1,
+            interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
         )
         reslice_ms = (perf_counter() - reslice_started_at) * 1000.0
         metadata_started_at = perf_counter()
@@ -2240,6 +2242,7 @@ class ViewerService:
             geometry,
             OutputShapePolicy(viewport_shapes={target_viewport: full_plane_shape}),
             self._get_independent_plane_normal_overrides(view.view_group),
+            use_display_basis_for_cursor_offsets=self._should_use_mpr_display_basis_for_cursor_offsets(view.view_group),
         )
         if output_shape is not None and tuple(output_shape) != full_plane_shape:
             sample_height = max(1, int(output_shape[0]))
@@ -2299,6 +2302,7 @@ class ViewerService:
             view.series_id,
             group.group_id if group is not None else view.view_id,
             self._get_mpr_revision(group),
+            self._should_use_mpr_display_basis_for_cursor_offsets(group),
             None if group is not None else int(view.mpr_axial_index),
             None if group is not None else int(view.mpr_coronal_index),
             None if group is not None else int(view.mpr_sagittal_index),
@@ -2972,8 +2976,23 @@ class ViewerService:
         pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
         active_plane = pose_context.poses[target_viewport]
         plane_shape = active_plane.output_shape
-        image_height = max(float(plane_shape[0]), 1.0)
-        image_width = max(float(plane_shape[1]), 1.0)
+        canvas_width = max(float(view.width or 0), 1.0)
+        canvas_height = max(float(view.height or 0), 1.0)
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(active_plane)
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=int(plane_shape[1]),
+            image_height=int(plane_shape[0]),
+            canvas_width=int(canvas_width),
+            canvas_height=int(canvas_height),
+            view=view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+
+        def payload_to_plane_image_point() -> tuple[float, float]:
+            canvas_x = min(max(float(payload.x or 0.0), 0.0), 1.0) * canvas_width
+            canvas_y = min(max(float(payload.y or 0.0), 0.0), 1.0) * canvas_height
+            return self._canvas_to_image_coordinates(image_transform, canvas_x, canvas_y)
 
         if payload.action_type == DRAG_ACTION_START:
             view.mpr_crosshair_drag_active = True
@@ -2981,10 +3000,7 @@ class ViewerService:
                 origin_center_ijk = world_to_ijk_point(pose_context.geometry, pose_context.cursor.center_world)
                 view.view_group.crosshair_drag_origin_center = tuple(float(value) for value in origin_center_ijk)
                 if payload.x is not None and payload.y is not None:
-                    view.view_group.crosshair_drag_origin_image = (
-                        min(max(float(payload.x), 0.0), 1.0) * image_width,
-                        min(max(float(payload.y), 0.0), 1.0) * image_height,
-                    )
+                    view.view_group.crosshair_drag_origin_image = payload_to_plane_image_point()
                 else:
                     view.view_group.crosshair_drag_origin_image = None
             return False
@@ -2994,8 +3010,7 @@ class ViewerService:
         if (payload.action_type != DRAG_ACTION_MOVE and not is_drag_end) or not was_dragging:
             return False
 
-        image_x = min(max(float(payload.x), 0.0), 1.0) * image_width
-        image_y = min(max(float(payload.y), 0.0), 1.0) * image_height
+        image_x, image_y = payload_to_plane_image_point()
         depth, height, width = volume.shape
         if view.view_group is not None:
             previous_center = tuple(float(value) for value in world_to_ijk_point(pose_context.geometry, pose_context.cursor.center_world))
@@ -3026,6 +3041,7 @@ class ViewerService:
             if view.view_group is not None:
                 next_cursor = replace(pose_context.cursor, center_world=np.asarray(next_center_world, dtype=np.float64))
                 self._sync_group_from_mpr_cursor(view.view_group, next_cursor, pose_context.geometry, volume.shape)
+                view.view_group.mpr_use_display_basis_for_cursor_offsets = True
             else:
                 view.mpr_axial_index = int(np.round(next_center[0]))
                 view.mpr_coronal_index = int(np.round(next_center[1]))
@@ -4130,6 +4146,16 @@ class ViewerService:
         return cursor
 
     @staticmethod
+    def _should_use_mpr_display_basis_for_cursor_offsets(group: ViewGroupRecord | None) -> bool:
+        return bool(
+            group is not None
+            and (
+                group.crosshair_drag_active
+                or group.mpr_use_display_basis_for_cursor_offsets
+            )
+        )
+
+    @staticmethod
     def _build_reslice_mip_config(mip_state: MprMipState, viewport_key: str) -> ResliceMipConfig:
         viewport_config = mip_state.viewports.get(viewport_key, MprMipViewportState())
         return ResliceMipConfig(
@@ -4192,9 +4218,7 @@ class ViewerService:
                 geometry,
                 normalized_shape,
                 normal_overrides=self._get_independent_plane_normal_overrides(view.view_group),
-                use_display_basis_for_cursor_offsets=bool(
-                    view.view_group is not None and view.view_group.crosshair_drag_active
-                ),
+                use_display_basis_for_cursor_offsets=self._should_use_mpr_display_basis_for_cursor_offsets(view.view_group),
             ),
         )
 

@@ -1234,7 +1234,7 @@ def test_mpr_window_move_uses_full_resolution_fast_preview(monkeypatch) -> None:
     assert outcome.broadcast_fast_preview_full_resolution is True
 
 
-def test_mpr_crosshair_end_broadcasts_full_quality_to_reference_views(monkeypatch) -> None:
+def test_mpr_crosshair_end_broadcasts_full_quality_to_all_mpr_views(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, axial_view = _build_axial_view(service, series, volume)
     coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
@@ -1276,12 +1276,12 @@ def test_mpr_crosshair_end_broadcasts_full_quality_to_reference_views(monkeypatc
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert set(outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id, sagittal_view.view_id}
     assert outcome.broadcast_image_format == "png"
     assert outcome.broadcast_fast_preview is False
 
 
-def test_mpr_oblique_end_broadcasts_full_quality_to_reference_views(monkeypatch) -> None:
+def test_mpr_oblique_end_broadcasts_full_quality_to_active_and_reference_views(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, axial_view = _build_axial_view(service, series, volume)
     coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
@@ -1329,12 +1329,12 @@ def test_mpr_oblique_end_broadcasts_full_quality_to_reference_views(monkeypatch)
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert set(outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id, sagittal_view.view_id}
     assert outcome.broadcast_image_format == "png"
     assert outcome.broadcast_fast_preview is False
 
 
-def test_mpr_double_oblique_move_broadcasts_only_changed_target_view(monkeypatch) -> None:
+def test_mpr_double_oblique_move_broadcasts_target_and_end_syncs_active_view(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, axial_view = _build_axial_view(service, series, volume)
     coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
@@ -1403,7 +1403,7 @@ def test_mpr_double_oblique_move_broadcasts_only_changed_target_view(monkeypatch
     assert outcome.broadcast_view_ids == (coronal_view.view_id,)
     assert outcome.broadcast_image_format == "jpeg"
     assert outcome.broadcast_fast_preview is True
-    assert end_outcome.broadcast_view_ids == (coronal_view.view_id,)
+    assert set(end_outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id}
     assert end_outcome.broadcast_image_format == "png"
     assert end_outcome.broadcast_fast_preview is False
 

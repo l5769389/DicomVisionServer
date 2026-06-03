@@ -207,6 +207,7 @@ class ViewGroupRecord:
     mpr_revision: int = 0
     rotation_drag: MprRotationDragRecord | None = None
     mpr_reference_center: tuple[float, float, float] | None = None
+    mpr_use_display_basis_for_cursor_offsets: bool = False
     mpr_model_rotation_world: Mat3 = (
         (1.0, 0.0, 0.0),
         (0.0, 1.0, 0.0),
