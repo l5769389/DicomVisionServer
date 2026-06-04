@@ -1723,20 +1723,16 @@ class ViewerService:
             if fast_preview
             else self._get_reference_instance_and_cache(series)
         )
-        slice_corner_info = (
-            None
-            if fast_preview
-            else self._build_slice_corner_info_overlay(
-                view,
-                series,
-                reference_cached.dataset if reference_cached is not None else None,
-                current_index=current,
-                total_slices=total,
-                viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
-                plane_state=plane_state,
-                plane_pose=target_plane_pose,
-                cursor=payload_pose_context.cursor,
-            )
+        slice_corner_info = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            reference_cached.dataset if reference_cached is not None else None,
+            current_index=current,
+            total_slices=total,
+            viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
+            plane_state=plane_state,
+            plane_pose=target_plane_pose,
+            cursor=payload_pose_context.cursor,
         )
         visible_measurements = [] if fast_preview else self._build_visible_measurements(view)
         context = RenderContext(
@@ -1756,7 +1752,10 @@ class ViewerService:
         metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
         image_started_at = perf_counter()
         if fast_preview:
-            image = self._render_fast_mpr_preview(context)
+            image = self._render_fast_mpr_preview(
+                context,
+                order=1 if fast_preview_full_resolution else 0,
+            )
         else:
             image = layered_renderer.render(context)
         image_ms = (perf_counter() - image_started_at) * 1000.0
@@ -1799,7 +1798,7 @@ class ViewerService:
                 mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
-                cornerInfo=None if fast_preview else self._serialize_corner_info_overlay(slice_corner_info),
+                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
                 measurements=[] if fast_preview else self._serialize_measurements(
                     visible_measurements,
                     image_transform=metadata_image_transform,
@@ -1820,14 +1819,14 @@ class ViewerService:
         )
 
     @staticmethod
-    def _render_fast_mpr_preview(context: RenderContext) -> Image.Image:
+    def _render_fast_mpr_preview(context: RenderContext, *, order: int = 0) -> Image.Image:
         return ViewerService._render_fast_base_image(
             source_pixels=context.source_pixels,
             pixel_min=context.pixel_min,
             pixel_max=context.pixel_max,
             render_view=context.view,
             image_transform=context.image_transform,
-            order=0,
+            order=order,
         )
 
     @staticmethod
@@ -2086,7 +2085,7 @@ class ViewerService:
             enabled=bool(state.enabled),
             algorithm=str(state.algorithm or "maximum"),
             viewports={
-                viewport_key: MprMipViewportConfig(thickness=max(1, int(viewport_state.thickness)))
+                viewport_key: MprMipViewportConfig(thickness=max(0, min(100, int(viewport_state.thickness))))
                 for viewport_key, viewport_state in state.viewports.items()
             },
         )
@@ -2103,7 +2102,7 @@ class ViewerService:
             if next_config is None:
                 next_viewports[viewport_key] = current_state.viewports.get(viewport_key, MprMipViewportState())
                 continue
-            next_viewports[viewport_key] = MprMipViewportState(thickness=max(1, int(next_config.thickness)))
+            next_viewports[viewport_key] = MprMipViewportState(thickness=max(0, min(100, int(next_config.thickness))))
 
         next_state = MprMipState(
             enabled=bool(incoming.enabled),
@@ -2260,7 +2259,7 @@ class ViewerService:
         )
         mip_config = self._build_reslice_mip_config(view.mpr_mip, target_viewport)
         if output_shape is not None and mip_config.enabled:
-            mip_config = replace(mip_config, thickness=min(max(1, int(mip_config.thickness)), 3))
+            mip_config = replace(mip_config, max_samples=3)
         plane = reslice_plane(
             volume,
             sampling_geometry,
@@ -2312,7 +2311,7 @@ class ViewerService:
             int(interpolation_order),
             bool(view.mpr_mip.enabled),
             str(view.mpr_mip.algorithm or "maximum"),
-            max(1, int(mip_state.thickness)),
+            max(0, min(100, int(mip_state.thickness))),
             model_rotation,
             independent_normals,
         )
@@ -2614,13 +2613,22 @@ class ViewerService:
 
     @staticmethod
     def _build_series_volume_cache_key(series: SeriesRecord) -> str:
+        cached_key = getattr(series, "volume_cache_key", None)
+        if cached_key:
+            return str(cached_key)
+
         content_keys = [
             dicom_cache.build_instance_content_key(instance.sop_instance_uid, instance.path)
             for instance in series.instances
             if instance.sop_instance_uid
         ]
         digest = hashlib.sha256("\n".join(content_keys).encode("utf-8")).hexdigest()
-        return f"volume::{digest}"
+        volume_cache_key = f"volume::{digest}"
+        try:
+            series.volume_cache_key = volume_cache_key
+        except Exception:
+            pass
+        return volume_cache_key
 
     def _build_series_volume(
         self,
@@ -3571,6 +3579,26 @@ class ViewerService:
             ),
             horizontalAngleRad=float(overlay.horizontal_angle_rad),
             verticalAngleRad=float(overlay.vertical_angle_rad),
+            horizontalSlabOffsetX=(
+                float(overlay.horizontal_slab_offset_x) / canvas_width
+                if overlay.horizontal_slab_offset_x is not None and canvas_width > 0
+                else None
+            ),
+            horizontalSlabOffsetY=(
+                float(overlay.horizontal_slab_offset_y) / canvas_height
+                if overlay.horizontal_slab_offset_y is not None and canvas_height > 0
+                else None
+            ),
+            verticalSlabOffsetX=(
+                float(overlay.vertical_slab_offset_x) / canvas_width
+                if overlay.vertical_slab_offset_x is not None and canvas_width > 0
+                else None
+            ),
+            verticalSlabOffsetY=(
+                float(overlay.vertical_slab_offset_y) / canvas_height
+                if overlay.vertical_slab_offset_y is not None and canvas_height > 0
+                else None
+            ),
         )
 
     @staticmethod
@@ -3591,6 +3619,33 @@ class ViewerService:
         inverse = np.linalg.inv(image_transform.matrix)
         point = inverse @ np.array([canvas_x, canvas_y, 1.0], dtype=np.float64)
         return float(point[0]), float(point[1])
+
+    @staticmethod
+    def _resolve_mpr_slab_offset_canvas(
+        plane_pose,
+        target_pose,
+        thickness_mm: float,
+        center_image_x: float,
+        center_image_y: float,
+        center_canvas_x: float,
+        center_canvas_y: float,
+        image_to_canvas,
+    ) -> tuple[float | None, float | None]:
+        active_normal = np.asarray(plane_pose.normal_world, dtype=np.float64)
+        target_normal = np.asarray(target_pose.normal_world, dtype=np.float64)
+        projected_normal = target_normal - float(np.dot(target_normal, active_normal)) * active_normal
+        projected_norm = float(np.linalg.norm(projected_normal))
+        if not np.isfinite(projected_norm) or projected_norm <= 1e-6:
+            return None, None
+
+        offset_world = projected_normal / projected_norm * (float(thickness_mm) / 2.0 / projected_norm)
+        offset_image_x = float(np.dot(offset_world, plane_pose.col_world)) / max(float(plane_pose.pixel_spacing_col_mm), 1e-6)
+        offset_image_y = float(np.dot(offset_world, plane_pose.row_world)) / max(float(plane_pose.pixel_spacing_row_mm), 1e-6)
+        offset_canvas_x, offset_canvas_y = image_to_canvas(
+            center_image_x + offset_image_x,
+            center_image_y + offset_image_y,
+        )
+        return float(offset_canvas_x - center_canvas_x), float(offset_canvas_y - center_canvas_y)
 
     def _build_mpr_crosshair_overlay(
         self,
@@ -3646,6 +3701,34 @@ class ViewerService:
             _, horizontal_position = image_to_canvas(0.0, center_image_y)
             vertical_position, _ = image_to_canvas(center_image_x, 0.0)
 
+        def slab_offset_for_line(line: str) -> tuple[float | None, float | None]:
+            if not view.mpr_mip.enabled:
+                return None, None
+            target_line_viewport = self._resolve_mpr_oblique_target_viewport(target_viewport, line)
+            viewport_mip = view.mpr_mip.viewports.get(target_line_viewport, MprMipViewportState())
+            target_pose = pose_context.poses.get(target_line_viewport)
+            if target_pose is None:
+                return None, None
+            configured_thickness_mm = float(viewport_mip.thickness)
+            thickness_mm = (
+                max(1e-6, float(spacing_along_world_direction(pose_context.geometry, target_pose.normal_world)))
+                if configured_thickness_mm <= 0.0
+                else configured_thickness_mm
+            )
+            return self._resolve_mpr_slab_offset_canvas(
+                plane_pose,
+                target_pose,
+                thickness_mm,
+                center_image_x,
+                center_image_y,
+                center_x,
+                center_y,
+                image_to_canvas,
+            )
+
+        horizontal_slab_offset_x, horizontal_slab_offset_y = slab_offset_for_line("horizontal")
+        vertical_slab_offset_x, vertical_slab_offset_y = slab_offset_for_line("vertical")
+
         if target_viewport == MPR_VIEWPORT_CORONAL:
             return MprCrosshairOverlay(
                 width=canvas_width,
@@ -3660,6 +3743,10 @@ class ViewerService:
                 vertical_color=sagittal_color,
                 horizontal_angle_rad=horizontal_angle,
                 vertical_angle_rad=vertical_angle,
+                horizontal_slab_offset_x=horizontal_slab_offset_x,
+                horizontal_slab_offset_y=horizontal_slab_offset_y,
+                vertical_slab_offset_x=vertical_slab_offset_x,
+                vertical_slab_offset_y=vertical_slab_offset_y,
                 center_x=center_x,
                 center_y=center_y,
                 is_active=is_active,
@@ -3678,6 +3765,10 @@ class ViewerService:
                 vertical_color=coronal_color,
                 horizontal_angle_rad=horizontal_angle,
                 vertical_angle_rad=vertical_angle,
+                horizontal_slab_offset_x=horizontal_slab_offset_x,
+                horizontal_slab_offset_y=horizontal_slab_offset_y,
+                vertical_slab_offset_x=vertical_slab_offset_x,
+                vertical_slab_offset_y=vertical_slab_offset_y,
                 center_x=center_x,
                 center_y=center_y,
                 is_active=is_active,
@@ -3695,6 +3786,10 @@ class ViewerService:
             vertical_color=sagittal_color,
             horizontal_angle_rad=horizontal_angle,
             vertical_angle_rad=vertical_angle,
+            horizontal_slab_offset_x=horizontal_slab_offset_x,
+            horizontal_slab_offset_y=horizontal_slab_offset_y,
+            vertical_slab_offset_x=vertical_slab_offset_x,
+            vertical_slab_offset_y=vertical_slab_offset_y,
             center_x=center_x,
             center_y=center_y,
             is_active=is_active,
@@ -4161,7 +4256,7 @@ class ViewerService:
         return ResliceMipConfig(
             enabled=bool(mip_state.enabled),
             algorithm=str(mip_state.algorithm or "maximum"),
-            thickness=max(1, int(viewport_config.thickness)),
+            thickness=max(0, min(100, int(viewport_config.thickness))),
         )
 
     @staticmethod
@@ -4728,7 +4823,9 @@ class ViewerService:
             # stay PNG so overlays and measurements align with lossless pixels.
             image.convert("RGB").save(output, format="JPEG", quality=FAST_PREVIEW_JPEG_QUALITY)
         else:
-            image.save(output, format="PNG")
+            # PNG remains lossless; a low compression level trades a larger
+            # socket payload for much lower CPU latency during interactive MPR.
+            image.save(output, format="PNG", compress_level=1, optimize=False)
         return output.getvalue()
 
 

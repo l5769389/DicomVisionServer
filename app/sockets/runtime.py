@@ -275,10 +275,7 @@ class ViewSocketHub:
             return False
         request_revision = int(request.mpr_revision)
         final_revision_value = int(final_revision)
-        if request.fast_preview_full_resolution:
-            # Pan/zoom/window previews update display state without changing the MPR geometry revision.
-            return request_revision < final_revision_value
-        return request_revision <= final_revision_value
+        return request_revision < final_revision_value
 
     def _resolve_target_sids(self, view_id: str, target_sids: tuple[str, ...] | None) -> tuple[str, ...]:
         if target_sids is not None:

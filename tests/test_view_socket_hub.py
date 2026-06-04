@@ -370,7 +370,7 @@ def test_mpr_final_preempts_locked_preview_and_suppresses_preview_emit(monkeypat
     assert image_updates[0][0]["imageFormat"] == "png"
 
 
-def test_mpr_low_resolution_preview_at_or_before_final_revision_is_dropped_before_render(monkeypatch) -> None:
+def test_mpr_low_resolution_preview_below_final_revision_is_dropped_before_render(monkeypatch) -> None:
     async def run() -> tuple[bool, list[tuple[str, str]]]:
         hub = ViewSocketHub()
         server = _SocketServerStub()
@@ -396,7 +396,7 @@ def test_mpr_low_resolution_preview_at_or_before_final_revision_is_dropped_befor
             image_format="jpeg",
             fast_preview=True,
             target_sids=("sid-1",),
-            mpr_revision=8,
+            mpr_revision=7,
         )
         return preview_result, render_calls
 
@@ -405,7 +405,7 @@ def test_mpr_low_resolution_preview_at_or_before_final_revision_is_dropped_befor
     assert render_calls == [("v-cor", "png")]
 
 
-def test_schedule_mpr_full_resolution_preview_at_final_revision_is_rendered(monkeypatch) -> None:
+def test_schedule_mpr_preview_at_final_revision_is_rendered(monkeypatch) -> None:
     async def run() -> list[tuple[str, str, int | None, bool]]:
         hub = ViewSocketHub()
         server = _SocketServerStub()
@@ -432,7 +432,6 @@ def test_schedule_mpr_full_resolution_preview_at_final_revision_is_rendered(monk
             ("v-cor",),
             image_format="jpeg",
             fast_preview=True,
-            fast_preview_full_resolution=True,
             target_sids=("sid-1",),
             mpr_revision=8,
         )
@@ -444,7 +443,7 @@ def test_schedule_mpr_full_resolution_preview_at_final_revision_is_rendered(monk
 
     assert asyncio.run(run()) == [
         ("v-cor", "png", 8, False),
-        ("v-cor", "jpeg", 8, True),
+        ("v-cor", "jpeg", 8, False),
     ]
 
 

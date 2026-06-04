@@ -17,25 +17,13 @@ class MipConfig:
     enabled: bool = False
     algorithm: str = DEFAULT_MIP_ALGORITHM
     thickness: int = 1
-
-
-SLAB_REDUCERS = {
-    "minimum": np.min,
-    "average": np.mean,
-    "sum": np.sum,
-    DEFAULT_MIP_ALGORITHM: np.max,
-}
+    max_samples: int | None = None
 
 
 def _get_ndimage():
     from scipy import ndimage
 
     return ndimage
-
-
-def _reduce_slab(slab: np.ndarray, algorithm: str) -> np.ndarray:
-    reducer = SLAB_REDUCERS.get(algorithm, SLAB_REDUCERS[DEFAULT_MIP_ALGORITHM])
-    return reducer(slab, axis=0)
 
 
 @lru_cache(maxsize=16)
@@ -55,12 +43,24 @@ def _slab_offsets_mm(geometry: VolumeGeometry, plane: PlanePose, mip: MipConfig 
     if mip is None or not mip.enabled:
         return np.asarray([0.0], dtype=np.float64)
 
-    thickness = max(1, int(mip.thickness))
-    half_before = (thickness - 1) // 2
-    step_mm = spacing_along_world_direction(geometry, plane.normal_world)
+    step_mm = max(1e-6, float(spacing_along_world_direction(geometry, plane.normal_world)))
+    thickness_mm = float(mip.thickness)
+    if not np.isfinite(thickness_mm) or thickness_mm <= 0.0:
+        return np.asarray([0.0], dtype=np.float64)
+    sample_count = max(1, int(np.ceil(thickness_mm / step_mm)))
     # Offsets are centered on the displayed plane so enabling MIP does not shift
-    # the current crosshair slice.
-    return (np.arange(-half_before, thickness - half_before, dtype=np.float64) * step_mm).astype(np.float64)
+    # the current crosshair slice. Even sample counts must use half-step offsets
+    # instead of one extra sample on either side.
+    full_offsets = (np.arange(sample_count, dtype=np.float64) - (float(sample_count) - 1.0) / 2.0) * step_mm
+    if mip.max_samples is None:
+        return full_offsets.astype(np.float64)
+
+    max_samples = max(1, int(mip.max_samples))
+    if full_offsets.size <= max_samples:
+        return full_offsets.astype(np.float64)
+    if max_samples == 1:
+        return np.asarray([0.0], dtype=np.float64)
+    return np.linspace(float(full_offsets[0]), float(full_offsets[-1]), num=max_samples, dtype=np.float64)
 
 
 def reslice_plane(
@@ -108,9 +108,17 @@ def reslice_plane(
     if slab_offsets_mm.size == 1:
         return sample_at_offset(float(slab_offsets_mm[0]))
 
-    sampled_planes: list[np.ndarray] = []
-    for slab_offset_mm in slab_offsets_mm:
-        sampled_planes.append(sample_at_offset(float(slab_offset_mm)))
+    algorithm = str(mip.algorithm or DEFAULT_MIP_ALGORITHM)
+    accumulator = sample_at_offset(float(slab_offsets_mm[0])).astype(np.float32, copy=True)
+    for slab_offset_mm in slab_offsets_mm[1:]:
+        sample = sample_at_offset(float(slab_offset_mm))
+        if algorithm == "minimum":
+            np.minimum(accumulator, sample, out=accumulator)
+        elif algorithm == "average" or algorithm == "sum":
+            accumulator += sample
+        else:
+            np.maximum(accumulator, sample, out=accumulator)
 
-    slab = np.stack(sampled_planes, axis=0)
-    return _reduce_slab(slab, str(mip.algorithm or DEFAULT_MIP_ALGORITHM)).astype(np.float32, copy=False)
+    if algorithm == "average":
+        accumulator /= float(slab_offsets_mm.size)
+    return accumulator.astype(np.float32, copy=False)

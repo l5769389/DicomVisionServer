@@ -146,6 +146,27 @@ def _render_broadcast(
     )
 
 
+def _render_full_resolution_preview_single(*, defer: bool = False) -> RenderDecision:
+    return _render_single(
+        "png",
+        fast_preview=True,
+        fast_preview_full_resolution=True,
+        defer=defer,
+    )
+
+
+def _render_full_resolution_preview_broadcast(
+    *,
+    viewports: tuple[str, ...] | None = None,
+) -> RenderDecision:
+    return _render_broadcast(
+        "png",
+        fast_preview=True,
+        fast_preview_full_resolution=True,
+        viewports=viewports,
+    )
+
+
 def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> RenderDecision:
     if render_decision.mode == "broadcast":
         return render_decision
@@ -161,6 +182,7 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
 MPR_GEOMETRY_REVISION_OPERATION_TYPES = {
     VIEW_OP_TYPE_SCROLL,
     VIEW_OP_TYPE_CROSSHAIR,
+    VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_ROTATE_3D,
     VIEW_OP_TYPE_RESET,
     VIEW_OP_TYPE_MPR_OBLIQUE,
@@ -278,7 +300,7 @@ def _handle_crosshair_operation(
     if not should_broadcast_group:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_broadcast("jpeg", fast_preview=True, viewports=_reference_mpr_viewports(service, view))
+        return _render_full_resolution_preview_broadcast(viewports=_reference_mpr_viewports(service, view))
     if payload.action_type == "end":
         return _render_broadcast(viewports=_viewports_with_active(service, view, _reference_mpr_viewports(service, view)))
     return _render_broadcast()
@@ -298,7 +320,7 @@ def _handle_zoom_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_single("jpeg", fast_preview=True, fast_preview_full_resolution=True, defer=True)
+            return _render_full_resolution_preview_single(defer=True)
         return _render_single(defer=True)
     return _resolve_drag_single_render_decision(service, view, payload)
 
@@ -323,7 +345,7 @@ def _handle_window_operation(
     service._handle_drag_window(view, payload)
     if is_mpr_view:
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_broadcast("jpeg", fast_preview=True, fast_preview_full_resolution=True)
+            return _render_full_resolution_preview_broadcast()
         return _render_broadcast()
     return _resolve_drag_single_render_decision(service, view, payload)
 
@@ -342,7 +364,7 @@ def _handle_pan_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_single("jpeg", fast_preview=True, fast_preview_full_resolution=True, defer=True)
+            return _render_full_resolution_preview_single(defer=True)
         return _render_single(defer=True)
     return _resolve_drag_single_render_decision(service, view, payload)
 
@@ -375,7 +397,7 @@ def _handle_rotate_3d_operation(
         if not service._handle_mpr_model_rotate_3d(view, payload):
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_broadcast("jpeg", fast_preview=True)
+            return _render_full_resolution_preview_broadcast()
         return _render_broadcast()
     service._handle_drag_rotate_3d(view, payload)
     return _resolve_drag_single_render_decision(service, view, payload, fast_preview_on_move=True)
@@ -502,6 +524,10 @@ def _handle_mpr_mip_config_operation(
         return _render_none()
     if not service._handle_mpr_mip_config(view, payload):
         return _render_none()
+    if payload.action_type == DRAG_ACTION_START:
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_full_resolution_preview_broadcast()
     return _render_broadcast()
 
 
@@ -518,9 +544,7 @@ def _handle_mpr_oblique_operation(
     if not service._handle_mpr_oblique(view, payload):
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_broadcast(
-            "jpeg",
-            fast_preview=True,
+        return _render_full_resolution_preview_broadcast(
             viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
         )
     if payload.action_type == "end":

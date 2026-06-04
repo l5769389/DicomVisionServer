@@ -93,6 +93,10 @@ class MprCrosshairInfo(BaseModel):
     vertical_position: float | None = Field(default=None, alias="verticalPosition")
     horizontal_angle_rad: float | None = Field(default=None, alias="horizontalAngleRad")
     vertical_angle_rad: float | None = Field(default=None, alias="verticalAngleRad")
+    horizontal_slab_offset_x: float | None = Field(default=None, alias="horizontalSlabOffsetX")
+    horizontal_slab_offset_y: float | None = Field(default=None, alias="horizontalSlabOffsetY")
+    vertical_slab_offset_x: float | None = Field(default=None, alias="verticalSlabOffsetX")
+    vertical_slab_offset_y: float | None = Field(default=None, alias="verticalSlabOffsetY")
 
     model_config = {"populate_by_name": True}
 
@@ -262,7 +266,7 @@ class ViewTransformPayload(BaseModel):
 
 
 class MprMipViewportConfig(BaseModel):
-    thickness: int = Field(default=12, ge=1, le=512)
+    thickness: int = Field(default=10, ge=0, le=100)
 
 
 class MprMipConfig(BaseModel):

@@ -6,11 +6,12 @@ import pytest
 from PIL import Image
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
-from app.models.viewer import MprFrameState, ViewGroupRecord, ViewRecord
+from app.models.viewer import InstanceRecord, MprFrameState, SeriesRecord, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay
 from app.services import viewer_service as viewer_service_module
 from app.services.mpr import (
+    MipConfig,
     axis_angle_rotation_matrix,
     build_geometry_from_patient_transform,
     build_identity_geometry,
@@ -25,6 +26,44 @@ from app.services.mpr import (
 from app.services.mpr_geometry import VolumePatientTransform
 from app.services.viewer_service import ViewerService
 from app.services.viewport_transformer import viewport_transformer
+
+
+def test_series_volume_cache_key_is_memoized(monkeypatch, tmp_path) -> None:
+    first_path = tmp_path / "a.dcm"
+    second_path = tmp_path / "b.dcm"
+    first_path.write_bytes(b"a")
+    second_path.write_bytes(b"b")
+    series = SeriesRecord(
+        series_id="s",
+        folder_path=str(tmp_path),
+        series_instance_uid="series-uid",
+        study_instance_uid=None,
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description=None,
+        instances=[
+            InstanceRecord(first_path, "1", 1, 1, 1),
+            InstanceRecord(second_path, "2", 2, 1, 1),
+        ],
+    )
+    calls: list[str] = []
+
+    def fake_build_instance_content_key(instance_uid, path):
+        calls.append(str(path))
+        return f"{instance_uid}:{path.name}"
+
+    monkeypatch.setattr(viewer_service_module.dicom_cache, "build_instance_content_key", fake_build_instance_content_key)
+
+    first_key = ViewerService._build_series_volume_cache_key(series)
+    second_key = ViewerService._build_series_volume_cache_key(series)
+
+    assert first_key == second_key
+    assert series.volume_cache_key == first_key
+    assert calls == [str(first_path), str(second_path)]
 
 
 def test_legacy_frame_round_trips_through_cursor_with_identity_geometry() -> None:
@@ -111,6 +150,97 @@ def test_reslice_plane_matches_legacy_orthogonal_default_planes() -> None:
     assert np.allclose(sagittal, np.flipud(volume[:, :, 4]), atol=1e-6)
 
 
+def test_reslice_plane_mip_uses_centered_physical_mm_offsets() -> None:
+    volume = np.arange(9, dtype=np.float32).reshape((9, 1, 1))
+    geometry = build_identity_geometry(volume.shape)
+    frame = MprFrameState(
+        center=(4.0, 0.0, 0.0),
+        axis_slice=(1.0, 0.0, 0.0),
+        axis_row=(0.0, 1.0, 0.0),
+        axis_col=(0.0, 0.0, 1.0),
+    )
+    cursor = legacy_frame_to_cursor(frame, geometry, reference_center=frame.center)
+    plane = derive_plane_pose(cursor, "mpr-ax", geometry)
+
+    average = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="average", thickness=4),
+        interpolation_order=1,
+    )
+    maximum = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="maximum", thickness=4),
+        interpolation_order=1,
+    )
+    minimum = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="minimum", thickness=4),
+        interpolation_order=1,
+    )
+    summed = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="sum", thickness=4),
+        interpolation_order=1,
+    )
+    native_layer = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="maximum", thickness=0),
+        interpolation_order=1,
+    )
+
+    assert float(average[0, 0]) == pytest.approx(4.0)
+    assert float(maximum[0, 0]) == pytest.approx(5.5)
+    assert float(minimum[0, 0]) == pytest.approx(2.5)
+    assert float(summed[0, 0]) == pytest.approx(16.0)
+    assert float(native_layer[0, 0]) == pytest.approx(4.0)
+
+
+def test_reslice_plane_mip_reduces_slab_without_stacking(monkeypatch) -> None:
+    volume = np.arange(9, dtype=np.float32).reshape((9, 1, 1))
+    geometry = build_identity_geometry(volume.shape)
+    frame = MprFrameState(
+        center=(4.0, 0.0, 0.0),
+        axis_slice=(1.0, 0.0, 0.0),
+        axis_row=(0.0, 1.0, 0.0),
+        axis_col=(0.0, 0.0, 1.0),
+    )
+    cursor = legacy_frame_to_cursor(frame, geometry, reference_center=frame.center)
+    plane = derive_plane_pose(cursor, "mpr-ax", geometry)
+
+    def forbidden_stack(*_args, **_kwargs):
+        raise AssertionError("MIP slab reduction should stream samples instead of stacking them")
+
+    monkeypatch.setattr(np, "stack", forbidden_stack)
+
+    maximum = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="maximum", thickness=4),
+        interpolation_order=1,
+    )
+    average = reslice_plane(
+        volume,
+        geometry,
+        plane,
+        mip=MipConfig(enabled=True, algorithm="average", thickness=4),
+        interpolation_order=1,
+    )
+
+    assert float(maximum[0, 0]) == pytest.approx(5.5)
+    assert float(average[0, 0]) == pytest.approx(4.0)
+
+
 def test_mpr_fast_preview_extracts_lower_resolution_plane(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
@@ -174,15 +304,15 @@ def test_mpr_fast_preview_extracts_lower_resolution_plane(monkeypatch) -> None:
             center_y=150.0,
         ),
     )
-    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context: Image.new("L", (300, 300)))
+    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context, **kwargs: Image.new("L", (300, 300)))
     monkeypatch.setattr(service, "_encode_image", lambda image, image_format: b"image")
 
     service._render_mpr_view(view, image_format="jpeg", fast_preview=True)
-    assert corner_info_calls == 0
-    service._render_mpr_view(view, image_format="jpeg", fast_preview=True, fast_preview_full_resolution=True)
-    assert corner_info_calls == 0
-    service._render_mpr_view(view, image_format="png", fast_preview=False)
     assert corner_info_calls == 1
+    service._render_mpr_view(view, image_format="jpeg", fast_preview=True, fast_preview_full_resolution=True)
+    assert corner_info_calls == 2
+    service._render_mpr_view(view, image_format="png", fast_preview=False)
+    assert corner_info_calls == 3
 
     assert captured_shapes[0] == service._get_mpr_fast_preview_plane_shape(
         volume.shape,
@@ -242,7 +372,7 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
         ),
     )
     monkeypatch.setattr(viewer_service_module.layered_renderer, "render", lambda context: Image.new("L", (300, 300)))
-    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context: Image.new("L", (300, 300)))
+    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context, **kwargs: Image.new("L", (300, 300)))
     monkeypatch.setattr(service, "_encode_image", lambda image, image_format: b"image")
 
     service._render_mpr_view(view, image_format="png", fast_preview=False)

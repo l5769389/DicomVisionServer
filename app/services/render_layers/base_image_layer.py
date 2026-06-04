@@ -25,13 +25,15 @@ class BaseImageLayer:
             lower = context.pixel_min
             upper = context.pixel_max
 
-        clipped = np.clip(pixels, lower, upper)
         scale = upper - lower
         if scale <= 0:
-            return np.zeros_like(clipped, dtype=np.uint8)
+            return np.zeros(pixels.shape, dtype=np.uint8)
 
-        normalized = (clipped - lower) / scale
-        grayscale = (normalized * 255.0).astype(np.uint8)
+        normalized = np.asarray(pixels, dtype=np.float32).copy()
+        np.clip(normalized, lower, upper, out=normalized)
+        normalized -= lower
+        normalized *= 255.0 / scale
+        grayscale = normalized.astype(np.uint8, copy=False)
         if context.view.pseudocolor_preset == DEFAULT_PSEUDOCOLOR_PRESET:
             return grayscale
         return apply_pseudocolor(grayscale, context.view.pseudocolor_preset)

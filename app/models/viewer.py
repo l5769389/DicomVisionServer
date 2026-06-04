@@ -83,6 +83,7 @@ class SeriesRecord:
     four_d_phase_sort_value: float | None = None
     four_d_phase_label_value: str | None = None
     four_d_phase_source: str | None = None
+    volume_cache_key: str | None = None
     instances: list[InstanceRecord] = field(default_factory=list)
     presentation_states_by_sop_uid: dict[str, list[PresentationStateRecord]] = field(default_factory=dict)
 
@@ -123,7 +124,7 @@ class DragState:
 
 @dataclass
 class MprMipViewportState:
-    thickness: int = 12
+    thickness: int = 10
 
 
 @dataclass
