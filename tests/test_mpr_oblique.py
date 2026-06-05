@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
 from app.models.viewer import MprMipViewportState, MprRotationDragRecord, ViewGroupRecord, ViewRecord
@@ -83,6 +84,25 @@ def test_mpr_render_by_id_uses_view_state_snapshot(monkeypatch) -> None:
     assert snapshot.view_group.mpr_revision == 7
     group.mpr_revision = 9
     assert snapshot.view_group.mpr_revision == 7
+
+
+def test_png_encoding_always_uses_low_compression_without_changing_format(monkeypatch) -> None:
+    save_calls: list[dict[str, object]] = []
+
+    def fake_save(self, output, **kwargs):
+        del self
+        save_calls.append(kwargs)
+        output.write(b"png")
+
+    monkeypatch.setattr(Image.Image, "save", fake_save)
+
+    ViewerService._encode_image(Image.new("L", (1, 1)), "png", fast_preview=True)
+    ViewerService._encode_image(Image.new("L", (1, 1)), "png", fast_preview=False)
+
+    assert save_calls[0]["format"] == "PNG"
+    assert save_calls[0]["compress_level"] == 1
+    assert save_calls[1]["format"] == "PNG"
+    assert save_calls[1]["compress_level"] == 1
 
 
 def test_mpr_plane_cache_reuses_reslice_when_only_pan_zoom_changes(monkeypatch) -> None:
@@ -1118,6 +1138,95 @@ def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) ->
     assert group.mpr_revision == 1
 
 
+def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
+    view.window_width = 400.0
+    view.window_center = 40.0
+    view.zoom = 1.0
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
+        )
+        window_move = service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="move", x=12, y=-8)
+        )
+        window_end = service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="end", x=12, y=-8)
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="zoom", actionType="start", x=0, y=0)
+        )
+        zoom_move = service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="zoom", actionType="move", x=0, y=-10)
+        )
+        zoom_end = service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="zoom", actionType="end", x=0, y=-10)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert window_move.primary_result is None
+    assert window_move.deferred_view_ids == (view.view_id,)
+    assert window_move.deferred_image_format == "png"
+    assert window_move.deferred_fast_preview is True
+    assert window_end.primary_result is None
+    assert window_end.deferred_view_ids == (view.view_id,)
+    assert window_end.deferred_image_format == "png"
+    assert window_end.deferred_fast_preview is False
+    assert zoom_move.primary_result is None
+    assert zoom_move.deferred_view_ids == (view.view_id,)
+    assert zoom_move.deferred_image_format == "png"
+    assert zoom_move.deferred_fast_preview is True
+    assert zoom_end.primary_result is None
+    assert zoom_end.deferred_view_ids == (view.view_id,)
+    assert zoom_end.deferred_image_format == "png"
+    assert zoom_end.deferred_fast_preview is False
+
+
+def test_stack_pan_move_uses_png_render(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="pan", actionType="start", x=0, y=0)
+        )
+        pan_move = service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="pan", actionType="move", x=12, y=-8)
+        )
+        pan_end = service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="pan", actionType="end", x=12, y=-8)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert pan_move.primary_result is None
+    assert pan_move.deferred_view_ids == (view.view_id,)
+    assert pan_move.deferred_image_format == "png"
+    assert pan_move.deferred_fast_preview is True
+    assert pan_end.primary_result is None
+    assert pan_end.deferred_view_ids == (view.view_id,)
+    assert pan_end.deferred_image_format == "png"
+    assert pan_end.deferred_fast_preview is False
+
+
 def test_mpr_pan_move_schedules_deferred_full_resolution_preview(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     _, axial_view = _build_axial_view(service, series, volume)
@@ -1391,6 +1500,9 @@ def test_mpr_fast_preview_includes_backend_corner_state(monkeypatch) -> None:
     )
 
     assert result.meta.corner_info is not None
+    assert result.meta.scale_bar is not None
+    assert result.meta.scale_bar.label == "10 cm"
+    assert result.meta.orientation is not None
     assert "W: 512 L: 42" in result.meta.corner_info.bottom_left
     assert "Zoom:1.5x" in result.meta.corner_info.bottom_right
     assert "X:18 Y:-7" in result.meta.corner_info.bottom_right

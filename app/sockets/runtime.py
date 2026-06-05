@@ -18,6 +18,7 @@ class RenderRequest:
     image_format: str = "png"
     fast_preview: bool = False
     fast_preview_full_resolution: bool = False
+    metadata_mode: str = "full"
     target_sids: tuple[str, ...] | None = None
     mpr_revision: int | None = None
 
@@ -30,6 +31,7 @@ class ViewSocketHub:
         self._sid_workspaces: dict[str, str] = {}
         self._render_locks: dict[str, asyncio.Lock] = {}
         self._pending_render_requests: dict[str, dict[str, RenderRequest]] = {}
+        self._preview_worker_tasks: dict[str, asyncio.Task[None]] = {}
         self._mpr_preview_worker_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_mpr_preview_batch_started_at: dict[str, float] = {}
         self._mpr_final_preemption_tokens: dict[str, int] = {}
@@ -77,6 +79,9 @@ class ViewSocketHub:
                 self._pending_render_requests.pop(queue_key, None)
         view_queue_key = f"view:{view_id}"
         self._render_locks.pop(view_queue_key, None)
+        preview_task = self._preview_worker_tasks.pop(view_queue_key, None)
+        if preview_task is not None and not preview_task.done():
+            preview_task.cancel()
 
     def _get_render_lock(self, queue_key: str) -> asyncio.Lock:
         lock = self._render_locks.get(queue_key)
@@ -138,6 +143,7 @@ class ViewSocketHub:
             image_format=chosen.image_format,
             fast_preview=chosen.fast_preview,
             fast_preview_full_resolution=chosen.fast_preview_full_resolution,
+            metadata_mode=chosen.metadata_mode,
             target_sids=target_sids,
             mpr_revision=chosen.mpr_revision
             if chosen.mpr_revision is not None
@@ -254,6 +260,12 @@ class ViewSocketHub:
             return
         self._mpr_preview_worker_tasks[queue_key] = asyncio.create_task(self._run_mpr_preview_worker(queue_key))
 
+    def _ensure_preview_worker(self, queue_key: str) -> None:
+        task = self._preview_worker_tasks.get(queue_key)
+        if task is not None and not task.done():
+            return
+        self._preview_worker_tasks[queue_key] = asyncio.create_task(self._run_preview_worker(queue_key))
+
     def _mark_mpr_final_preemption(self, queue_key: str) -> None:
         if not self._is_mpr_group_queue(queue_key):
             return
@@ -351,6 +363,46 @@ class ViewSocketHub:
             if self._mpr_preview_worker_tasks.get(queue_key) is current_task:
                 self._mpr_preview_worker_tasks.pop(queue_key, None)
 
+    async def _run_preview_worker(self, queue_key: str) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                request_batch = self._pop_pending_render_batch(queue_key)
+                if not request_batch:
+                    return
+                await asyncio.gather(
+                    *(
+                        self.emit_render_for_view(
+                            view_id,
+                            image_format=request.image_format,
+                            fast_preview=request.fast_preview,
+                            fast_preview_full_resolution=request.fast_preview_full_resolution,
+                            metadata_mode=request.metadata_mode,
+                            target_sids=request.target_sids,
+                            mpr_revision=request.mpr_revision,
+                        )
+                        for view_id, request in request_batch.items()
+                    )
+                )
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._preview_worker_tasks.get(queue_key) is current_task:
+                self._preview_worker_tasks.pop(queue_key, None)
+
+    @staticmethod
+    def _build_image_update_payload(result_meta, request: RenderRequest) -> dict[str, object]:
+        payload = result_meta.model_dump(by_alias=True)
+        if request.metadata_mode == "stack-preview-lite":
+            payload.pop("measurements", None)
+            payload.pop("annotations", None)
+        elif request.metadata_mode == "mpr-pan-zoom-preview":
+            payload.pop("cornerInfo", None)
+            payload.pop("orientation", None)
+            payload.pop("measurements", None)
+            payload.pop("annotations", None)
+        return payload
+
     async def _emit_progress_message(self, view_id: str, sids: tuple[str, ...], payload: dict[str, object]) -> None:
         if self._server is None or not sids:
             return
@@ -392,11 +444,13 @@ class ViewSocketHub:
         if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
             return False
 
-        await self._emit_progress_message(view_id, sids, {"phase": "queued", "progressPercent": 2})
+        should_emit_progress = not request.fast_preview
+        if should_emit_progress:
+            await self._emit_progress_message(view_id, sids, {"phase": "queued", "progressPercent": 2})
         loop = asyncio.get_running_loop()
 
         def progress_callback(payload: dict[str, object]) -> None:
-            if self._server is None:
+            if self._server is None or not should_emit_progress:
                 return
             if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
                 return
@@ -412,14 +466,16 @@ class ViewSocketHub:
             image_format=request.image_format,
             fast_preview=request.fast_preview,
             fast_preview_full_resolution=request.fast_preview_full_resolution,
-            progress_callback=progress_callback,
+            metadata_mode=request.metadata_mode,
+            progress_callback=progress_callback if should_emit_progress else None,
         )
         if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
             return False
-        message = (result.meta.model_dump(by_alias=True), result.image_bytes)
+        message = (self._build_image_update_payload(result.meta, request), result.image_bytes)
         for sid in sids:
             await self._server.emit("image_update", message, to=sid)
-        await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
+        if should_emit_progress:
+            await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
         return True
 
     async def _emit_render_message_safely(self, view_id: str, request: RenderRequest) -> bool:
@@ -472,6 +528,7 @@ class ViewSocketHub:
         image_format: str = "png",
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
         target_sids: tuple[str, ...] | None = None,
         mpr_revision: int | None = None,
     ) -> bool:
@@ -489,6 +546,7 @@ class ViewSocketHub:
                 image_format=image_format,
                 fast_preview=fast_preview,
                 fast_preview_full_resolution=fast_preview_full_resolution,
+                metadata_mode=metadata_mode,
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
             )
@@ -505,6 +563,11 @@ class ViewSocketHub:
                     continue
                 if self._replace_pending_preview_batch(queue_key, request_batch):
                     self._ensure_mpr_preview_worker(queue_key)
+                continue
+
+            if is_preview_batch:
+                if self._replace_pending_preview_batch(queue_key, request_batch):
+                    self._ensure_preview_worker(queue_key)
                 continue
 
             if is_mpr_group and is_final_batch:
@@ -535,6 +598,7 @@ class ViewSocketHub:
         image_format: str = "png",
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
         target_sids: tuple[str, ...] | None = None,
         mpr_revision: int | None = None,
     ) -> bool:
@@ -547,6 +611,7 @@ class ViewSocketHub:
             image_format=image_format,
             fast_preview=fast_preview,
             fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
             target_sids=target_sids,
             mpr_revision=mpr_revision,
         )

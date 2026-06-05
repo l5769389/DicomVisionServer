@@ -52,10 +52,11 @@ def test_handle_operation_schedules_mpr_broadcast_batch_without_waiting(monkeypa
             image_format: str = "png",
             fast_preview: bool = False,
             fast_preview_full_resolution: bool = False,
+            metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
         ) -> bool:
-            del fast_preview_full_resolution, mpr_revision
+            del fast_preview_full_resolution, metadata_mode, mpr_revision
             render_calls.append((view_ids, image_format, fast_preview, target_sids))
             return False
 
@@ -250,10 +251,11 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
             image_format: str = "png",
             fast_preview: bool = False,
             fast_preview_full_resolution: bool = False,
+            metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
         ) -> bool:
-            del image_format, fast_preview, target_sids
+            del image_format, fast_preview, metadata_mode, target_sids
             scheduled_options.append((view_ids, mpr_revision, fast_preview_full_resolution))
             return False
 
@@ -302,10 +304,11 @@ def test_handle_operation_routes_mpr_deferred_preview_through_batch_scheduler(mo
             image_format: str = "png",
             fast_preview: bool = False,
             fast_preview_full_resolution: bool = False,
+            metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
         ) -> bool:
-            del image_format, fast_preview, fast_preview_full_resolution
+            del image_format, fast_preview, fast_preview_full_resolution, metadata_mode
             scheduled_batches.append((view_ids, target_sids, mpr_revision))
             return False
 
@@ -334,10 +337,11 @@ def test_background_render_error_is_reported_to_socket(monkeypatch) -> None:
             image_format: str = "png",
             fast_preview: bool = False,
             fast_preview_full_resolution: bool = False,
+            metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
         ) -> bool:
-            del view_id, image_format, fast_preview, fast_preview_full_resolution, target_sids, mpr_revision
+            del view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode, target_sids, mpr_revision
             raise RuntimeError("render failed")
 
         monkeypatch.setattr(handlers.view_socket_hub, "emit_render_for_view", fake_emit_render_for_view)

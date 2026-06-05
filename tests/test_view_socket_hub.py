@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from time import perf_counter
 
+from app.sockets import runtime as socket_runtime
 from app.sockets.runtime import RenderRequest, ViewSocketHub
 
 
@@ -93,6 +94,119 @@ def test_emit_progress_message_targets_bound_sids() -> None:
     assert asyncio.run(run()) == [
         ("view_progress", {"viewId": "view-1", "phase": "volume", "progressPercent": 42}, "sid-1"),
         ("view_progress", {"viewId": "view-1", "phase": "volume", "progressPercent": 42}, "sid-2"),
+    ]
+
+
+def test_fast_preview_render_skips_progress_messages(monkeypatch) -> None:
+    class _Meta:
+        def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+            del by_alias
+            return {"viewId": "view-1", "imageFormat": "png"}
+
+    def fake_render_view_by_id(*args, **kwargs):
+        assert kwargs["progress_callback"] is None
+        return SimpleNamespace(meta=_Meta(), image_bytes=b"image")
+
+    async def run() -> list[tuple[str, dict[str, object], str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-1")
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+
+        emitted = await hub._emit_render_message(
+            "view-1",
+            RenderRequest(image_format="png", fast_preview=True, target_sids=("sid-1",)),
+        )
+
+        assert emitted is True
+        return server.events
+
+    assert asyncio.run(run()) == [
+        ("image_update", ({"viewId": "view-1", "imageFormat": "png"}, b"image"), "sid-1"),
+    ]
+
+
+def test_preview_metadata_modes_drop_heavy_fields() -> None:
+    meta = SimpleNamespace(
+        model_dump=lambda **kwargs: {
+            "viewId": "view-1",
+            "imageFormat": "png",
+            "cornerInfo": {"topLeft": ["A"]},
+            "orientation": {"top": "A"},
+            "measurements": [{"measurementId": "m"}],
+            "annotations": [{"annotationId": "a"}],
+        }
+    )
+
+    stack_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-preview-lite"),
+    )
+    mpr_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="png", fast_preview=True, metadata_mode="mpr-pan-zoom-preview"),
+    )
+
+    assert "measurements" not in stack_payload
+    assert "annotations" not in stack_payload
+    assert "cornerInfo" in stack_payload
+    assert "orientation" in stack_payload
+    assert "measurements" not in mpr_payload
+    assert "annotations" not in mpr_payload
+    assert "cornerInfo" not in mpr_payload
+    assert "orientation" not in mpr_payload
+
+
+def test_non_mpr_preview_worker_keeps_latest_pending_request(monkeypatch) -> None:
+    async def run() -> list[tuple[str, str, bool, str]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "view:v")
+
+        first_render_started = asyncio.Event()
+        release_first_render = asyncio.Event()
+        calls: list[tuple[str, str, bool, str]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            calls.append((view_id, request.image_format, request.fast_preview, request.metadata_mode))
+            if len(calls) == 1:
+                first_render_started.set()
+                await release_first_render.wait()
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        assert await hub.schedule_render_batch(
+            ("v",),
+            image_format="jpeg",
+            fast_preview=True,
+            metadata_mode="first",
+        ) is False
+        await asyncio.wait_for(first_render_started.wait(), timeout=1.0)
+        assert await hub.schedule_render_batch(
+            ("v",),
+            image_format="jpeg",
+            fast_preview=True,
+            metadata_mode="second",
+        ) is False
+        assert await hub.schedule_render_batch(
+            ("v",),
+            image_format="png",
+            fast_preview=True,
+            metadata_mode="latest",
+        ) is False
+
+        release_first_render.set()
+        worker = hub._preview_worker_tasks.get("view:v")
+        if worker is not None:
+            await asyncio.wait_for(worker, timeout=1.0)
+        return calls
+
+    assert asyncio.run(run()) == [
+        ("v", "jpeg", True, "first"),
+        ("v", "png", True, "latest"),
     ]
 
 

@@ -92,6 +92,7 @@ def _schedule_render_for_view(
     image_format: str,
     fast_preview: bool,
     fast_preview_full_resolution: bool = False,
+    metadata_mode: str = "full",
     target_sids: tuple[str, ...] | None = None,
     mpr_revision: int | None = None,
 ) -> asyncio.Task[None]:
@@ -109,6 +110,7 @@ def _schedule_render_for_view(
                 image_format=image_format,
                 fast_preview=fast_preview,
                 fast_preview_full_resolution=fast_preview_full_resolution,
+                metadata_mode=metadata_mode,
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
             )
@@ -134,6 +136,7 @@ def _schedule_render_batch_for_views(
     image_format: str,
     fast_preview: bool,
     fast_preview_full_resolution: bool = False,
+    metadata_mode: str = "full",
     target_sids: tuple[str, ...] | None = None,
     mpr_revision: int | None = None,
 ) -> asyncio.Task[None]:
@@ -151,6 +154,7 @@ def _schedule_render_batch_for_views(
                 image_format=image_format,
                 fast_preview=fast_preview,
                 fast_preview_full_resolution=fast_preview_full_resolution,
+                metadata_mode=metadata_mode,
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
             )
@@ -249,6 +253,7 @@ async def _dispatch_operation_result(
                 image_format=result.broadcast_image_format,
                 fast_preview=result.broadcast_fast_preview,
                 fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
+                metadata_mode=result.broadcast_metadata_mode,
                 mpr_revision=result.mpr_revision,
             )
         else:
@@ -259,30 +264,32 @@ async def _dispatch_operation_result(
                 image_format=result.broadcast_image_format,
                 fast_preview=result.broadcast_fast_preview,
                 fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
+                metadata_mode=result.broadcast_metadata_mode,
                 mpr_revision=result.mpr_revision,
             )
     if result.deferred_view_ids:
-        if is_mpr_view:
-            if result.deferred_fast_preview or result.deferred_image_format == "jpeg":
-                await view_socket_hub.schedule_render_batch(
-                    result.deferred_view_ids,
-                    image_format=result.deferred_image_format,
-                    fast_preview=result.deferred_fast_preview,
-                    fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
-                    target_sids=(sid,),
-                    mpr_revision=result.mpr_revision,
-                )
-            else:
-                _schedule_render_batch_for_views(
-                    server,
-                    sid,
-                    result.deferred_view_ids,
-                    image_format=result.deferred_image_format,
-                    fast_preview=result.deferred_fast_preview,
-                    fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
-                    target_sids=(sid,),
-                    mpr_revision=result.mpr_revision,
-                )
+        if result.deferred_fast_preview or result.deferred_image_format == "jpeg":
+            await view_socket_hub.schedule_render_batch(
+                result.deferred_view_ids,
+                image_format=result.deferred_image_format,
+                fast_preview=result.deferred_fast_preview,
+                fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
+                metadata_mode=result.deferred_metadata_mode,
+                target_sids=(sid,),
+                mpr_revision=result.mpr_revision,
+            )
+        elif is_mpr_view:
+            _schedule_render_batch_for_views(
+                server,
+                sid,
+                result.deferred_view_ids,
+                image_format=result.deferred_image_format,
+                fast_preview=result.deferred_fast_preview,
+                fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
+                metadata_mode=result.deferred_metadata_mode,
+                target_sids=(sid,),
+                mpr_revision=result.mpr_revision,
+            )
         else:
             for view_id in result.deferred_view_ids:
                 _schedule_render_for_view(
@@ -292,6 +299,7 @@ async def _dispatch_operation_result(
                     image_format=result.deferred_image_format,
                     fast_preview=result.deferred_fast_preview,
                     fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
+                    metadata_mode=result.deferred_metadata_mode,
                     target_sids=(sid,),
                     mpr_revision=result.mpr_revision,
                 )

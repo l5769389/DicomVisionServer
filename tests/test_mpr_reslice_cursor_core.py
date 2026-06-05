@@ -8,7 +8,7 @@ from PIL import Image
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
 from app.models.viewer import InstanceRecord, MprFrameState, SeriesRecord, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
-from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay
+from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, RenderContext
 from app.services import viewer_service as viewer_service_module
 from app.services.mpr import (
     MipConfig,
@@ -305,7 +305,7 @@ def test_mpr_fast_preview_extracts_lower_resolution_plane(monkeypatch) -> None:
         ),
     )
     monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context, **kwargs: Image.new("L", (300, 300)))
-    monkeypatch.setattr(service, "_encode_image", lambda image, image_format: b"image")
+    monkeypatch.setattr(service, "_encode_image", lambda image, image_format, **kwargs: b"image")
 
     service._render_mpr_view(view, image_format="jpeg", fast_preview=True)
     assert corner_info_calls == 1
@@ -373,7 +373,7 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     )
     monkeypatch.setattr(viewer_service_module.layered_renderer, "render", lambda context: Image.new("L", (300, 300)))
     monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context, **kwargs: Image.new("L", (300, 300)))
-    monkeypatch.setattr(service, "_encode_image", lambda image, image_format: b"image")
+    monkeypatch.setattr(service, "_encode_image", lambda image, image_format, **kwargs: b"image")
 
     service._render_mpr_view(view, image_format="png", fast_preview=False)
     view.offset_x = 18.0
@@ -382,6 +382,96 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     service._render_mpr_view(view, image_format="jpeg", fast_preview=True, fast_preview_full_resolution=True)
 
     assert reslice_calls == 1
+
+
+def test_fast_preview_reuses_windowed_base_pixels_for_pan_zoom(monkeypatch) -> None:
+    service = ViewerService()
+    source_pixels = np.arange(16, dtype=np.float32).reshape(4, 4)
+    view = ViewRecord(
+        view_id="v",
+        series_id="s",
+        view_type="Stack",
+        width=8,
+        height=8,
+        is_initialized=True,
+    )
+    view.window_width = 100.0
+    view.window_center = 50.0
+
+    window_calls = 0
+    original_window_array = ViewerService._window_array
+
+    def counted_window_array(*args, **kwargs):
+        nonlocal window_calls
+        window_calls += 1
+        return original_window_array(*args, **kwargs)
+
+    monkeypatch.setattr(ViewerService, "_window_array", staticmethod(counted_window_array))
+
+    def render_once() -> None:
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=source_pixels.shape[1],
+            image_height=source_pixels.shape[0],
+            canvas_width=view.width or 0,
+            canvas_height=view.height or 0,
+            view=view,
+        )
+        context = RenderContext(
+            view=view,
+            source_pixels=source_pixels,
+            pixel_min=0.0,
+            pixel_max=15.0,
+            image_transform=image_transform,
+        )
+        service._render_cached_fast_base_image(context)
+
+    render_once()
+    view.offset_x = 6.0
+    view.offset_y = -3.0
+    view.zoom = 1.4
+    render_once()
+    assert window_calls == 1
+
+    view.window_center = 40.0
+    render_once()
+    assert window_calls == 2
+
+
+def test_stack_fast_preview_without_server_overlay_stays_luminance(monkeypatch) -> None:
+    service = ViewerService()
+    source_pixels = np.arange(16, dtype=np.float32).reshape(4, 4)
+    view = ViewRecord(
+        view_id="v",
+        series_id="s",
+        view_type="Stack",
+        width=8,
+        height=8,
+        is_initialized=True,
+    )
+    image_transform = viewport_transformer.build_image_to_canvas_transform(
+        image_width=source_pixels.shape[1],
+        image_height=source_pixels.shape[0],
+        canvas_width=view.width or 0,
+        canvas_height=view.height or 0,
+        view=view,
+    )
+    context = RenderContext(
+        view=view,
+        source_pixels=source_pixels,
+        pixel_min=0.0,
+        pixel_max=15.0,
+        image_transform=image_transform,
+    )
+
+    def fail_composite(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("fast preview should not composite empty overlays")
+
+    monkeypatch.setattr(viewer_service_module.layered_renderer, "composite_overlays", fail_composite)
+
+    image = service._render_fast_preview(context)
+
+    assert image.mode == "L"
 
 
 def test_mpr_fast_preview_shape_respects_viewport_size() -> None:

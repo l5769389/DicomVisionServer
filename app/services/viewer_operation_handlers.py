@@ -49,10 +49,12 @@ class OperationRenderOutcome:
     broadcast_image_format: ImageFormat = "png"
     broadcast_fast_preview: bool = False
     broadcast_fast_preview_full_resolution: bool = False
+    broadcast_metadata_mode: str = "full"
     deferred_view_ids: tuple[str, ...] = ()
     deferred_image_format: ImageFormat = "png"
     deferred_fast_preview: bool = False
     deferred_fast_preview_full_resolution: bool = False
+    deferred_metadata_mode: str = "full"
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class RenderDecision:
     fast_preview: bool = False
     fast_preview_full_resolution: bool = False
     defer_single: bool = False
+    metadata_mode: str = "full"
     draft_measurement: dict[str, object] | None = None
     broadcast_viewports: tuple[str, ...] | None = None
 
@@ -120,6 +123,7 @@ def _render_single(
     fast_preview: bool = False,
     fast_preview_full_resolution: bool = False,
     defer: bool = False,
+    metadata_mode: str = "full",
 ) -> RenderDecision:
     return RenderDecision(
         mode="single",
@@ -127,6 +131,7 @@ def _render_single(
         fast_preview=fast_preview,
         fast_preview_full_resolution=fast_preview_full_resolution,
         defer_single=defer,
+        metadata_mode=metadata_mode,
     )
 
 
@@ -135,6 +140,7 @@ def _render_broadcast(
     *,
     fast_preview: bool = False,
     fast_preview_full_resolution: bool = False,
+    metadata_mode: str = "full",
     viewports: tuple[str, ...] | None = None,
 ) -> RenderDecision:
     return RenderDecision(
@@ -142,16 +148,18 @@ def _render_broadcast(
         image_format=image_format,
         fast_preview=fast_preview,
         fast_preview_full_resolution=fast_preview_full_resolution,
+        metadata_mode=metadata_mode,
         broadcast_viewports=viewports,
     )
 
 
-def _render_full_resolution_preview_single(*, defer: bool = False) -> RenderDecision:
+def _render_full_resolution_preview_single(*, defer: bool = False, metadata_mode: str = "full") -> RenderDecision:
     return _render_single(
         "png",
         fast_preview=True,
         fast_preview_full_resolution=True,
         defer=defer,
+        metadata_mode=metadata_mode,
     )
 
 
@@ -175,6 +183,7 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
         image_format=render_decision.image_format,
         fast_preview=render_decision.fast_preview,
         fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
+        metadata_mode=render_decision.metadata_mode,
         broadcast_viewports=render_decision.broadcast_viewports,
     )
 
@@ -263,16 +272,22 @@ def _resolve_drag_single_render_decision(
     view: ViewRecord,
     payload: ViewOperationRequest,
     *,
+    move_image_format: ImageFormat = "jpeg",
     fast_preview_on_move: bool | None = None,
+    defer_on_move: bool = False,
+    defer_on_end: bool = False,
+    move_metadata_mode: str = "full",
 ) -> RenderDecision:
     if payload.action_type == "start":
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
         return _render_single(
-            "jpeg",
+            move_image_format,
             fast_preview=service._is_3d_view_type(view.view_type) if fast_preview_on_move is None else fast_preview_on_move,
+            defer=defer_on_move,
+            metadata_mode=move_metadata_mode,
         )
-    return _render_single()
+    return _render_single(defer=defer_on_end)
 
 
 def _handle_scroll_operation(
@@ -320,9 +335,18 @@ def _handle_zoom_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_single(defer=True)
+            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
         return _render_single(defer=True)
-    return _resolve_drag_single_render_decision(service, view, payload)
+    return _resolve_drag_single_render_decision(
+        service,
+        view,
+        payload,
+        move_image_format="png",
+        fast_preview_on_move=True,
+        defer_on_move=True,
+        defer_on_end=True,
+        move_metadata_mode="stack-preview-lite",
+    )
 
 
 def _handle_window_operation(
@@ -347,7 +371,16 @@ def _handle_window_operation(
         if payload.action_type == DRAG_ACTION_MOVE:
             return _render_full_resolution_preview_broadcast()
         return _render_broadcast()
-    return _resolve_drag_single_render_decision(service, view, payload)
+    return _resolve_drag_single_render_decision(
+        service,
+        view,
+        payload,
+        move_image_format="png",
+        fast_preview_on_move=True,
+        defer_on_move=True,
+        defer_on_end=True,
+        move_metadata_mode="stack-preview-lite",
+    )
 
 
 def _handle_pan_operation(
@@ -364,9 +397,18 @@ def _handle_pan_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_single(defer=True)
+            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
         return _render_single(defer=True)
-    return _resolve_drag_single_render_decision(service, view, payload)
+    return _resolve_drag_single_render_decision(
+        service,
+        view,
+        payload,
+        move_image_format="png",
+        fast_preview_on_move=True,
+        defer_on_move=True,
+        defer_on_end=True,
+        move_metadata_mode="stack-preview-lite",
+    )
 
 
 def _handle_pseudocolor_operation(
@@ -715,6 +757,7 @@ def _build_operation_render_outcome(
             broadcast_image_format=render_decision.image_format,
             broadcast_fast_preview=render_decision.fast_preview,
             broadcast_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
+            broadcast_metadata_mode=render_decision.metadata_mode,
         )
 
     if service._is_3d_view_type(view.view_type) or render_decision.defer_single:
@@ -727,6 +770,7 @@ def _build_operation_render_outcome(
             deferred_image_format=render_decision.image_format,
             deferred_fast_preview=render_decision.fast_preview,
             deferred_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
+            deferred_metadata_mode=render_decision.metadata_mode,
         )
 
     return OperationRenderOutcome(
@@ -737,6 +781,7 @@ def _build_operation_render_outcome(
             image_format=render_decision.image_format,
             fast_preview=render_decision.fast_preview,
             fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
+            metadata_mode=render_decision.metadata_mode,
         )
     )
 

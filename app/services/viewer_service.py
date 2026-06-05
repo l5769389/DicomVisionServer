@@ -159,9 +159,11 @@ CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
+PNG_COMPRESS_LEVEL = 1
 MPR_FAST_PREVIEW_SCALE = 0.33
 MPR_FAST_PREVIEW_MIN_SIDE = 96
 MPR_PLANE_CACHE_MAX_ITEMS = 48
+FAST_BASE_PIXELS_CACHE_MAX_ITEMS = 64
 MPR_CROSSHAIR_MODE_ORTHOGONAL = "orthogonal"
 MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE = "double-oblique"
 MPR_CROSSHAIR_MODES = {
@@ -249,6 +251,7 @@ class ViewerService:
             on_evict=self._handle_series_volume_cache_evict,
         )
         self._mpr_plane_cache: OrderedDict[tuple[object, ...], tuple[np.ndarray, int, int]] = OrderedDict()
+        self._fast_base_pixels_cache: OrderedDict[tuple[object, ...], np.ndarray] = OrderedDict()
         self._mtf_analysis_service = MtfAnalysisService(self)
         self._water_phantom_qa_service = WaterPhantomQaService(self)
         self._logger = logger
@@ -293,6 +296,7 @@ class ViewerService:
         image_format: ImageFormat = "png",
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
         workspace_id: str | None = None,
     ) -> RenderedImageResult:
@@ -304,6 +308,7 @@ class ViewerService:
             image_format=image_format,
             fast_preview=fast_preview,
             fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
             progress_callback=progress_callback,
         )
 
@@ -359,7 +364,7 @@ class ViewerService:
                 try:
                     image = Image.open(io.BytesIO(rendered.image_bytes)).convert("RGB")
                     image = self._apply_export_overlays(image, overlays)
-                    rendered_bytes = self._encode_image(image, "png")
+                    rendered_bytes = self._encode_image(image, "png", fast_preview=False)
                 except Exception as exc:  # pragma: no cover - defensive
                     raise HTTPException(status_code=500, detail="Failed to render export overlays") from exc
             else:
@@ -1072,6 +1077,7 @@ class ViewerService:
         *,
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         return render_by_view_type(
@@ -1080,6 +1086,7 @@ class ViewerService:
             image_format=image_format,
             fast_preview=fast_preview,
             fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
             progress_callback=progress_callback,
         )
 
@@ -1498,7 +1505,7 @@ class ViewerService:
         )
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
-        image_bytes = self._encode_image(image, image_format)
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
 
         return RenderedImageResult(
             meta=ViewImageResponse(
@@ -1530,7 +1537,9 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        metadata_mode: str = "full",
     ) -> RenderedImageResult:
+        render_started_at = perf_counter()
         ensure_view_size(view)
 
         series = series_registry.get(view.series_id)
@@ -1538,7 +1547,10 @@ class ViewerService:
         if not instance.sop_instance_uid:
             raise HTTPException(status_code=400, detail="DICOM instance does not contain SOPInstanceUID")
 
+        cache_started_at = perf_counter()
         cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
+        cache_ms = (perf_counter() - cache_started_at) * 1000.0
+        metadata_started_at = perf_counter()
         render_plan = self._build_render_plan_for_shape(view, *cached.source_pixels.shape[:2])
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=cached.source_pixels.shape[1],
@@ -1560,6 +1572,8 @@ class ViewerService:
             total_slices=len(series.instances),
             viewport_label="Stack",
         )
+        include_stack_overlay_payloads = not (fast_preview and metadata_mode == "stack-preview-lite")
+        visible_measurements = self._build_visible_measurements(view) if include_stack_overlay_payloads else ()
         context = RenderContext(
             view=render_plan.render_view,
             source_pixels=cached.source_pixels,
@@ -1568,23 +1582,39 @@ class ViewerService:
             instance=instance,
             cached=cached,
             image_transform=image_transform,
-            measurements=self._build_visible_measurements(view),
+            measurements=visible_measurements,
             corner_info=None,
             orientation=None,
         )
-        visible_measurements = self._build_visible_measurements(view)
-        visible_presentation_measurements = self._build_visible_presentation_measurements(series, instance)
-        visible_presentation_annotations = self._build_visible_presentation_annotations(series, instance)
+        visible_presentation_measurements = (
+            self._build_visible_presentation_measurements(series, instance)
+            if include_stack_overlay_payloads
+            else ()
+        )
+        visible_presentation_annotations = (
+            self._build_visible_presentation_annotations(series, instance)
+            if include_stack_overlay_payloads
+            else ()
+        )
+        metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
 
+        image_started_at = perf_counter()
         if fast_preview:
             image = self._render_fast_preview(context)
         else:
             image = layered_renderer.render(context)
+        image_ms = (perf_counter() - image_started_at) * 1000.0
+
+        encode_started_at = perf_counter()
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        encode_ms = (perf_counter() - encode_started_at) * 1000.0
 
         logger.debug(
-            "render completed view_id=%s index=%s viewport=%sx%s render=%sx%s ratio=%.4f zoom=%.4f ww=%s wl=%s image_format=%s fast_window=%s",
+            "stack render timing view_id=%s index=%s fast_preview=%s image_format=%s viewport=%sx%s render=%sx%s ratio=%.4f zoom=%.4f ww=%s wl=%s cache_ms=%.1f metadata_ms=%.1f image_ms=%.1f encode_ms=%.1f total_ms=%.1f",
             view.view_id,
             view.current_index,
+            fast_preview,
+            image_format,
             view.width,
             view.height,
             render_plan.render_view.width,
@@ -1593,8 +1623,11 @@ class ViewerService:
             view.zoom,
             view.window_width,
             view.window_center,
-            image_format,
-            fast_preview,
+            cache_ms,
+            metadata_ms,
+            image_ms,
+            encode_ms,
+            (perf_counter() - render_started_at) * 1000.0,
         )
 
         return RenderedImageResult(
@@ -1606,13 +1639,13 @@ class ViewerService:
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
                 scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
-                measurements=self._serialize_measurements(
+                measurements=[] if not include_stack_overlay_payloads else self._serialize_measurements(
                     (*visible_measurements, *visible_presentation_measurements),
                     image_transform=image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
                 ),
-                annotations=self._serialize_annotations(
+                annotations=[] if not include_stack_overlay_payloads else self._serialize_annotations(
                     visible_presentation_annotations,
                     image_transform=image_transform,
                     canvas_width=render_plan.render_view.width or 0,
@@ -1623,7 +1656,7 @@ class ViewerService:
                     self._build_stack_orientation_overlay(render_plan.render_view, cached.dataset)
                 ),
             ),
-            image_bytes=self._encode_image(image, image_format),
+            image_bytes=image_bytes,
         )
 
     def _render_mpr_view(
@@ -1633,6 +1666,7 @@ class ViewerService:
         *,
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
         render_started_at = perf_counter()
@@ -1701,14 +1735,10 @@ class ViewerService:
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
-        scale_bar = (
-            None
-            if fast_preview
-            else self._build_scale_bar_info(
-                render_plan.render_view,
-                metadata_image_transform,
-                self._get_mpr_spacing_xy_from_pose(target_plane_pose),
-            )
+        scale_bar = self._build_scale_bar_info(
+            render_plan.render_view,
+            metadata_image_transform,
+            self._get_mpr_spacing_xy_from_pose(target_plane_pose),
         )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
@@ -1718,21 +1748,26 @@ class ViewerService:
             target_plane_pose.output_shape,
             metadata_image_transform,
         )
+        include_static_preview_metadata = not (fast_preview and metadata_mode == "mpr-pan-zoom-preview")
         reference_instance, reference_cached = (
             (None, None)
             if fast_preview
             else self._get_reference_instance_and_cache(series)
         )
-        slice_corner_info = self._build_slice_corner_info_overlay(
-            view,
-            series,
-            reference_cached.dataset if reference_cached is not None else None,
-            current_index=current,
-            total_slices=total,
-            viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
-            plane_state=plane_state,
-            plane_pose=target_plane_pose,
-            cursor=payload_pose_context.cursor,
+        slice_corner_info = (
+            None
+            if not include_static_preview_metadata
+            else self._build_slice_corner_info_overlay(
+                view,
+                series,
+                reference_cached.dataset if reference_cached is not None else None,
+                current_index=current,
+                total_slices=total,
+                viewport_label=self._build_mpr_viewport_label(target_viewport, plane_state),
+                plane_state=plane_state,
+                plane_pose=target_plane_pose,
+                cursor=payload_pose_context.cursor,
+            )
         )
         visible_measurements = [] if fast_preview else self._build_visible_measurements(view)
         context = RenderContext(
@@ -1762,7 +1797,7 @@ class ViewerService:
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
         encode_started_at = perf_counter()
-        image_bytes = self._encode_image(image, image_format)
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
         encode_ms = (perf_counter() - encode_started_at) * 1000.0
         logger.debug(
             "mpr render timing view_id=%s viewport=%s fast_preview=%s source_shape=%s full_shape=%s volume_ms=%.1f reslice_ms=%.1f metadata_ms=%.1f image_ms=%.1f encode_ms=%.1f total_ms=%.1f",
@@ -1798,7 +1833,7 @@ class ViewerService:
                 mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
-                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
+                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info) if slice_corner_info is not None else None,
                 measurements=[] if fast_preview else self._serialize_measurements(
                     visible_measurements,
                     image_transform=metadata_image_transform,
@@ -1806,7 +1841,7 @@ class ViewerService:
                     canvas_height=render_plan.render_view.height or 0,
                 ),
                 transform=self._build_view_transform_payload(view),
-                orientation=None if fast_preview else self._serialize_orientation_overlay(
+                orientation=None if not include_static_preview_metadata else self._serialize_orientation_overlay(
                     self._build_mpr_orientation_overlay(
                         render_plan.render_view,
                         target_viewport,
@@ -1818,27 +1853,61 @@ class ViewerService:
             image_bytes=image_bytes,
         )
 
-    @staticmethod
-    def _render_fast_mpr_preview(context: RenderContext, *, order: int = 0) -> Image.Image:
-        return ViewerService._render_fast_base_image(
-            source_pixels=context.source_pixels,
+    def _render_fast_mpr_preview(self, context: RenderContext, *, order: int = 0) -> Image.Image:
+        return self._render_cached_fast_base_image(context, order=order)
+
+    def _render_fast_preview(self, context: RenderContext) -> Image.Image:
+        image = self._render_cached_fast_base_image(context)
+        if not layered_renderer._has_overlay_content(context):
+            return image
+        return layered_renderer.composite_overlays(image.convert("RGBA"), context)
+
+    def _render_cached_fast_base_image(self, context: RenderContext, *, order: int = 1) -> Image.Image:
+        base_pixels = self._get_cached_fast_base_pixels(context)
+        transformed = viewport_transformer.apply_affine_array(
+            base_pixels,
+            context.view.width or 0,
+            context.view.height or 0,
+            context.image_transform,
+            order=order,
+            cval=0.0,
+        )
+        if context.view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
+            transformed = apply_pseudocolor(transformed, context.view.pseudocolor_preset)
+            return Image.fromarray(transformed)
+        return Image.fromarray(transformed)
+
+    def _get_cached_fast_base_pixels(self, context: RenderContext) -> np.ndarray:
+        cache_key = self._build_fast_base_pixels_cache_key(context)
+        cached = self._fast_base_pixels_cache.get(cache_key)
+        if cached is not None:
+            self._fast_base_pixels_cache.move_to_end(cache_key)
+            return cached
+
+        base_pixels = self._window_array(
+            context.source_pixels,
+            context.view.window_width,
+            context.view.window_center,
             pixel_min=context.pixel_min,
             pixel_max=context.pixel_max,
-            render_view=context.view,
-            image_transform=context.image_transform,
-            order=order,
         )
+        self._fast_base_pixels_cache[cache_key] = base_pixels
+        self._fast_base_pixels_cache.move_to_end(cache_key)
+        while len(self._fast_base_pixels_cache) > FAST_BASE_PIXELS_CACHE_MAX_ITEMS:
+            self._fast_base_pixels_cache.popitem(last=False)
+        return base_pixels
 
     @staticmethod
-    def _render_fast_preview(context: RenderContext) -> Image.Image:
-        image = ViewerService._render_fast_base_image(
-            source_pixels=context.source_pixels,
-            pixel_min=context.pixel_min,
-            pixel_max=context.pixel_max,
-            render_view=context.view,
-            image_transform=context.image_transform,
-        ).convert("RGBA")
-        return layered_renderer.composite_overlays(image, context)
+    def _build_fast_base_pixels_cache_key(context: RenderContext) -> tuple[object, ...]:
+        return (
+            id(context.source_pixels),
+            tuple(context.source_pixels.shape),
+            str(context.source_pixels.dtype),
+            float(context.pixel_min),
+            float(context.pixel_max),
+            None if context.view.window_width is None else float(context.view.window_width),
+            None if context.view.window_center is None else float(context.view.window_center),
+        )
 
     @staticmethod
     def _render_fast_base_image(
@@ -3446,18 +3515,13 @@ class ViewerService:
         if not np.isfinite(mm_per_canvas_pixel) or mm_per_canvas_pixel <= 0.0:
             return None
 
-        canvas_width = float(render_view.width)
         selected_length_mm = 100.0
         selected_length_px = selected_length_mm / mm_per_canvas_pixel
-        if (
-            not np.isfinite(selected_length_px)
-            or selected_length_px <= 0.0
-            or selected_length_px > canvas_width * 0.8
-        ):
+        if not np.isfinite(selected_length_px) or selected_length_px <= 0.0:
             return None
 
         return ScaleBarInfo(
-            lengthNorm=float(selected_length_px) / canvas_width,
+            lengthNorm=float(selected_length_px) / float(render_view.width),
             label="10 cm",
         )
 
@@ -4816,16 +4880,22 @@ class ViewerService:
         view.drag_origin_arcball_y = None
 
     @staticmethod
-    def _encode_image(image: Image.Image, image_format: ImageFormat) -> bytes:
+    def _encode_image(image: Image.Image, image_format: ImageFormat, *, fast_preview: bool = False) -> bytes:
         output = io.BytesIO()
         if image_format == "jpeg":
             # JPEG is only used for transient interaction previews. Settled frames
             # stay PNG so overlays and measurements align with lossless pixels.
             image.convert("RGB").save(output, format="JPEG", quality=FAST_PREVIEW_JPEG_QUALITY)
         else:
-            # PNG remains lossless; a low compression level trades a larger
-            # socket payload for much lower CPU latency during interactive MPR.
-            image.save(output, format="PNG", compress_level=1, optimize=False)
+            # PNG is lossless at every compression level. Keep all viewer PNG
+            # frames at a low compression level to reduce encode latency and
+            # avoid final-frame tail spikes during interaction.
+            image.save(
+                output,
+                format="PNG",
+                compress_level=PNG_COMPRESS_LEVEL,
+                optimize=False,
+            )
         return output.getvalue()
 
 

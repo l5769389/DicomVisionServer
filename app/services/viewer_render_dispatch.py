@@ -16,6 +16,7 @@ def render_by_view_type(
     *,
     fast_preview: bool = False,
     fast_preview_full_resolution: bool = False,
+    metadata_mode: str = "full",
     progress_callback: ViewRenderProgressCallback | None = None,
 ) -> "RenderedImageResult":
     """Route a view record to the renderer that owns its view type."""
@@ -26,6 +27,7 @@ def render_by_view_type(
             image_format=image_format,
             fast_preview=fast_preview,
             fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
             progress_callback=progress_callback,
         )
     if service._is_3d_view_type(view.view_type):
@@ -35,4 +37,9 @@ def render_by_view_type(
             fast_preview=fast_preview,
             progress_callback=progress_callback,
         )
-    return service._render_view(view, image_format=image_format, fast_preview=fast_preview)
+    return service._render_view(
+        view,
+        image_format=image_format,
+        fast_preview=fast_preview,
+        metadata_mode=metadata_mode,
+    )
