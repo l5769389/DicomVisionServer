@@ -42,6 +42,7 @@ class CornerInfoOverlay:
     top_right: tuple[str, ...] = field(default_factory=tuple)
     bottom_left: tuple[str, ...] = field(default_factory=tuple)
     bottom_right: tuple[str, ...] = field(default_factory=tuple)
+    tags: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

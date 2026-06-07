@@ -155,6 +155,7 @@ class CornerInfoPayload(BaseModel):
     top_right: list[str] = Field(default_factory=list, alias="topRight")
     bottom_left: list[str] = Field(default_factory=list, alias="bottomLeft")
     bottom_right: list[str] = Field(default_factory=list, alias="bottomRight")
+    tags: dict[str, list[str]] = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True}
 

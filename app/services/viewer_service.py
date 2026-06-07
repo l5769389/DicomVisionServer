@@ -3893,6 +3893,60 @@ class ViewerService:
             return instance, dicom_cache.get(instance.sop_instance_uid, instance.path)
         return None, None
 
+    @staticmethod
+    def _corner_info_tag(value: str | None) -> tuple[str, ...]:
+        return (value,) if value else tuple()
+
+    @staticmethod
+    def _labeled_corner_info_tag(label: str, value: str | None) -> tuple[str, ...]:
+        return (f"{label}: {value}",) if value else tuple()
+
+    @staticmethod
+    def _build_corner_info_tags(items: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+        return {
+            key: tuple(line for line in lines if line)
+            for key, lines in items.items()
+            if any(line for line in lines)
+        }
+
+    @staticmethod
+    def _format_multi_number(value, *, precision: int = 2, separator: str = " x ", suffix: str = "") -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
+        try:
+            values = list(value)
+        except TypeError:
+            return ViewerService._format_number(value, precision=precision, suffix=suffix)
+        parts: list[str] = []
+        for item in values:
+            formatted = ViewerService._format_number(item, precision=precision)
+            if formatted is None:
+                formatted = ViewerService._safe_text(item)
+            if formatted:
+                parts.append(formatted)
+        if not parts:
+            return None
+        return f"{separator.join(parts)}{suffix}"
+
+    @staticmethod
+    def _build_matrix_label(rows, columns) -> str | None:
+        row_text = ViewerService._safe_text(rows)
+        column_text = ViewerService._safe_text(columns)
+        if not row_text or not column_text:
+            return None
+        return f"{row_text} x {column_text}"
+
+    @staticmethod
+    def _build_rescale_label(slope, intercept) -> str | None:
+        slope_text = ViewerService._format_number(slope, precision=4)
+        intercept_text = ViewerService._format_number(intercept, precision=4)
+        if not slope_text and not intercept_text:
+            return None
+        return f"m {slope_text or '-'}  b {intercept_text or '-'}"
+
     def _build_series_corner_info_overlay(
         self,
         series: SeriesRecord,
@@ -3903,10 +3957,14 @@ class ViewerService:
         station_name = self._safe_text(getattr(dataset, "StationName", None))
         institution_name = self._safe_text(getattr(dataset, "InstitutionName", None))
         study_description = self._safe_text(getattr(dataset, "StudyDescription", None))
+        series_description = self._first_non_empty(
+            self._safe_text(getattr(dataset, "SeriesDescription", None)),
+            self._safe_text(series.series_description),
+        )
         exam_text = self._first_non_empty(
             study_description,
             self._safe_text(getattr(dataset, "StudyID", None)),
-            self._safe_text(series.series_description),
+            series_description,
         )
         series_number = self._safe_text(getattr(dataset, "SeriesNumber", None))
         patient_name = self._safe_text(getattr(dataset, "PatientName", None))
@@ -3926,10 +3984,84 @@ class ViewerService:
         kv = self._format_number(getattr(dataset, "KVP", None), suffix="kV")
         ma = self._format_number(getattr(dataset, "XRayTubeCurrent", None), suffix="mA")
         thickness = self._format_number(getattr(dataset, "SliceThickness", None), suffix="mm")
+        modality = self._first_non_empty(self._safe_text(getattr(dataset, "Modality", None)), self._safe_text(series.modality))
+        accession_number = self._first_non_empty(
+            self._safe_text(getattr(dataset, "AccessionNumber", None)),
+            self._safe_text(series.accession_number),
+        )
+        study_date = self._first_non_empty(
+            self._format_dicom_date(getattr(dataset, "StudyDate", None)),
+            self._format_dicom_date(series.study_date),
+        )
+        study_time = self._format_dicom_time(getattr(dataset, "StudyTime", None))
+        study_id = self._safe_text(getattr(dataset, "StudyID", None))
+        study_uid = self._first_non_empty(
+            self._safe_text(getattr(dataset, "StudyInstanceUID", None)),
+            self._safe_text(series.study_instance_uid),
+        )
+        series_uid = self._first_non_empty(
+            self._safe_text(getattr(dataset, "SeriesInstanceUID", None)),
+            self._safe_text(series.series_instance_uid),
+        )
+        sop_uid = self._safe_text(getattr(dataset, "SOPInstanceUID", None))
+        body_part = self._safe_text(getattr(dataset, "BodyPartExamined", None))
+        protocol_name = self._safe_text(getattr(dataset, "ProtocolName", None))
+        patient_birth_date = self._format_dicom_date(getattr(dataset, "PatientBirthDate", None))
+        referring_physician = self._safe_text(getattr(dataset, "ReferringPhysicianName", None))
+        patient_position = self._safe_text(getattr(dataset, "PatientPosition", None))
+        pixel_spacing = self._format_multi_number(getattr(dataset, "PixelSpacing", None), precision=3, suffix="mm")
+        matrix = self._build_matrix_label(getattr(dataset, "Rows", None), getattr(dataset, "Columns", None))
+        image_position = self._format_multi_number(getattr(dataset, "ImagePositionPatient", None), precision=2, separator=", ")
+        image_orientation = self._format_multi_number(getattr(dataset, "ImageOrientationPatient", None), precision=4, separator=", ")
+        rescale = self._build_rescale_label(getattr(dataset, "RescaleSlope", None), getattr(dataset, "RescaleIntercept", None))
+        convolution_kernel = self._safe_text(getattr(dataset, "ConvolutionKernel", None))
+        reconstruction_diameter = self._format_number(getattr(dataset, "ReconstructionDiameter", None), precision=1, suffix="mm")
+        ctdi_vol = self._format_number(getattr(dataset, "CTDIvol", None), precision=2, suffix="mGy")
+        exposure = self._format_number(getattr(dataset, "Exposure", None), precision=1, suffix="mAs")
+        exposure_time = self._format_number(getattr(dataset, "ExposureTime", None), precision=1, suffix="ms")
 
         vendor_line = self._join_non_empty(" / ", manufacturer, manufacturer_model)
         patient_meta = self._join_non_empty(" ", patient_id, self._join_non_empty(" / ", patient_sex, patient_age))
         technique_parts = [part for part in (kv, ma) if part]
+        acquisition_datetime = self._join_non_empty(" ", acquisition_date, acquisition_time)
+        tags = self._build_corner_info_tags(
+            {
+                "manufacturerModel": self._corner_info_tag(vendor_line),
+                "stationName": self._corner_info_tag(station_name),
+                "institutionName": self._corner_info_tag(institution_name),
+                "examDescription": self._corner_info_tag(exam_text),
+                "seriesNumber": self._corner_info_tag(f"Se: {series_number}" if series_number else None),
+                "patientName": self._corner_info_tag(patient_name),
+                "patientSummary": self._corner_info_tag(patient_meta),
+                "technique": self._corner_info_tag(" ".join(technique_parts) if technique_parts else None),
+                "sliceThickness": self._corner_info_tag(thickness),
+                "acquisitionDateTime": self._corner_info_tag(acquisition_datetime),
+                "modality": self._labeled_corner_info_tag("Modality", modality),
+                "accessionNumber": self._labeled_corner_info_tag("Acc", accession_number),
+                "studyDate": self._labeled_corner_info_tag("Study date", study_date),
+                "studyTime": self._labeled_corner_info_tag("Study time", study_time),
+                "studyId": self._labeled_corner_info_tag("Study ID", study_id),
+                "studyInstanceUid": self._labeled_corner_info_tag("Study UID", study_uid),
+                "seriesInstanceUid": self._labeled_corner_info_tag("Series UID", series_uid),
+                "sopInstanceUid": self._labeled_corner_info_tag("SOP UID", sop_uid),
+                "seriesDescription": self._labeled_corner_info_tag("Series", series_description),
+                "bodyPartExamined": self._labeled_corner_info_tag("Body", body_part),
+                "protocolName": self._labeled_corner_info_tag("Protocol", protocol_name),
+                "patientBirthDate": self._labeled_corner_info_tag("Birth", patient_birth_date),
+                "referringPhysicianName": self._labeled_corner_info_tag("Referrer", referring_physician),
+                "patientPosition": self._labeled_corner_info_tag("Patient pos", patient_position),
+                "pixelSpacing": self._labeled_corner_info_tag("Pixel", pixel_spacing),
+                "rowsColumns": self._labeled_corner_info_tag("Matrix", matrix),
+                "imagePositionPatient": self._labeled_corner_info_tag("IPP", image_position),
+                "imageOrientationPatient": self._labeled_corner_info_tag("IOP", image_orientation),
+                "rescaleSlopeIntercept": self._labeled_corner_info_tag("Rescale", rescale),
+                "convolutionKernel": self._labeled_corner_info_tag("Kernel", convolution_kernel),
+                "reconstructionDiameter": self._labeled_corner_info_tag("FOV", reconstruction_diameter),
+                "ctdiVol": self._labeled_corner_info_tag("CTDIvol", ctdi_vol),
+                "exposure": self._labeled_corner_info_tag("Exposure", exposure),
+                "exposureTime": self._labeled_corner_info_tag("Exp time", exposure_time),
+            }
+        )
 
         top_left = tuple(
             line
@@ -3955,7 +4087,7 @@ class ViewerService:
             for line in (
                 " ".join(technique_parts) if technique_parts else None,
                 thickness,
-                self._join_non_empty(" ", acquisition_date, acquisition_time),
+                acquisition_datetime,
             )
             if line
         )
@@ -3964,6 +4096,7 @@ class ViewerService:
             top_right=top_right,
             bottom_left=bottom_left,
             bottom_right=tuple(),
+            tags=tags,
         )
 
     def _build_slice_corner_info_overlay(
@@ -3990,11 +4123,38 @@ class ViewerService:
             plane_pose=plane_pose,
             cursor=cursor,
         )
+        viewport_location = self._join_non_empty("  ", viewport_label, physical_location)
+        image_index = f"Im: {current_index + 1}/{total_slices}" if total_slices > 0 else None
+        window_level = self._build_window_label(view.window_width, view.window_center)
+        coordinate_line = f"X:{int(round(view.offset_x))} Y:{int(round(view.offset_y))}"
+        slice_location = self._format_number(getattr(dataset, "SliceLocation", None), precision=2, suffix="mm")
+        instance_number = self._safe_text(getattr(dataset, "InstanceNumber", None))
+        sop_uid = self._safe_text(getattr(dataset, "SOPInstanceUID", None))
+        image_position = self._format_multi_number(getattr(dataset, "ImagePositionPatient", None), precision=2, separator=", ")
+        image_orientation = self._format_multi_number(getattr(dataset, "ImageOrientationPatient", None), precision=4, separator=", ")
+        pixel_spacing = self._format_multi_number(getattr(dataset, "PixelSpacing", None), precision=3, suffix="mm")
+        matrix = self._build_matrix_label(getattr(dataset, "Rows", None), getattr(dataset, "Columns", None))
+        tags = self._build_corner_info_tags(
+            {
+                "viewportLocation": self._corner_info_tag(viewport_location),
+                "imageIndex": self._corner_info_tag(image_index),
+                "windowLevel": self._corner_info_tag(window_level),
+                "zoom": self._corner_info_tag(f"Zoom:{zoom}" if zoom else None),
+                "coordinates": self._corner_info_tag(coordinate_line),
+                "sliceLocation": self._labeled_corner_info_tag("Slice loc", slice_location),
+                "instanceNumber": self._labeled_corner_info_tag("Instance", instance_number),
+                "sopInstanceUid": self._labeled_corner_info_tag("SOP UID", sop_uid),
+                "imagePositionPatient": self._labeled_corner_info_tag("IPP", image_position),
+                "imageOrientationPatient": self._labeled_corner_info_tag("IOP", image_orientation),
+                "pixelSpacing": self._labeled_corner_info_tag("Pixel", pixel_spacing),
+                "rowsColumns": self._labeled_corner_info_tag("Matrix", matrix),
+            }
+        )
         top_left = tuple(
             line
             for line in (
-                self._join_non_empty("  ", viewport_label, physical_location),
-                f"Im: {current_index + 1}/{total_slices}" if total_slices > 0 else None,
+                viewport_location,
+                image_index,
             )
             if line
         )
@@ -4002,7 +4162,7 @@ class ViewerService:
         bottom_left = tuple(
             line
             for line in (
-                self._build_window_label(view.window_width, view.window_center),
+                window_level,
             )
             if line
         )
@@ -4010,7 +4170,7 @@ class ViewerService:
             line
             for line in (
                 f"Zoom:{zoom}" if zoom else None,
-                f"X:{int(round(view.offset_x))} Y:{int(round(view.offset_y))}",
+                coordinate_line,
             )
             if line
         )
@@ -4019,6 +4179,7 @@ class ViewerService:
             top_right=top_right,
             bottom_left=bottom_left,
             bottom_right=bottom_right,
+            tags=tags,
         )
 
     @staticmethod
@@ -4028,6 +4189,7 @@ class ViewerService:
             topRight=list(overlay.top_right),
             bottomLeft=list(overlay.bottom_left),
             bottomRight=list(overlay.bottom_right),
+            tags={key: list(lines) for key, lines in overlay.tags.items() if lines},
         )
 
     @staticmethod
