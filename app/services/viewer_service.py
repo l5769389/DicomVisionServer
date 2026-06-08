@@ -25,6 +25,10 @@ from app.core import (
     DRAG_ACTION_END,
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
+    FUSION_PANE_CT_AXIAL,
+    FUSION_PANE_OVERLAY_AXIAL,
+    FUSION_PANE_PET_AXIAL,
+    FUSION_PANE_PET_CORONAL_MIP,
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
@@ -48,6 +52,7 @@ from app.core import (
 from app.core.logging import get_logger
 from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import (
+    FusionRegistrationState,
     InstanceRecord,
     MprCursorRecord,
     MprFrameState,
@@ -85,6 +90,8 @@ from app.schemas.view import (
     ViewQaWaterAnalyzeRequest,
     ViewQaWaterAnalyzeResponse,
     ViewTransformPayload,
+    FusionInfo,
+    FusionRegistrationInfo,
     ViewMtfAnalyzeResponse,
     ViewOperationRequest,
     ViewSetSizeRequest,
@@ -142,6 +149,12 @@ from app.services.view_group_registry import view_group_registry
 from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
 from app.services.viewer_render_dispatch import render_by_view_type
+from app.services.viewer_fusion import (
+    FUSION_VIEW_TYPES,
+    FUSION_VIEW_TYPE_TO_PANE_ROLE,
+    image_from_pixels,
+    render_fusion_pixels,
+)
 from app.services.viewer_render_guards import ensure_view_size
 from app.services.water_phantom_qa_service import WaterPhantomQaService
 from app.services.volume_render_config import (
@@ -263,6 +276,10 @@ class ViewerService:
     @staticmethod
     def _is_3d_view_type(view_type: str) -> bool:
         return view_type == "3D"
+
+    @staticmethod
+    def _is_fusion_view_type(view_type: str) -> bool:
+        return view_type in FUSION_VIEW_TYPES
 
     def set_view_size(
         self,
@@ -1301,6 +1318,85 @@ class ViewerService:
             view.window_center,
         )
 
+    def _resolve_fusion_group_series(self, view: ViewRecord) -> tuple[ViewGroupRecord, SeriesRecord, SeriesRecord]:
+        group = view.view_group
+        if group is None or str(group.group_type).lower() != "fusion":
+            raise HTTPException(status_code=400, detail="Fusion view is missing shared group state")
+        ct_series_id = group.fusion_ct_series_id or view.series_id
+        pet_series_id = group.fusion_pet_series_id or view.secondary_series_id
+        if not pet_series_id:
+            raise HTTPException(status_code=400, detail="Fusion view is missing PET series")
+        ct_series = series_registry.get(ct_series_id, workspace_id=view.workspace_id)
+        pet_series = series_registry.get(pet_series_id, workspace_id=view.workspace_id)
+        return group, ct_series, pet_series
+
+    def _derive_default_window_for_volume(self, series: SeriesRecord, volume: np.ndarray) -> tuple[float, float]:
+        first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
+        if first_instance is not None and first_instance.sop_instance_uid:
+            cached = dicom_cache.get(first_instance.sop_instance_uid, first_instance.path)
+            return (
+                float(cached.window_width or self._derive_default_window_width(cached)),
+                float(cached.window_center or self._derive_default_window_center(cached)),
+            )
+        pixel_min = float(np.min(volume))
+        pixel_max = float(np.max(volume))
+        return (max(WINDOW_WIDTH_MIN, pixel_max - pixel_min), (pixel_min + pixel_max) / 2.0)
+
+    def _initialize_fusion_viewport(self, view: ViewRecord) -> None:
+        ensure_view_size(view)
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        pet_volume = self._get_series_volume(pet_series)
+        if not group.fusion_initialized:
+            group.fusion_axial_index = ct_volume.shape[0] // 2
+            ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
+            pet_ww, pet_wl = self._derive_default_window_for_volume(pet_series, pet_volume)
+            group.window.window_width = ct_ww
+            group.window.window_center = ct_wl
+            group.fusion_pet_window.window_width = pet_ww
+            group.fusion_pet_window.window_center = pet_wl
+            group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(group.fusion_pet_pseudocolor_preset or "pet")
+            group.fusion_initialized = True
+        self._sync_fusion_view_state_from_group(view)
+        view.is_initialized = True
+
+    def _sync_fusion_view_state_from_group(self, view: ViewRecord) -> None:
+        group = view.view_group
+        if group is None:
+            return
+        role = self._resolve_fusion_pane_role(view)
+        view.current_index = int(group.fusion_axial_index)
+        if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
+            view.window_width = group.fusion_pet_window.window_width
+            view.window_center = group.fusion_pet_window.window_center
+            view.pseudocolor_preset = group.fusion_pet_pseudocolor_preset
+        elif role == FUSION_PANE_OVERLAY_AXIAL:
+            view.window_width = group.window.window_width
+            view.window_center = group.window.window_center
+            view.pseudocolor_preset = group.fusion_pet_pseudocolor_preset
+        else:
+            view.window_width = group.window.window_width
+            view.window_center = group.window.window_center
+            view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
+
+    def _reset_fusion_view_group(self, view: ViewRecord) -> None:
+        group = view.view_group
+        if group is None:
+            self._initialize_fusion_viewport(view)
+            return
+        group.fusion_initialized = False
+        group.fusion_registration = FusionRegistrationState()
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            group_view.offset_x = 0.0
+            group_view.offset_y = 0.0
+            group_view.zoom = 1.0
+            group_view.rotation_degrees = 0
+            group_view.hor_flip = False
+            group_view.ver_flip = False
+            self._reset_drag_state(group_view)
+            self._initialize_fusion_viewport(group_view)
+
     def _reset_view(self, view: ViewRecord) -> None:
         if self._is_mpr_view_type(view.view_type):
             self._reset_mpr_view_group(view)
@@ -1309,6 +1405,8 @@ class ViewerService:
             view.hor_flip = False
             view.ver_flip = False
             self._initialize_3d_viewport(view)
+        elif self._is_fusion_view_type(view.view_type):
+            self._reset_fusion_view_group(view)
         else:
             view.rotation_degrees = 0
             view.hor_flip = False
@@ -1654,6 +1752,119 @@ class ViewerService:
                 transform=self._build_view_transform_payload(view),
                 orientation=self._serialize_orientation_overlay(
                     self._build_stack_orientation_overlay(render_plan.render_view, cached.dataset)
+                ),
+            ),
+            image_bytes=image_bytes,
+        )
+
+    def _render_fusion_view(
+        self,
+        view: ViewRecord,
+        image_format: ImageFormat = "png",
+        *,
+        fast_preview: bool = False,
+        metadata_mode: str = "full",
+        progress_callback: ViewRenderProgressCallback | None = None,
+    ) -> RenderedImageResult:
+        del metadata_mode
+        render_started_at = perf_counter()
+        ensure_view_size(view)
+        if not view.is_initialized:
+            self._initialize_fusion_viewport(view)
+
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series, progress_callback=progress_callback)
+        pet_volume = self._get_series_volume(pet_series, progress_callback=progress_callback)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
+        role = self._resolve_fusion_pane_role(view)
+        self._sync_fusion_view_state_from_group(view)
+
+        pixels, spacing_xy, slice_index, slice_total = render_fusion_pixels(
+            pane_role=role,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+            axial_index=group.fusion_axial_index,
+            ct_window_width=group.window.window_width,
+            ct_window_center=group.window.window_center,
+            pet_window_width=group.fusion_pet_window.window_width,
+            pet_window_center=group.fusion_pet_window.window_center,
+            pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
+            registration=group.fusion_registration,
+            alpha=group.fusion_alpha,
+            interpolation_order=0 if fast_preview else 1,
+        )
+        source_image = image_from_pixels(pixels)
+        render_plan = self._build_render_plan_for_shape(view, source_image.height, source_image.width)
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=source_image.width,
+            image_height=source_image.height,
+            canvas_width=render_plan.render_view.width or 0,
+            canvas_height=render_plan.render_view.height or 0,
+            view=render_plan.render_view,
+        )
+        transformed = viewport_transformer.apply_affine_array(
+            np.asarray(source_image),
+            render_plan.render_view.width or 0,
+            render_plan.render_view.height or 0,
+            image_transform,
+            order=0 if fast_preview else 1,
+            cval=0.0,
+        )
+        image = image_from_pixels(transformed)
+        scale_bar = self._build_scale_bar_info(render_plan.render_view, image_transform, spacing_xy)
+        corner_series = pet_series if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP} else ct_series
+        corner_instance, corner_cached = self._get_reference_instance_and_cache(corner_series)
+        corner_info = (
+            self._build_slice_corner_info_overlay(
+                view,
+                corner_series,
+                corner_cached.dataset,
+                current_index=slice_index,
+                total_slices=slice_total,
+                viewport_label="PET/CT",
+            )
+            if corner_instance is not None and corner_cached is not None
+            else None
+        )
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        logger.debug(
+            "fusion render timing view_id=%s role=%s fast_preview=%s image_format=%s source_shape=%s render=%sx%s total_ms=%.1f",
+            view.view_id,
+            role,
+            fast_preview,
+            image_format,
+            tuple(int(value) for value in pixels.shape[:2]),
+            render_plan.render_view.width,
+            render_plan.render_view.height,
+            (perf_counter() - render_started_at) * 1000.0,
+        )
+        return RenderedImageResult(
+            meta=ViewImageResponse(
+                slice_info=SliceInfo(current=slice_index + 1, total=max(1, slice_total)),
+                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
+                imageFormat=image_format,
+                viewId=view.view_id,
+                scaleBar=scale_bar,
+                cornerInfo=self._serialize_corner_info_overlay(corner_info) if corner_info is not None else None,
+                orientation=None,
+                transform=self._build_view_transform_payload(view),
+                color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
+                fusionInfo=FusionInfo(
+                    paneRole=role,
+                    ctSeriesId=ct_series.series_id,
+                    petSeriesId=pet_series.series_id,
+                    petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    alpha=float(group.fusion_alpha),
+                    revision=int(group.fusion_revision),
+                    registration=FusionRegistrationInfo(
+                        translateRowMm=float(group.fusion_registration.translate_row_mm),
+                        translateColMm=float(group.fusion_registration.translate_col_mm),
+                        rotationDegrees=float(group.fusion_registration.rotation_degrees),
+                        saved=bool(group.fusion_registration.saved),
+                    ),
                 ),
             ),
             image_bytes=image_bytes,
@@ -3039,6 +3250,204 @@ class ViewerService:
             return [view]
         group_views = view_registry.list_view_group(view.view_group.group_id)
         return group_views or [view]
+
+    def _get_group_views(self, view: ViewRecord) -> list[ViewRecord]:
+        if view.view_group is None:
+            return [view]
+        group_views = view_registry.list_view_group(view.view_group.group_id, workspace_id=view.workspace_id)
+        return group_views or [view]
+
+    @staticmethod
+    def _resolve_fusion_pane_role(view: ViewRecord) -> str:
+        return view.fusion_pane_role or FUSION_VIEW_TYPE_TO_PANE_ROLE.get(view.view_type, FUSION_PANE_OVERLAY_AXIAL)
+
+    def _bump_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
+        if group is None or str(group.group_type).lower() != "fusion":
+            return None
+        group.fusion_revision += 1
+        return int(group.fusion_revision)
+
+    def _get_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
+        if group is None or str(group.group_type).lower() != "fusion":
+            return None
+        return int(group.fusion_revision)
+
+    def _handle_fusion_scroll(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if payload.delta is None:
+            return False
+        group, ct_series, _ = self._resolve_fusion_group_series(view)
+        ct_shape = self._get_series_volume(ct_series).shape
+        group.fusion_axial_index = max(0, min(int(group.fusion_axial_index) + int(payload.delta), ct_shape[0] - 1))
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _handle_fusion_drag_pan(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        group = view.view_group
+        group_views = self._get_group_views(view)
+        if payload.action_type == DRAG_ACTION_START:
+            for group_view in group_views:
+                group_view.drag_origin_offset_x = group_view.offset_x
+                group_view.drag_origin_offset_y = group_view.offset_y
+            return
+        if payload.action_type == DRAG_ACTION_MOVE:
+            for group_view in group_views:
+                base_x = group_view.drag_origin_offset_x if group_view.drag_origin_offset_x is not None else group_view.offset_x
+                base_y = group_view.drag_origin_offset_y if group_view.drag_origin_offset_y is not None else group_view.offset_y
+                group_view.offset_x = float(base_x) + float(payload.x or 0.0)
+                group_view.offset_y = float(base_y) + float(payload.y or 0.0)
+                group_view.is_initialized = True
+            if group is not None:
+                group.fusion_revision += 1
+            return
+        if payload.action_type == DRAG_ACTION_END:
+            for group_view in group_views:
+                group_view.drag_origin_offset_x = None
+                group_view.drag_origin_offset_y = None
+
+    def _handle_fusion_drag_zoom(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        group = view.view_group
+        group_views = self._get_group_views(view)
+        if payload.action_type == DRAG_ACTION_START:
+            for group_view in group_views:
+                group_view.drag_origin_zoom = group_view.zoom
+            return
+        if payload.action_type == DRAG_ACTION_MOVE:
+            delta_y = float(payload.y or 0.0)
+            for group_view in group_views:
+                base_zoom = group_view.drag_origin_zoom if group_view.drag_origin_zoom is not None else group_view.zoom
+                zoom_factor = max(ZOOM_DRAG_FACTOR_MIN, 1.0 - delta_y * ZOOM_DRAG_SENSITIVITY)
+                group_view.zoom = viewport_transformer.clamp_zoom(float(base_zoom) * zoom_factor)
+                group_view.is_initialized = True
+            if group is not None:
+                group.fusion_revision += 1
+            return
+        if payload.action_type == DRAG_ACTION_END:
+            for group_view in group_views:
+                group_view.drag_origin_zoom = None
+
+    def _handle_fusion_window(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        role = self._resolve_fusion_pane_role(view)
+        target_window = group.fusion_pet_window if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP} else group.window
+
+        if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
+            if payload.ww is not None:
+                target_window.window_width = float(payload.ww)
+            if payload.wl is not None:
+                target_window.window_center = float(payload.wl)
+        elif payload.action_type == DRAG_ACTION_START:
+            group.drag_origin_window_width = target_window.window_width
+            group.drag_origin_window_center = target_window.window_center
+            return True
+        elif payload.action_type == DRAG_ACTION_MOVE:
+            base_ww = float(group.drag_origin_window_width if group.drag_origin_window_width is not None else target_window.window_width or 0.0)
+            base_wl = float(group.drag_origin_window_center if group.drag_origin_window_center is not None else target_window.window_center or 0.0)
+            target_window.window_width = base_ww + float(payload.x or 0.0) * WINDOW_DRAG_SENSITIVITY
+            target_window.window_center = base_wl - float(payload.y or 0.0) * WINDOW_DRAG_SENSITIVITY
+        elif payload.action_type == DRAG_ACTION_END:
+            group.drag_origin_window_width = None
+            group.drag_origin_window_center = None
+            return True
+        else:
+            return False
+
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _handle_fusion_pseudocolor(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None or payload.pseudocolor_preset is None:
+            return False
+        next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+        if group.fusion_pet_pseudocolor_preset == next_preset:
+            return False
+        group.fusion_pet_pseudocolor_preset = next_preset
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _handle_fusion_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        changed = False
+        if payload.fusion_alpha is not None:
+            next_alpha = max(0.0, min(float(payload.fusion_alpha), 1.0))
+            if abs(group.fusion_alpha - next_alpha) > 1e-6:
+                group.fusion_alpha = next_alpha
+                changed = True
+        if payload.pseudocolor_preset is not None:
+            next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+            if group.fusion_pet_pseudocolor_preset != next_preset:
+                group.fusion_pet_pseudocolor_preset = next_preset
+                changed = True
+        if changed:
+            group.fusion_revision += 1
+            for group_view in self._get_group_views(view):
+                self._sync_fusion_view_state_from_group(group_view)
+                group_view.is_initialized = True
+        return changed
+
+    def _handle_fusion_registration(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        sub_op = str(payload.sub_op_type or "translate").strip().lower()
+        registration = group.fusion_registration
+        if sub_op == "reset":
+            group.fusion_registration = FusionRegistrationState()
+        elif sub_op == "save":
+            view_group_registry.save_fusion_registration(group)
+        elif payload.action_type == DRAG_ACTION_START:
+            group.rotation_drag = None
+            group.crosshair_drag_origin_center = (
+                registration.translate_row_mm,
+                registration.translate_col_mm,
+                registration.rotation_degrees,
+            )
+            return True
+        elif payload.action_type == DRAG_ACTION_MOVE:
+            origin = group.crosshair_drag_origin_center or (
+                registration.translate_row_mm,
+                registration.translate_col_mm,
+                registration.rotation_degrees,
+            )
+            origin_row, origin_col, origin_rotation = (float(origin[0]), float(origin[1]), float(origin[2]))
+            if sub_op == "rotate":
+                registration.rotation_degrees = origin_rotation + float(payload.x or 0.0) * 0.35
+            else:
+                plane = self._get_fusion_reference_plane(view)
+                zoom = max(float(view.zoom or 1.0), 1e-6)
+                registration.translate_col_mm = origin_col + float(payload.x or 0.0) * plane.pixel_spacing_col_mm / zoom
+                registration.translate_row_mm = origin_row + float(payload.y or 0.0) * plane.pixel_spacing_row_mm / zoom
+            registration.saved = False
+        elif payload.action_type == DRAG_ACTION_END:
+            group.crosshair_drag_origin_center = None
+        else:
+            return False
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _get_fusion_reference_plane(self, view: ViewRecord) -> PlanePose:
+        group, ct_series, _ = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        from app.services.viewer_fusion import build_ct_axial_plane
+
+        return build_ct_axial_plane(ct_geometry, ct_volume.shape, group.fusion_axial_index)
 
     def _handle_mpr_crosshair(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         if payload.x is None or payload.y is None:

@@ -96,7 +96,7 @@ class ViewSocketHub:
             view = view_registry.get(view_id)
         except Exception:
             return f"view:{view_id}"
-        if view.view_group is not None and str(view.view_group.group_type).lower() == "mpr":
+        if view.view_group is not None and str(view.view_group.group_type).lower() in {"mpr", "fusion"}:
             return f"mpr-group:{view.view_group.group_id}"
         return f"view:{view_id}"
 

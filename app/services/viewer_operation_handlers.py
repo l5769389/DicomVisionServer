@@ -10,6 +10,8 @@ from app.core import (
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
     VIEW_OP_TYPE_CROSSHAIR,
+    VIEW_OP_TYPE_FUSION_CONFIG,
+    VIEW_OP_TYPE_FUSION_REGISTRATION,
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_PSEUDOCOLOR,
     VIEW_OP_TYPE_SCROLL,
@@ -96,6 +98,7 @@ def handle_view_operation(
         else:
             view_registry.get(payload.source_view_id, workspace_id=workspace_id)
     is_mpr_view = service._is_mpr_view_type(view.view_type)
+    is_fusion_view = service._is_fusion_view_type(view.view_type)
 
     active_viewport_changed = _sync_mpr_active_viewport(service, view) if is_mpr_view else False
     operation_handler = _get_operation_handler(payload)
@@ -109,7 +112,7 @@ def handle_view_operation(
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     _log_view_operation_state(service, view, payload)
-    mpr_revision = _resolve_mpr_revision_for_render(service, view, payload, is_mpr_view)
+    mpr_revision = _resolve_operation_revision_for_render(service, view, payload, is_mpr_view, is_fusion_view)
     return _build_operation_render_outcome(service, view, render_decision, mpr_revision=mpr_revision)
 
 
@@ -200,19 +203,22 @@ MPR_GEOMETRY_REVISION_OPERATION_TYPES = {
 }
 
 
-def _resolve_mpr_revision_for_render(
+def _resolve_operation_revision_for_render(
     service: ViewerService,
     view: ViewRecord,
     payload: ViewOperationRequest,
     is_mpr_view: bool,
+    is_fusion_view: bool,
 ) -> int | None:
-    if not is_mpr_view:
-        return None
+    if is_mpr_view:
+        if _should_bump_mpr_geometry_revision(payload):
+            return service._bump_mpr_revision(view.view_group)
+        return service._get_mpr_revision(view.view_group)
 
-    if _should_bump_mpr_geometry_revision(payload):
-        return service._bump_mpr_revision(view.view_group)
+    if is_fusion_view:
+        return service._get_fusion_revision(view.view_group)
 
-    return service._get_mpr_revision(view.view_group)
+    return None
 
 
 def _should_bump_mpr_geometry_revision(payload: ViewOperationRequest) -> bool:
@@ -299,6 +305,10 @@ def _handle_scroll_operation(
 ) -> RenderDecision:
     if payload.delta is None:
         return _render_none()
+    if service._is_fusion_view_type(view.view_type):
+        if not service._handle_fusion_scroll(view, payload):
+            return _render_none()
+        return _render_broadcast()
     service._handle_scroll(view, series, int(payload.delta))
     return _render_broadcast() if is_mpr_view else _render_single()
 
@@ -330,6 +340,13 @@ def _handle_zoom_operation(
 ) -> RenderDecision:
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
+    if service._is_fusion_view_type(view.view_type):
+        service._handle_fusion_drag_zoom(view, payload)
+        if payload.action_type == DRAG_ACTION_START:
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_full_resolution_preview_broadcast()
+        return _render_broadcast()
     service._handle_drag_zoom(view, payload)
     if is_mpr_view:
         if payload.action_type == DRAG_ACTION_START:
@@ -356,6 +373,15 @@ def _handle_window_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
+    if service._is_fusion_view_type(view.view_type):
+        if not service._handle_fusion_window(view, payload):
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_START:
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_full_resolution_preview_broadcast()
+        return _render_broadcast()
+
     if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
         if payload.ww is not None:
             view.window_width = float(payload.ww)
@@ -392,6 +418,13 @@ def _handle_pan_operation(
 ) -> RenderDecision:
     if payload.action_type is None:
         return _handle_generic_operation(service, view, series, payload, is_mpr_view)
+    if service._is_fusion_view_type(view.view_type):
+        service._handle_fusion_drag_pan(view, payload)
+        if payload.action_type == DRAG_ACTION_START:
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_MOVE:
+            return _render_full_resolution_preview_broadcast()
+        return _render_broadcast()
     service._handle_drag_pan(view, payload)
     if is_mpr_view:
         if payload.action_type == DRAG_ACTION_START:
@@ -421,6 +454,10 @@ def _handle_pseudocolor_operation(
     del series, is_mpr_view
     if payload.pseudocolor_preset is None:
         return _render_none()
+    if service._is_fusion_view_type(view.view_type):
+        if not service._handle_fusion_pseudocolor(view, payload):
+            return _render_none()
+        return _render_broadcast()
     service._handle_pseudocolor(view, payload)
     if not view.width or not view.height:
         return _render_none()
@@ -472,6 +509,10 @@ def _handle_reset_operation(
         if not service._clear_measurements(view):
             return _render_none()
         return _render_broadcast() if is_mpr_view else _render_single()
+
+    if service._is_fusion_view_type(view.view_type):
+        service._reset_view(view)
+        return _render_broadcast()
 
     if reset_target in {"mtf", "annotations"}:
         return _render_broadcast() if is_mpr_view else _render_single()
@@ -630,6 +671,42 @@ def _handle_mpr_state_sync_operation(
     return _render_broadcast()
 
 
+def _handle_fusion_config_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if not service._is_fusion_view_type(view.view_type):
+        return _render_none()
+    if not service._handle_fusion_config(view, payload):
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_full_resolution_preview_broadcast()
+    return _render_broadcast()
+
+
+def _handle_fusion_registration_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if not service._is_fusion_view_type(view.view_type):
+        return _render_none()
+    if not service._handle_fusion_registration(view, payload):
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_START:
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_full_resolution_preview_broadcast()
+    return _render_broadcast()
+
+
 def _handle_generic_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -666,12 +743,23 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
     VIEW_OP_TYPE_MPR_CROSSHAIR_MODE: _handle_mpr_crosshair_mode_operation,
     VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
+    VIEW_OP_TYPE_FUSION_CONFIG: _handle_fusion_config_operation,
+    VIEW_OP_TYPE_FUSION_REGISTRATION: _handle_fusion_registration_operation,
     VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
 }
 
 
 def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest) -> None:
-    handled_drag_ops = {VIEW_OP_TYPE_CROSSHAIR, VIEW_OP_TYPE_MPR_OBLIQUE, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_WINDOW, VIEW_OP_TYPE_PAN, VIEW_OP_TYPE_ROTATE_3D}
+    handled_drag_ops = {
+        VIEW_OP_TYPE_CROSSHAIR,
+        VIEW_OP_TYPE_FUSION_CONFIG,
+        VIEW_OP_TYPE_FUSION_REGISTRATION,
+        VIEW_OP_TYPE_MPR_OBLIQUE,
+        VIEW_OP_TYPE_ZOOM,
+        VIEW_OP_TYPE_WINDOW,
+        VIEW_OP_TYPE_PAN,
+        VIEW_OP_TYPE_ROTATE_3D,
+    }
     if payload.x is not None and payload.op_type not in handled_drag_ops:
         view.offset_x += float(payload.x)
         view.is_initialized = True
@@ -696,6 +784,8 @@ def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload:
         and payload.op_type in {
             VIEW_OP_TYPE_CROSSHAIR,
             VIEW_OP_TYPE_MPR_OBLIQUE,
+            VIEW_OP_TYPE_FUSION_CONFIG,
+            VIEW_OP_TYPE_FUSION_REGISTRATION,
             VIEW_OP_TYPE_ZOOM,
             VIEW_OP_TYPE_WINDOW,
             VIEW_OP_TYPE_PAN,
@@ -738,6 +828,24 @@ def _build_operation_render_outcome(
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     if render_decision.mode == "broadcast":
+        if service._is_fusion_view_type(view.view_type):
+            sized_group_view_ids = tuple(
+                group_view.view_id
+                for group_view in service._get_group_views(view)
+                if group_view.width and group_view.height
+            )
+            if not sized_group_view_ids:
+                return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
+
+            return OperationRenderOutcome(
+                mpr_revision=mpr_revision,
+                broadcast_view_ids=sized_group_view_ids,
+                broadcast_image_format=render_decision.image_format,
+                broadcast_fast_preview=render_decision.fast_preview,
+                broadcast_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
+                broadcast_metadata_mode=render_decision.metadata_mode,
+            )
+
         sized_group_view_ids = tuple(
             group_view.view_id
             for group_view in service._get_mpr_group_views(view)

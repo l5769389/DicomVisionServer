@@ -7,10 +7,14 @@ from app.core import (
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
     VIEW_OP_TYPE_CROSSHAIR,
+    VIEW_OP_TYPE_FUSION_CONFIG,
+    VIEW_OP_TYPE_FUSION_REGISTRATION,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_MPR_OBLIQUE,
     VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_PSEUDOCOLOR,
     VIEW_OP_TYPE_ROTATE_3D,
+    VIEW_OP_TYPE_SCROLL,
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
 )
@@ -40,6 +44,21 @@ MPR_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_ZOOM,
 }
 MPR_VIEW_TYPES = {"MPR", "AX", "COR", "SAG"}
+FUSION_VIEW_TYPES = {
+    "FusionCTAxial",
+    "FusionPETAxial",
+    "FusionOverlayAxial",
+    "FusionPETCoronalMip",
+}
+FUSION_LOW_LATENCY_OPERATION_TYPES = {
+    VIEW_OP_TYPE_FUSION_CONFIG,
+    VIEW_OP_TYPE_FUSION_REGISTRATION,
+    VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_PSEUDOCOLOR,
+    VIEW_OP_TYPE_SCROLL,
+    VIEW_OP_TYPE_WINDOW,
+    VIEW_OP_TYPE_ZOOM,
+}
 
 
 @dataclass
@@ -173,9 +192,13 @@ def _schedule_render_batch_for_views(
 
 
 def _should_queue_mpr_operation(view_type: str, payload: ViewOperationRequest) -> bool:
-    if view_type not in MPR_VIEW_TYPES:
+    if view_type in MPR_VIEW_TYPES:
+        allowed_operation_types = MPR_LOW_LATENCY_OPERATION_TYPES
+    elif view_type in FUSION_VIEW_TYPES:
+        allowed_operation_types = FUSION_LOW_LATENCY_OPERATION_TYPES
+    else:
         return False
-    if payload.op_type not in MPR_LOW_LATENCY_OPERATION_TYPES:
+    if payload.op_type not in allowed_operation_types:
         return False
     # High-frequency MPR drags are lossy: start/end are preserved, while move
     # events are coalesced to the latest payload by the group operation queue.

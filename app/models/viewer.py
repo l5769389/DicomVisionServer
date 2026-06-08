@@ -141,6 +141,14 @@ class MprMipState:
 
 
 @dataclass
+class FusionRegistrationState:
+    translate_row_mm: float = 0.0
+    translate_col_mm: float = 0.0
+    rotation_degrees: float = 0.0
+    saved: bool = False
+
+
+@dataclass
 class MprObliquePlaneState:
     row: tuple[float, float, float]
     col: tuple[float, float, float]
@@ -189,6 +197,17 @@ class ViewGroupRecord:
     group_type: str
     series_id: str
     workspace_id: str = DEFAULT_WORKSPACE_ID
+    secondary_series_id: str | None = None
+    fusion_ct_series_id: str | None = None
+    fusion_pet_series_id: str | None = None
+    fusion_view_group_key: str | None = None
+    fusion_initialized: bool = False
+    fusion_axial_index: int = 0
+    fusion_pet_pseudocolor_preset: str = "pet"
+    fusion_alpha: float = 0.52
+    fusion_pet_window: WindowState = field(default_factory=WindowState)
+    fusion_revision: int = 0
+    fusion_registration: FusionRegistrationState = field(default_factory=FusionRegistrationState)
     active_viewport: str = "mpr-ax"
     axial_index: int = 0
     coronal_index: int = 0
@@ -223,6 +242,8 @@ class ViewRecord:
     series_id: str
     view_type: str
     workspace_id: str = DEFAULT_WORKSPACE_ID
+    secondary_series_id: str | None = None
+    fusion_pane_role: str | None = None
     pseudocolor_preset: str = "bw"
     width: int | None = None
     height: int | None = None

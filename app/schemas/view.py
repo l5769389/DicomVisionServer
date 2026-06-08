@@ -5,11 +5,22 @@ from pydantic import BaseModel, Field
 from app.schemas.dicom import CornerInfoPayload
 
 
-ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
+ViewType = Literal[
+    "Stack",
+    "MPR",
+    "3D",
+    "AX",
+    "COR",
+    "SAG",
+    "FusionCTAxial",
+    "FusionPETAxial",
+    "FusionOverlayAxial",
+    "FusionPETCoronalMip",
+]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "fusionRegistration", "fusionConfig"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -22,10 +33,20 @@ MprCrosshairMode = Literal["orthogonal", "double-oblique"]
 class ViewCreateRequest(BaseModel):
     series_id: str = Field(alias="seriesId", description="Registered series ID to view.")
     view_type: ViewType = Field(alias="viewType", description="Requested view type: Stack, MPR, 3D, or a concrete MPR viewport.")
+    secondary_series_id: str | None = Field(
+        default=None,
+        alias="secondarySeriesId",
+        description="Optional second series ID for paired views such as PET/CT fusion.",
+    )
+    fusion_pane_role: str | None = Field(
+        default=None,
+        alias="fusionPaneRole",
+        description="Optional frontend pane role for PET/CT fusion routing.",
+    )
     view_group_key: str | None = Field(
         default=None,
         alias="viewGroupKey",
-        description="Optional key for sharing MPR state across AX/COR/SAG views or 4D phases.",
+        description="Optional key for sharing MPR or fusion state across related views.",
     )
     four_d_phase_index: int | None = Field(
         default=None,
@@ -277,6 +298,27 @@ class MprMipConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class FusionRegistrationInfo(BaseModel):
+    translate_row_mm: float = Field(default=0.0, alias="translateRowMm")
+    translate_col_mm: float = Field(default=0.0, alias="translateColMm")
+    rotation_degrees: float = Field(default=0.0, alias="rotationDegrees")
+    saved: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionInfo(BaseModel):
+    pane_role: str = Field(alias="paneRole")
+    ct_series_id: str = Field(alias="ctSeriesId")
+    pet_series_id: str = Field(alias="petSeriesId")
+    pet_pseudocolor_preset: str = Field(alias="petPseudocolorPreset")
+    alpha: float
+    revision: int
+    registration: FusionRegistrationInfo
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewImageResponse(BaseModel):
     slice_info: SliceInfo = Field(alias="slice_info")
     window_info: WindowInfo = Field(alias="window_info")
@@ -294,6 +336,7 @@ class ViewImageResponse(BaseModel):
     orientation: OrientationInfo | None = None
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
+    fusion_info: FusionInfo | None = Field(default=None, alias="fusionInfo")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_crosshair_mode: MprCrosshairMode = Field(default="orthogonal", alias="mprCrosshairMode")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
@@ -361,6 +404,8 @@ class ViewOperationRequest(BaseModel):
     ww: float | None = None
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
+    fusion_alpha: float | None = Field(default=None, alias="fusionAlpha")
+    fusion_manual_registration: bool | None = Field(default=None, alias="fusionManualRegistration")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
