@@ -152,6 +152,7 @@ from app.services.viewer_render_dispatch import render_by_view_type
 from app.services.viewer_fusion import (
     FUSION_VIEW_TYPES,
     FUSION_VIEW_TYPE_TO_PANE_ROLE,
+    build_ct_axial_plane,
     image_from_pixels,
     render_fusion_pixels,
 )
@@ -1087,6 +1088,21 @@ class ViewerService:
     def _get_mpr_display_aspect_xy_from_pose(plane_pose: PlanePose) -> tuple[float, float]:
         return ViewerService._get_mpr_spacing_xy_from_pose(plane_pose)
 
+    @staticmethod
+    def _get_display_aspect_xy_from_spacing(spacing_xy: tuple[float, float] | None) -> tuple[float, float]:
+        if spacing_xy is None:
+            return (1.0, 1.0)
+        try:
+            spacing_x = abs(float(spacing_xy[0]))
+            spacing_y = abs(float(spacing_xy[1]))
+        except (TypeError, ValueError, IndexError):
+            return (1.0, 1.0)
+        if not np.isfinite(spacing_x) or spacing_x <= 0.0:
+            spacing_x = 1.0
+        if not np.isfinite(spacing_y) or spacing_y <= 0.0:
+            spacing_y = 1.0
+        return (max(spacing_x, 1e-6), max(spacing_y, 1e-6))
+
     def _render_by_view_type(
         self,
         view: ViewRecord,
@@ -1342,11 +1358,79 @@ class ViewerService:
         pixel_max = float(np.max(volume))
         return (max(WINDOW_WIDTH_MIN, pixel_max - pixel_min), (pixel_min + pixel_max) / 2.0)
 
+    @staticmethod
+    def _get_geometry_axis_spacing(geometry: VolumeGeometry, axis_index: int) -> float:
+        axis = np.asarray(geometry.ijk_to_world[:3, axis_index], dtype=np.float64)
+        spacing = float(np.linalg.norm(axis))
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            return 1.0
+        return max(spacing, 1e-6)
+
+    def _get_fusion_source_shape_and_spacing(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> tuple[int, int, tuple[float, float]]:
+        role = self._resolve_fusion_pane_role(view)
+        if role == FUSION_PANE_PET_CORONAL_MIP:
+            image_height = int(pet_volume.shape[0])
+            image_width = int(pet_volume.shape[2])
+            spacing_x = self._get_geometry_axis_spacing(pet_geometry, 2)
+            spacing_y = self._get_geometry_axis_spacing(pet_geometry, 0)
+            return image_height, image_width, (spacing_x, spacing_y)
+
+        group = view.view_group
+        axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+        plane = build_ct_axial_plane(ct_geometry, ct_volume.shape, axial_index)
+        return (
+            int(plane.output_shape[0]),
+            int(plane.output_shape[1]),
+            (float(plane.pixel_spacing_col_mm), float(plane.pixel_spacing_row_mm)),
+        )
+
+    def _fit_fusion_view_to_source(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> None:
+        image_height, image_width, spacing_xy = self._get_fusion_source_shape_and_spacing(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+        )
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
+        view.zoom = viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=view.width or image_width,
+            canvas_height=view.height or image_height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        view.rotation_degrees = 0
+        view.hor_flip = False
+        view.ver_flip = False
+        self._reset_drag_state(view)
+
     def _initialize_fusion_viewport(self, view: ViewRecord) -> None:
         ensure_view_size(view)
         group, ct_series, pet_series = self._resolve_fusion_group_series(view)
         ct_volume = self._get_series_volume(ct_series)
         pet_volume = self._get_series_volume(pet_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
         if not group.fusion_initialized:
             group.fusion_axial_index = ct_volume.shape[0] // 2
             ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
@@ -1357,6 +1441,13 @@ class ViewerService:
             group.fusion_pet_window.window_center = pet_wl
             group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(group.fusion_pet_pseudocolor_preset or "pet")
             group.fusion_initialized = True
+        self._fit_fusion_view_to_source(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+        )
         self._sync_fusion_view_state_from_group(view)
         view.is_initialized = True
 
@@ -1775,12 +1866,14 @@ class ViewerService:
         group, ct_series, pet_series = self._resolve_fusion_group_series(view)
         ct_volume = self._get_series_volume(ct_series, progress_callback=progress_callback)
         pet_volume = self._get_series_volume(pet_series, progress_callback=progress_callback)
+        ct_transform = self._get_series_patient_transform(ct_series)
+        pet_transform = self._get_series_patient_transform(pet_series)
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
         pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
         role = self._resolve_fusion_pane_role(view)
         self._sync_fusion_view_state_from_group(view)
 
-        pixels, spacing_xy, slice_index, slice_total = render_fusion_pixels(
+        fusion_result = render_fusion_pixels(
             pane_role=role,
             ct_volume=ct_volume,
             ct_geometry=ct_geometry,
@@ -1794,16 +1887,35 @@ class ViewerService:
             pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
             registration=group.fusion_registration,
             alpha=group.fusion_alpha,
+            ct_has_patient_geometry=(
+                ct_transform is not None
+                and tuple(int(value) for value in ct_transform.shape)
+                == tuple(int(value) for value in ct_volume.shape)
+            ),
+            pet_has_patient_geometry=(
+                pet_transform is not None
+                and tuple(int(value) for value in pet_transform.shape)
+                == tuple(int(value) for value in pet_volume.shape)
+            ),
             interpolation_order=0 if fast_preview else 1,
         )
-        source_image = image_from_pixels(pixels)
-        render_plan = self._build_render_plan_for_shape(view, source_image.height, source_image.width)
+        source_image = image_from_pixels(fusion_result.pixels)
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(fusion_result.spacing_xy)
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            source_image.height,
+            source_image.width,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
         image_transform = viewport_transformer.build_image_to_canvas_transform(
             image_width=source_image.width,
             image_height=source_image.height,
             canvas_width=render_plan.render_view.width or 0,
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         transformed = viewport_transformer.apply_affine_array(
             np.asarray(source_image),
@@ -1814,17 +1926,23 @@ class ViewerService:
             cval=0.0,
         )
         image = image_from_pixels(transformed)
-        scale_bar = self._build_scale_bar_info(render_plan.render_view, image_transform, spacing_xy)
+        scale_bar = self._build_scale_bar_info(render_plan.render_view, image_transform, fusion_result.spacing_xy)
+        orientation_overlay = self._build_direction_orientation_overlay(
+            render_plan.render_view,
+            fusion_result.row_world,
+            fusion_result.col_world,
+        )
         corner_series = pet_series if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP} else ct_series
+        viewport_label = self._build_fusion_viewport_label(role)
         corner_instance, corner_cached = self._get_reference_instance_and_cache(corner_series)
         corner_info = (
             self._build_slice_corner_info_overlay(
                 view,
                 corner_series,
                 corner_cached.dataset,
-                current_index=slice_index,
-                total_slices=slice_total,
-                viewport_label="PET/CT",
+                current_index=fusion_result.slice_index,
+                total_slices=fusion_result.slice_total,
+                viewport_label=viewport_label,
             )
             if corner_instance is not None and corner_cached is not None
             else None
@@ -1836,22 +1954,22 @@ class ViewerService:
             role,
             fast_preview,
             image_format,
-            tuple(int(value) for value in pixels.shape[:2]),
+            tuple(int(value) for value in fusion_result.pixels.shape[:2]),
             render_plan.render_view.width,
             render_plan.render_view.height,
             (perf_counter() - render_started_at) * 1000.0,
         )
         return RenderedImageResult(
             meta=ViewImageResponse(
-                slice_info=SliceInfo(current=slice_index + 1, total=max(1, slice_total)),
+                slice_info=SliceInfo(current=fusion_result.slice_index + 1, total=max(1, fusion_result.slice_total)),
                 window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
                 imageFormat=image_format,
                 viewId=view.view_id,
                 scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(corner_info) if corner_info is not None else None,
-                orientation=None,
+                orientation=self._serialize_orientation_overlay(orientation_overlay),
                 transform=self._build_view_transform_payload(view),
-                color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
+                color=ViewColorInfo(pseudocolorPreset=fusion_result.pseudocolor_preset),
                 fusionInfo=FusionInfo(
                     paneRole=role,
                     ctSeriesId=ct_series.series_id,
@@ -3261,6 +3379,16 @@ class ViewerService:
     def _resolve_fusion_pane_role(view: ViewRecord) -> str:
         return view.fusion_pane_role or FUSION_VIEW_TYPE_TO_PANE_ROLE.get(view.view_type, FUSION_PANE_OVERLAY_AXIAL)
 
+    @staticmethod
+    def _build_fusion_viewport_label(role: str) -> str:
+        if role == FUSION_PANE_CT_AXIAL:
+            return "CT Axial"
+        if role == FUSION_PANE_PET_AXIAL:
+            return "PET Axial"
+        if role == FUSION_PANE_PET_CORONAL_MIP:
+            return "PET Coronal MIP"
+        return "PET/CT"
+
     def _bump_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
         if group is None or str(group.group_type).lower() != "fusion":
             return None
@@ -3445,7 +3573,6 @@ class ViewerService:
         group, ct_series, _ = self._resolve_fusion_group_series(view)
         ct_volume = self._get_series_volume(ct_series)
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
-        from app.services.viewer_fusion import build_ct_axial_plane
 
         return build_ct_axial_plane(ct_geometry, ct_volume.shape, group.fusion_axial_index)
 
@@ -5193,6 +5320,27 @@ class ViewerService:
             isOblique=bool(plane_pose.is_oblique if plane_pose is not None else plane.is_oblique),
         )
 
+    def _build_direction_orientation_overlay(
+        self,
+        view: ViewRecord,
+        row_world: np.ndarray | None,
+        col_world: np.ndarray | None,
+    ) -> OrientationOverlay | None:
+        row_direction = self._normalize_vector(np.asarray(row_world, dtype=np.float64)) if row_world is not None else None
+        col_direction = self._normalize_vector(np.asarray(col_world, dtype=np.float64)) if col_world is not None else None
+        if row_direction is None or col_direction is None:
+            return None
+
+        x_vector = col_direction * (-1.0 if view.hor_flip else 1.0)
+        y_vector = row_direction * (-1.0 if view.ver_flip else 1.0)
+        x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
+        return OrientationOverlay(
+            top=self._orientation_text_for_vector(-y_vector),
+            right=self._orientation_text_for_vector(x_vector),
+            bottom=self._orientation_text_for_vector(y_vector),
+            left=self._orientation_text_for_vector(-x_vector),
+        )
+
     def _build_stack_orientation_overlay(self, view: ViewRecord, dataset: Dataset | None) -> OrientationOverlay | None:
         orientation = self._get_dataset_orientation(dataset)
         if orientation is None:
@@ -5203,15 +5351,7 @@ class ViewerService:
         if row_direction is None or column_direction is None:
             return None
 
-        x_vector = row_direction * (-1.0 if view.hor_flip else 1.0)
-        y_vector = column_direction * (-1.0 if view.ver_flip else 1.0)
-        x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
-        return OrientationOverlay(
-            top=self._orientation_text_for_vector(-y_vector),
-            right=self._orientation_text_for_vector(x_vector),
-            bottom=self._orientation_text_for_vector(y_vector),
-            left=self._orientation_text_for_vector(-x_vector),
-        )
+        return self._build_direction_orientation_overlay(view, column_direction, row_direction)
 
     def _build_mpr_orientation_overlay(
         self,
