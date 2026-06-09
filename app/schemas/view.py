@@ -312,6 +312,10 @@ class FusionInfo(BaseModel):
     ct_series_id: str = Field(alias="ctSeriesId")
     pet_series_id: str = Field(alias="petSeriesId")
     pet_pseudocolor_preset: str = Field(alias="petPseudocolorPreset")
+    pet_unit: str = Field(default="SUVbw", alias="petUnit")
+    pet_unit_label: str = Field(default="g/ml (SUVbw)", alias="petUnitLabel")
+    pet_window_min: float | None = Field(default=None, alias="petWindowMin")
+    pet_window_max: float | None = Field(default=None, alias="petWindowMax")
     alpha: float
     revision: int
     registration: FusionRegistrationInfo
@@ -406,6 +410,9 @@ class ViewOperationRequest(BaseModel):
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
     fusion_alpha: float | None = Field(default=None, alias="fusionAlpha")
     fusion_manual_registration: bool | None = Field(default=None, alias="fusionManualRegistration")
+    fusion_pet_unit: str | None = Field(default=None, alias="fusionPetUnit")
+    fusion_pet_window_min: float | None = Field(default=None, alias="fusionPetWindowMin")
+    fusion_pet_window_max: float | None = Field(default=None, alias="fusionPetWindowMax")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")
     source_view_id: str | None = Field(default=None, alias="sourceViewId")

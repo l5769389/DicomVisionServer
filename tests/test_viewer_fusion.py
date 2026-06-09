@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from pydicom.dataset import Dataset
 
 from app.core import (
     FUSION_PANE_CT_AXIAL,
@@ -7,10 +8,12 @@ from app.core import (
     FUSION_PANE_PET_AXIAL,
     FUSION_PANE_PET_CORONAL_MIP,
 )
-from app.models.viewer import FusionRegistrationState, ViewRecord
+from app.models.viewer import FusionRegistrationState, SeriesRecord, ViewGroupRecord, ViewRecord
 from app.services.mpr import VolumeGeometry, build_identity_geometry
+from app.services.render_layers.render_context import CornerInfoOverlay
 from app.services.viewer_fusion import render_fusion_pixels
-from app.services.viewer_service import ViewerService
+from app.services.viewer_service import FusionPetDisplayVolume, ViewerService
+from app.schemas.view import ViewOperationRequest
 
 
 def _volume(shape: tuple[int, int, int] = (5, 6, 7)) -> np.ndarray:
@@ -144,17 +147,33 @@ def test_pet_axial_orientation_tracks_manual_registration_rotation() -> None:
     [
         (FUSION_PANE_CT_AXIAL, "bw"),
         (FUSION_PANE_PET_AXIAL, "bwinverse"),
-        (FUSION_PANE_OVERLAY_AXIAL, "pet"),
+        (FUSION_PANE_OVERLAY_AXIAL, "petct-rainbow"),
         (FUSION_PANE_PET_CORONAL_MIP, "bwinverse"),
     ],
 )
 def test_fusion_result_reports_actual_rendered_pseudocolor(role: str, expected_preset: str) -> None:
-    result = _render(role)
+    result = render_fusion_pixels(
+        pane_role=role,
+        ct_volume=_volume(),
+        ct_geometry=build_identity_geometry(tuple(int(value) for value in _volume().shape)),
+        pet_volume=_volume(),
+        pet_geometry=build_identity_geometry(tuple(int(value) for value in _volume().shape)),
+        axial_index=2,
+        ct_window_width=400,
+        ct_window_center=40,
+        pet_window_width=8,
+        pet_window_center=4,
+        pet_pseudocolor_preset="petct-rainbow",
+        registration=FusionRegistrationState(),
+        alpha=0.52,
+        ct_has_patient_geometry=True,
+        pet_has_patient_geometry=True,
+    )
 
     assert result.pseudocolor_preset == expected_preset
 
 
-def test_pet_only_views_preserve_user_selected_non_default_pseudocolor() -> None:
+def test_pet_only_views_use_inverse_grayscale_even_when_overlay_pseudocolor_changes() -> None:
     ct_volume = _volume()
     pet_volume = _volume()
     geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
@@ -177,7 +196,7 @@ def test_pet_only_views_preserve_user_selected_non_default_pseudocolor() -> None
         pet_has_patient_geometry=True,
     )
 
-    assert result.pseudocolor_preset == "hotiron"
+    assert result.pseudocolor_preset == "bwinverse"
 
 
 def test_pet_coronal_mip_uses_physical_spacing_and_head_first_direction() -> None:
@@ -253,6 +272,31 @@ def test_fusion_coronal_mip_initial_fit_uses_physical_aspect() -> None:
     assert view.zoom == pytest.approx(600.0 / (267.0 * 3.0))
 
 
+@pytest.mark.parametrize("view_type", ["FusionCTAxial", "FusionPETAxial", "FusionOverlayAxial"])
+def test_fusion_axial_initial_fit_uses_shared_ct_pet_physical_extent(view_type: str) -> None:
+    ct_volume = _volume((20, 100, 100))
+    pet_volume = _volume((20, 200, 200))
+    ct_geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+    pet_geometry = build_identity_geometry(tuple(int(value) for value in pet_volume.shape))
+    view = ViewRecord(
+        view_id="fusion-axial",
+        series_id="ct",
+        view_type=view_type,
+        width=600,
+        height=600,
+    )
+
+    ViewerService()._fit_fusion_view_to_source(
+        view,
+        ct_volume=ct_volume,
+        ct_geometry=ct_geometry,
+        pet_volume=pet_volume,
+        pet_geometry=pet_geometry,
+    )
+
+    assert view.zoom == pytest.approx(3.0)
+
+
 @pytest.mark.parametrize(
     ("role", "expected_label"),
     [
@@ -264,3 +308,214 @@ def test_fusion_coronal_mip_initial_fit_uses_physical_aspect() -> None:
 )
 def test_fusion_corner_info_label_only_marks_overlay_as_fusion(role: str, expected_label: str) -> None:
     assert ViewerService._build_fusion_viewport_label(role) == expected_label
+
+
+def test_fusion_view_windows_are_scoped_by_pane_role() -> None:
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.window.window_width = 400.0
+    group.window.window_center = 40.0
+    group.fusion_pet_window.window_width = 9.0
+    group.fusion_pet_window.window_center = 4.5
+    ct_view = ViewRecord(
+        view_id="ct",
+        series_id="ct",
+        view_type="FusionCTAxial",
+        fusion_pane_role=FUSION_PANE_CT_AXIAL,
+        view_group=group,
+    )
+    overlay_view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+    )
+    pet_view = ViewRecord(
+        view_id="pet",
+        series_id="pet",
+        view_type="FusionPETAxial",
+        fusion_pane_role=FUSION_PANE_PET_AXIAL,
+        view_group=group,
+    )
+
+    assert ct_view.window_width == 400.0
+    assert overlay_view.window_center == 40.0
+    assert pet_view.window_width == 9.0
+    assert pet_view.window_center == 4.5
+
+    pet_view.window_width = 12.0
+    pet_view.window_center = 6.0
+
+    assert group.fusion_pet_window.window_width == 12.0
+    assert group.fusion_pet_window.window_center == 6.0
+    assert group.window.window_width == 400.0
+    assert group.window.window_center == 40.0
+
+
+def test_fusion_info_reports_pet_window_for_overlay_pane(monkeypatch) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.window.window_width = 400.0
+    group.window.window_center = 40.0
+    group.fusion_pet_window.window_width = 4.5
+    group.fusion_pet_window.window_center = 2.25
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    ct_series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+    pet_series = SeriesRecord(
+        series_id="pet",
+        folder_path="",
+        series_instance_uid="pet-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="PT",
+        series_description="PET",
+    )
+    ct_volume = np.arange(64, dtype=np.float32).reshape(4, 4, 4)
+    pet_volume = np.arange(64, dtype=np.float32).reshape(4, 4, 4)
+    geometry = build_identity_geometry((4, 4, 4))
+
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda view: (group, ct_series, pet_series))
+    monkeypatch.setattr(
+        service,
+        "_get_series_volume",
+        lambda series, **_: ct_volume if series.series_id == "ct" else pet_volume,
+    )
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda series, shape: geometry)
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda series, volume, unit: FusionPetDisplayVolume(
+            volume=np.asarray(volume, dtype=np.float32),
+            unit="SUVbw",
+            unit_label="g/ml (SUVbw)",
+        ),
+    )
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=64,
+        height=64,
+    )
+    view.window_width = 400.0
+    view.window_center = 40.0
+
+    result = service._render_fusion_view(view)
+
+    assert result.meta.fusion_info is not None
+    assert result.meta.fusion_info.pet_window_min == pytest.approx(0.0)
+    assert result.meta.fusion_info.pet_window_max == pytest.approx(4.5)
+
+
+def test_fusion_pet_bqml_can_be_displayed_as_suvbw() -> None:
+    dataset = Dataset()
+    dataset.Units = "BQML"
+    dataset.PatientWeight = 70.0
+    dataset.CorrectedImage = ["DECY"]
+    dataset.DecayCorrection = "START"
+    dataset.AcquisitionDate = "20200101"
+    dataset.AcquisitionTime = "120000"
+    radiopharmaceutical = Dataset()
+    radiopharmaceutical.RadionuclideTotalDose = 350_000_000.0
+    radiopharmaceutical.RadionuclideHalfLife = 6586.2
+    radiopharmaceutical.RadiopharmaceuticalStartTime = "120000"
+    dataset.RadiopharmaceuticalInformationSequence = [radiopharmaceutical]
+
+    scale, unit, label = ViewerService()._resolve_pet_display_scale(dataset, "SUVbw")
+
+    assert unit == "SUVbw"
+    assert label == "g/ml (SUVbw)"
+    assert scale == pytest.approx(0.0002)
+
+
+def test_fusion_pet_corner_info_uses_pet_window_label() -> None:
+    display = FusionPetDisplayVolume(
+        volume=np.zeros((2, 2, 2), dtype=np.float32),
+        unit="SUVbw",
+        unit_label="g/ml (SUVbw)",
+    )
+    corner_info = CornerInfoOverlay(
+        bottom_left=("W: 8 L: 4", "2006.04.27"),
+        tags={"windowLevel": ("W: 8 L: 4",)},
+    )
+
+    updated = ViewerService()._with_pet_window_corner_info(corner_info, display, 8.0, 4.0)
+
+    assert updated.tags["windowLevel"] == ("SUV:0.00--8.00 g/ml (SUVbw)",)
+    assert updated.bottom_left[0] == "SUV:0.00--8.00 g/ml (SUVbw)"
+    assert "W: 8 L: 4" not in updated.bottom_left
+
+
+def test_fusion_pet_corner_info_replaces_leaked_ct_window_label() -> None:
+    display = FusionPetDisplayVolume(
+        volume=np.zeros((2, 2, 2), dtype=np.float32),
+        unit="SUVbw",
+        unit_label="g/ml (SUVbw)",
+    )
+    corner_info = CornerInfoOverlay(
+        bottom_left=("W: 400 L: 40", "2006.04.27"),
+        tags={"windowLevel": ("W: 400 L: 40",)},
+    )
+
+    updated = ViewerService()._with_pet_window_corner_info(corner_info, display, 4.5, 2.25)
+
+    assert updated.tags["windowLevel"] == ("SUV:0.00--4.50 g/ml (SUVbw)",)
+    assert updated.bottom_left[0] == "SUV:0.00--4.50 g/ml (SUVbw)"
+    assert "W: 400 L: 40" not in updated.bottom_left
+
+
+def test_fusion_suv_default_window_matches_pet_display_range() -> None:
+    display = FusionPetDisplayVolume(
+        volume=np.linspace(0.0, 18.0, num=32, dtype=np.float32).reshape(2, 4, 4),
+        unit="SUVbw",
+        unit_label="g/ml (SUVbw)",
+    )
+
+    ww, wl = ViewerService()._derive_default_pet_window_for_display_volume(display)
+
+    assert ww == pytest.approx(4.5)
+    assert wl == pytest.approx(2.25)
+
+
+def test_fusion_config_updates_pet_window_range() -> None:
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_pet_window.window_width = 4.5
+    group.fusion_pet_window.window_center = 2.25
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+    )
+    payload = ViewOperationRequest(
+        viewId="overlay",
+        opType="fusionConfig",
+        fusionPetWindowMin=0.0,
+        fusionPetWindowMax=12.5,
+    )
+
+    changed = ViewerService()._handle_fusion_config(view, payload)
+
+    assert changed is True
+    assert group.fusion_pet_window.window_width == pytest.approx(12.5)
+    assert group.fusion_pet_window.window_center == pytest.approx(6.25)

@@ -27,6 +27,16 @@ def test_apply_pseudocolor_returns_rgb_pixels() -> None:
     assert tuple(colored[0, -1]) == (255, 77, 90)
 
 
+def test_petct_rainbow_uses_reference_black_red_yellow_white_ramp() -> None:
+    grayscale = np.asarray([[0, 80, 180, 255]], dtype=np.uint8)
+    colored = apply_pseudocolor(grayscale, "petct-rainbow")
+
+    assert tuple(colored[0, 0]) == (0, 0, 0)
+    assert colored[0, 1, 0] > colored[0, 1, 1]
+    assert colored[0, 2, 0] >= colored[0, 2, 1] > colored[0, 2, 2]
+    assert tuple(colored[0, -1]) == (255, 254, 240)
+
+
 def test_render_fast_base_image_switches_to_rgb_for_pseudocolor() -> None:
     source_pixels = np.asarray([[0.0, 50.0], [100.0, 150.0]], dtype=np.float32)
     transform = AffineTransform(matrix=np.eye(3, dtype=np.float64))

@@ -169,6 +169,30 @@ from app.services.volume_rendering.contracts import SurfaceRenderRequest, Volume
 
 logger = get_logger(__name__)
 
+FUSION_PET_UNIT_SOURCE = "source"
+FUSION_PET_UNIT_KBQML = "kBqml"
+FUSION_PET_UNIT_SUV_BW = "SUVbw"
+FUSION_PET_UNIT_SUV_BSA = "SUVbsa"
+FUSION_PET_UNIT_SUL = "SUL"
+FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
+FUSION_PET_UNIT_LABELS: dict[str, str] = {
+    FUSION_PET_UNIT_SOURCE: "source",
+    FUSION_PET_UNIT_KBQML: "kBq/ml (uptake)",
+    FUSION_PET_UNIT_SUV_BSA: "cm2/ml (SUVbsa)",
+    FUSION_PET_UNIT_SUV_BW: "g/ml (SUVbw)",
+    FUSION_PET_UNIT_SUL: "g/ml* (SUL)",
+    FUSION_PET_UNIT_PERCENT_ID_G: "%ID/g",
+}
+
+
+@dataclass(frozen=True)
+class FusionPetDisplayVolume:
+    volume: np.ndarray
+    unit: str
+    unit_label: str
+    source_units: str | None = None
+    scale: float = 1.0
+
 CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
@@ -1346,6 +1370,200 @@ class ViewerService:
         pet_series = series_registry.get(pet_series_id, workspace_id=view.workspace_id)
         return group, ct_series, pet_series
 
+    @staticmethod
+    def _normalize_fusion_pet_unit(value: str | None) -> str:
+        normalized = str(value or FUSION_PET_UNIT_SUV_BW).strip()
+        aliases = {
+            "raw": FUSION_PET_UNIT_SOURCE,
+            "source": FUSION_PET_UNIT_SOURCE,
+            "BQML": FUSION_PET_UNIT_SOURCE,
+            "kBq/ml": FUSION_PET_UNIT_KBQML,
+            "kBqml": FUSION_PET_UNIT_KBQML,
+            "uptake": FUSION_PET_UNIT_KBQML,
+            "SUV": FUSION_PET_UNIT_SUV_BW,
+            "SUVbw": FUSION_PET_UNIT_SUV_BW,
+            "GML": FUSION_PET_UNIT_SUV_BW,
+            "SUVbsa": FUSION_PET_UNIT_SUV_BSA,
+            "SUL": FUSION_PET_UNIT_SUL,
+            "%ID/g": FUSION_PET_UNIT_PERCENT_ID_G,
+            "percentIDg": FUSION_PET_UNIT_PERCENT_ID_G,
+        }
+        return aliases.get(normalized, aliases.get(normalized.upper(), FUSION_PET_UNIT_SUV_BW))
+
+    @staticmethod
+    def _parse_dicom_datetime(date_value: object | None, time_value: object | None = None) -> datetime | None:
+        if date_value is None and time_value is None:
+            return None
+        date_text = str(date_value or "").strip()
+        time_text = str(time_value or "").strip()
+        text = f"{date_text}{time_text}" if time_text else date_text
+        text = text.replace(" ", "").replace(":", "")
+        if "." in text:
+            head, tail = text.split(".", 1)
+            text = f"{head}.{''.join(ch for ch in tail if ch.isdigit())}"
+        else:
+            text = "".join(ch for ch in text if ch.isdigit())
+        if time_text:
+            date_digits = "".join(ch for ch in date_text if ch.isdigit())
+            time_digits = "".join(ch for ch in time_text if ch.isdigit())
+            text = f"{date_digits}{time_digits}"
+        if not text:
+            return None
+
+        if "." in text:
+            main_text, fractional_text = text.split(".", 1)
+            text = f"{main_text}{fractional_text[:6].ljust(6, '0')}"
+            formats = ("%Y%m%d%H%M%S%f",)
+        else:
+            formats = ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y%m%d")
+        for fmt in formats:
+            expected_len = len(datetime(2000, 1, 1, 1, 1, 1, 123456).strftime(fmt))
+            try:
+                return datetime.strptime(text[:expected_len], fmt)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _get_first_sequence_item(dataset: Dataset | None, name: str) -> Dataset | None:
+        if dataset is None:
+            return None
+        sequence = getattr(dataset, name, None)
+        try:
+            return sequence[0] if sequence else None
+        except Exception:
+            return None
+
+    def _resolve_pet_decay_corrected_dose_bq(self, dataset: Dataset | None) -> float | None:
+        radiopharmaceutical = self._get_first_sequence_item(dataset, "RadiopharmaceuticalInformationSequence")
+        if dataset is None or radiopharmaceutical is None:
+            return None
+        dose = self._safe_float(getattr(radiopharmaceutical, "RadionuclideTotalDose", None))
+        if dose is None or dose <= 0.0:
+            return None
+
+        corrected_value = getattr(dataset, "CorrectedImage", []) or []
+        corrected_image = (
+            str(corrected_value).upper()
+            if isinstance(corrected_value, str)
+            else " ".join(str(value).upper() for value in corrected_value)
+        )
+        decay_correction = str(getattr(dataset, "DecayCorrection", "") or "").upper()
+        half_life = self._safe_float(getattr(radiopharmaceutical, "RadionuclideHalfLife", None))
+        if "DECY" not in corrected_image or decay_correction not in {"START", "NONE"} or half_life is None or half_life <= 0.0:
+            return float(dose)
+
+        injection_datetime = self._parse_dicom_datetime(
+            getattr(radiopharmaceutical, "RadiopharmaceuticalStartDateTime", None),
+            None,
+        ) or self._parse_dicom_datetime(
+            getattr(dataset, "SeriesDate", None) or getattr(dataset, "AcquisitionDate", None) or getattr(dataset, "StudyDate", None),
+            getattr(radiopharmaceutical, "RadiopharmaceuticalStartTime", None),
+        )
+        scan_datetime = self._parse_dicom_datetime(
+            getattr(dataset, "AcquisitionDateTime", None),
+            None,
+        ) or self._parse_dicom_datetime(
+            getattr(dataset, "AcquisitionDate", None) or getattr(dataset, "SeriesDate", None) or getattr(dataset, "StudyDate", None),
+            getattr(dataset, "AcquisitionTime", None) or getattr(dataset, "SeriesTime", None) or getattr(dataset, "StudyTime", None),
+        )
+        if injection_datetime is None or scan_datetime is None:
+            return float(dose)
+
+        elapsed_seconds = max(0.0, (scan_datetime - injection_datetime).total_seconds())
+        return float(dose) * float(np.exp(-np.log(2.0) * elapsed_seconds / float(half_life)))
+
+    @staticmethod
+    def _safe_float(value: object | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if np.isfinite(result) else None
+
+    def _resolve_pet_display_scale(self, dataset: Dataset | None, requested_unit: str) -> tuple[float, str, str]:
+        source_units = str(getattr(dataset, "Units", "") or "").strip().upper() if dataset is not None else ""
+        unit = self._normalize_fusion_pet_unit(requested_unit)
+        if unit == FUSION_PET_UNIT_SOURCE:
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        if unit == FUSION_PET_UNIT_KBQML:
+            if source_units == "BQML":
+                return (0.001, unit, FUSION_PET_UNIT_LABELS[unit])
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        if source_units in {"GML", "SUVBW"} and unit == FUSION_PET_UNIT_SUV_BW:
+            return (1.0, FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SUV_BW])
+        if source_units != "BQML":
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        dose = self._resolve_pet_decay_corrected_dose_bq(dataset)
+        if dose is None or dose <= 0.0:
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        weight_kg = self._safe_float(getattr(dataset, "PatientWeight", None))
+        height_m = self._safe_float(getattr(dataset, "PatientSize", None))
+        sex = str(getattr(dataset, "PatientSex", "") or "").upper()
+        if unit == FUSION_PET_UNIT_SUV_BW and weight_kg is not None and weight_kg > 0.0:
+            return ((weight_kg * 1000.0) / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        if unit == FUSION_PET_UNIT_SUV_BSA and weight_kg is not None and weight_kg > 0.0 and height_m is not None and height_m > 0.0:
+            height_cm = height_m * 100.0
+            bsa_cm2 = 0.007184 * (height_cm ** 0.725) * (weight_kg ** 0.425) * 10000.0
+            return (bsa_cm2 / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        if unit == FUSION_PET_UNIT_SUL and weight_kg is not None and weight_kg > 0.0 and height_m is not None and height_m > 0.0:
+            height_cm = height_m * 100.0
+            if sex == "F":
+                lbm_kg = 1.07 * weight_kg - 148.0 * ((weight_kg / height_cm) ** 2)
+            else:
+                lbm_kg = 1.10 * weight_kg - 128.0 * ((weight_kg / height_cm) ** 2)
+            if lbm_kg > 0.0:
+                return ((lbm_kg * 1000.0) / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        if unit == FUSION_PET_UNIT_PERCENT_ID_G:
+            return (100.0 / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+    def _build_fusion_pet_display_volume(
+        self,
+        pet_series: SeriesRecord,
+        pet_volume: np.ndarray,
+        requested_unit: str | None,
+    ) -> FusionPetDisplayVolume:
+        _, cached = self._get_reference_instance_and_cache(pet_series)
+        scale, actual_unit, actual_label = self._resolve_pet_display_scale(
+            cached.dataset if cached is not None else None,
+            requested_unit or FUSION_PET_UNIT_SUV_BW,
+        )
+        if abs(scale - 1.0) <= 1e-12:
+            display_volume = pet_volume
+        else:
+            display_volume = np.asarray(pet_volume, dtype=np.float32) * np.float32(scale)
+        source_units = str(getattr(cached.dataset, "Units", "") or "").strip() if cached is not None else None
+        return FusionPetDisplayVolume(
+            volume=display_volume,
+            unit=actual_unit,
+            unit_label=actual_label,
+            source_units=source_units or None,
+            scale=float(scale),
+        )
+
+    def _derive_default_pet_window_for_display_volume(
+        self,
+        display: FusionPetDisplayVolume,
+    ) -> tuple[float, float]:
+        finite = np.asarray(display.volume, dtype=np.float32)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return (1.0, 0.5)
+        if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL}:
+            return (4.5, 2.25)
+        low = 0.0 if float(np.nanmin(finite)) >= 0.0 else float(np.nanpercentile(finite, 1.0))
+        high = float(np.nanpercentile(finite, 99.5))
+        if not np.isfinite(high) or high <= low:
+            high = low + 1.0
+        return (max(WINDOW_WIDTH_MIN, high - low), (high + low) / 2.0)
+
     def _derive_default_window_for_volume(self, series: SeriesRecord, volume: np.ndarray) -> tuple[float, float]:
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
@@ -1392,6 +1610,74 @@ class ViewerService:
             (float(plane.pixel_spacing_col_mm), float(plane.pixel_spacing_row_mm)),
         )
 
+    @staticmethod
+    def _calculate_fusion_physical_contain_zoom(
+        view: ViewRecord,
+        *,
+        width_mm: float,
+        height_mm: float,
+    ) -> float:
+        width = max(float(width_mm), 1e-6)
+        height = max(float(height_mm), 1e-6)
+        return viewport_transformer.calculate_contain_zoom(
+            image_width=1,
+            image_height=1,
+            canvas_width=view.width or 1,
+            canvas_height=view.height or 1,
+            pixel_aspect_x=width,
+            pixel_aspect_y=height,
+        )
+
+    @staticmethod
+    def _project_volume_extent_to_plane(
+        *,
+        volume_shape: tuple[int, int, int],
+        geometry: VolumeGeometry,
+        plane: PlanePose,
+    ) -> tuple[float, float]:
+        row_world = np.asarray(plane.row_world, dtype=np.float64)
+        col_world = np.asarray(plane.col_world, dtype=np.float64)
+        center_world = np.asarray(plane.center_world, dtype=np.float64)
+        row_values: list[float] = []
+        col_values: list[float] = []
+        bounds = [(-0.5, float(size) - 0.5) for size in volume_shape]
+        for i_value in bounds[0]:
+            for j_value in bounds[1]:
+                for k_value in bounds[2]:
+                    voxel = np.asarray([i_value, j_value, k_value, 1.0], dtype=np.float64)
+                    world = np.asarray(geometry.ijk_to_world @ voxel, dtype=np.float64)[:3]
+                    delta = world - center_world
+                    row_values.append(float(np.dot(delta, row_world)))
+                    col_values.append(float(np.dot(delta, col_world)))
+        width_mm = max(max(col_values) - min(col_values), 1e-6)
+        height_mm = max(max(row_values) - min(row_values), 1e-6)
+        return width_mm, height_mm
+
+    def _calculate_fusion_axial_shared_fit_zoom(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> float:
+        group = view.view_group
+        axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+        plane = build_ct_axial_plane(ct_geometry, ct_volume.shape, axial_index)
+        ct_width_mm = max(float(plane.output_shape[1]) * float(plane.pixel_spacing_col_mm), 1e-6)
+        ct_height_mm = max(float(plane.output_shape[0]) * float(plane.pixel_spacing_row_mm), 1e-6)
+        pet_width_mm, pet_height_mm = self._project_volume_extent_to_plane(
+            volume_shape=tuple(int(value) for value in pet_volume.shape),
+            geometry=pet_geometry,
+            plane=plane,
+        )
+        return self._calculate_fusion_physical_contain_zoom(
+            view,
+            width_mm=max(ct_width_mm, pet_width_mm),
+            height_mm=max(ct_height_mm, pet_height_mm),
+        )
+
     def _fit_fusion_view_to_source(
         self,
         view: ViewRecord,
@@ -1401,6 +1687,22 @@ class ViewerService:
         pet_volume: np.ndarray,
         pet_geometry: VolumeGeometry,
     ) -> None:
+        if self._resolve_fusion_pane_role(view) != FUSION_PANE_PET_CORONAL_MIP:
+            view.zoom = self._calculate_fusion_axial_shared_fit_zoom(
+                view,
+                ct_volume=ct_volume,
+                ct_geometry=ct_geometry,
+                pet_volume=pet_volume,
+                pet_geometry=pet_geometry,
+            )
+            view.offset_x = 0.0
+            view.offset_y = 0.0
+            view.rotation_degrees = 0
+            view.hor_flip = False
+            view.ver_flip = False
+            self._reset_drag_state(view)
+            return
+
         image_height, image_width, spacing_xy = self._get_fusion_source_shape_and_spacing(
             view,
             ct_volume=ct_volume,
@@ -1434,12 +1736,15 @@ class ViewerService:
         if not group.fusion_initialized:
             group.fusion_axial_index = ct_volume.shape[0] // 2
             ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
-            pet_ww, pet_wl = self._derive_default_window_for_volume(pet_series, pet_volume)
+            group.fusion_pet_unit = self._normalize_fusion_pet_unit(group.fusion_pet_unit)
+            pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
+            group.fusion_pet_unit = pet_display.unit
+            pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
             group.window.window_width = ct_ww
             group.window.window_center = ct_wl
             group.fusion_pet_window.window_width = pet_ww
             group.fusion_pet_window.window_center = pet_wl
-            group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(group.fusion_pet_pseudocolor_preset or "pet")
+            group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(group.fusion_pet_pseudocolor_preset or "petct-rainbow")
             group.fusion_initialized = True
         self._fit_fusion_view_to_source(
             view,
@@ -1476,6 +1781,8 @@ class ViewerService:
             self._initialize_fusion_viewport(view)
             return
         group.fusion_initialized = False
+        group.fusion_pet_pseudocolor_preset = "petct-rainbow"
+        group.fusion_pet_unit = FUSION_PET_UNIT_SUV_BW
         group.fusion_registration = FusionRegistrationState()
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
@@ -1866,18 +2173,20 @@ class ViewerService:
         group, ct_series, pet_series = self._resolve_fusion_group_series(view)
         ct_volume = self._get_series_volume(ct_series, progress_callback=progress_callback)
         pet_volume = self._get_series_volume(pet_series, progress_callback=progress_callback)
+        pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
         ct_transform = self._get_series_patient_transform(ct_series)
         pet_transform = self._get_series_patient_transform(pet_series)
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
         pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
         role = self._resolve_fusion_pane_role(view)
         self._sync_fusion_view_state_from_group(view)
+        self._emit_render_progress(progress_callback, "render", progress_percent=82)
 
         fusion_result = render_fusion_pixels(
             pane_role=role,
             ct_volume=ct_volume,
             ct_geometry=ct_geometry,
-            pet_volume=pet_volume,
+            pet_volume=pet_display.volume,
             pet_geometry=pet_geometry,
             axial_index=group.fusion_axial_index,
             ct_window_width=group.window.window_width,
@@ -1897,7 +2206,7 @@ class ViewerService:
                 and tuple(int(value) for value in pet_transform.shape)
                 == tuple(int(value) for value in pet_volume.shape)
             ),
-            interpolation_order=0 if fast_preview else 1,
+            interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
         )
         source_image = image_from_pixels(fusion_result.pixels)
         pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(fusion_result.spacing_xy)
@@ -1947,6 +2256,14 @@ class ViewerService:
             if corner_instance is not None and corner_cached is not None
             else None
         )
+        if corner_info is not None and role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
+            corner_info = self._with_pet_window_corner_info(
+                corner_info,
+                pet_display,
+                group.fusion_pet_window.window_width,
+                group.fusion_pet_window.window_center,
+            )
+        self._emit_render_progress(progress_callback, "encode", progress_percent=96)
         image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
         logger.debug(
             "fusion render timing view_id=%s role=%s fast_preview=%s image_format=%s source_shape=%s render=%sx%s total_ms=%.1f",
@@ -1975,6 +2292,16 @@ class ViewerService:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petUnit=pet_display.unit,
+                    petUnitLabel=pet_display.unit_label,
+                    petWindowMin=self._resolve_window_min(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    petWindowMax=self._resolve_window_max(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=FusionRegistrationInfo(
@@ -3518,6 +3845,41 @@ class ViewerService:
             next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
             if group.fusion_pet_pseudocolor_preset != next_preset:
                 group.fusion_pet_pseudocolor_preset = next_preset
+                changed = True
+        if payload.fusion_pet_unit is not None:
+            next_unit = self._normalize_fusion_pet_unit(payload.fusion_pet_unit)
+            if group.fusion_pet_unit != next_unit:
+                group.fusion_pet_unit = next_unit
+                try:
+                    _, _, pet_series = self._resolve_fusion_group_series(view)
+                    pet_volume = self._get_series_volume(pet_series)
+                    pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, next_unit)
+                    group.fusion_pet_unit = pet_display.unit
+                    pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+                    group.fusion_pet_window.window_width = pet_ww
+                    group.fusion_pet_window.window_center = pet_wl
+                except Exception:
+                    logger.debug("failed to reset fusion PET window for unit=%s", next_unit, exc_info=True)
+                changed = True
+        if payload.fusion_pet_window_min is not None or payload.fusion_pet_window_max is not None:
+            current_low = self._resolve_window_min(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
+            current_high = self._resolve_window_max(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
+            next_low = float(payload.fusion_pet_window_min) if payload.fusion_pet_window_min is not None else float(current_low or 0.0)
+            next_high = float(payload.fusion_pet_window_max) if payload.fusion_pet_window_max is not None else float(current_high or max(next_low + 1.0, 1.0))
+            if not np.isfinite(next_low):
+                next_low = 0.0
+            if not np.isfinite(next_high) or next_high <= next_low:
+                next_high = next_low + 1.0
+            next_width = max(WINDOW_WIDTH_MIN, next_high - next_low)
+            next_center = (next_low + next_high) / 2.0
+            if (
+                group.fusion_pet_window.window_width is None
+                or group.fusion_pet_window.window_center is None
+                or abs(float(group.fusion_pet_window.window_width) - next_width) > 1e-6
+                or abs(float(group.fusion_pet_window.window_center) - next_center) > 1e-6
+            ):
+                group.fusion_pet_window.window_width = next_width
+                group.fusion_pet_window.window_center = next_center
                 changed = True
         if changed:
             group.fusion_revision += 1
@@ -5473,6 +5835,56 @@ class ViewerService:
         if ww is None and wl is None:
             return None
         return f"W: {ww or '-'} L: {wl or '-'}"
+
+    @staticmethod
+    def _resolve_window_min(window_width: float | None, window_center: float | None) -> float | None:
+        if window_width is None or window_center is None:
+            return None
+        return float(window_center) - float(window_width) / 2.0
+
+    @staticmethod
+    def _resolve_window_max(window_width: float | None, window_center: float | None) -> float | None:
+        if window_width is None or window_center is None:
+            return None
+        return float(window_center) + float(window_width) / 2.0
+
+    @staticmethod
+    def _build_pet_window_label(
+        display: FusionPetDisplayVolume,
+        window_width: float | None,
+        window_center: float | None,
+    ) -> str | None:
+        low = ViewerService._resolve_window_min(window_width, window_center)
+        high = ViewerService._resolve_window_max(window_width, window_center)
+        if low is None or high is None:
+            return None
+        low_text = f"{float(low):.2f}"
+        high_text = f"{float(high):.2f}"
+        prefix = "SUV" if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL} else "PET"
+        return f"{prefix}:{low_text}--{high_text} {display.unit_label}"
+
+    def _with_pet_window_corner_info(
+        self,
+        corner_info: CornerInfoOverlay,
+        display: FusionPetDisplayVolume,
+        window_width: float | None,
+        window_center: float | None,
+    ) -> CornerInfoOverlay:
+        pet_window = self._build_pet_window_label(display, window_width, window_center)
+        if not pet_window:
+            return corner_info
+        default_window = self._build_window_label(window_width, window_center)
+        tags = dict(corner_info.tags)
+        tags["windowLevel"] = (pet_window,)
+        bottom_left = tuple(
+            pet_window
+            if (default_window and line == default_window) or str(line).strip().upper().startswith("W:")
+            else line
+            for line in corner_info.bottom_left
+        )
+        if pet_window not in bottom_left:
+            bottom_left = (pet_window, *bottom_left)
+        return replace(corner_info, bottom_left=bottom_left, tags=tags)
 
     @staticmethod
     def _safe_text(value) -> str | None:

@@ -54,9 +54,8 @@ def _axis_direction_and_spacing(geometry: VolumeGeometry, axis_index: int) -> tu
     return axis / spacing, spacing
 
 
-def _resolve_pet_standalone_pseudocolor_preset(preset: str | None) -> str:
-    normalized = normalize_pseudocolor_preset(preset)
-    return "bwinverse" if normalized == "pet" else normalized
+def _resolve_pet_standalone_pseudocolor_preset() -> str:
+    return "bwinverse"
 
 
 def clamp_fusion_axial_index(index: int, ct_shape: tuple[int, int, int]) -> int:
@@ -175,7 +174,7 @@ def render_fusion_pixels(
         pet_mip = np.max(np.asarray(pet_volume, dtype=np.float32), axis=1)
         pet_mip = np.flipud(pet_mip)
         pet_uint8 = window_to_uint8(pet_mip, pet_window_width, pet_window_center)
-        pet_display_preset = _resolve_pet_standalone_pseudocolor_preset(pet_pseudocolor_preset)
+        pet_display_preset = _resolve_pet_standalone_pseudocolor_preset()
         pet_rgb = apply_pseudocolor(pet_uint8, pet_display_preset)
         row_world, row_spacing = _axis_direction_and_spacing(pet_geometry, 0)
         col_world, col_spacing = _axis_direction_and_spacing(pet_geometry, 2)
@@ -211,7 +210,7 @@ def render_fusion_pixels(
 
     pet_uint8 = window_to_uint8(pet_slice, pet_window_width, pet_window_center)
     if pane_role == FUSION_PANE_PET_AXIAL:
-        pet_display_preset = _resolve_pet_standalone_pseudocolor_preset(pet_pseudocolor_preset)
+        pet_display_preset = _resolve_pet_standalone_pseudocolor_preset()
         pet_rgb = apply_pseudocolor(pet_uint8, pet_display_preset)
         return FusionRenderResult(
             pixels=pet_rgb,
