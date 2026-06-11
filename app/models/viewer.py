@@ -141,6 +141,34 @@ class MprMipState:
 
 
 @dataclass
+class MprSegmentationVoiBoxState:
+    x_min: float = 0.0
+    x_max: float = 1.0
+    y_min: float = 0.0
+    y_max: float = 1.0
+    z_min: float = 0.0
+    z_max: float = 1.0
+
+
+@dataclass
+class MprSegmentationState:
+    enabled: bool = False
+    lower_hu: float = 300.0
+    upper_hu: float = 3071.0
+    opacity: float = 0.45
+    color: str = "#22d3ee"
+    voi_box: MprSegmentationVoiBoxState | None = field(default_factory=MprSegmentationVoiBoxState)
+
+
+@dataclass
+class FusionRegistrationState:
+    translate_row_mm: float = 0.0
+    translate_col_mm: float = 0.0
+    rotation_degrees: float = 0.0
+    saved: bool = False
+
+
+@dataclass
 class MprObliquePlaneState:
     row: tuple[float, float, float]
     col: tuple[float, float, float]
@@ -189,6 +217,18 @@ class ViewGroupRecord:
     group_type: str
     series_id: str
     workspace_id: str = DEFAULT_WORKSPACE_ID
+    secondary_series_id: str | None = None
+    fusion_ct_series_id: str | None = None
+    fusion_pet_series_id: str | None = None
+    fusion_view_group_key: str | None = None
+    fusion_initialized: bool = False
+    fusion_axial_index: int = 0
+    fusion_pet_pseudocolor_preset: str = "petct-rainbow"
+    fusion_pet_unit: str = "SUVbw"
+    fusion_alpha: float = 0.52
+    fusion_pet_window: WindowState = field(default_factory=WindowState)
+    fusion_revision: int = 0
+    fusion_registration: FusionRegistrationState = field(default_factory=FusionRegistrationState)
     active_viewport: str = "mpr-ax"
     axial_index: int = 0
     coronal_index: int = 0
@@ -201,6 +241,7 @@ class ViewGroupRecord:
     crosshair_drag_origin_center: tuple[float, float, float] | None = None
     crosshair_drag_origin_image: tuple[float, float] | None = None
     mpr_mip: MprMipState = field(default_factory=MprMipState)
+    mpr_segmentation: MprSegmentationState = field(default_factory=MprSegmentationState)
     mpr_cursor: MprCursorRecord | None = None
     mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
     mpr_crosshair_mode: str = "orthogonal"
@@ -223,6 +264,8 @@ class ViewRecord:
     series_id: str
     view_type: str
     workspace_id: str = DEFAULT_WORKSPACE_ID
+    secondary_series_id: str | None = None
+    fusion_pane_role: str | None = None
     pseudocolor_preset: str = "bw"
     width: int | None = None
     height: int | None = None
@@ -322,14 +365,26 @@ class ViewRecord:
     def ver_flip(self, value: bool) -> None:
         self.transform.ver_flip = value
 
+    def _uses_fusion_pet_window(self) -> bool:
+        return (
+            self.view_group is not None
+            and self.view_group.group_type == "fusion"
+            and self.fusion_pane_role in {"fusion-pet-ax", "fusion-pet-cor-mip"}
+        )
+
     @property
     def window_width(self) -> float | None:
+        if self._uses_fusion_pet_window():
+            return self.view_group.fusion_pet_window.window_width
         if self.view_group is not None:
             return self.view_group.window.window_width
         return self.window.window_width
 
     @window_width.setter
     def window_width(self, value: float | None) -> None:
+        if self._uses_fusion_pet_window():
+            self.view_group.fusion_pet_window.window_width = value
+            return
         if self.view_group is not None:
             self.view_group.window.window_width = value
             return
@@ -337,12 +392,17 @@ class ViewRecord:
 
     @property
     def window_center(self) -> float | None:
+        if self._uses_fusion_pet_window():
+            return self.view_group.fusion_pet_window.window_center
         if self.view_group is not None:
             return self.view_group.window.window_center
         return self.window.window_center
 
     @window_center.setter
     def window_center(self, value: float | None) -> None:
+        if self._uses_fusion_pet_window():
+            self.view_group.fusion_pet_window.window_center = value
+            return
         if self.view_group is not None:
             self.view_group.window.window_center = value
             return
@@ -483,4 +543,10 @@ class ViewRecord:
         if self.view_group is not None:
             return self.view_group.mpr_mip
         return MprMipState()
+
+    @property
+    def mpr_segmentation(self) -> MprSegmentationState:
+        if self.view_group is not None:
+            return self.view_group.mpr_segmentation
+        return MprSegmentationState()
 

@@ -15,10 +15,13 @@ VIEW_OP_TYPE_VOLUME_CONFIG: Final = "volumeConfig"
 VIEW_OP_TYPE_RENDER_3D_MODE: Final = "render3dMode"
 VIEW_OP_TYPE_SURFACE_CONFIG: Final = "surfaceConfig"
 VIEW_OP_TYPE_MPR_MIP_CONFIG: Final = "mprMipConfig"
+VIEW_OP_TYPE_MPR_SEGMENTATION: Final = "mprSegmentation"
 VIEW_OP_TYPE_MPR_OBLIQUE: Final = "mprOblique"
 VIEW_OP_TYPE_MPR_CROSSHAIR_MODE: Final = "mprCrosshairMode"
 VIEW_OP_TYPE_MPR_STATE_SYNC: Final = "mprStateSync"
 VIEW_OP_TYPE_MEASUREMENT: Final = "measurement"
+VIEW_OP_TYPE_FUSION_REGISTRATION: Final = "fusionRegistration"
+VIEW_OP_TYPE_FUSION_CONFIG: Final = "fusionConfig"
 
 DRAG_ACTION_START: Final = "start"
 DRAG_ACTION_MOVE: Final = "move"
@@ -46,5 +49,16 @@ MPR_VIEWPORT_TYPES: Final = {
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
+}
+
+FUSION_PANE_CT_AXIAL: Final = "fusion-ct-ax"
+FUSION_PANE_PET_AXIAL: Final = "fusion-pet-ax"
+FUSION_PANE_OVERLAY_AXIAL: Final = "fusion-overlay-ax"
+FUSION_PANE_PET_CORONAL_MIP: Final = "fusion-pet-cor-mip"
+FUSION_PANE_TYPES: Final = {
+    FUSION_PANE_CT_AXIAL,
+    FUSION_PANE_PET_AXIAL,
+    FUSION_PANE_OVERLAY_AXIAL,
+    FUSION_PANE_PET_CORONAL_MIP,
 }
 

@@ -25,6 +25,10 @@ from app.core import (
     DRAG_ACTION_END,
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
+    FUSION_PANE_CT_AXIAL,
+    FUSION_PANE_OVERLAY_AXIAL,
+    FUSION_PANE_PET_AXIAL,
+    FUSION_PANE_PET_CORONAL_MIP,
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
@@ -48,6 +52,7 @@ from app.core import (
 from app.core.logging import get_logger
 from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import (
+    FusionRegistrationState,
     InstanceRecord,
     MprCursorRecord,
     MprFrameState,
@@ -55,6 +60,8 @@ from app.models.viewer import (
     MprMipViewportState,
     MprObliquePlaneState,
     MprRotationDragRecord,
+    MprSegmentationState,
+    MprSegmentationVoiBoxState,
     PresentationAnnotationRecord,
     PresentationMeasurementRecord,
     SeriesRecord,
@@ -71,6 +78,8 @@ from app.schemas.view import (
     MprMipConfig,
     MprMipViewportConfig,
     MprPlaneInfo,
+    MprSegmentationConfig,
+    MprSegmentationVoiBox,
     MeasurementOverlayPayload,
     OperationAcceptedResponse,
     OrientationInfo,
@@ -85,6 +94,9 @@ from app.schemas.view import (
     ViewQaWaterAnalyzeRequest,
     ViewQaWaterAnalyzeResponse,
     ViewTransformPayload,
+    FusionInfo,
+    FusionProjectionInfo,
+    FusionRegistrationInfo,
     ViewMtfAnalyzeResponse,
     ViewOperationRequest,
     ViewSetSizeRequest,
@@ -142,6 +154,15 @@ from app.services.view_group_registry import view_group_registry
 from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
 from app.services.viewer_render_dispatch import render_by_view_type
+from app.services.viewer_fusion import (
+    FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET,
+    FUSION_VIEW_TYPES,
+    FUSION_VIEW_TYPE_TO_PANE_ROLE,
+    FusionSourceProjection,
+    build_ct_axial_plane,
+    image_from_pixels,
+    render_fusion_pixels,
+)
 from app.services.viewer_render_guards import ensure_view_size
 from app.services.water_phantom_qa_service import WaterPhantomQaService
 from app.services.volume_render_config import (
@@ -154,6 +175,33 @@ from app.services.volume_rendering.contracts import SurfaceRenderRequest, Volume
 
 
 logger = get_logger(__name__)
+
+FUSION_PET_UNIT_SOURCE = "source"
+FUSION_PET_UNIT_KBQML = "kBqml"
+FUSION_PET_UNIT_SUV_BW = "SUVbw"
+FUSION_PET_UNIT_SUV_BSA = "SUVbsa"
+FUSION_PET_UNIT_SUL = "SUL"
+FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
+FUSION_PET_UNIT_LABELS: dict[str, str] = {
+    FUSION_PET_UNIT_SOURCE: "source",
+    FUSION_PET_UNIT_KBQML: "kBq/ml (uptake)",
+    FUSION_PET_UNIT_SUV_BSA: "cm2/ml (SUVbsa)",
+    FUSION_PET_UNIT_SUV_BW: "g/ml (SUVbw)",
+    FUSION_PET_UNIT_SUL: "g/ml* (SUL)",
+    FUSION_PET_UNIT_PERCENT_ID_G: "%ID/g",
+}
+# SUV fusion display starts from a reference-viewer preset, not from PET intensity percentiles.
+FUSION_DEFAULT_SUV_WINDOW_MIN = 0.0
+FUSION_DEFAULT_SUV_WINDOW_MAX = 4.49
+
+
+@dataclass(frozen=True)
+class FusionPetDisplayVolume:
+    volume: np.ndarray
+    unit: str
+    unit_label: str
+    source_units: str | None = None
+    scale: float = 1.0
 
 CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
@@ -264,6 +312,10 @@ class ViewerService:
     def _is_3d_view_type(view_type: str) -> bool:
         return view_type == "3D"
 
+    @staticmethod
+    def _is_fusion_view_type(view_type: str) -> bool:
+        return view_type in FUSION_VIEW_TYPES
+
     def set_view_size(
         self,
         payload: ViewSetSizeRequest,
@@ -283,7 +335,9 @@ class ViewerService:
         )
 
         if not view.is_initialized:
-            if not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
+            if self._is_fusion_view_type(view.view_type):
+                self._initialize_fusion_viewport(view)
+            elif not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
                 self._initialize_viewport(view)
                 view.is_initialized = True
 
@@ -1070,6 +1124,21 @@ class ViewerService:
     def _get_mpr_display_aspect_xy_from_pose(plane_pose: PlanePose) -> tuple[float, float]:
         return ViewerService._get_mpr_spacing_xy_from_pose(plane_pose)
 
+    @staticmethod
+    def _get_display_aspect_xy_from_spacing(spacing_xy: tuple[float, float] | None) -> tuple[float, float]:
+        if spacing_xy is None:
+            return (1.0, 1.0)
+        try:
+            spacing_x = abs(float(spacing_xy[0]))
+            spacing_y = abs(float(spacing_xy[1]))
+        except (TypeError, ValueError, IndexError):
+            return (1.0, 1.0)
+        if not np.isfinite(spacing_x) or spacing_x <= 0.0:
+            spacing_x = 1.0
+        if not np.isfinite(spacing_y) or spacing_y <= 0.0:
+            spacing_y = 1.0
+        return (max(spacing_x, 1e-6), max(spacing_y, 1e-6))
+
     def _render_by_view_type(
         self,
         view: ViewRecord,
@@ -1256,6 +1325,7 @@ class ViewerService:
         target_group.mpr_crosshair_mode = self._normalize_mpr_crosshair_mode(source_group.mpr_crosshair_mode)
         target_group.mpr_independent_plane_normals = deepcopy(source_group.mpr_independent_plane_normals)
         target_group.mpr_mip = deepcopy(source_group.mpr_mip)
+        target_group.mpr_segmentation = deepcopy(source_group.mpr_segmentation)
         target_group.mpr_use_display_basis_for_cursor_offsets = bool(source_group.mpr_use_display_basis_for_cursor_offsets)
         target_group.mpr_model_rotation_world = deepcopy(source_group.mpr_model_rotation_world)
         target_group.mpr_model_rotation_pivot_world = deepcopy(source_group.mpr_model_rotation_pivot_world)
@@ -1301,6 +1371,447 @@ class ViewerService:
             view.window_center,
         )
 
+    def _resolve_fusion_group_series(self, view: ViewRecord) -> tuple[ViewGroupRecord, SeriesRecord, SeriesRecord]:
+        group = view.view_group
+        if group is None or str(group.group_type).lower() != "fusion":
+            raise HTTPException(status_code=400, detail="Fusion view is missing shared group state")
+        ct_series_id = group.fusion_ct_series_id or view.series_id
+        pet_series_id = group.fusion_pet_series_id or view.secondary_series_id
+        if not pet_series_id:
+            raise HTTPException(status_code=400, detail="Fusion view is missing PET series")
+        ct_series = series_registry.get(ct_series_id, workspace_id=view.workspace_id)
+        pet_series = series_registry.get(pet_series_id, workspace_id=view.workspace_id)
+        return group, ct_series, pet_series
+
+    @staticmethod
+    def _normalize_fusion_pet_unit(value: str | None) -> str:
+        normalized = str(value or FUSION_PET_UNIT_SUV_BW).strip()
+        aliases = {
+            "raw": FUSION_PET_UNIT_SOURCE,
+            "source": FUSION_PET_UNIT_SOURCE,
+            "BQML": FUSION_PET_UNIT_SOURCE,
+            "kBq/ml": FUSION_PET_UNIT_KBQML,
+            "kBqml": FUSION_PET_UNIT_KBQML,
+            "uptake": FUSION_PET_UNIT_KBQML,
+            "SUV": FUSION_PET_UNIT_SUV_BW,
+            "SUVbw": FUSION_PET_UNIT_SUV_BW,
+            "GML": FUSION_PET_UNIT_SUV_BW,
+            "SUVbsa": FUSION_PET_UNIT_SUV_BSA,
+            "SUL": FUSION_PET_UNIT_SUL,
+            "%ID/g": FUSION_PET_UNIT_PERCENT_ID_G,
+            "percentIDg": FUSION_PET_UNIT_PERCENT_ID_G,
+        }
+        return aliases.get(normalized, aliases.get(normalized.upper(), FUSION_PET_UNIT_SUV_BW))
+
+    @staticmethod
+    def _parse_dicom_datetime(date_value: object | None, time_value: object | None = None) -> datetime | None:
+        if date_value is None and time_value is None:
+            return None
+        date_text = str(date_value or "").strip()
+        time_text = str(time_value or "").strip()
+        text = f"{date_text}{time_text}" if time_text else date_text
+        text = text.replace(" ", "").replace(":", "")
+        if "." in text:
+            head, tail = text.split(".", 1)
+            text = f"{head}.{''.join(ch for ch in tail if ch.isdigit())}"
+        else:
+            text = "".join(ch for ch in text if ch.isdigit())
+        if time_text:
+            date_digits = "".join(ch for ch in date_text if ch.isdigit())
+            time_digits = "".join(ch for ch in time_text if ch.isdigit())
+            text = f"{date_digits}{time_digits}"
+        if not text:
+            return None
+
+        if "." in text:
+            main_text, fractional_text = text.split(".", 1)
+            text = f"{main_text}{fractional_text[:6].ljust(6, '0')}"
+            formats = ("%Y%m%d%H%M%S%f",)
+        else:
+            formats = ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y%m%d")
+        for fmt in formats:
+            expected_len = len(datetime(2000, 1, 1, 1, 1, 1, 123456).strftime(fmt))
+            try:
+                return datetime.strptime(text[:expected_len], fmt)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _get_first_sequence_item(dataset: Dataset | None, name: str) -> Dataset | None:
+        if dataset is None:
+            return None
+        sequence = getattr(dataset, name, None)
+        try:
+            return sequence[0] if sequence else None
+        except Exception:
+            return None
+
+    def _resolve_pet_decay_corrected_dose_bq(self, dataset: Dataset | None) -> float | None:
+        radiopharmaceutical = self._get_first_sequence_item(dataset, "RadiopharmaceuticalInformationSequence")
+        if dataset is None or radiopharmaceutical is None:
+            return None
+        dose = self._safe_float(getattr(radiopharmaceutical, "RadionuclideTotalDose", None))
+        if dose is None or dose <= 0.0:
+            return None
+
+        corrected_value = getattr(dataset, "CorrectedImage", []) or []
+        corrected_image = (
+            str(corrected_value).upper()
+            if isinstance(corrected_value, str)
+            else " ".join(str(value).upper() for value in corrected_value)
+        )
+        decay_correction = str(getattr(dataset, "DecayCorrection", "") or "").upper()
+        half_life = self._safe_float(getattr(radiopharmaceutical, "RadionuclideHalfLife", None))
+        if "DECY" not in corrected_image or decay_correction not in {"START", "NONE"} or half_life is None or half_life <= 0.0:
+            return float(dose)
+
+        injection_datetime = self._parse_dicom_datetime(
+            getattr(radiopharmaceutical, "RadiopharmaceuticalStartDateTime", None),
+            None,
+        ) or self._parse_dicom_datetime(
+            getattr(dataset, "SeriesDate", None) or getattr(dataset, "AcquisitionDate", None) or getattr(dataset, "StudyDate", None),
+            getattr(radiopharmaceutical, "RadiopharmaceuticalStartTime", None),
+        )
+        scan_datetime = self._parse_dicom_datetime(
+            getattr(dataset, "AcquisitionDateTime", None),
+            None,
+        ) or self._parse_dicom_datetime(
+            getattr(dataset, "AcquisitionDate", None) or getattr(dataset, "SeriesDate", None) or getattr(dataset, "StudyDate", None),
+            getattr(dataset, "AcquisitionTime", None) or getattr(dataset, "SeriesTime", None) or getattr(dataset, "StudyTime", None),
+        )
+        if injection_datetime is None or scan_datetime is None:
+            return float(dose)
+
+        elapsed_seconds = max(0.0, (scan_datetime - injection_datetime).total_seconds())
+        return float(dose) * float(np.exp(-np.log(2.0) * elapsed_seconds / float(half_life)))
+
+    @staticmethod
+    def _safe_float(value: object | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if np.isfinite(result) else None
+
+    def _resolve_pet_display_scale(self, dataset: Dataset | None, requested_unit: str) -> tuple[float, str, str]:
+        source_units = str(getattr(dataset, "Units", "") or "").strip().upper() if dataset is not None else ""
+        unit = self._normalize_fusion_pet_unit(requested_unit)
+        if unit == FUSION_PET_UNIT_SOURCE:
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        if unit == FUSION_PET_UNIT_KBQML:
+            if source_units == "BQML":
+                return (0.001, unit, FUSION_PET_UNIT_LABELS[unit])
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        if source_units in {"GML", "SUVBW"} and unit == FUSION_PET_UNIT_SUV_BW:
+            return (1.0, FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SUV_BW])
+        if source_units != "BQML":
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        dose = self._resolve_pet_decay_corrected_dose_bq(dataset)
+        if dose is None or dose <= 0.0:
+            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+        weight_kg = self._safe_float(getattr(dataset, "PatientWeight", None))
+        height_m = self._safe_float(getattr(dataset, "PatientSize", None))
+        sex = str(getattr(dataset, "PatientSex", "") or "").upper()
+        if unit == FUSION_PET_UNIT_SUV_BW and weight_kg is not None and weight_kg > 0.0:
+            return ((weight_kg * 1000.0) / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        if unit == FUSION_PET_UNIT_SUV_BSA and weight_kg is not None and weight_kg > 0.0 and height_m is not None and height_m > 0.0:
+            height_cm = height_m * 100.0
+            bsa_cm2 = 0.007184 * (height_cm ** 0.725) * (weight_kg ** 0.425) * 10000.0
+            return (bsa_cm2 / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        if unit == FUSION_PET_UNIT_SUL and weight_kg is not None and weight_kg > 0.0 and height_m is not None and height_m > 0.0:
+            height_cm = height_m * 100.0
+            if sex == "F":
+                lbm_kg = 1.07 * weight_kg - 148.0 * ((weight_kg / height_cm) ** 2)
+            else:
+                lbm_kg = 1.10 * weight_kg - 128.0 * ((weight_kg / height_cm) ** 2)
+            if lbm_kg > 0.0:
+                return ((lbm_kg * 1000.0) / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        if unit == FUSION_PET_UNIT_PERCENT_ID_G:
+            return (100.0 / dose, unit, FUSION_PET_UNIT_LABELS[unit])
+        return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+
+    def _build_fusion_pet_display_volume(
+        self,
+        pet_series: SeriesRecord,
+        pet_volume: np.ndarray,
+        requested_unit: str | None,
+    ) -> FusionPetDisplayVolume:
+        _, cached = self._get_reference_instance_and_cache(pet_series)
+        scale, actual_unit, actual_label = self._resolve_pet_display_scale(
+            cached.dataset if cached is not None else None,
+            requested_unit or FUSION_PET_UNIT_SUV_BW,
+        )
+        if abs(scale - 1.0) <= 1e-12:
+            display_volume = pet_volume
+        else:
+            display_volume = np.asarray(pet_volume, dtype=np.float32) * np.float32(scale)
+        source_units = str(getattr(cached.dataset, "Units", "") or "").strip() if cached is not None else None
+        return FusionPetDisplayVolume(
+            volume=display_volume,
+            unit=actual_unit,
+            unit_label=actual_label,
+            source_units=source_units or None,
+            scale=float(scale),
+        )
+
+    def _derive_default_pet_window_for_display_volume(
+        self,
+        display: FusionPetDisplayVolume,
+    ) -> tuple[float, float]:
+        finite = np.asarray(display.volume, dtype=np.float32)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return (1.0, 0.5)
+        if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL}:
+            window_width = FUSION_DEFAULT_SUV_WINDOW_MAX - FUSION_DEFAULT_SUV_WINDOW_MIN
+            window_center = (FUSION_DEFAULT_SUV_WINDOW_MAX + FUSION_DEFAULT_SUV_WINDOW_MIN) / 2.0
+            return (window_width, window_center)
+        positive = finite[finite > 0.0]
+        pet_window_values = positive if positive.size else finite
+        low = 0.0 if float(np.nanmin(finite)) >= 0.0 else float(np.nanpercentile(finite, 1.0))
+        high = float(np.nanpercentile(pet_window_values, 99.5))
+        if not np.isfinite(high) or high <= low:
+            high = low + 1.0
+        return (max(WINDOW_WIDTH_MIN, high - low), (high + low) / 2.0)
+
+    def _derive_default_window_for_volume(self, series: SeriesRecord, volume: np.ndarray) -> tuple[float, float]:
+        first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
+        if first_instance is not None and first_instance.sop_instance_uid:
+            cached = dicom_cache.get(first_instance.sop_instance_uid, first_instance.path)
+            return (
+                float(cached.window_width or self._derive_default_window_width(cached)),
+                float(cached.window_center or self._derive_default_window_center(cached)),
+            )
+        pixel_min = float(np.min(volume))
+        pixel_max = float(np.max(volume))
+        return (max(WINDOW_WIDTH_MIN, pixel_max - pixel_min), (pixel_min + pixel_max) / 2.0)
+
+    @staticmethod
+    def _get_geometry_axis_spacing(geometry: VolumeGeometry, axis_index: int) -> float:
+        axis = np.asarray(geometry.ijk_to_world[:3, axis_index], dtype=np.float64)
+        spacing = float(np.linalg.norm(axis))
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            return 1.0
+        return max(spacing, 1e-6)
+
+    def _get_fusion_source_shape_and_spacing(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> tuple[int, int, tuple[float, float]]:
+        role = self._resolve_fusion_pane_role(view)
+        if role == FUSION_PANE_PET_CORONAL_MIP:
+            image_height = int(pet_volume.shape[0])
+            image_width = int(pet_volume.shape[2])
+            spacing_x = self._get_geometry_axis_spacing(pet_geometry, 2)
+            spacing_y = self._get_geometry_axis_spacing(pet_geometry, 0)
+            return image_height, image_width, (spacing_x, spacing_y)
+
+        group = view.view_group
+        axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+        plane = build_ct_axial_plane(ct_geometry, ct_volume.shape, axial_index)
+        return (
+            int(plane.output_shape[0]),
+            int(plane.output_shape[1]),
+            (float(plane.pixel_spacing_col_mm), float(plane.pixel_spacing_row_mm)),
+        )
+
+    @staticmethod
+    def _calculate_fusion_physical_contain_zoom(
+        view: ViewRecord,
+        *,
+        width_mm: float,
+        height_mm: float,
+    ) -> float:
+        width = max(float(width_mm), 1e-6)
+        height = max(float(height_mm), 1e-6)
+        return viewport_transformer.calculate_contain_zoom(
+            image_width=1,
+            image_height=1,
+            canvas_width=view.width or 1,
+            canvas_height=view.height or 1,
+            pixel_aspect_x=width,
+            pixel_aspect_y=height,
+        )
+
+    @staticmethod
+    def _project_volume_extent_to_plane(
+        *,
+        volume_shape: tuple[int, int, int],
+        geometry: VolumeGeometry,
+        plane: PlanePose,
+    ) -> tuple[float, float]:
+        row_world = np.asarray(plane.row_world, dtype=np.float64)
+        col_world = np.asarray(plane.col_world, dtype=np.float64)
+        center_world = np.asarray(plane.center_world, dtype=np.float64)
+        row_values: list[float] = []
+        col_values: list[float] = []
+        bounds = [(-0.5, float(size) - 0.5) for size in volume_shape]
+        for i_value in bounds[0]:
+            for j_value in bounds[1]:
+                for k_value in bounds[2]:
+                    voxel = np.asarray([i_value, j_value, k_value, 1.0], dtype=np.float64)
+                    world = np.asarray(geometry.ijk_to_world @ voxel, dtype=np.float64)[:3]
+                    delta = world - center_world
+                    row_values.append(float(np.dot(delta, row_world)))
+                    col_values.append(float(np.dot(delta, col_world)))
+        width_mm = max(max(col_values) - min(col_values), 1e-6)
+        height_mm = max(max(row_values) - min(row_values), 1e-6)
+        return width_mm, height_mm
+
+    def _calculate_fusion_axial_shared_fit_zoom(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> float:
+        group = view.view_group
+        axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+        plane = build_ct_axial_plane(ct_geometry, ct_volume.shape, axial_index)
+        ct_width_mm = max(float(plane.output_shape[1]) * float(plane.pixel_spacing_col_mm), 1e-6)
+        ct_height_mm = max(float(plane.output_shape[0]) * float(plane.pixel_spacing_row_mm), 1e-6)
+        pet_width_mm, pet_height_mm = self._project_volume_extent_to_plane(
+            volume_shape=tuple(int(value) for value in pet_volume.shape),
+            geometry=pet_geometry,
+            plane=plane,
+        )
+        return self._calculate_fusion_physical_contain_zoom(
+            view,
+            width_mm=max(ct_width_mm, pet_width_mm),
+            height_mm=max(ct_height_mm, pet_height_mm),
+        )
+
+    def _fit_fusion_view_to_source(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> None:
+        if self._resolve_fusion_pane_role(view) != FUSION_PANE_PET_CORONAL_MIP:
+            view.zoom = self._calculate_fusion_axial_shared_fit_zoom(
+                view,
+                ct_volume=ct_volume,
+                ct_geometry=ct_geometry,
+                pet_volume=pet_volume,
+                pet_geometry=pet_geometry,
+            )
+            view.offset_x = 0.0
+            view.offset_y = 0.0
+            view.rotation_degrees = 0
+            view.hor_flip = False
+            view.ver_flip = False
+            self._reset_drag_state(view)
+            return
+
+        image_height, image_width, spacing_xy = self._get_fusion_source_shape_and_spacing(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+        )
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
+        view.zoom = viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=view.width or image_width,
+            canvas_height=view.height or image_height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        view.rotation_degrees = 0
+        view.hor_flip = False
+        view.ver_flip = False
+        self._reset_drag_state(view)
+
+    def _initialize_fusion_viewport(self, view: ViewRecord) -> None:
+        ensure_view_size(view)
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        pet_volume = self._get_series_volume(pet_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
+        if not group.fusion_initialized:
+            group.fusion_axial_index = ct_volume.shape[0] // 2
+            ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
+            group.fusion_pet_unit = self._normalize_fusion_pet_unit(group.fusion_pet_unit)
+            pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
+            group.fusion_pet_unit = pet_display.unit
+            pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+            group.window.window_width = ct_ww
+            group.window.window_center = ct_wl
+            group.fusion_pet_window.window_width = pet_ww
+            group.fusion_pet_window.window_center = pet_wl
+            group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(group.fusion_pet_pseudocolor_preset or "petct-rainbow")
+            group.fusion_initialized = True
+        self._fit_fusion_view_to_source(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+        )
+        self._sync_fusion_view_state_from_group(view)
+        view.is_initialized = True
+
+    def _sync_fusion_view_state_from_group(self, view: ViewRecord) -> None:
+        group = view.view_group
+        if group is None:
+            return
+        role = self._resolve_fusion_pane_role(view)
+        view.current_index = int(group.fusion_axial_index)
+        if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
+            view.window_width = group.fusion_pet_window.window_width
+            view.window_center = group.fusion_pet_window.window_center
+            view.pseudocolor_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+        elif role == FUSION_PANE_OVERLAY_AXIAL:
+            view.window_width = group.window.window_width
+            view.window_center = group.window.window_center
+            view.pseudocolor_preset = group.fusion_pet_pseudocolor_preset
+        else:
+            view.window_width = group.window.window_width
+            view.window_center = group.window.window_center
+            view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
+
+    def _reset_fusion_view_group(self, view: ViewRecord) -> None:
+        group = view.view_group
+        if group is None:
+            self._initialize_fusion_viewport(view)
+            return
+        group.fusion_initialized = False
+        group.fusion_pet_pseudocolor_preset = "petct-rainbow"
+        group.fusion_pet_unit = FUSION_PET_UNIT_SUV_BW
+        group.fusion_registration = FusionRegistrationState()
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            group_view.offset_x = 0.0
+            group_view.offset_y = 0.0
+            group_view.zoom = 1.0
+            group_view.rotation_degrees = 0
+            group_view.hor_flip = False
+            group_view.ver_flip = False
+            self._reset_drag_state(group_view)
+            self._initialize_fusion_viewport(group_view)
+
     def _reset_view(self, view: ViewRecord) -> None:
         if self._is_mpr_view_type(view.view_type):
             self._reset_mpr_view_group(view)
@@ -1309,6 +1820,8 @@ class ViewerService:
             view.hor_flip = False
             view.ver_flip = False
             self._initialize_3d_viewport(view)
+        elif self._is_fusion_view_type(view.view_type):
+            self._reset_fusion_view_group(view)
         else:
             view.rotation_degrees = 0
             view.hor_flip = False
@@ -1353,6 +1866,7 @@ class ViewerService:
         group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_ORTHOGONAL
         group.mpr_independent_plane_normals.clear()
         group.mpr_mip = self._create_default_mpr_mip_state()
+        group.mpr_segmentation = self._create_default_mpr_segmentation_state()
         group.mpr_use_display_basis_for_cursor_offsets = False
         self._set_mpr_model_rotation_matrix(group, np.eye(3, dtype=np.float64))
         group.mpr_model_rotation_pivot_world = None
@@ -1659,6 +2173,241 @@ class ViewerService:
             image_bytes=image_bytes,
         )
 
+    @staticmethod
+    def _build_fusion_projection_info(
+        *,
+        pane_role: str,
+        source_projection: FusionSourceProjection | None,
+        image_transform: Any,
+        image_width: int,
+        image_height: int,
+    ) -> FusionProjectionInfo | None:
+        if source_projection is None or image_width <= 0 or image_height <= 0:
+            return None
+        try:
+            image_to_source = np.linalg.inv(np.asarray(image_transform.matrix, dtype=np.float64))
+        except Exception:
+            return None
+
+        source_to_world_origin = np.asarray(source_projection.source_to_world_origin, dtype=np.float64)
+        source_to_world_x = np.asarray(source_projection.source_to_world_x, dtype=np.float64)
+        source_to_world_y = np.asarray(source_projection.source_to_world_y, dtype=np.float64)
+
+        def source_to_world(source_x: float, source_y: float) -> np.ndarray:
+            return source_to_world_origin + source_to_world_x * float(source_x) + source_to_world_y * float(source_y)
+
+        def image_to_world(image_x: float, image_y: float) -> np.ndarray:
+            source = image_to_source @ np.asarray([float(image_x), float(image_y), 1.0], dtype=np.float64)
+            return source_to_world(float(source[0]), float(source[1]))
+
+        normalized_origin = image_to_world(0.0, 0.0)
+        normalized_x_world = image_to_world(float(image_width), 0.0) - normalized_origin
+        normalized_y_world = image_to_world(0.0, float(image_height)) - normalized_origin
+
+        source_from_world = np.asarray(
+            [
+                source_projection.world_to_source_x,
+                source_projection.world_to_source_y,
+                np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            ],
+            dtype=np.float64,
+        )
+        image_from_world = np.asarray(image_transform.matrix, dtype=np.float64) @ source_from_world
+        world_to_normalized_x = image_from_world[0] / float(image_width)
+        world_to_normalized_y = image_from_world[1] / float(image_height)
+        reference_world = np.asarray(source_projection.reference_world, dtype=np.float64)
+        reference_homogeneous = np.asarray([*reference_world, 1.0], dtype=np.float64)
+        reference_x = float(world_to_normalized_x @ reference_homogeneous)
+        reference_y = float(world_to_normalized_y @ reference_homogeneous)
+
+        def vector3(value: np.ndarray) -> tuple[float, float, float]:
+            return (float(value[0]), float(value[1]), float(value[2]))
+
+        def vector4(value: np.ndarray) -> tuple[float, float, float, float]:
+            return (float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+
+        return FusionProjectionInfo(
+            paneRole=pane_role,
+            referenceWorld=vector3(reference_world),
+            referenceX=reference_x,
+            referenceY=reference_y,
+            normalizedToWorldOrigin=vector3(normalized_origin),
+            normalizedToWorldX=vector3(normalized_x_world),
+            normalizedToWorldY=vector3(normalized_y_world),
+            worldToNormalizedX=vector4(world_to_normalized_x),
+            worldToNormalizedY=vector4(world_to_normalized_y),
+        )
+
+    def _render_fusion_view(
+        self,
+        view: ViewRecord,
+        image_format: ImageFormat = "png",
+        *,
+        fast_preview: bool = False,
+        metadata_mode: str = "full",
+        progress_callback: ViewRenderProgressCallback | None = None,
+    ) -> RenderedImageResult:
+        del metadata_mode
+        render_started_at = perf_counter()
+        ensure_view_size(view)
+        if not view.is_initialized:
+            self._initialize_fusion_viewport(view)
+
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series, progress_callback=progress_callback)
+        pet_volume = self._get_series_volume(pet_series, progress_callback=progress_callback)
+        pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
+        ct_transform = self._get_series_patient_transform(ct_series)
+        pet_transform = self._get_series_patient_transform(pet_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
+        role = self._resolve_fusion_pane_role(view)
+        self._sync_fusion_view_state_from_group(view)
+        self._emit_render_progress(progress_callback, "render", progress_percent=82)
+
+        fusion_result = render_fusion_pixels(
+            pane_role=role,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_display.volume,
+            pet_geometry=pet_geometry,
+            axial_index=group.fusion_axial_index,
+            ct_window_width=group.window.window_width,
+            ct_window_center=group.window.window_center,
+            pet_window_width=group.fusion_pet_window.window_width,
+            pet_window_center=group.fusion_pet_window.window_center,
+            pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
+            registration=group.fusion_registration,
+            alpha=group.fusion_alpha,
+            ct_has_patient_geometry=(
+                ct_transform is not None
+                and tuple(int(value) for value in ct_transform.shape)
+                == tuple(int(value) for value in ct_volume.shape)
+            ),
+            pet_has_patient_geometry=(
+                pet_transform is not None
+                and tuple(int(value) for value in pet_transform.shape)
+                == tuple(int(value) for value in pet_volume.shape)
+            ),
+            interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
+        )
+        source_image = image_from_pixels(fusion_result.pixels)
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(fusion_result.spacing_xy)
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            source_image.height,
+            source_image.width,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=source_image.width,
+            image_height=source_image.height,
+            canvas_width=render_plan.render_view.width or 0,
+            canvas_height=render_plan.render_view.height or 0,
+            view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        transformed = viewport_transformer.apply_affine_array(
+            np.asarray(source_image),
+            render_plan.render_view.width or 0,
+            render_plan.render_view.height or 0,
+            image_transform,
+            order=0 if fast_preview else 1,
+            cval=0.0,
+        )
+        image = image_from_pixels(transformed)
+        fusion_projection = self._build_fusion_projection_info(
+            pane_role=role,
+            source_projection=fusion_result.source_projection,
+            image_transform=image_transform,
+            image_width=image.width,
+            image_height=image.height,
+        )
+        scale_bar = self._build_scale_bar_info(render_plan.render_view, image_transform, fusion_result.spacing_xy)
+        orientation_overlay = self._build_direction_orientation_overlay(
+            render_plan.render_view,
+            fusion_result.row_world,
+            fusion_result.col_world,
+        )
+        corner_series = pet_series if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP} else ct_series
+        viewport_label = self._build_fusion_corner_viewport_label(role)
+        corner_instance, corner_cached = self._get_indexed_instance_and_cache(corner_series, fusion_result.slice_index)
+        corner_info = (
+            self._build_slice_corner_info_overlay(
+                view,
+                corner_series,
+                corner_cached.dataset,
+                current_index=fusion_result.slice_index,
+                total_slices=fusion_result.slice_total,
+                viewport_label=viewport_label,
+                show_physical_location=role != FUSION_PANE_PET_CORONAL_MIP,
+                show_image_index=role != FUSION_PANE_PET_CORONAL_MIP,
+            )
+            if corner_instance is not None and corner_cached is not None
+            else None
+        )
+        if corner_info is not None and role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
+            corner_info = self._with_pet_window_corner_info(
+                corner_info,
+                pet_display,
+                group.fusion_pet_window.window_width,
+                group.fusion_pet_window.window_center,
+            )
+        self._emit_render_progress(progress_callback, "encode", progress_percent=96)
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        logger.debug(
+            "fusion render timing view_id=%s role=%s fast_preview=%s image_format=%s source_shape=%s render=%sx%s total_ms=%.1f",
+            view.view_id,
+            role,
+            fast_preview,
+            image_format,
+            tuple(int(value) for value in fusion_result.pixels.shape[:2]),
+            render_plan.render_view.width,
+            render_plan.render_view.height,
+            (perf_counter() - render_started_at) * 1000.0,
+        )
+        return RenderedImageResult(
+            meta=ViewImageResponse(
+                slice_info=SliceInfo(current=fusion_result.slice_index + 1, total=max(1, fusion_result.slice_total)),
+                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
+                imageFormat=image_format,
+                viewId=view.view_id,
+                scaleBar=scale_bar,
+                cornerInfo=self._serialize_corner_info_overlay(corner_info) if corner_info is not None else None,
+                orientation=self._serialize_orientation_overlay(orientation_overlay),
+                transform=self._build_view_transform_payload(view),
+                color=ViewColorInfo(pseudocolorPreset=fusion_result.pseudocolor_preset),
+                fusionProjection=fusion_projection,
+                fusionInfo=FusionInfo(
+                    paneRole=role,
+                    ctSeriesId=ct_series.series_id,
+                    petSeriesId=pet_series.series_id,
+                    petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petUnit=pet_display.unit,
+                    petUnitLabel=pet_display.unit_label,
+                    petWindowMin=self._resolve_window_min(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    petWindowMax=self._resolve_window_max(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    alpha=float(group.fusion_alpha),
+                    revision=int(group.fusion_revision),
+                    registration=FusionRegistrationInfo(
+                        translateRowMm=float(group.fusion_registration.translate_row_mm),
+                        translateColMm=float(group.fusion_registration.translate_col_mm),
+                        rotationDegrees=float(group.fusion_registration.rotation_degrees),
+                        saved=bool(group.fusion_registration.saved),
+                    ),
+                ),
+            ),
+            image_bytes=image_bytes,
+        )
+
     def _render_mpr_view(
         self,
         view: ViewRecord,
@@ -1793,6 +2542,15 @@ class ViewerService:
             )
         else:
             image = layered_renderer.render(context)
+        image = self._apply_mpr_segmentation_overlay(
+            image,
+            view.mpr_segmentation,
+            plane_pixels,
+            target_viewport,
+            render_image_transform,
+            render_plan.render_view.width or 0,
+            render_plan.render_view.height or 0,
+        )
         image_ms = (perf_counter() - image_started_at) * 1000.0
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
@@ -1830,6 +2588,7 @@ class ViewerService:
                     plane_pose=target_plane_pose,
                 ),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
+                mprSegmentationConfig=self._serialize_mpr_segmentation_config(view.mpr_segmentation),
                 mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
@@ -2047,6 +2806,10 @@ class ViewerService:
         return MprMipState()
 
     @staticmethod
+    def _create_default_mpr_segmentation_state() -> MprSegmentationState:
+        return MprSegmentationState()
+
+    @staticmethod
     def _normalize_mpr_crosshair_mode(value: object) -> str:
         mode = str(value or "").strip().lower()
         return mode if mode in MPR_CROSSHAIR_MODES else MPR_CROSSHAIR_MODE_ORTHOGONAL
@@ -2157,6 +2920,204 @@ class ViewerService:
                 viewport_key: MprMipViewportConfig(thickness=max(0, min(100, int(viewport_state.thickness))))
                 for viewport_key, viewport_state in state.viewports.items()
             },
+        )
+
+    @staticmethod
+    def _serialize_mpr_segmentation_config(state: MprSegmentationState) -> MprSegmentationConfig:
+        voi_box = state.voi_box
+        return MprSegmentationConfig(
+            enabled=bool(state.enabled),
+            lowerHu=float(state.lower_hu),
+            upperHu=float(state.upper_hu),
+            opacity=float(state.opacity),
+            color=str(state.color or "#22d3ee"),
+            voiBox=None if voi_box is None else MprSegmentationVoiBox(
+                xMin=float(voi_box.x_min),
+                xMax=float(voi_box.x_max),
+                yMin=float(voi_box.y_min),
+                yMax=float(voi_box.y_max),
+                zMin=float(voi_box.z_min),
+                zMax=float(voi_box.z_max),
+            ),
+        )
+
+    def _handle_mpr_segmentation_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_mpr_view_type(view.view_type) or view.view_group is None:
+            return False
+        if payload.mpr_segmentation_config is None:
+            return False
+        view.view_group.mpr_segmentation = self._normalize_mpr_segmentation_state(payload.mpr_segmentation_config)
+        return True
+
+    @classmethod
+    def _normalize_mpr_segmentation_state(cls, config: MprSegmentationConfig) -> MprSegmentationState:
+        lower_hu = cls._clamp_float(config.lower_hu, -1024.0, 3071.0, 300.0)
+        upper_hu = cls._clamp_float(config.upper_hu, -1024.0, 3071.0, 3071.0)
+        if lower_hu > upper_hu:
+            lower_hu, upper_hu = upper_hu, lower_hu
+        return MprSegmentationState(
+            enabled=bool(config.enabled),
+            lower_hu=lower_hu,
+            upper_hu=upper_hu,
+            opacity=cls._clamp_float(config.opacity, 0.0, 1.0, 0.45),
+            color=cls._normalize_mpr_segmentation_color(config.color),
+            voi_box=cls._normalize_mpr_segmentation_voi_box(config.voi_box),
+        )
+
+    @classmethod
+    def _normalize_mpr_segmentation_voi_box(
+        cls,
+        voi_box: MprSegmentationVoiBox | MprSegmentationVoiBoxState | None,
+    ) -> MprSegmentationVoiBoxState | None:
+        if voi_box is None:
+            return None
+
+        def axis_range(min_name: str, max_name: str) -> tuple[float, float]:
+            lower = cls._clamp_float(getattr(voi_box, min_name, 0.0), 0.0, 1.0, 0.0)
+            upper = cls._clamp_float(getattr(voi_box, max_name, 1.0), 0.0, 1.0, 1.0)
+            if lower > upper:
+                lower, upper = upper, lower
+            return lower, upper
+
+        x_min, x_max = axis_range("x_min", "x_max")
+        y_min, y_max = axis_range("y_min", "y_max")
+        z_min, z_max = axis_range("z_min", "z_max")
+        return MprSegmentationVoiBoxState(
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+        )
+
+    @staticmethod
+    def _normalize_mpr_segmentation_color(color: object) -> str:
+        text = str(color or "").strip()
+        if len(text) == 7 and text.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in text[1:]):
+            return text.lower()
+        return "#22d3ee"
+
+    @staticmethod
+    def _clamp_float(value: object, minimum: float, maximum: float, fallback: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not np.isfinite(numeric):
+            return fallback
+        return max(minimum, min(maximum, numeric))
+
+    @classmethod
+    def _apply_mpr_segmentation_overlay(
+        cls,
+        image: Image.Image,
+        state: MprSegmentationState,
+        source_pixels: np.ndarray,
+        viewport_key: str,
+        image_transform,
+        canvas_width: int,
+        canvas_height: int,
+    ) -> Image.Image:
+        if canvas_width <= 0 or canvas_height <= 0:
+            return image
+        mask = cls._build_mpr_segmentation_plane_mask(source_pixels, state, viewport_key)
+        if mask is None or not bool(np.any(mask)):
+            return image
+
+        transformed_mask = viewport_transformer.apply_affine_array(
+            mask.astype(np.uint8) * 255,
+            int(canvas_width),
+            int(canvas_height),
+            image_transform,
+            order=0,
+            cval=0.0,
+        )
+        overlay_mask = transformed_mask > 0
+        if not bool(np.any(overlay_mask)):
+            return image
+
+        alpha = cls._clamp_float(state.opacity, 0.0, 1.0, 0.45)
+        if alpha <= 0.0:
+            return image
+        color = np.asarray(cls._parse_hex_rgb(state.color), dtype=np.float32)
+        pixels = np.asarray(image.convert("RGBA"), dtype=np.float32).copy()
+        pixels[overlay_mask, :3] = pixels[overlay_mask, :3] * (1.0 - alpha) + color * alpha
+        return Image.fromarray(np.clip(pixels, 0, 255).astype(np.uint8))
+
+    @classmethod
+    def _build_mpr_segmentation_plane_mask(
+        cls,
+        source_pixels: np.ndarray,
+        state: MprSegmentationState,
+        viewport_key: str,
+    ) -> np.ndarray | None:
+        if not state.enabled:
+            return None
+        if state.opacity <= 0.0:
+            return None
+        pixels = np.asarray(source_pixels)
+        if pixels.ndim < 2:
+            return None
+        if pixels.ndim == 3:
+            pixels = pixels[..., 0]
+        lower_hu = cls._clamp_float(state.lower_hu, -1024.0, 3071.0, 300.0)
+        upper_hu = cls._clamp_float(state.upper_hu, -1024.0, 3071.0, 3071.0)
+        if lower_hu > upper_hu:
+            lower_hu, upper_hu = upper_hu, lower_hu
+
+        mask = (pixels >= lower_hu) & (pixels <= upper_hu)
+        return cls._apply_voi_box_to_mpr_plane_mask(mask, state.voi_box, viewport_key)
+
+    @classmethod
+    def _apply_voi_box_to_mpr_plane_mask(
+        cls,
+        mask: np.ndarray,
+        voi_box: MprSegmentationVoiBoxState | None,
+        viewport_key: str,
+    ) -> np.ndarray:
+        if voi_box is None:
+            return mask.astype(bool, copy=False)
+
+        height, width = mask.shape[:2]
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            horizontal_min, horizontal_max = voi_box.x_min, voi_box.x_max
+            vertical_min, vertical_max = voi_box.z_min, voi_box.z_max
+        elif viewport_key == MPR_VIEWPORT_SAGITTAL:
+            horizontal_min, horizontal_max = voi_box.y_min, voi_box.y_max
+            vertical_min, vertical_max = voi_box.z_min, voi_box.z_max
+        else:
+            horizontal_min, horizontal_max = voi_box.x_min, voi_box.x_max
+            vertical_min, vertical_max = voi_box.y_min, voi_box.y_max
+
+        col_start, col_end = cls._project_normalized_range_to_indices(horizontal_min, horizontal_max, width)
+        row_start, row_end = cls._project_normalized_range_to_indices(vertical_min, vertical_max, height)
+        if col_start >= col_end or row_start >= row_end:
+            return np.zeros(mask.shape[:2], dtype=bool)
+
+        voi_mask = np.zeros(mask.shape[:2], dtype=bool)
+        voi_mask[row_start:row_end, col_start:col_end] = True
+        return mask.astype(bool, copy=False) & voi_mask
+
+    @classmethod
+    def _project_normalized_range_to_indices(cls, minimum: float, maximum: float, size: int) -> tuple[int, int]:
+        if size <= 0:
+            return 0, 0
+        lower = cls._clamp_float(minimum, 0.0, 1.0, 0.0)
+        upper = cls._clamp_float(maximum, 0.0, 1.0, 1.0)
+        if lower > upper:
+            lower, upper = upper, lower
+        start = int(np.floor(lower * size))
+        end = int(np.ceil(upper * size))
+        return max(0, min(size, start)), max(0, min(size, end))
+
+    @staticmethod
+    def _parse_hex_rgb(color: str) -> tuple[int, int, int]:
+        normalized = ViewerService._normalize_mpr_segmentation_color(color)
+        return (
+            int(normalized[1:3], 16),
+            int(normalized[3:5], 16),
+            int(normalized[5:7], 16),
         )
 
     def _handle_mpr_mip_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
@@ -3040,6 +4001,322 @@ class ViewerService:
         group_views = view_registry.list_view_group(view.view_group.group_id)
         return group_views or [view]
 
+    def _get_group_views(self, view: ViewRecord) -> list[ViewRecord]:
+        if view.view_group is None:
+            return [view]
+        group_views = view_registry.list_view_group(view.view_group.group_id, workspace_id=view.workspace_id)
+        return group_views or [view]
+
+    @staticmethod
+    def _resolve_fusion_pane_role(view: ViewRecord) -> str:
+        return view.fusion_pane_role or FUSION_VIEW_TYPE_TO_PANE_ROLE.get(view.view_type, FUSION_PANE_OVERLAY_AXIAL)
+
+    @staticmethod
+    def _build_fusion_viewport_label(role: str) -> str:
+        if role == FUSION_PANE_CT_AXIAL:
+            return "CT Axial"
+        if role == FUSION_PANE_PET_AXIAL:
+            return "PET Axial"
+        if role == FUSION_PANE_PET_CORONAL_MIP:
+            return "PET Coronal MIP"
+        return "PET/CT"
+
+    @staticmethod
+    def _build_fusion_corner_viewport_label(role: str) -> str:
+        if role == FUSION_PANE_PET_CORONAL_MIP:
+            return "MIP"
+        return "Axial"
+
+    @staticmethod
+    def _is_fusion_pet_display_role(role: str) -> bool:
+        return role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}
+
+    def _set_fusion_pet_window_range(
+        self,
+        group: ViewGroupRecord,
+        *,
+        min_value: float = 0.0,
+        max_value: float,
+    ) -> bool:
+        next_low = float(min_value) if np.isfinite(float(min_value)) else 0.0
+        next_high = float(max_value) if np.isfinite(float(max_value)) else next_low + 1.0
+        if next_high <= next_low:
+            next_high = next_low + 1e-6
+        next_width = max(1e-6, next_high - next_low)
+        next_center = (next_low + next_high) / 2.0
+        if (
+            group.fusion_pet_window.window_width is not None
+            and group.fusion_pet_window.window_center is not None
+            and abs(float(group.fusion_pet_window.window_width) - next_width) <= 1e-6
+            and abs(float(group.fusion_pet_window.window_center) - next_center) <= 1e-6
+        ):
+            return False
+        group.fusion_pet_window.window_width = next_width
+        group.fusion_pet_window.window_center = next_center
+        return True
+
+    @staticmethod
+    def _resolve_fusion_pet_window_drag_sensitivity(window_high: float | None) -> float:
+        high = float(window_high) if window_high is not None and np.isfinite(float(window_high)) else 0.0
+        return max(0.001, abs(high) * 0.01)
+
+    def _bump_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
+        if group is None or str(group.group_type).lower() != "fusion":
+            return None
+        group.fusion_revision += 1
+        return int(group.fusion_revision)
+
+    def _get_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
+        if group is None or str(group.group_type).lower() != "fusion":
+            return None
+        return int(group.fusion_revision)
+
+    def _handle_fusion_scroll(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if payload.delta is None:
+            return False
+        group, ct_series, _ = self._resolve_fusion_group_series(view)
+        ct_shape = self._get_series_volume(ct_series).shape
+        group.fusion_axial_index = max(0, min(int(group.fusion_axial_index) + int(payload.delta), ct_shape[0] - 1))
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _handle_fusion_drag_pan(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        group = view.view_group
+        group_views = self._get_group_views(view)
+        if payload.action_type == DRAG_ACTION_START:
+            for group_view in group_views:
+                group_view.drag_origin_offset_x = group_view.offset_x
+                group_view.drag_origin_offset_y = group_view.offset_y
+            return
+        if payload.action_type == DRAG_ACTION_MOVE:
+            for group_view in group_views:
+                base_x = group_view.drag_origin_offset_x if group_view.drag_origin_offset_x is not None else group_view.offset_x
+                base_y = group_view.drag_origin_offset_y if group_view.drag_origin_offset_y is not None else group_view.offset_y
+                group_view.offset_x = float(base_x) + float(payload.x or 0.0)
+                group_view.offset_y = float(base_y) + float(payload.y or 0.0)
+                group_view.is_initialized = True
+            if group is not None:
+                group.fusion_revision += 1
+            return
+        if payload.action_type == DRAG_ACTION_END:
+            for group_view in group_views:
+                group_view.drag_origin_offset_x = None
+                group_view.drag_origin_offset_y = None
+
+    def _handle_fusion_drag_zoom(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
+        group = view.view_group
+        group_views = self._get_group_views(view)
+        if payload.action_type == DRAG_ACTION_START:
+            for group_view in group_views:
+                group_view.drag_origin_zoom = group_view.zoom
+            return
+        if payload.action_type == DRAG_ACTION_MOVE:
+            delta_y = float(payload.y or 0.0)
+            for group_view in group_views:
+                base_zoom = group_view.drag_origin_zoom if group_view.drag_origin_zoom is not None else group_view.zoom
+                zoom_factor = max(ZOOM_DRAG_FACTOR_MIN, 1.0 - delta_y * ZOOM_DRAG_SENSITIVITY)
+                group_view.zoom = viewport_transformer.clamp_zoom(float(base_zoom) * zoom_factor)
+                group_view.is_initialized = True
+            if group is not None:
+                group.fusion_revision += 1
+            return
+        if payload.action_type == DRAG_ACTION_END:
+            for group_view in group_views:
+                group_view.drag_origin_zoom = None
+
+    def _handle_fusion_window(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        role = self._resolve_fusion_pane_role(view)
+        if self._is_fusion_pet_display_role(role):
+            current_high = self._resolve_window_max(
+                group.fusion_pet_window.window_width,
+                group.fusion_pet_window.window_center,
+            )
+            if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
+                if payload.ww is not None and payload.wl is not None:
+                    next_high = float(payload.wl) + float(payload.ww) / 2.0
+                elif payload.ww is not None:
+                    next_high = float(payload.ww)
+                else:
+                    next_high = float(payload.wl or 0.0) * 2.0
+                changed = self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high)
+            elif payload.action_type == DRAG_ACTION_START:
+                group.drag_origin_window_width = float(
+                    current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
+                )
+                group.drag_origin_window_center = 0.0
+                return True
+            elif payload.action_type == DRAG_ACTION_MOVE:
+                base_high = float(
+                    group.drag_origin_window_width
+                    if group.drag_origin_window_width is not None
+                    else current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
+                )
+                delta = float(payload.x or 0.0) - float(payload.y or 0.0)
+                next_high = base_high + delta * self._resolve_fusion_pet_window_drag_sensitivity(base_high)
+                changed = self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high)
+            elif payload.action_type == DRAG_ACTION_END:
+                group.drag_origin_window_width = None
+                group.drag_origin_window_center = None
+                return True
+            else:
+                return False
+
+            if not changed:
+                return False
+            group.fusion_revision += 1
+            for group_view in self._get_group_views(view):
+                self._sync_fusion_view_state_from_group(group_view)
+                group_view.is_initialized = True
+            return True
+
+        target_window = group.window
+
+        if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
+            if payload.ww is not None:
+                target_window.window_width = float(payload.ww)
+            if payload.wl is not None:
+                target_window.window_center = float(payload.wl)
+        elif payload.action_type == DRAG_ACTION_START:
+            group.drag_origin_window_width = target_window.window_width
+            group.drag_origin_window_center = target_window.window_center
+            return True
+        elif payload.action_type == DRAG_ACTION_MOVE:
+            base_ww = float(group.drag_origin_window_width if group.drag_origin_window_width is not None else target_window.window_width or 0.0)
+            base_wl = float(group.drag_origin_window_center if group.drag_origin_window_center is not None else target_window.window_center or 0.0)
+            target_window.window_width = base_ww + float(payload.x or 0.0) * WINDOW_DRAG_SENSITIVITY
+            target_window.window_center = base_wl - float(payload.y or 0.0) * WINDOW_DRAG_SENSITIVITY
+        elif payload.action_type == DRAG_ACTION_END:
+            group.drag_origin_window_width = None
+            group.drag_origin_window_center = None
+            return True
+        else:
+            return False
+
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _handle_fusion_pseudocolor(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None or payload.pseudocolor_preset is None:
+            return False
+        next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+        if group.fusion_pet_pseudocolor_preset == next_preset:
+            return False
+        group.fusion_pet_pseudocolor_preset = next_preset
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _handle_fusion_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        should_finalize_drag = payload.action_type == DRAG_ACTION_END
+        changed = False
+        if payload.fusion_alpha is not None:
+            next_alpha = max(0.0, min(float(payload.fusion_alpha), 1.0))
+            if abs(group.fusion_alpha - next_alpha) > 1e-6:
+                group.fusion_alpha = next_alpha
+                changed = True
+        if payload.pseudocolor_preset is not None:
+            next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+            if group.fusion_pet_pseudocolor_preset != next_preset:
+                group.fusion_pet_pseudocolor_preset = next_preset
+                changed = True
+        if payload.fusion_pet_unit is not None:
+            next_unit = self._normalize_fusion_pet_unit(payload.fusion_pet_unit)
+            if group.fusion_pet_unit != next_unit:
+                group.fusion_pet_unit = next_unit
+                try:
+                    _, _, pet_series = self._resolve_fusion_group_series(view)
+                    pet_volume = self._get_series_volume(pet_series)
+                    pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, next_unit)
+                    group.fusion_pet_unit = pet_display.unit
+                    pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+                    group.fusion_pet_window.window_width = pet_ww
+                    group.fusion_pet_window.window_center = pet_wl
+                except Exception:
+                    logger.debug("failed to reset fusion PET window for unit=%s", next_unit, exc_info=True)
+                changed = True
+        if payload.fusion_pet_window_min is not None or payload.fusion_pet_window_max is not None:
+            current_high = self._resolve_window_max(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
+            next_high = (
+                float(payload.fusion_pet_window_max)
+                if payload.fusion_pet_window_max is not None
+                else float(current_high or FUSION_DEFAULT_SUV_WINDOW_MAX)
+            )
+            if not np.isfinite(next_high):
+                next_high = FUSION_DEFAULT_SUV_WINDOW_MAX
+            if self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high):
+                changed = True
+        if changed:
+            group.fusion_revision += 1
+            for group_view in self._get_group_views(view):
+                self._sync_fusion_view_state_from_group(group_view)
+                group_view.is_initialized = True
+        return changed or should_finalize_drag
+
+    def _handle_fusion_registration(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        sub_op = str(payload.sub_op_type or "translate").strip().lower()
+        registration = group.fusion_registration
+        if sub_op == "reset":
+            group.fusion_registration = FusionRegistrationState()
+        elif sub_op == "save":
+            view_group_registry.save_fusion_registration(group)
+        elif payload.action_type == DRAG_ACTION_START:
+            group.rotation_drag = None
+            group.crosshair_drag_origin_center = (
+                registration.translate_row_mm,
+                registration.translate_col_mm,
+                registration.rotation_degrees,
+            )
+            return True
+        elif payload.action_type == DRAG_ACTION_MOVE:
+            origin = group.crosshair_drag_origin_center or (
+                registration.translate_row_mm,
+                registration.translate_col_mm,
+                registration.rotation_degrees,
+            )
+            origin_row, origin_col, origin_rotation = (float(origin[0]), float(origin[1]), float(origin[2]))
+            if sub_op == "rotate":
+                registration.rotation_degrees = origin_rotation + float(payload.x or 0.0) * 0.35
+            else:
+                plane = self._get_fusion_reference_plane(view)
+                zoom = max(float(view.zoom or 1.0), 1e-6)
+                registration.translate_col_mm = origin_col + float(payload.x or 0.0) * plane.pixel_spacing_col_mm / zoom
+                registration.translate_row_mm = origin_row + float(payload.y or 0.0) * plane.pixel_spacing_row_mm / zoom
+            registration.saved = False
+        elif payload.action_type == DRAG_ACTION_END:
+            group.crosshair_drag_origin_center = None
+        else:
+            return False
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _get_fusion_reference_plane(self, view: ViewRecord) -> PlanePose:
+        group, ct_series, _ = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+
+        return build_ct_axial_plane(ct_geometry, ct_volume.shape, group.fusion_axial_index)
+
     def _handle_mpr_crosshair(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         if payload.x is None or payload.y is None:
             return False
@@ -3894,6 +5171,19 @@ class ViewerService:
         return None, None
 
     @staticmethod
+    def _get_indexed_instance_and_cache(
+        series: SeriesRecord,
+        index: int,
+    ) -> tuple[InstanceRecord | None, CachedDicom | None]:
+        if not series.instances:
+            return None, None
+        clamped_index = max(0, min(int(index), len(series.instances) - 1))
+        instance = series.instances[clamped_index]
+        if not instance.sop_instance_uid:
+            return ViewerService._get_reference_instance_and_cache(series)
+        return instance, dicom_cache.get(instance.sop_instance_uid, instance.path)
+
+    @staticmethod
     def _corner_info_tag(value: str | None) -> tuple[str, ...]:
         return (value,) if value else tuple()
 
@@ -4111,20 +5401,26 @@ class ViewerService:
         plane_state: MprObliquePlaneState | None = None,
         plane_pose: PlanePose | None = None,
         cursor: MprCursorState | None = None,
+        show_physical_location: bool = True,
+        show_image_index: bool = True,
     ) -> CornerInfoOverlay:
         zoom = self._format_number(view.zoom, precision=2, suffix="x")
-        physical_location = self._build_physical_location_label(
-            view,
-            series,
-            dataset,
-            current_index,
-            viewport_label,
-            plane_state=plane_state,
-            plane_pose=plane_pose,
-            cursor=cursor,
+        physical_location = (
+            self._build_physical_location_label(
+                view,
+                series,
+                dataset,
+                current_index,
+                viewport_label,
+                plane_state=plane_state,
+                plane_pose=plane_pose,
+                cursor=cursor,
+            )
+            if show_physical_location
+            else None
         )
         viewport_location = self._join_non_empty("  ", viewport_label, physical_location)
-        image_index = f"Im: {current_index + 1}/{total_slices}" if total_slices > 0 else None
+        image_index = f"Im: {current_index + 1}/{total_slices}" if show_image_index and total_slices > 0 else None
         window_level = self._build_window_label(view.window_width, view.window_center)
         coordinate_line = f"X:{int(round(view.offset_x))} Y:{int(round(view.offset_y))}"
         slice_location = self._format_number(getattr(dataset, "SliceLocation", None), precision=2, suffix="mm")
@@ -4141,11 +5437,11 @@ class ViewerService:
                 "windowLevel": self._corner_info_tag(window_level),
                 "zoom": self._corner_info_tag(f"Zoom:{zoom}" if zoom else None),
                 "coordinates": self._corner_info_tag(coordinate_line),
-                "sliceLocation": self._labeled_corner_info_tag("Slice loc", slice_location),
-                "instanceNumber": self._labeled_corner_info_tag("Instance", instance_number),
-                "sopInstanceUid": self._labeled_corner_info_tag("SOP UID", sop_uid),
-                "imagePositionPatient": self._labeled_corner_info_tag("IPP", image_position),
-                "imageOrientationPatient": self._labeled_corner_info_tag("IOP", image_orientation),
+                "sliceLocation": self._labeled_corner_info_tag("Slice loc", slice_location) if show_image_index else tuple(),
+                "instanceNumber": self._labeled_corner_info_tag("Instance", instance_number) if show_image_index else tuple(),
+                "sopInstanceUid": self._labeled_corner_info_tag("SOP UID", sop_uid) if show_image_index else tuple(),
+                "imagePositionPatient": self._labeled_corner_info_tag("IPP", image_position) if show_image_index else tuple(),
+                "imageOrientationPatient": self._labeled_corner_info_tag("IOP", image_orientation) if show_image_index else tuple(),
                 "pixelSpacing": self._labeled_corner_info_tag("Pixel", pixel_spacing),
                 "rowsColumns": self._labeled_corner_info_tag("Matrix", matrix),
             }
@@ -4784,6 +6080,27 @@ class ViewerService:
             isOblique=bool(plane_pose.is_oblique if plane_pose is not None else plane.is_oblique),
         )
 
+    def _build_direction_orientation_overlay(
+        self,
+        view: ViewRecord,
+        row_world: np.ndarray | None,
+        col_world: np.ndarray | None,
+    ) -> OrientationOverlay | None:
+        row_direction = self._normalize_vector(np.asarray(row_world, dtype=np.float64)) if row_world is not None else None
+        col_direction = self._normalize_vector(np.asarray(col_world, dtype=np.float64)) if col_world is not None else None
+        if row_direction is None or col_direction is None:
+            return None
+
+        x_vector = col_direction * (-1.0 if view.hor_flip else 1.0)
+        y_vector = row_direction * (-1.0 if view.ver_flip else 1.0)
+        x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
+        return OrientationOverlay(
+            top=self._orientation_text_for_vector(-y_vector),
+            right=self._orientation_text_for_vector(x_vector),
+            bottom=self._orientation_text_for_vector(y_vector),
+            left=self._orientation_text_for_vector(-x_vector),
+        )
+
     def _build_stack_orientation_overlay(self, view: ViewRecord, dataset: Dataset | None) -> OrientationOverlay | None:
         orientation = self._get_dataset_orientation(dataset)
         if orientation is None:
@@ -4794,15 +6111,7 @@ class ViewerService:
         if row_direction is None or column_direction is None:
             return None
 
-        x_vector = row_direction * (-1.0 if view.hor_flip else 1.0)
-        y_vector = column_direction * (-1.0 if view.ver_flip else 1.0)
-        x_vector, y_vector = self._rotate_screen_axes(x_vector, y_vector, view.rotation_degrees)
-        return OrientationOverlay(
-            top=self._orientation_text_for_vector(-y_vector),
-            right=self._orientation_text_for_vector(x_vector),
-            bottom=self._orientation_text_for_vector(y_vector),
-            left=self._orientation_text_for_vector(-x_vector),
-        )
+        return self._build_direction_orientation_overlay(view, column_direction, row_direction)
 
     def _build_mpr_orientation_overlay(
         self,
@@ -4924,6 +6233,66 @@ class ViewerService:
         if ww is None and wl is None:
             return None
         return f"W: {ww or '-'} L: {wl or '-'}"
+
+    @staticmethod
+    def _resolve_window_min(window_width: float | None, window_center: float | None) -> float | None:
+        if window_width is None or window_center is None:
+            return None
+        return float(window_center) - float(window_width) / 2.0
+
+    @staticmethod
+    def _resolve_window_max(window_width: float | None, window_center: float | None) -> float | None:
+        if window_width is None or window_center is None:
+            return None
+        return float(window_center) + float(window_width) / 2.0
+
+    @staticmethod
+    def _build_pet_window_label(
+        display: FusionPetDisplayVolume,
+        window_width: float | None,
+        window_center: float | None,
+    ) -> str | None:
+        low = ViewerService._resolve_window_min(window_width, window_center)
+        high = ViewerService._resolve_window_max(window_width, window_center)
+        if low is None or high is None:
+            return None
+        low_text = f"{float(low):.2f}"
+        high_text = f"{float(high):.2f}"
+        prefix = "SUV" if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL} else "PET"
+        unit_label = ViewerService._strip_trailing_unit_detail(display.unit_label)
+        return f"{prefix}:{low_text}--{high_text}{unit_label}".strip()
+
+    @staticmethod
+    def _strip_trailing_unit_detail(value: str | None) -> str:
+        text = str(value or "").strip()
+        if text.endswith(")") and "(" in text:
+            prefix = text.rsplit("(", 1)[0].strip()
+            if prefix:
+                return prefix
+        return text
+
+    def _with_pet_window_corner_info(
+        self,
+        corner_info: CornerInfoOverlay,
+        display: FusionPetDisplayVolume,
+        window_width: float | None,
+        window_center: float | None,
+    ) -> CornerInfoOverlay:
+        pet_window = self._build_pet_window_label(display, window_width, window_center)
+        if not pet_window:
+            return corner_info
+        default_window = self._build_window_label(window_width, window_center)
+        tags = dict(corner_info.tags)
+        tags["windowLevel"] = (pet_window,)
+        bottom_left = tuple(
+            pet_window
+            if (default_window and line == default_window) or str(line).strip().upper().startswith("W:")
+            else line
+            for line in corner_info.bottom_left
+        )
+        if pet_window not in bottom_left:
+            bottom_left = (pet_window, *bottom_left)
+        return replace(corner_info, bottom_left=bottom_left, tags=tags)
 
     @staticmethod
     def _safe_text(value) -> str | None:
