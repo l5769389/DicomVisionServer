@@ -141,6 +141,26 @@ class MprMipState:
 
 
 @dataclass
+class MprSegmentationVoiBoxState:
+    x_min: float = 0.0
+    x_max: float = 1.0
+    y_min: float = 0.0
+    y_max: float = 1.0
+    z_min: float = 0.0
+    z_max: float = 1.0
+
+
+@dataclass
+class MprSegmentationState:
+    enabled: bool = False
+    lower_hu: float = 300.0
+    upper_hu: float = 3071.0
+    opacity: float = 0.45
+    color: str = "#22d3ee"
+    voi_box: MprSegmentationVoiBoxState | None = field(default_factory=MprSegmentationVoiBoxState)
+
+
+@dataclass
 class FusionRegistrationState:
     translate_row_mm: float = 0.0
     translate_col_mm: float = 0.0
@@ -221,6 +241,7 @@ class ViewGroupRecord:
     crosshair_drag_origin_center: tuple[float, float, float] | None = None
     crosshair_drag_origin_image: tuple[float, float] | None = None
     mpr_mip: MprMipState = field(default_factory=MprMipState)
+    mpr_segmentation: MprSegmentationState = field(default_factory=MprSegmentationState)
     mpr_cursor: MprCursorRecord | None = None
     mpr_crosshair_angles: dict[str, tuple[float, float]] = field(default_factory=dict)
     mpr_crosshair_mode: str = "orthogonal"
@@ -522,4 +543,10 @@ class ViewRecord:
         if self.view_group is not None:
             return self.view_group.mpr_mip
         return MprMipState()
+
+    @property
+    def mpr_segmentation(self) -> MprSegmentationState:
+        if self.view_group is not None:
+            return self.view_group.mpr_segmentation
+        return MprSegmentationState()
 

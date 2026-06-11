@@ -20,7 +20,7 @@ ViewType = Literal[
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "fusionRegistration", "fusionConfig"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "fusionRegistration", "fusionConfig"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -298,6 +298,28 @@ class MprMipConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprSegmentationVoiBox(BaseModel):
+    x_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="xMin")
+    x_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="xMax")
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="yMin")
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="yMax")
+    z_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="zMin")
+    z_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="zMax")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationConfig(BaseModel):
+    enabled: bool = False
+    lower_hu: float = Field(default=300.0, ge=-1024.0, le=3071.0, alias="lowerHu")
+    upper_hu: float = Field(default=3071.0, ge=-1024.0, le=3071.0, alias="upperHu")
+    opacity: float = Field(default=0.45, ge=0.0, le=1.0)
+    color: str = "#22d3ee"
+    voi_box: MprSegmentationVoiBox | None = Field(default_factory=MprSegmentationVoiBox, alias="voiBox")
+
+    model_config = {"populate_by_name": True}
+
+
 class FusionRegistrationInfo(BaseModel):
     translate_row_mm: float = Field(default=0.0, alias="translateRowMm")
     translate_col_mm: float = Field(default=0.0, alias="translateColMm")
@@ -323,6 +345,20 @@ class FusionInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class FusionProjectionInfo(BaseModel):
+    pane_role: str = Field(alias="paneRole")
+    reference_world: tuple[float, float, float] = Field(alias="referenceWorld")
+    reference_x: float = Field(alias="referenceX")
+    reference_y: float = Field(alias="referenceY")
+    normalized_to_world_origin: tuple[float, float, float] = Field(alias="normalizedToWorldOrigin")
+    normalized_to_world_x: tuple[float, float, float] = Field(alias="normalizedToWorldX")
+    normalized_to_world_y: tuple[float, float, float] = Field(alias="normalizedToWorldY")
+    world_to_normalized_x: tuple[float, float, float, float] = Field(alias="worldToNormalizedX")
+    world_to_normalized_y: tuple[float, float, float, float] = Field(alias="worldToNormalizedY")
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewImageResponse(BaseModel):
     slice_info: SliceInfo = Field(alias="slice_info")
     window_info: WindowInfo = Field(alias="window_info")
@@ -341,7 +377,9 @@ class ViewImageResponse(BaseModel):
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
     fusion_info: FusionInfo | None = Field(default=None, alias="fusionInfo")
+    fusion_projection: FusionProjectionInfo | None = Field(default=None, alias="fusionProjection")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
     mpr_crosshair_mode: MprCrosshairMode = Field(default="orthogonal", alias="mprCrosshairMode")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
@@ -414,6 +452,7 @@ class ViewOperationRequest(BaseModel):
     fusion_pet_window_min: float | None = Field(default=None, alias="fusionPetWindowMin")
     fusion_pet_window_max: float | None = Field(default=None, alias="fusionPetWindowMax")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
     mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")

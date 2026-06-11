@@ -60,6 +60,8 @@ from app.models.viewer import (
     MprMipViewportState,
     MprObliquePlaneState,
     MprRotationDragRecord,
+    MprSegmentationState,
+    MprSegmentationVoiBoxState,
     PresentationAnnotationRecord,
     PresentationMeasurementRecord,
     SeriesRecord,
@@ -76,6 +78,8 @@ from app.schemas.view import (
     MprMipConfig,
     MprMipViewportConfig,
     MprPlaneInfo,
+    MprSegmentationConfig,
+    MprSegmentationVoiBox,
     MeasurementOverlayPayload,
     OperationAcceptedResponse,
     OrientationInfo,
@@ -91,6 +95,7 @@ from app.schemas.view import (
     ViewQaWaterAnalyzeResponse,
     ViewTransformPayload,
     FusionInfo,
+    FusionProjectionInfo,
     FusionRegistrationInfo,
     ViewMtfAnalyzeResponse,
     ViewOperationRequest,
@@ -150,8 +155,10 @@ from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
 from app.services.viewer_render_dispatch import render_by_view_type
 from app.services.viewer_fusion import (
+    FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET,
     FUSION_VIEW_TYPES,
     FUSION_VIEW_TYPE_TO_PANE_ROLE,
+    FusionSourceProjection,
     build_ct_axial_plane,
     image_from_pixels,
     render_fusion_pixels,
@@ -183,6 +190,9 @@ FUSION_PET_UNIT_LABELS: dict[str, str] = {
     FUSION_PET_UNIT_SUL: "g/ml* (SUL)",
     FUSION_PET_UNIT_PERCENT_ID_G: "%ID/g",
 }
+# SUV fusion display starts from a reference-viewer preset, not from PET intensity percentiles.
+FUSION_DEFAULT_SUV_WINDOW_MIN = 0.0
+FUSION_DEFAULT_SUV_WINDOW_MAX = 4.49
 
 
 @dataclass(frozen=True)
@@ -325,7 +335,9 @@ class ViewerService:
         )
 
         if not view.is_initialized:
-            if not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
+            if self._is_fusion_view_type(view.view_type):
+                self._initialize_fusion_viewport(view)
+            elif not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
                 self._initialize_viewport(view)
                 view.is_initialized = True
 
@@ -1313,6 +1325,7 @@ class ViewerService:
         target_group.mpr_crosshair_mode = self._normalize_mpr_crosshair_mode(source_group.mpr_crosshair_mode)
         target_group.mpr_independent_plane_normals = deepcopy(source_group.mpr_independent_plane_normals)
         target_group.mpr_mip = deepcopy(source_group.mpr_mip)
+        target_group.mpr_segmentation = deepcopy(source_group.mpr_segmentation)
         target_group.mpr_use_display_basis_for_cursor_offsets = bool(source_group.mpr_use_display_basis_for_cursor_offsets)
         target_group.mpr_model_rotation_world = deepcopy(source_group.mpr_model_rotation_world)
         target_group.mpr_model_rotation_pivot_world = deepcopy(source_group.mpr_model_rotation_pivot_world)
@@ -1557,9 +1570,13 @@ class ViewerService:
         if finite.size == 0:
             return (1.0, 0.5)
         if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL}:
-            return (4.5, 2.25)
+            window_width = FUSION_DEFAULT_SUV_WINDOW_MAX - FUSION_DEFAULT_SUV_WINDOW_MIN
+            window_center = (FUSION_DEFAULT_SUV_WINDOW_MAX + FUSION_DEFAULT_SUV_WINDOW_MIN) / 2.0
+            return (window_width, window_center)
+        positive = finite[finite > 0.0]
+        pet_window_values = positive if positive.size else finite
         low = 0.0 if float(np.nanmin(finite)) >= 0.0 else float(np.nanpercentile(finite, 1.0))
-        high = float(np.nanpercentile(finite, 99.5))
+        high = float(np.nanpercentile(pet_window_values, 99.5))
         if not np.isfinite(high) or high <= low:
             high = low + 1.0
         return (max(WINDOW_WIDTH_MIN, high - low), (high + low) / 2.0)
@@ -1765,7 +1782,7 @@ class ViewerService:
         if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
             view.window_width = group.fusion_pet_window.window_width
             view.window_center = group.fusion_pet_window.window_center
-            view.pseudocolor_preset = group.fusion_pet_pseudocolor_preset
+            view.pseudocolor_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
         elif role == FUSION_PANE_OVERLAY_AXIAL:
             view.window_width = group.window.window_width
             view.window_center = group.window.window_center
@@ -1849,6 +1866,7 @@ class ViewerService:
         group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_ORTHOGONAL
         group.mpr_independent_plane_normals.clear()
         group.mpr_mip = self._create_default_mpr_mip_state()
+        group.mpr_segmentation = self._create_default_mpr_segmentation_state()
         group.mpr_use_display_basis_for_cursor_offsets = False
         self._set_mpr_model_rotation_matrix(group, np.eye(3, dtype=np.float64))
         group.mpr_model_rotation_pivot_world = None
@@ -2155,6 +2173,71 @@ class ViewerService:
             image_bytes=image_bytes,
         )
 
+    @staticmethod
+    def _build_fusion_projection_info(
+        *,
+        pane_role: str,
+        source_projection: FusionSourceProjection | None,
+        image_transform: Any,
+        image_width: int,
+        image_height: int,
+    ) -> FusionProjectionInfo | None:
+        if source_projection is None or image_width <= 0 or image_height <= 0:
+            return None
+        try:
+            image_to_source = np.linalg.inv(np.asarray(image_transform.matrix, dtype=np.float64))
+        except Exception:
+            return None
+
+        source_to_world_origin = np.asarray(source_projection.source_to_world_origin, dtype=np.float64)
+        source_to_world_x = np.asarray(source_projection.source_to_world_x, dtype=np.float64)
+        source_to_world_y = np.asarray(source_projection.source_to_world_y, dtype=np.float64)
+
+        def source_to_world(source_x: float, source_y: float) -> np.ndarray:
+            return source_to_world_origin + source_to_world_x * float(source_x) + source_to_world_y * float(source_y)
+
+        def image_to_world(image_x: float, image_y: float) -> np.ndarray:
+            source = image_to_source @ np.asarray([float(image_x), float(image_y), 1.0], dtype=np.float64)
+            return source_to_world(float(source[0]), float(source[1]))
+
+        normalized_origin = image_to_world(0.0, 0.0)
+        normalized_x_world = image_to_world(float(image_width), 0.0) - normalized_origin
+        normalized_y_world = image_to_world(0.0, float(image_height)) - normalized_origin
+
+        source_from_world = np.asarray(
+            [
+                source_projection.world_to_source_x,
+                source_projection.world_to_source_y,
+                np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+            ],
+            dtype=np.float64,
+        )
+        image_from_world = np.asarray(image_transform.matrix, dtype=np.float64) @ source_from_world
+        world_to_normalized_x = image_from_world[0] / float(image_width)
+        world_to_normalized_y = image_from_world[1] / float(image_height)
+        reference_world = np.asarray(source_projection.reference_world, dtype=np.float64)
+        reference_homogeneous = np.asarray([*reference_world, 1.0], dtype=np.float64)
+        reference_x = float(world_to_normalized_x @ reference_homogeneous)
+        reference_y = float(world_to_normalized_y @ reference_homogeneous)
+
+        def vector3(value: np.ndarray) -> tuple[float, float, float]:
+            return (float(value[0]), float(value[1]), float(value[2]))
+
+        def vector4(value: np.ndarray) -> tuple[float, float, float, float]:
+            return (float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+
+        return FusionProjectionInfo(
+            paneRole=pane_role,
+            referenceWorld=vector3(reference_world),
+            referenceX=reference_x,
+            referenceY=reference_y,
+            normalizedToWorldOrigin=vector3(normalized_origin),
+            normalizedToWorldX=vector3(normalized_x_world),
+            normalizedToWorldY=vector3(normalized_y_world),
+            worldToNormalizedX=vector4(world_to_normalized_x),
+            worldToNormalizedY=vector4(world_to_normalized_y),
+        )
+
     def _render_fusion_view(
         self,
         view: ViewRecord,
@@ -2235,6 +2318,13 @@ class ViewerService:
             cval=0.0,
         )
         image = image_from_pixels(transformed)
+        fusion_projection = self._build_fusion_projection_info(
+            pane_role=role,
+            source_projection=fusion_result.source_projection,
+            image_transform=image_transform,
+            image_width=image.width,
+            image_height=image.height,
+        )
         scale_bar = self._build_scale_bar_info(render_plan.render_view, image_transform, fusion_result.spacing_xy)
         orientation_overlay = self._build_direction_orientation_overlay(
             render_plan.render_view,
@@ -2242,8 +2332,8 @@ class ViewerService:
             fusion_result.col_world,
         )
         corner_series = pet_series if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP} else ct_series
-        viewport_label = self._build_fusion_viewport_label(role)
-        corner_instance, corner_cached = self._get_reference_instance_and_cache(corner_series)
+        viewport_label = self._build_fusion_corner_viewport_label(role)
+        corner_instance, corner_cached = self._get_indexed_instance_and_cache(corner_series, fusion_result.slice_index)
         corner_info = (
             self._build_slice_corner_info_overlay(
                 view,
@@ -2252,6 +2342,8 @@ class ViewerService:
                 current_index=fusion_result.slice_index,
                 total_slices=fusion_result.slice_total,
                 viewport_label=viewport_label,
+                show_physical_location=role != FUSION_PANE_PET_CORONAL_MIP,
+                show_image_index=role != FUSION_PANE_PET_CORONAL_MIP,
             )
             if corner_instance is not None and corner_cached is not None
             else None
@@ -2287,6 +2379,7 @@ class ViewerService:
                 orientation=self._serialize_orientation_overlay(orientation_overlay),
                 transform=self._build_view_transform_payload(view),
                 color=ViewColorInfo(pseudocolorPreset=fusion_result.pseudocolor_preset),
+                fusionProjection=fusion_projection,
                 fusionInfo=FusionInfo(
                     paneRole=role,
                     ctSeriesId=ct_series.series_id,
@@ -2449,6 +2542,15 @@ class ViewerService:
             )
         else:
             image = layered_renderer.render(context)
+        image = self._apply_mpr_segmentation_overlay(
+            image,
+            view.mpr_segmentation,
+            plane_pixels,
+            target_viewport,
+            render_image_transform,
+            render_plan.render_view.width or 0,
+            render_plan.render_view.height or 0,
+        )
         image_ms = (perf_counter() - image_started_at) * 1000.0
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
@@ -2486,6 +2588,7 @@ class ViewerService:
                     plane_pose=target_plane_pose,
                 ),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
+                mprSegmentationConfig=self._serialize_mpr_segmentation_config(view.mpr_segmentation),
                 mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
@@ -2703,6 +2806,10 @@ class ViewerService:
         return MprMipState()
 
     @staticmethod
+    def _create_default_mpr_segmentation_state() -> MprSegmentationState:
+        return MprSegmentationState()
+
+    @staticmethod
     def _normalize_mpr_crosshair_mode(value: object) -> str:
         mode = str(value or "").strip().lower()
         return mode if mode in MPR_CROSSHAIR_MODES else MPR_CROSSHAIR_MODE_ORTHOGONAL
@@ -2813,6 +2920,204 @@ class ViewerService:
                 viewport_key: MprMipViewportConfig(thickness=max(0, min(100, int(viewport_state.thickness))))
                 for viewport_key, viewport_state in state.viewports.items()
             },
+        )
+
+    @staticmethod
+    def _serialize_mpr_segmentation_config(state: MprSegmentationState) -> MprSegmentationConfig:
+        voi_box = state.voi_box
+        return MprSegmentationConfig(
+            enabled=bool(state.enabled),
+            lowerHu=float(state.lower_hu),
+            upperHu=float(state.upper_hu),
+            opacity=float(state.opacity),
+            color=str(state.color or "#22d3ee"),
+            voiBox=None if voi_box is None else MprSegmentationVoiBox(
+                xMin=float(voi_box.x_min),
+                xMax=float(voi_box.x_max),
+                yMin=float(voi_box.y_min),
+                yMax=float(voi_box.y_max),
+                zMin=float(voi_box.z_min),
+                zMax=float(voi_box.z_max),
+            ),
+        )
+
+    def _handle_mpr_segmentation_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_mpr_view_type(view.view_type) or view.view_group is None:
+            return False
+        if payload.mpr_segmentation_config is None:
+            return False
+        view.view_group.mpr_segmentation = self._normalize_mpr_segmentation_state(payload.mpr_segmentation_config)
+        return True
+
+    @classmethod
+    def _normalize_mpr_segmentation_state(cls, config: MprSegmentationConfig) -> MprSegmentationState:
+        lower_hu = cls._clamp_float(config.lower_hu, -1024.0, 3071.0, 300.0)
+        upper_hu = cls._clamp_float(config.upper_hu, -1024.0, 3071.0, 3071.0)
+        if lower_hu > upper_hu:
+            lower_hu, upper_hu = upper_hu, lower_hu
+        return MprSegmentationState(
+            enabled=bool(config.enabled),
+            lower_hu=lower_hu,
+            upper_hu=upper_hu,
+            opacity=cls._clamp_float(config.opacity, 0.0, 1.0, 0.45),
+            color=cls._normalize_mpr_segmentation_color(config.color),
+            voi_box=cls._normalize_mpr_segmentation_voi_box(config.voi_box),
+        )
+
+    @classmethod
+    def _normalize_mpr_segmentation_voi_box(
+        cls,
+        voi_box: MprSegmentationVoiBox | MprSegmentationVoiBoxState | None,
+    ) -> MprSegmentationVoiBoxState | None:
+        if voi_box is None:
+            return None
+
+        def axis_range(min_name: str, max_name: str) -> tuple[float, float]:
+            lower = cls._clamp_float(getattr(voi_box, min_name, 0.0), 0.0, 1.0, 0.0)
+            upper = cls._clamp_float(getattr(voi_box, max_name, 1.0), 0.0, 1.0, 1.0)
+            if lower > upper:
+                lower, upper = upper, lower
+            return lower, upper
+
+        x_min, x_max = axis_range("x_min", "x_max")
+        y_min, y_max = axis_range("y_min", "y_max")
+        z_min, z_max = axis_range("z_min", "z_max")
+        return MprSegmentationVoiBoxState(
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+        )
+
+    @staticmethod
+    def _normalize_mpr_segmentation_color(color: object) -> str:
+        text = str(color or "").strip()
+        if len(text) == 7 and text.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in text[1:]):
+            return text.lower()
+        return "#22d3ee"
+
+    @staticmethod
+    def _clamp_float(value: object, minimum: float, maximum: float, fallback: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not np.isfinite(numeric):
+            return fallback
+        return max(minimum, min(maximum, numeric))
+
+    @classmethod
+    def _apply_mpr_segmentation_overlay(
+        cls,
+        image: Image.Image,
+        state: MprSegmentationState,
+        source_pixels: np.ndarray,
+        viewport_key: str,
+        image_transform,
+        canvas_width: int,
+        canvas_height: int,
+    ) -> Image.Image:
+        if canvas_width <= 0 or canvas_height <= 0:
+            return image
+        mask = cls._build_mpr_segmentation_plane_mask(source_pixels, state, viewport_key)
+        if mask is None or not bool(np.any(mask)):
+            return image
+
+        transformed_mask = viewport_transformer.apply_affine_array(
+            mask.astype(np.uint8) * 255,
+            int(canvas_width),
+            int(canvas_height),
+            image_transform,
+            order=0,
+            cval=0.0,
+        )
+        overlay_mask = transformed_mask > 0
+        if not bool(np.any(overlay_mask)):
+            return image
+
+        alpha = cls._clamp_float(state.opacity, 0.0, 1.0, 0.45)
+        if alpha <= 0.0:
+            return image
+        color = np.asarray(cls._parse_hex_rgb(state.color), dtype=np.float32)
+        pixels = np.asarray(image.convert("RGBA"), dtype=np.float32).copy()
+        pixels[overlay_mask, :3] = pixels[overlay_mask, :3] * (1.0 - alpha) + color * alpha
+        return Image.fromarray(np.clip(pixels, 0, 255).astype(np.uint8))
+
+    @classmethod
+    def _build_mpr_segmentation_plane_mask(
+        cls,
+        source_pixels: np.ndarray,
+        state: MprSegmentationState,
+        viewport_key: str,
+    ) -> np.ndarray | None:
+        if not state.enabled:
+            return None
+        if state.opacity <= 0.0:
+            return None
+        pixels = np.asarray(source_pixels)
+        if pixels.ndim < 2:
+            return None
+        if pixels.ndim == 3:
+            pixels = pixels[..., 0]
+        lower_hu = cls._clamp_float(state.lower_hu, -1024.0, 3071.0, 300.0)
+        upper_hu = cls._clamp_float(state.upper_hu, -1024.0, 3071.0, 3071.0)
+        if lower_hu > upper_hu:
+            lower_hu, upper_hu = upper_hu, lower_hu
+
+        mask = (pixels >= lower_hu) & (pixels <= upper_hu)
+        return cls._apply_voi_box_to_mpr_plane_mask(mask, state.voi_box, viewport_key)
+
+    @classmethod
+    def _apply_voi_box_to_mpr_plane_mask(
+        cls,
+        mask: np.ndarray,
+        voi_box: MprSegmentationVoiBoxState | None,
+        viewport_key: str,
+    ) -> np.ndarray:
+        if voi_box is None:
+            return mask.astype(bool, copy=False)
+
+        height, width = mask.shape[:2]
+        if viewport_key == MPR_VIEWPORT_CORONAL:
+            horizontal_min, horizontal_max = voi_box.x_min, voi_box.x_max
+            vertical_min, vertical_max = voi_box.z_min, voi_box.z_max
+        elif viewport_key == MPR_VIEWPORT_SAGITTAL:
+            horizontal_min, horizontal_max = voi_box.y_min, voi_box.y_max
+            vertical_min, vertical_max = voi_box.z_min, voi_box.z_max
+        else:
+            horizontal_min, horizontal_max = voi_box.x_min, voi_box.x_max
+            vertical_min, vertical_max = voi_box.y_min, voi_box.y_max
+
+        col_start, col_end = cls._project_normalized_range_to_indices(horizontal_min, horizontal_max, width)
+        row_start, row_end = cls._project_normalized_range_to_indices(vertical_min, vertical_max, height)
+        if col_start >= col_end or row_start >= row_end:
+            return np.zeros(mask.shape[:2], dtype=bool)
+
+        voi_mask = np.zeros(mask.shape[:2], dtype=bool)
+        voi_mask[row_start:row_end, col_start:col_end] = True
+        return mask.astype(bool, copy=False) & voi_mask
+
+    @classmethod
+    def _project_normalized_range_to_indices(cls, minimum: float, maximum: float, size: int) -> tuple[int, int]:
+        if size <= 0:
+            return 0, 0
+        lower = cls._clamp_float(minimum, 0.0, 1.0, 0.0)
+        upper = cls._clamp_float(maximum, 0.0, 1.0, 1.0)
+        if lower > upper:
+            lower, upper = upper, lower
+        start = int(np.floor(lower * size))
+        end = int(np.ceil(upper * size))
+        return max(0, min(size, start)), max(0, min(size, end))
+
+    @staticmethod
+    def _parse_hex_rgb(color: str) -> tuple[int, int, int]:
+        normalized = ViewerService._normalize_mpr_segmentation_color(color)
+        return (
+            int(normalized[1:3], 16),
+            int(normalized[3:5], 16),
+            int(normalized[5:7], 16),
         )
 
     def _handle_mpr_mip_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
@@ -3716,6 +4021,45 @@ class ViewerService:
             return "PET Coronal MIP"
         return "PET/CT"
 
+    @staticmethod
+    def _build_fusion_corner_viewport_label(role: str) -> str:
+        if role == FUSION_PANE_PET_CORONAL_MIP:
+            return "MIP"
+        return "Axial"
+
+    @staticmethod
+    def _is_fusion_pet_display_role(role: str) -> bool:
+        return role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}
+
+    def _set_fusion_pet_window_range(
+        self,
+        group: ViewGroupRecord,
+        *,
+        min_value: float = 0.0,
+        max_value: float,
+    ) -> bool:
+        next_low = float(min_value) if np.isfinite(float(min_value)) else 0.0
+        next_high = float(max_value) if np.isfinite(float(max_value)) else next_low + 1.0
+        if next_high <= next_low:
+            next_high = next_low + 1e-6
+        next_width = max(1e-6, next_high - next_low)
+        next_center = (next_low + next_high) / 2.0
+        if (
+            group.fusion_pet_window.window_width is not None
+            and group.fusion_pet_window.window_center is not None
+            and abs(float(group.fusion_pet_window.window_width) - next_width) <= 1e-6
+            and abs(float(group.fusion_pet_window.window_center) - next_center) <= 1e-6
+        ):
+            return False
+        group.fusion_pet_window.window_width = next_width
+        group.fusion_pet_window.window_center = next_center
+        return True
+
+    @staticmethod
+    def _resolve_fusion_pet_window_drag_sensitivity(window_high: float | None) -> float:
+        high = float(window_high) if window_high is not None and np.isfinite(float(window_high)) else 0.0
+        return max(0.001, abs(high) * 0.01)
+
     def _bump_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
         if group is None or str(group.group_type).lower() != "fusion":
             return None
@@ -3788,7 +4132,50 @@ class ViewerService:
         if group is None:
             return False
         role = self._resolve_fusion_pane_role(view)
-        target_window = group.fusion_pet_window if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP} else group.window
+        if self._is_fusion_pet_display_role(role):
+            current_high = self._resolve_window_max(
+                group.fusion_pet_window.window_width,
+                group.fusion_pet_window.window_center,
+            )
+            if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
+                if payload.ww is not None and payload.wl is not None:
+                    next_high = float(payload.wl) + float(payload.ww) / 2.0
+                elif payload.ww is not None:
+                    next_high = float(payload.ww)
+                else:
+                    next_high = float(payload.wl or 0.0) * 2.0
+                changed = self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high)
+            elif payload.action_type == DRAG_ACTION_START:
+                group.drag_origin_window_width = float(
+                    current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
+                )
+                group.drag_origin_window_center = 0.0
+                return True
+            elif payload.action_type == DRAG_ACTION_MOVE:
+                base_high = float(
+                    group.drag_origin_window_width
+                    if group.drag_origin_window_width is not None
+                    else current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
+                )
+                delta = float(payload.x or 0.0) - float(payload.y or 0.0)
+                next_high = base_high + delta * self._resolve_fusion_pet_window_drag_sensitivity(base_high)
+                changed = self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high)
+            elif payload.action_type == DRAG_ACTION_END:
+                group.drag_origin_window_width = None
+                group.drag_origin_window_center = None
+                return True
+            else:
+                return False
+
+            if not changed:
+                return False
+            group.fusion_revision += 1
+            for group_view in self._get_group_views(view):
+                self._sync_fusion_view_state_from_group(group_view)
+                group_view.is_initialized = True
+            return True
+
+        target_window = group.window
 
         if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
             if payload.ww is not None:
@@ -3835,6 +4222,7 @@ class ViewerService:
         group = view.view_group
         if group is None:
             return False
+        should_finalize_drag = payload.action_type == DRAG_ACTION_END
         changed = False
         if payload.fusion_alpha is not None:
             next_alpha = max(0.0, min(float(payload.fusion_alpha), 1.0))
@@ -3862,31 +4250,22 @@ class ViewerService:
                     logger.debug("failed to reset fusion PET window for unit=%s", next_unit, exc_info=True)
                 changed = True
         if payload.fusion_pet_window_min is not None or payload.fusion_pet_window_max is not None:
-            current_low = self._resolve_window_min(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
             current_high = self._resolve_window_max(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
-            next_low = float(payload.fusion_pet_window_min) if payload.fusion_pet_window_min is not None else float(current_low or 0.0)
-            next_high = float(payload.fusion_pet_window_max) if payload.fusion_pet_window_max is not None else float(current_high or max(next_low + 1.0, 1.0))
-            if not np.isfinite(next_low):
-                next_low = 0.0
-            if not np.isfinite(next_high) or next_high <= next_low:
-                next_high = next_low + 1.0
-            next_width = max(WINDOW_WIDTH_MIN, next_high - next_low)
-            next_center = (next_low + next_high) / 2.0
-            if (
-                group.fusion_pet_window.window_width is None
-                or group.fusion_pet_window.window_center is None
-                or abs(float(group.fusion_pet_window.window_width) - next_width) > 1e-6
-                or abs(float(group.fusion_pet_window.window_center) - next_center) > 1e-6
-            ):
-                group.fusion_pet_window.window_width = next_width
-                group.fusion_pet_window.window_center = next_center
+            next_high = (
+                float(payload.fusion_pet_window_max)
+                if payload.fusion_pet_window_max is not None
+                else float(current_high or FUSION_DEFAULT_SUV_WINDOW_MAX)
+            )
+            if not np.isfinite(next_high):
+                next_high = FUSION_DEFAULT_SUV_WINDOW_MAX
+            if self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high):
                 changed = True
         if changed:
             group.fusion_revision += 1
             for group_view in self._get_group_views(view):
                 self._sync_fusion_view_state_from_group(group_view)
                 group_view.is_initialized = True
-        return changed
+        return changed or should_finalize_drag
 
     def _handle_fusion_registration(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         group = view.view_group
@@ -4792,6 +5171,19 @@ class ViewerService:
         return None, None
 
     @staticmethod
+    def _get_indexed_instance_and_cache(
+        series: SeriesRecord,
+        index: int,
+    ) -> tuple[InstanceRecord | None, CachedDicom | None]:
+        if not series.instances:
+            return None, None
+        clamped_index = max(0, min(int(index), len(series.instances) - 1))
+        instance = series.instances[clamped_index]
+        if not instance.sop_instance_uid:
+            return ViewerService._get_reference_instance_and_cache(series)
+        return instance, dicom_cache.get(instance.sop_instance_uid, instance.path)
+
+    @staticmethod
     def _corner_info_tag(value: str | None) -> tuple[str, ...]:
         return (value,) if value else tuple()
 
@@ -5009,20 +5401,26 @@ class ViewerService:
         plane_state: MprObliquePlaneState | None = None,
         plane_pose: PlanePose | None = None,
         cursor: MprCursorState | None = None,
+        show_physical_location: bool = True,
+        show_image_index: bool = True,
     ) -> CornerInfoOverlay:
         zoom = self._format_number(view.zoom, precision=2, suffix="x")
-        physical_location = self._build_physical_location_label(
-            view,
-            series,
-            dataset,
-            current_index,
-            viewport_label,
-            plane_state=plane_state,
-            plane_pose=plane_pose,
-            cursor=cursor,
+        physical_location = (
+            self._build_physical_location_label(
+                view,
+                series,
+                dataset,
+                current_index,
+                viewport_label,
+                plane_state=plane_state,
+                plane_pose=plane_pose,
+                cursor=cursor,
+            )
+            if show_physical_location
+            else None
         )
         viewport_location = self._join_non_empty("  ", viewport_label, physical_location)
-        image_index = f"Im: {current_index + 1}/{total_slices}" if total_slices > 0 else None
+        image_index = f"Im: {current_index + 1}/{total_slices}" if show_image_index and total_slices > 0 else None
         window_level = self._build_window_label(view.window_width, view.window_center)
         coordinate_line = f"X:{int(round(view.offset_x))} Y:{int(round(view.offset_y))}"
         slice_location = self._format_number(getattr(dataset, "SliceLocation", None), precision=2, suffix="mm")
@@ -5039,11 +5437,11 @@ class ViewerService:
                 "windowLevel": self._corner_info_tag(window_level),
                 "zoom": self._corner_info_tag(f"Zoom:{zoom}" if zoom else None),
                 "coordinates": self._corner_info_tag(coordinate_line),
-                "sliceLocation": self._labeled_corner_info_tag("Slice loc", slice_location),
-                "instanceNumber": self._labeled_corner_info_tag("Instance", instance_number),
-                "sopInstanceUid": self._labeled_corner_info_tag("SOP UID", sop_uid),
-                "imagePositionPatient": self._labeled_corner_info_tag("IPP", image_position),
-                "imageOrientationPatient": self._labeled_corner_info_tag("IOP", image_orientation),
+                "sliceLocation": self._labeled_corner_info_tag("Slice loc", slice_location) if show_image_index else tuple(),
+                "instanceNumber": self._labeled_corner_info_tag("Instance", instance_number) if show_image_index else tuple(),
+                "sopInstanceUid": self._labeled_corner_info_tag("SOP UID", sop_uid) if show_image_index else tuple(),
+                "imagePositionPatient": self._labeled_corner_info_tag("IPP", image_position) if show_image_index else tuple(),
+                "imageOrientationPatient": self._labeled_corner_info_tag("IOP", image_orientation) if show_image_index else tuple(),
                 "pixelSpacing": self._labeled_corner_info_tag("Pixel", pixel_spacing),
                 "rowsColumns": self._labeled_corner_info_tag("Matrix", matrix),
             }
@@ -5861,7 +6259,17 @@ class ViewerService:
         low_text = f"{float(low):.2f}"
         high_text = f"{float(high):.2f}"
         prefix = "SUV" if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL} else "PET"
-        return f"{prefix}:{low_text}--{high_text} {display.unit_label}"
+        unit_label = ViewerService._strip_trailing_unit_detail(display.unit_label)
+        return f"{prefix}:{low_text}--{high_text}{unit_label}".strip()
+
+    @staticmethod
+    def _strip_trailing_unit_detail(value: str | None) -> str:
+        text = str(value or "").strip()
+        if text.endswith(")") and "(" in text:
+            prefix = text.rsplit("(", 1)[0].strip()
+            if prefix:
+                return prefix
+        return text
 
     def _with_pet_window_corner_info(
         self,

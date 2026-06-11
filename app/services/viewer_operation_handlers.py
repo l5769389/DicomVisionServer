@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 from app.core import (
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
+    FUSION_PANE_OVERLAY_AXIAL,
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
@@ -25,6 +26,7 @@ from app.core import (
     VIEW_OP_TYPE_RENDER_3D_MODE,
     VIEW_OP_TYPE_SURFACE_CONFIG,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
+    VIEW_OP_TYPE_MPR_SEGMENTATION,
     VIEW_OP_TYPE_MPR_OBLIQUE,
     VIEW_OP_TYPE_MPR_CROSSHAIR_MODE,
     VIEW_OP_TYPE_MPR_STATE_SYNC,
@@ -195,6 +197,7 @@ MPR_GEOMETRY_REVISION_OPERATION_TYPES = {
     VIEW_OP_TYPE_SCROLL,
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
+    VIEW_OP_TYPE_MPR_SEGMENTATION,
     VIEW_OP_TYPE_ROTATE_3D,
     VIEW_OP_TYPE_RESET,
     VIEW_OP_TYPE_MPR_OBLIQUE,
@@ -614,6 +617,25 @@ def _handle_mpr_mip_config_operation(
     return _render_broadcast()
 
 
+def _handle_mpr_segmentation_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series
+    if not is_mpr_view:
+        return _render_none()
+    if not service._handle_mpr_segmentation_config(view, payload):
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_START:
+        return _render_none()
+    if payload.action_type == DRAG_ACTION_MOVE:
+        return _render_full_resolution_preview_broadcast()
+    return _render_broadcast()
+
+
 def _handle_mpr_oblique_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -703,7 +725,7 @@ def _handle_fusion_registration_operation(
     if payload.action_type == DRAG_ACTION_START:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_full_resolution_preview_broadcast()
+        return _render_full_resolution_preview_broadcast(viewports=(FUSION_PANE_OVERLAY_AXIAL,))
     return _render_broadcast()
 
 
@@ -740,6 +762,7 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_RENDER_3D_MODE: _handle_render_3d_mode_operation,
     VIEW_OP_TYPE_SURFACE_CONFIG: _handle_surface_config_operation,
     VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
+    VIEW_OP_TYPE_MPR_SEGMENTATION: _handle_mpr_segmentation_operation,
     VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,
     VIEW_OP_TYPE_MPR_CROSSHAIR_MODE: _handle_mpr_crosshair_mode_operation,
     VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
@@ -833,6 +856,10 @@ def _build_operation_render_outcome(
                 group_view.view_id
                 for group_view in service._get_group_views(view)
                 if group_view.width and group_view.height
+                and (
+                    render_decision.broadcast_viewports is None
+                    or service._resolve_fusion_pane_role(group_view) in render_decision.broadcast_viewports
+                )
             )
             if not sized_group_view_ids:
                 return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
