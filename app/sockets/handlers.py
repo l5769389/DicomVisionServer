@@ -224,6 +224,14 @@ def _pop_next_mpr_operation(state: _MprOperationQueueState) -> _QueuedMprOperati
         operation = state.pending_start
         state.pending_start = None
         return operation
+    if (
+        state.pending_end is not None
+        and state.pending_move is not None
+        and state.pending_move.payload.op_type == VIEW_OP_TYPE_FUSION_REGISTRATION
+    ):
+        operation = state.pending_move
+        state.pending_move = None
+        return operation
     if state.pending_end is not None:
         operation = state.pending_end
         state.pending_end = None
@@ -243,7 +251,8 @@ def _enqueue_mpr_operation(queue_key: str, operation: _QueuedMprOperation) -> No
         state.pending_move = None
         state.pending_end = None
     elif action_type == DRAG_ACTION_END:
-        state.pending_move = None
+        if operation.payload.op_type != VIEW_OP_TYPE_FUSION_REGISTRATION:
+            state.pending_move = None
         state.pending_end = operation
     elif action_type == DRAG_ACTION_MOVE:
         if state.pending_end is None:
@@ -339,7 +348,10 @@ async def _dispatch_operation_result(
 async def _process_queued_mpr_operation(operation: _QueuedMprOperation) -> None:
     try:
         view = view_registry.get(operation.payload.view_id, workspace_id=operation.workspace_id)
-        result = viewer_service.handle_view_operation(operation.payload, operation.workspace_id)
+        if view.view_type in FUSION_VIEW_TYPES:
+            result = await asyncio.to_thread(viewer_service.handle_view_operation, operation.payload, operation.workspace_id)
+        else:
+            result = viewer_service.handle_view_operation(operation.payload, operation.workspace_id)
         await _dispatch_operation_result(operation.server, operation.sid, view, operation.payload, result)
     except Exception as exc:
         logger.exception("socket queued MPR operation failed sid=%s view_id=%s", operation.sid, operation.payload.view_id)

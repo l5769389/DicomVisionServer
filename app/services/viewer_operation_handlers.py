@@ -13,6 +13,7 @@ from app.core import (
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_FUSION_CONFIG,
     VIEW_OP_TYPE_FUSION_REGISTRATION,
+    VIEW_OP_TYPE_PET_CONFIG,
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_PSEUDOCOLOR,
     VIEW_OP_TYPE_SCROLL,
@@ -385,6 +386,18 @@ def _handle_window_operation(
             return _render_full_resolution_preview_broadcast()
         return _render_broadcast()
 
+    if service._is_pet_view_type(view.view_type):
+        if not service._handle_pet_window(view, payload):
+            return _render_none()
+        if payload.action_type == DRAG_ACTION_START:
+            return _render_none()
+        return _render_single(
+            "png",
+            fast_preview=payload.action_type == DRAG_ACTION_MOVE,
+            defer=payload.action_type == DRAG_ACTION_MOVE,
+            metadata_mode="stack-preview-lite" if payload.action_type == DRAG_ACTION_MOVE else "full",
+        )
+
     if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
         if payload.ww is not None:
             view.window_width = float(payload.ww)
@@ -725,8 +738,23 @@ def _handle_fusion_registration_operation(
     if payload.action_type == DRAG_ACTION_START:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_full_resolution_preview_broadcast(viewports=(FUSION_PANE_OVERLAY_AXIAL,))
+        return _render_single("png", fast_preview=True)
     return _render_broadcast()
+
+
+def _handle_pet_config_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if not service._is_pet_view_type(view.view_type):
+        return _render_none()
+    if not service._handle_pet_config(view, payload):
+        return _render_none()
+    return _render_single()
 
 
 def _handle_generic_operation(
@@ -768,6 +796,7 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_MPR_STATE_SYNC: _handle_mpr_state_sync_operation,
     VIEW_OP_TYPE_FUSION_CONFIG: _handle_fusion_config_operation,
     VIEW_OP_TYPE_FUSION_REGISTRATION: _handle_fusion_registration_operation,
+    VIEW_OP_TYPE_PET_CONFIG: _handle_pet_config_operation,
     VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
 }
 

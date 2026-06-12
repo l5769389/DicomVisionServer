@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +9,7 @@ ViewType = Literal[
     "Stack",
     "MPR",
     "3D",
+    "PET",
     "AX",
     "COR",
     "SAG",
@@ -19,8 +20,9 @@ ViewType = Literal[
 ]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
+FusionRegistrationExportMode = Literal["newDicom", "br"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "fusionRegistration", "fusionConfig"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "fusionRegistration", "fusionConfig", "petConfig"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -211,6 +213,35 @@ class ViewExportRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class FusionRegistrationExportRequest(BaseModel):
+    view_id: str = Field(alias="viewId", description="Overlay fusion view ID whose registration state should be exported.")
+    mode: FusionRegistrationExportMode = Field(description="Registration export mode: new derived DICOM series or .br sidecar.")
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+    output_directory: str = Field(alias="outputDirectory")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionRegistrationArtifactExportRequest(BaseModel):
+    view_id: str = Field(alias="viewId", description="Overlay fusion view ID whose registration state should be exported.")
+    mode: FusionRegistrationExportMode = Field(description="Registration export mode: new derived DICOM series zip or .br sidecar.")
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionRegistrationExportResponse(BaseModel):
+    mode: FusionRegistrationExportMode
+    directory_path: str = Field(alias="directoryPath")
+    file_path: str | None = Field(default=None, alias="filePath")
+    file_count: int = Field(alias="fileCount")
+    series_description: str = Field(alias="seriesDescription")
+    pet_unit: str = Field(alias="petUnit")
+    pet_unit_label: str = Field(alias="petUnitLabel")
+
+    model_config = {"populate_by_name": True}
+
+
 class ScaleBarInfo(BaseModel):
     length_norm: float = Field(alias="lengthNorm")
     label: str
@@ -345,6 +376,17 @@ class FusionInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class PetInfo(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    pet_unit: str = Field(default="SUVbw", alias="petUnit")
+    pet_unit_label: str = Field(default="g/ml (SUVbw)", alias="petUnitLabel")
+    pet_window_min: float | None = Field(default=None, alias="petWindowMin")
+    pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    pseudocolor_preset: str = Field(default="bwinverse", alias="pseudocolorPreset")
+
+    model_config = {"populate_by_name": True}
+
+
 class FusionProjectionInfo(BaseModel):
     pane_role: str = Field(alias="paneRole")
     reference_world: tuple[float, float, float] = Field(alias="referenceWorld")
@@ -376,6 +418,7 @@ class ViewImageResponse(BaseModel):
     orientation: OrientationInfo | None = None
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
+    pet_info: PetInfo | None = Field(default=None, alias="petInfo")
     fusion_info: FusionInfo | None = Field(default=None, alias="fusionInfo")
     fusion_projection: FusionProjectionInfo | None = Field(default=None, alias="fusionProjection")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
@@ -451,6 +494,10 @@ class ViewOperationRequest(BaseModel):
     fusion_pet_unit: str | None = Field(default=None, alias="fusionPetUnit")
     fusion_pet_window_min: float | None = Field(default=None, alias="fusionPetWindowMin")
     fusion_pet_window_max: float | None = Field(default=None, alias="fusionPetWindowMax")
+    pet_unit: str | None = Field(default=None, alias="petUnit")
+    pet_window_min: float | None = Field(default=None, alias="petWindowMin")
+    pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    fusion_registration_file: dict[str, Any] | None = Field(default=None, alias="fusionRegistrationFile")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
     mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")

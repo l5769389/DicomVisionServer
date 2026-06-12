@@ -1,8 +1,13 @@
+import json
+import io
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from fastapi import HTTPException
+from pydicom import dcmread
 from pydicom.dataset import Dataset
 
 from app.core import (
@@ -15,8 +20,9 @@ from app.models.viewer import FusionRegistrationState, InstanceRecord, SeriesRec
 from app.services.mpr import VolumeGeometry, build_identity_geometry
 from app.services.render_layers.render_context import CornerInfoOverlay
 from app.services.viewer_fusion import render_fusion_pixels
+from app.services.viewer_operation_handlers import _handle_fusion_registration_operation
 from app.services.viewer_service import FusionPetDisplayVolume, ViewerService
-from app.schemas.view import ViewOperationRequest, ViewSetSizeRequest, ViewSize
+from app.schemas.view import FusionRegistrationArtifactExportRequest, FusionRegistrationExportRequest, ViewOperationRequest, ViewSetSizeRequest, ViewSize
 
 
 def _volume(shape: tuple[int, int, int] = (5, 6, 7)) -> np.ndarray:
@@ -717,6 +723,206 @@ def test_fusion_pet_bqml_can_be_displayed_as_suvbw() -> None:
     assert scale == pytest.approx(0.0002)
 
 
+def test_fusion_pet_missing_required_suv_fields_falls_back_to_source() -> None:
+    dataset = Dataset()
+    dataset.Units = "BQML"
+
+    scale, unit, label = ViewerService()._resolve_pet_display_scale(dataset, "SUVbw")
+
+    assert scale == pytest.approx(1.0)
+    assert unit == "source"
+    assert label == "BQML"
+
+
+def test_fusion_registration_move_uses_immediate_overlay_fast_preview() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+    )
+    series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+
+    move = _handle_fusion_registration_operation(
+        service,
+        view,
+        series,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="move",
+            subOpType="rotate",
+            x=10,
+            y=0,
+        ),
+        False,
+    )
+    end = _handle_fusion_registration_operation(
+        service,
+        view,
+        series,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="rotate",
+            x=10,
+            y=0,
+        ),
+        False,
+    )
+
+    assert move.mode == "single"
+    assert move.fast_preview is True
+    assert move.fast_preview_full_resolution is False
+    assert move.broadcast_viewports is None
+    assert end.mode == "broadcast"
+    assert end.fast_preview is False
+    assert end.broadcast_viewports is None
+
+
+def test_fusion_registration_end_applies_final_delta_without_move() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+    )
+    series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+
+    _handle_fusion_registration_operation(
+        service,
+        view,
+        series,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="rotate",
+            x=0,
+            y=0,
+        ),
+        False,
+    )
+    end = _handle_fusion_registration_operation(
+        service,
+        view,
+        series,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="rotate",
+            x=10,
+            y=0,
+        ),
+        False,
+    )
+
+    assert end.mode == "broadcast"
+    assert group.fusion_registration.rotation_degrees == pytest.approx(3.5)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_config_pet_unit_updates_group_and_resets_pet_window(monkeypatch) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    group.fusion_pet_unit = "SUVbw"
+    group.fusion_pet_window.window_width = 4.49
+    group.fusion_pet_window.window_center = 2.245
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+    )
+    ct_series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+    pet_series = SeriesRecord(
+        series_id="pet",
+        folder_path="",
+        series_instance_uid="pet-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="PT",
+        series_description="PET",
+    )
+
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda _view: (group, ct_series, pet_series))
+    monkeypatch.setattr(service, "_get_series_volume", lambda _series, **_: np.ones((2, 2, 2), dtype=np.float32))
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda _series, volume, unit: FusionPetDisplayVolume(
+            volume=np.asarray(volume, dtype=np.float32) * 0.001,
+            unit="kBqml",
+            unit_label="kBq/ml (uptake)",
+            source_units="BQML",
+            scale=0.001,
+        ),
+    )
+    monkeypatch.setattr(service, "_derive_default_pet_window_for_display_volume", lambda _display: (2.0, 1.0))
+
+    changed = service._handle_fusion_config(
+        view,
+        ViewOperationRequest(viewId="overlay", opType="fusionConfig", fusionPetUnit="kBqml"),
+    )
+
+    assert changed is True
+    assert group.fusion_pet_unit == "kBqml"
+    assert group.fusion_pet_window.window_width == pytest.approx(2.0)
+    assert group.fusion_pet_window.window_center == pytest.approx(1.0)
+    assert group.fusion_revision == 1
+
+
 def test_fusion_pet_corner_info_uses_pet_window_label() -> None:
     display = FusionPetDisplayVolume(
         volume=np.zeros((2, 2, 2), dtype=np.float32),
@@ -865,3 +1071,329 @@ def test_fusion_pet_window_drag_keeps_lower_bound_at_zero() -> None:
 def test_fusion_pet_window_drag_sensitivity_scales_with_current_range() -> None:
     assert ViewerService._resolve_fusion_pet_window_drag_sensitivity(4.5) == pytest.approx(0.045)
     assert ViewerService._resolve_fusion_pet_window_drag_sensitivity(30.0) == pytest.approx(0.3)
+
+
+def _export_test_series(series_id: str, modality: str, description: str) -> SeriesRecord:
+    uid_suffix = {"ct": "1", "pet": "2"}.get(series_id, "9")
+    return SeriesRecord(
+        series_id=series_id,
+        folder_path="",
+        series_instance_uid=f"1.2.826.0.1.3680043.10.5432.{uid_suffix}",
+        study_instance_uid="study",
+        patient_id="patient",
+        patient_name="Patient",
+        study_date="20200101",
+        study_description="Study",
+        accession_number="ACC",
+        modality=modality,
+        series_description=description,
+    )
+
+
+def _export_test_group_and_view() -> tuple[ViewGroupRecord, ViewRecord]:
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    group.fusion_pet_unit = "SUVbw"
+    group.fusion_pet_window.window_width = 4.49
+    group.fusion_pet_window.window_center = 2.245
+    group.fusion_registration.translate_row_mm = 1.5
+    group.fusion_registration.translate_col_mm = -2.25
+    group.fusion_registration.rotation_degrees = 6.0
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        secondary_series_id="pet",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+    )
+    return (group, view)
+
+
+def _patch_export_dependencies(
+    monkeypatch,
+    service: ViewerService,
+    group: ViewGroupRecord,
+    view: ViewRecord,
+    *,
+    ct_volume: np.ndarray | None = None,
+    pet_volume: np.ndarray | None = None,
+) -> tuple[SeriesRecord, SeriesRecord]:
+    ct_series = _export_test_series("ct", "CT", "CT")
+    pet_series = _export_test_series("pet", "PT", "PET FDG SUV")
+    ct_data = ct_volume if ct_volume is not None else np.zeros((2, 3, 4), dtype=np.float32)
+    pet_data = pet_volume if pet_volume is not None else np.arange(np.prod(ct_data.shape), dtype=np.float32).reshape(ct_data.shape)
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_data.shape))
+
+    monkeypatch.setattr("app.services.viewer_service.view_registry.get", lambda *_args, **_kwargs: view)
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda _view: (group, ct_series, pet_series))
+    monkeypatch.setattr(
+        service,
+        "_get_series_volume",
+        lambda series, **_: ct_data if series.series_id == "ct" else pet_data,
+    )
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda _series, _shape: geometry)
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda _series, volume, _unit: FusionPetDisplayVolume(
+            volume=np.asarray(volume, dtype=np.float32),
+            unit="SUVbw",
+            unit_label="g/ml (SUVbw)",
+            source_units="BQML",
+            scale=0.0002,
+        ),
+    )
+    return (ct_series, pet_series)
+
+
+def _registration_sidecar_payload(
+    ct_series: SeriesRecord,
+    pet_series: SeriesRecord,
+    *,
+    translate_row_mm: float = 7.5,
+    translate_col_mm: float = -3.25,
+    rotation_degrees: float = 12.0,
+    pet_unit: str = "kBqml",
+) -> dict[str, object]:
+    return {
+        "format": "DicomVisionFusionRegistration",
+        "version": 1,
+        "seriesDescription": "PET FDG SUV_Reg",
+        "ct": {
+            "seriesId": ct_series.series_id,
+            "seriesInstanceUid": ct_series.series_instance_uid,
+        },
+        "pet": {
+            "seriesId": pet_series.series_id,
+            "seriesInstanceUid": pet_series.series_instance_uid,
+            "unit": pet_unit,
+            "window": {"min": 0.25, "max": 9.5},
+        },
+        "registration": {
+            "translateRowMm": translate_row_mm,
+            "translateColMm": translate_col_mm,
+            "rotationDegrees": rotation_degrees,
+        },
+    }
+
+
+def test_fusion_registration_export_writes_br_sidecar(tmp_path, monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    _patch_export_dependencies(monkeypatch, service, group, view)
+
+    response = service.export_fusion_registration(
+        FusionRegistrationExportRequest(
+            viewId="overlay",
+            mode="br",
+            seriesDescription="PET FDG SUV_Reg",
+            outputDirectory=str(tmp_path),
+        )
+    )
+
+    assert response.mode == "br"
+    assert response.file_count == 1
+    assert response.pet_unit == "SUVbw"
+    assert group.fusion_registration.saved is True
+    file_path = Path(response.file_path or "")
+    assert file_path.exists()
+    payload = json.loads(file_path.read_text(encoding="utf-8"))
+    assert payload["format"] == "DicomVisionFusionRegistration"
+    assert payload["ct"]["seriesId"] == "ct"
+    assert payload["pet"]["seriesId"] == "pet"
+    assert payload["pet"]["unit"] == "SUVbw"
+    assert payload["registration"]["translateRowMm"] == pytest.approx(1.5)
+    assert payload["registration"]["translateColMm"] == pytest.approx(-2.25)
+    assert payload["registration"]["rotationDegrees"] == pytest.approx(6.0)
+
+
+def test_fusion_registration_export_writes_derived_dicom_series(tmp_path, monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    _, pet_series = _patch_export_dependencies(
+        monkeypatch,
+        service,
+        group,
+        view,
+        ct_volume=np.zeros((3, 4, 5), dtype=np.float32),
+        pet_volume=np.arange(60, dtype=np.float32).reshape(3, 4, 5),
+    )
+    reference = Dataset()
+    reference.SOPClassUID = "1.2.840.10008.5.1.4.1.1.128"
+    reference.SOPInstanceUID = "1.2.3.4.5"
+    reference.SeriesInstanceUID = pet_series.series_instance_uid
+    reference.Modality = "PT"
+    reference.SeriesNumber = "7"
+    monkeypatch.setattr(service, "_get_reference_instance_and_cache", lambda _series: (None, SimpleNamespace(dataset=reference)))
+
+    response = service.export_fusion_registration(
+        FusionRegistrationExportRequest(
+            viewId="overlay",
+            mode="newDicom",
+            seriesDescription="PET FDG SUV_Reg",
+            outputDirectory=str(tmp_path),
+        )
+    )
+
+    output_dir = Path(response.directory_path)
+    files = sorted(output_dir.glob("*.dcm"))
+    assert response.mode == "newDicom"
+    assert response.file_count == 3
+    assert len(files) == 3
+    assert response.file_path is None
+    assert group.fusion_registration.saved is True
+
+    dataset = dcmread(str(files[0]))
+    assert dataset.SeriesDescription == "PET FDG SUV_Reg"
+    assert dataset.SeriesInstanceUID != pet_series.series_instance_uid
+    assert dataset.SOPInstanceUID != reference.SOPInstanceUID
+    assert dataset.Rows == 4
+    assert dataset.Columns == 5
+    assert int(dataset.SeriesNumber) == 1007
+    assert dataset.Units == "GML"
+    assert dataset[(0x0011, 0x1001)].value == "SUVbw"
+    assert dataset[(0x0011, 0x1002)].value == "g/ml (SUVbw)"
+    assert float(dataset[(0x0011, 0x1003)].value) == pytest.approx(1.5)
+    assert float(dataset[(0x0011, 0x1004)].value) == pytest.approx(-2.25)
+    assert float(dataset[(0x0011, 0x1005)].value) == pytest.approx(6.0)
+
+
+def test_fusion_registration_artifact_exports_br_json(monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    _patch_export_dependencies(monkeypatch, service, group, view)
+
+    result = service.export_fusion_registration_artifact(
+        FusionRegistrationArtifactExportRequest(
+            viewId="overlay",
+            mode="br",
+            seriesDescription="PET FDG SUV_Reg",
+        )
+    )
+
+    payload = json.loads(result.file_bytes.decode("utf-8"))
+    assert result.file_name == "PET-FDG-SUV_Reg.br"
+    assert result.media_type == "application/json"
+    assert result.extra_headers == {"x-dicomvision-artifact-kind": "br", "x-dicomvision-file-count": "1"}
+    assert payload["format"] == "DicomVisionFusionRegistration"
+    assert payload["pet"]["unit"] == "SUVbw"
+    assert payload["registration"]["translateRowMm"] == pytest.approx(1.5)
+    assert group.fusion_registration.saved is True
+
+
+def test_fusion_registration_artifact_exports_derived_dicom_zip(monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    _, pet_series = _patch_export_dependencies(
+        monkeypatch,
+        service,
+        group,
+        view,
+        ct_volume=np.zeros((2, 3, 4), dtype=np.float32),
+        pet_volume=np.arange(24, dtype=np.float32).reshape(2, 3, 4),
+    )
+    reference = Dataset()
+    reference.SOPClassUID = "1.2.840.10008.5.1.4.1.1.128"
+    reference.SOPInstanceUID = "1.2.3.4.5"
+    reference.SeriesInstanceUID = pet_series.series_instance_uid
+    reference.Modality = "PT"
+    monkeypatch.setattr(service, "_get_reference_instance_and_cache", lambda _series: (None, SimpleNamespace(dataset=reference)))
+
+    result = service.export_fusion_registration_artifact(
+        FusionRegistrationArtifactExportRequest(
+            viewId="overlay",
+            mode="newDicom",
+            seriesDescription="PET FDG SUV_Reg",
+        )
+    )
+
+    assert result.file_name == "PET-FDG-SUV_Reg.zip"
+    assert result.media_type == "application/zip"
+    assert result.extra_headers == {"x-dicomvision-artifact-kind": "zip", "x-dicomvision-file-count": "2"}
+    with zipfile.ZipFile(io.BytesIO(result.file_bytes)) as archive:
+        names = archive.namelist()
+        assert names == ["PET-FDG-SUV_Reg/IM000001.dcm", "PET-FDG-SUV_Reg/IM000002.dcm"]
+        dataset = dcmread(io.BytesIO(archive.read(names[0])))
+    assert dataset.SeriesDescription == "PET FDG SUV_Reg"
+    assert dataset.SeriesInstanceUID != pet_series.series_instance_uid
+    assert dataset.Rows == 3
+    assert dataset.Columns == 4
+    assert dataset[(0x0011, 0x1001)].value == "SUVbw"
+    assert group.fusion_registration.saved is True
+
+
+def test_fusion_registration_load_applies_matching_br_payload(monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    ct_series, pet_series = _patch_export_dependencies(monkeypatch, service, group, view)
+    payload = _registration_sidecar_payload(ct_series, pet_series)
+
+    changed = service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            subOpType="load",
+            fusionRegistrationFile=payload,
+        ),
+    )
+
+    assert changed is True
+    assert group.fusion_registration.translate_row_mm == pytest.approx(7.5)
+    assert group.fusion_registration.translate_col_mm == pytest.approx(-3.25)
+    assert group.fusion_registration.rotation_degrees == pytest.approx(12.0)
+    assert group.fusion_registration.saved is True
+    assert group.fusion_pet_unit == "kBqml"
+    assert group.fusion_pet_window.window_width == pytest.approx(9.25)
+    assert group.fusion_pet_window.window_center == pytest.approx(4.875)
+    assert group.fusion_revision == 1
+
+
+def test_fusion_registration_load_rejects_mismatched_series(monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    ct_series, pet_series = _patch_export_dependencies(monkeypatch, service, group, view)
+    payload = _registration_sidecar_payload(ct_series, pet_series)
+    payload["pet"] = {**payload["pet"], "seriesId": "other-pet", "seriesInstanceUid": "9.9.9"}
+
+    with pytest.raises(HTTPException, match="PET series"):
+        service._handle_fusion_registration(
+            view,
+            ViewOperationRequest(
+                viewId="overlay",
+                opType="fusionRegistration",
+                subOpType="load",
+                fusionRegistrationFile=payload,
+            ),
+        )
+
+
+def test_fusion_registration_load_rejects_invalid_payload(monkeypatch) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    ct_series, pet_series = _patch_export_dependencies(monkeypatch, service, group, view)
+    payload = _registration_sidecar_payload(ct_series, pet_series, rotation_degrees=float("nan"))
+
+    with pytest.raises(HTTPException, match="finite number"):
+        service._handle_fusion_registration(
+            view,
+            ViewOperationRequest(
+                viewId="overlay",
+                opType="fusionRegistration",
+                subOpType="load",
+                fusionRegistrationFile=payload,
+            ),
+        )
+
+    with pytest.raises(HTTPException, match="Unsupported registration file format"):
+        service._handle_fusion_registration(
+            view,
+            ViewOperationRequest(
+                viewId="overlay",
+                opType="fusionRegistration",
+                subOpType="load",
+                fusionRegistrationFile={"format": "Other"},
+            ),
+        )

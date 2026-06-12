@@ -5,6 +5,9 @@ from fastapi.responses import Response
 
 from app.api.workspace import get_request_workspace_id
 from app.schemas.view import (
+    FusionRegistrationArtifactExportRequest,
+    FusionRegistrationExportRequest,
+    FusionRegistrationExportResponse,
     OperationAcceptedResponse,
     ViewCloseRequest,
     ViewCreateRequest,
@@ -152,5 +155,37 @@ def export_view(
     return Response(
         content=exported.file_bytes,
         media_type=exported.media_type,
-        headers=_build_attachment_headers(exported.file_name),
+        headers={**_build_attachment_headers(exported.file_name), **(exported.extra_headers or {})},
+    )
+
+
+@router.post(
+    "/fusion/registration/export",
+    response_model=FusionRegistrationExportResponse,
+    summary="Export PET/CT fusion registration result",
+    description="Saves the current PET/CT fusion registration as a derived DICOM series or DicomVision .br sidecar.",
+)
+def export_fusion_registration(
+    payload: FusionRegistrationExportRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> FusionRegistrationExportResponse:
+    """Persist the current fusion registration result without overwriting source DICOM files."""
+    return viewer_service.export_fusion_registration(payload, workspace_id=workspace_id)
+
+
+@router.post(
+    "/fusion/registration/export/artifact",
+    summary="Download PET/CT fusion registration result artifact",
+    description="Packages the current PET/CT fusion registration as a downloadable .br file or derived DICOM zip.",
+)
+def export_fusion_registration_artifact(
+    payload: FusionRegistrationArtifactExportRequest,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> Response:
+    """Return a browser-downloadable fusion registration artifact."""
+    exported = viewer_service.export_fusion_registration_artifact(payload, workspace_id=workspace_id)
+    return Response(
+        content=exported.file_bytes,
+        media_type=exported.media_type,
+        headers={**_build_attachment_headers(exported.file_name), **(exported.extra_headers or {})},
     )

@@ -75,7 +75,9 @@ class ViewRegistry:
             create_series_id = ct_series.series_id
             create_secondary_series_id = pet_series.series_id
         else:
-            series_registry.get(payload.series_id, workspace_id=normalized_workspace_id)
+            series = series_registry.get(payload.series_id, workspace_id=normalized_workspace_id)
+            if payload.view_type == "PET" and not _is_pet_series(series):
+                raise HTTPException(status_code=400, detail="PET view requires a PT/PET series")
             create_series_id = payload.series_id
             create_secondary_series_id = payload.secondary_series_id
 

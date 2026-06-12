@@ -1,10 +1,13 @@
 import io
 import hashlib
+import json
+import zipfile
 from collections import OrderedDict
 from datetime import datetime
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from importlib import import_module
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 from uuid import uuid4
@@ -34,6 +37,7 @@ from app.core import (
     MPR_VIEWPORT_SAGITTAL,
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_PET_CONFIG,
     VIEW_OP_TYPE_SET_SIZE,
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
@@ -70,6 +74,9 @@ from app.models.viewer import (
 )
 from app.schemas.dicom import CornerInfoPayload, CornerInfoRequest, CornerInfoResponse
 from app.schemas.view import (
+    FusionRegistrationArtifactExportRequest,
+    FusionRegistrationExportRequest,
+    FusionRegistrationExportResponse,
     ImageFormat,
     AnnotationOverlayPayload,
     MprCrosshairInfo,
@@ -95,6 +102,7 @@ from app.schemas.view import (
     ViewQaWaterAnalyzeResponse,
     ViewTransformPayload,
     FusionInfo,
+    PetInfo,
     FusionProjectionInfo,
     FusionRegistrationInfo,
     ViewMtfAnalyzeResponse,
@@ -162,6 +170,7 @@ from app.services.viewer_fusion import (
     build_ct_axial_plane,
     image_from_pixels,
     render_fusion_pixels,
+    transform_pet_sampling_plane,
 )
 from app.services.viewer_render_guards import ensure_view_size
 from app.services.water_phantom_qa_service import WaterPhantomQaService
@@ -278,6 +287,20 @@ class ExportedFileResult:
     file_bytes: bytes
     file_name: str
     media_type: str
+    extra_headers: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class FusionRegistrationExportContext:
+    group: ViewGroupRecord
+    ct_series: SeriesRecord
+    pet_series: SeriesRecord
+    ct_volume: np.ndarray
+    pet_volume: np.ndarray
+    ct_geometry: VolumeGeometry
+    pet_geometry: VolumeGeometry
+    pet_display: FusionPetDisplayVolume
+    series_description: str
 
 
 @dataclass(frozen=True)
@@ -313,6 +336,10 @@ class ViewerService:
         return view_type == "3D"
 
     @staticmethod
+    def _is_pet_view_type(view_type: str) -> bool:
+        return view_type == "PET"
+
+    @staticmethod
     def _is_fusion_view_type(view_type: str) -> bool:
         return view_type in FUSION_VIEW_TYPES
 
@@ -337,6 +364,9 @@ class ViewerService:
         if not view.is_initialized:
             if self._is_fusion_view_type(view.view_type):
                 self._initialize_fusion_viewport(view)
+            elif self._is_pet_view_type(view.view_type):
+                self._initialize_pet_viewport(view)
+                view.is_initialized = True
             elif not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
                 self._initialize_viewport(view)
                 view.is_initialized = True
@@ -447,6 +477,563 @@ class ViewerService:
             file_name=f"{view.view_id}-{safe_view_type}.dcm",
             media_type="application/dicom",
         )
+
+    def export_fusion_registration(
+        self,
+        payload: FusionRegistrationExportRequest,
+        *,
+        workspace_id: str | None = None,
+    ) -> FusionRegistrationExportResponse:
+        output_directory = self._resolve_fusion_registration_output_directory(payload.output_directory)
+        context = self._build_fusion_registration_export_context(
+            payload.view_id,
+            payload.series_description,
+            workspace_id=workspace_id,
+        )
+
+        if payload.mode == "br":
+            file_path = self._write_fusion_registration_sidecar(
+                output_directory,
+                group=context.group,
+                ct_series=context.ct_series,
+                pet_series=context.pet_series,
+                pet_display=context.pet_display,
+                series_description=context.series_description,
+            )
+            view_group_registry.save_fusion_registration(context.group)
+            return FusionRegistrationExportResponse(
+                mode="br",
+                directoryPath=str(file_path.parent),
+                filePath=str(file_path),
+                fileCount=1,
+                seriesDescription=context.series_description,
+                petUnit=context.pet_display.unit,
+                petUnitLabel=context.pet_display.unit_label,
+            )
+
+        if payload.mode != "newDicom":
+            raise HTTPException(status_code=400, detail="Unsupported fusion registration export mode")
+
+        directory_path, file_count = self._write_fusion_registration_dicom_series(
+            output_directory,
+            group=context.group,
+            ct_series=context.ct_series,
+            pet_series=context.pet_series,
+            ct_volume=context.ct_volume,
+            ct_geometry=context.ct_geometry,
+            pet_geometry=context.pet_geometry,
+            pet_display=context.pet_display,
+            series_description=context.series_description,
+        )
+        view_group_registry.save_fusion_registration(context.group)
+        return FusionRegistrationExportResponse(
+            mode="newDicom",
+            directoryPath=str(directory_path),
+            filePath=None,
+            fileCount=file_count,
+            seriesDescription=context.series_description,
+            petUnit=context.pet_display.unit,
+            petUnitLabel=context.pet_display.unit_label,
+        )
+
+    def export_fusion_registration_artifact(
+        self,
+        payload: FusionRegistrationArtifactExportRequest,
+        *,
+        workspace_id: str | None = None,
+    ) -> ExportedFileResult:
+        context = self._build_fusion_registration_export_context(
+            payload.view_id,
+            payload.series_description,
+            workspace_id=workspace_id,
+        )
+        if payload.mode == "br":
+            file_name = f"{self._safe_fusion_file_name_part(context.series_description)}.br"
+            sidecar_payload = self._build_fusion_registration_sidecar_payload(
+                group=context.group,
+                ct_series=context.ct_series,
+                pet_series=context.pet_series,
+                pet_display=context.pet_display,
+                series_description=context.series_description,
+            )
+            view_group_registry.save_fusion_registration(context.group)
+            return ExportedFileResult(
+                file_bytes=json.dumps(sidecar_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=file_name,
+                media_type="application/json",
+                extra_headers={
+                    "x-dicomvision-artifact-kind": "br",
+                    "x-dicomvision-file-count": "1",
+                },
+            )
+
+        if payload.mode != "newDicom":
+            raise HTTPException(status_code=400, detail="Unsupported fusion registration export mode")
+
+        series_folder = self._safe_fusion_file_name_part(context.series_description)
+        datasets = self._build_fusion_registration_dicom_datasets(
+            group=context.group,
+            ct_series=context.ct_series,
+            pet_series=context.pet_series,
+            ct_volume=context.ct_volume,
+            ct_geometry=context.ct_geometry,
+            pet_geometry=context.pet_geometry,
+            pet_display=context.pet_display,
+            series_description=context.series_description,
+        )
+        archive = io.BytesIO()
+        try:
+            with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                for index, dataset in enumerate(datasets, start=1):
+                    buffer = io.BytesIO()
+                    dcmwrite(buffer, dataset, write_like_original=False)
+                    zip_file.writestr(f"{series_folder}/IM{index:06d}.dcm", buffer.getvalue())
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to package DICOM export artifact: {exc}") from exc
+
+        view_group_registry.save_fusion_registration(context.group)
+        return ExportedFileResult(
+            file_bytes=archive.getvalue(),
+            file_name=f"{series_folder}.zip",
+            media_type="application/zip",
+            extra_headers={
+                "x-dicomvision-artifact-kind": "zip",
+                "x-dicomvision-file-count": str(len(datasets)),
+            },
+        )
+
+    def _build_fusion_registration_export_context(
+        self,
+        view_id: str,
+        series_description: str | None,
+        *,
+        workspace_id: str | None = None,
+    ) -> FusionRegistrationExportContext:
+        view = view_registry.get(view_id, workspace_id=workspace_id)
+        if not self._is_fusion_view_type(view.view_type):
+            raise HTTPException(status_code=400, detail="viewId does not refer to a PET/CT fusion view")
+
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        resolved_description = self._resolve_fusion_registration_series_description(
+            series_description,
+            pet_series,
+        )
+        ct_volume = self._get_series_volume(ct_series)
+        pet_volume = self._get_series_volume(pet_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
+        pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
+        group.fusion_pet_unit = pet_display.unit
+        return FusionRegistrationExportContext(
+            group=group,
+            ct_series=ct_series,
+            pet_series=pet_series,
+            ct_volume=ct_volume,
+            pet_volume=pet_volume,
+            ct_geometry=ct_geometry,
+            pet_geometry=pet_geometry,
+            pet_display=pet_display,
+            series_description=resolved_description,
+        )
+
+    @staticmethod
+    def _resolve_fusion_registration_output_directory(value: str) -> Path:
+        text = str(value or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="outputDirectory is required")
+        directory = Path(text).expanduser().resolve()
+        if directory.exists() and not directory.is_dir():
+            raise HTTPException(status_code=400, detail="outputDirectory must be a directory")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to create output directory: {exc}") from exc
+        return directory
+
+    @classmethod
+    def _resolve_fusion_registration_series_description(
+        cls,
+        value: str | None,
+        pet_series: SeriesRecord,
+    ) -> str:
+        fallback = f"{str(pet_series.series_description or pet_series.series_id or 'PET').strip() or 'PET'}_Reg"
+        description = str(value or fallback).strip() or fallback
+        return description[:64]
+
+    @staticmethod
+    def _safe_fusion_file_name_part(value: object) -> str:
+        text = str(value or "").strip()
+        sanitized = "".join("-" if char in '\\/:*?"<>|\r\n\t' else char for char in text)
+        sanitized = "-".join(part for part in sanitized.split() if part).strip(".-_ ")
+        return sanitized or "fusion-registration"
+
+    @classmethod
+    def _resolve_unique_path(cls, path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        index = 1
+        while True:
+            candidate = parent / f"{stem}-{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    @classmethod
+    def _resolve_unique_directory(cls, directory: Path) -> Path:
+        if not directory.exists():
+            return directory
+        parent = directory.parent
+        stem = directory.name
+        index = 1
+        while True:
+            candidate = parent / f"{stem}-{index}"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    @staticmethod
+    def _format_dicom_ds(value: float) -> str:
+        text = format(float(value), ".8g")
+        return text if len(text) <= 16 else format(float(value), ".6e")
+
+    def _build_fusion_registration_sidecar_payload(
+        self,
+        *,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        pet_display: FusionPetDisplayVolume,
+        series_description: str,
+    ) -> dict[str, object]:
+        registration = group.fusion_registration
+        return {
+            "format": "DicomVisionFusionRegistration",
+            "version": 1,
+            "createdAt": datetime.now().isoformat(timespec="seconds"),
+            "seriesDescription": series_description,
+            "ct": {
+                "seriesId": ct_series.series_id,
+                "seriesInstanceUid": ct_series.series_instance_uid,
+                "seriesDescription": ct_series.series_description,
+            },
+            "pet": {
+                "seriesId": pet_series.series_id,
+                "seriesInstanceUid": pet_series.series_instance_uid,
+                "seriesDescription": pet_series.series_description,
+                "unit": pet_display.unit,
+                "unitLabel": pet_display.unit_label,
+                "sourceUnits": pet_display.source_units,
+                "scale": float(pet_display.scale),
+                "window": {
+                    "min": self._resolve_window_min(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    "max": self._resolve_window_max(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                },
+            },
+            "registration": {
+                "translateRowMm": float(registration.translate_row_mm),
+                "translateColMm": float(registration.translate_col_mm),
+                "rotationDegrees": float(registration.rotation_degrees),
+            },
+        }
+
+    def _write_fusion_registration_sidecar(
+        self,
+        output_directory: Path,
+        *,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        pet_display: FusionPetDisplayVolume,
+        series_description: str,
+    ) -> Path:
+        file_name = f"{self._safe_fusion_file_name_part(series_description)}.br"
+        file_path = self._resolve_unique_path(output_directory / file_name)
+        payload = self._build_fusion_registration_sidecar_payload(
+            group=group,
+            ct_series=ct_series,
+            pet_series=pet_series,
+            pet_display=pet_display,
+            series_description=series_description,
+        )
+        try:
+            file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to write .br file: {exc}") from exc
+        return file_path
+
+    @staticmethod
+    def _resolve_pet_dicom_units(display: FusionPetDisplayVolume) -> str:
+        if display.unit == FUSION_PET_UNIT_SUV_BW:
+            return "GML"
+        if display.unit == FUSION_PET_UNIT_SOURCE and display.source_units:
+            return display.source_units
+        return "CNTS"
+
+    def _resample_fusion_pet_volume_to_ct_grid(
+        self,
+        *,
+        group: ViewGroupRecord,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_geometry: VolumeGeometry,
+        pet_display: FusionPetDisplayVolume,
+    ) -> list[tuple[PlanePose, np.ndarray]]:
+        ct_shape = tuple(int(value) for value in ct_volume.shape)
+        slices: list[tuple[PlanePose, np.ndarray]] = []
+        for axial_index in range(ct_shape[0]):
+            plane = build_ct_axial_plane(ct_geometry, ct_shape, axial_index)
+            pet_plane = transform_pet_sampling_plane(plane, group.fusion_registration)
+            pet_slice = reslice_plane(
+                pet_display.volume,
+                pet_geometry,
+                pet_plane,
+                ResliceMipConfig(enabled=False),
+                interpolation_order=1,
+            )
+            slices.append((plane, np.asarray(pet_slice, dtype=np.float32)))
+        return slices
+
+    @staticmethod
+    def _resolve_dicom_rescale_for_slices(slices: list[np.ndarray]) -> tuple[float, float]:
+        finite_arrays: list[np.ndarray] = []
+        for item in slices:
+            array = np.asarray(item, dtype=np.float32)
+            finite = array[np.isfinite(array)]
+            if finite.size:
+                finite_arrays.append(finite)
+        if not finite_arrays:
+            return (1.0, 0.0)
+        finite_values = np.concatenate(finite_arrays)
+        low = float(np.min(finite_values))
+        high = float(np.max(finite_values))
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            return (1.0, low if np.isfinite(low) else 0.0)
+        return ((high - low) / 65535.0, low)
+
+    @staticmethod
+    def _encode_dicom_uint16_pixels(pixels: np.ndarray, *, slope: float, intercept: float) -> np.ndarray:
+        source = np.asarray(pixels, dtype=np.float32)
+        source = np.where(np.isfinite(source), source, intercept)
+        if abs(float(slope)) <= 1e-12:
+            encoded = np.zeros(source.shape, dtype=np.uint16)
+        else:
+            encoded = np.clip(np.rint((source - float(intercept)) / float(slope)), 0, 65535).astype(np.uint16)
+        return np.ascontiguousarray(encoded)
+
+    def _apply_fusion_registration_private_tags(
+        self,
+        dataset: Dataset,
+        *,
+        group: ViewGroupRecord,
+        pet_display: FusionPetDisplayVolume,
+    ) -> None:
+        registration = group.fusion_registration
+        dataset.add_new((0x0011, 0x0010), "LO", "DICOMVISION_FUSION")
+        dataset.add_new((0x0011, 0x1001), "LO", pet_display.unit)
+        dataset.add_new((0x0011, 0x1002), "LO", pet_display.unit_label)
+        dataset.add_new((0x0011, 0x1003), "DS", self._format_dicom_ds(registration.translate_row_mm))
+        dataset.add_new((0x0011, 0x1004), "DS", self._format_dicom_ds(registration.translate_col_mm))
+        dataset.add_new((0x0011, 0x1005), "DS", self._format_dicom_ds(registration.rotation_degrees))
+        window_min = self._resolve_window_min(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
+        window_max = self._resolve_window_max(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
+        if window_min is not None:
+            dataset.add_new((0x0011, 0x1006), "DS", self._format_dicom_ds(window_min))
+        if window_max is not None:
+            dataset.add_new((0x0011, 0x1007), "DS", self._format_dicom_ds(window_max))
+
+    @staticmethod
+    def _resolve_derived_series_number(dataset: Dataset) -> int:
+        try:
+            return int(float(getattr(dataset, "SeriesNumber", 0) or 0)) + 1000
+        except (TypeError, ValueError):
+            return 1000
+
+    def _build_fusion_registration_dicom_dataset(
+        self,
+        *,
+        reference_dataset: Dataset | None,
+        plane: PlanePose,
+        pixels: np.ndarray,
+        group: ViewGroupRecord,
+        pet_display: FusionPetDisplayVolume,
+        series_description: str,
+        series_instance_uid: str,
+        instance_number: int,
+        rescale_slope: float,
+        rescale_intercept: float,
+    ) -> Dataset:
+        dataset = deepcopy(reference_dataset) if reference_dataset is not None else Dataset()
+        now = datetime.now()
+        sop_instance_uid = generate_uid()
+        sop_class_uid = str(getattr(dataset, "SOPClassUID", "") or SecondaryCaptureImageStorage)
+
+        file_meta = getattr(dataset, "file_meta", None)
+        if file_meta is None:
+            file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = sop_class_uid
+        file_meta.MediaStorageSOPInstanceUID = sop_instance_uid
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        file_meta.ImplementationClassUID = PYDICOM_IMPLEMENTATION_UID
+        dataset.file_meta = file_meta
+        dataset.is_little_endian = True
+        dataset.is_implicit_VR = False
+
+        encoded_pixels = self._encode_dicom_uint16_pixels(
+            pixels,
+            slope=rescale_slope,
+            intercept=rescale_intercept,
+        )
+        rows, columns = encoded_pixels.shape
+        top_left_world = (
+            np.asarray(plane.center_world, dtype=np.float64)
+            - np.asarray(plane.col_world, dtype=np.float64) * plane.pixel_spacing_col_mm * ((float(columns) - 1.0) / 2.0)
+            - np.asarray(plane.row_world, dtype=np.float64) * plane.pixel_spacing_row_mm * ((float(rows) - 1.0) / 2.0)
+        )
+
+        for keyword in (
+            "NumberOfFrames",
+            "SharedFunctionalGroupsSequence",
+            "PerFrameFunctionalGroupsSequence",
+            "FloatPixelData",
+            "DoubleFloatPixelData",
+        ):
+            if hasattr(dataset, keyword):
+                delattr(dataset, keyword)
+
+        dataset.SOPClassUID = sop_class_uid
+        dataset.SOPInstanceUID = sop_instance_uid
+        dataset.SeriesInstanceUID = series_instance_uid
+        dataset.Modality = str(getattr(dataset, "Modality", "") or "PT")
+        dataset.SeriesDescription = series_description
+        dataset.SeriesNumber = self._resolve_derived_series_number(dataset)
+        dataset.InstanceNumber = instance_number
+        dataset.ImageType = ["DERIVED", "SECONDARY", "REGISTRATION"]
+        dataset.DerivationDescription = (
+            "DicomVision PET/CT registration export; "
+            f"unit={pet_display.unit}; "
+            f"translateRowMm={self._format_dicom_ds(group.fusion_registration.translate_row_mm)}; "
+            f"translateColMm={self._format_dicom_ds(group.fusion_registration.translate_col_mm)}; "
+            f"rotationDegrees={self._format_dicom_ds(group.fusion_registration.rotation_degrees)}"
+        )
+        dataset.ContentDate = now.strftime("%Y%m%d")
+        dataset.ContentTime = now.strftime("%H%M%S")
+        dataset.InstanceCreationDate = dataset.ContentDate
+        dataset.InstanceCreationTime = dataset.ContentTime
+        dataset.Rows = int(rows)
+        dataset.Columns = int(columns)
+        dataset.SamplesPerPixel = 1
+        dataset.PhotometricInterpretation = "MONOCHROME2"
+        dataset.BitsAllocated = 16
+        dataset.BitsStored = 16
+        dataset.HighBit = 15
+        dataset.PixelRepresentation = 0
+        dataset.RescaleSlope = self._format_dicom_ds(rescale_slope)
+        dataset.RescaleIntercept = self._format_dicom_ds(rescale_intercept)
+        dataset.RescaleType = pet_display.unit
+        dataset.Units = self._resolve_pet_dicom_units(pet_display)
+        dataset.WindowWidth = self._format_dicom_ds(group.fusion_pet_window.window_width or 1.0)
+        dataset.WindowCenter = self._format_dicom_ds(group.fusion_pet_window.window_center or 0.5)
+        dataset.PixelSpacing = [
+            self._format_dicom_ds(plane.pixel_spacing_row_mm),
+            self._format_dicom_ds(plane.pixel_spacing_col_mm),
+        ]
+        dataset.ImageOrientationPatient = [
+            self._format_dicom_ds(float(value))
+            for value in (*np.asarray(plane.row_world, dtype=np.float64), *np.asarray(plane.col_world, dtype=np.float64))
+        ]
+        dataset.ImagePositionPatient = [self._format_dicom_ds(float(value)) for value in top_left_world]
+        dataset.SliceLocation = self._format_dicom_ds(float(np.dot(plane.normal_world, plane.center_world)))
+        dataset.PixelData = encoded_pixels.tobytes()
+        self._apply_fusion_registration_private_tags(dataset, group=group, pet_display=pet_display)
+        return dataset
+
+    def _build_fusion_registration_dicom_datasets(
+        self,
+        *,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_geometry: VolumeGeometry,
+        pet_display: FusionPetDisplayVolume,
+        series_description: str,
+    ) -> list[Dataset]:
+        _, reference_cached = self._get_reference_instance_and_cache(pet_series)
+        series_instance_uid = generate_uid()
+        resampled_slices = self._resample_fusion_pet_volume_to_ct_grid(
+            group=group,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_geometry=pet_geometry,
+            pet_display=pet_display,
+        )
+        rescale_slope, rescale_intercept = self._resolve_dicom_rescale_for_slices([pixels for _, pixels in resampled_slices])
+
+        datasets: list[Dataset] = []
+        for index, (plane, pixels) in enumerate(resampled_slices, start=1):
+            dataset = self._build_fusion_registration_dicom_dataset(
+                reference_dataset=reference_cached.dataset if reference_cached is not None else None,
+                plane=plane,
+                pixels=pixels,
+                group=group,
+                pet_display=pet_display,
+                series_description=series_description,
+                series_instance_uid=series_instance_uid,
+                instance_number=index,
+                rescale_slope=rescale_slope,
+                rescale_intercept=rescale_intercept,
+            )
+            datasets.append(dataset)
+        return datasets
+
+    def _write_fusion_registration_dicom_series(
+        self,
+        output_directory: Path,
+        *,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_geometry: VolumeGeometry,
+        pet_display: FusionPetDisplayVolume,
+        series_description: str,
+    ) -> tuple[Path, int]:
+        series_folder = self._safe_fusion_file_name_part(series_description)
+        directory_path = self._resolve_unique_directory(output_directory / series_folder)
+        try:
+            directory_path.mkdir(parents=True, exist_ok=False)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to create DICOM output directory: {exc}") from exc
+
+        datasets = self._build_fusion_registration_dicom_datasets(
+            group=group,
+            ct_series=ct_series,
+            pet_series=pet_series,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_geometry=pet_geometry,
+            pet_display=pet_display,
+            series_description=series_description,
+        )
+        for index, dataset in enumerate(datasets, start=1):
+            file_path = directory_path / f"IM{index:06d}.dcm"
+            try:
+                dcmwrite(str(file_path), dataset, write_like_original=False)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Failed to write DICOM file: {exc}") from exc
+
+        return (directory_path, len(datasets))
 
     def _apply_export_overlays(self, image: Image.Image, overlays: ViewExportOverlaysPayload) -> Image.Image:
         canvas = image.convert("RGBA")
@@ -1247,6 +1834,52 @@ class ViewerService:
             view.window_center,
         )
 
+    @staticmethod
+    def _is_pet_series(series: SeriesRecord | None) -> bool:
+        return str(series.modality or "").strip().upper() in {"PT", "PET"} if series is not None else False
+
+    def _initialize_pet_viewport(self, view: ViewRecord) -> None:
+        ensure_view_size(view)
+
+        series = series_registry.get(view.series_id)
+        if not self._is_pet_series(series):
+            raise HTTPException(status_code=400, detail="PET view requires a PT/PET series")
+        if not series.instances:
+            raise HTTPException(status_code=400, detail="PET series does not contain image instances")
+
+        pet_volume = self._get_series_volume(series)
+        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        view.pet_unit = pet_display.unit
+        view.pet_unit_label = pet_display.unit_label
+        view.current_index = max(0, min(self._resolve_representative_stack_index(series), pet_display.volume.shape[0] - 1))
+        image_height = int(pet_display.volume.shape[1]) if pet_display.volume.ndim >= 2 else 1
+        image_width = int(pet_display.volume.shape[2]) if pet_display.volume.ndim >= 3 else 1
+        view.zoom = viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=view.width,
+            canvas_height=view.height,
+        )
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        view.rotation_degrees = 0
+        view.hor_flip = False
+        view.ver_flip = False
+        view.pseudocolor_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+        pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+        view.window_width = pet_ww
+        view.window_center = pet_wl
+        self._reset_drag_state(view)
+        logger.info(
+            "PET viewport initialized view_id=%s volume=%s unit=%s zoom=%.4f ww=%s wl=%s",
+            view.view_id,
+            tuple(int(value) for value in pet_display.volume.shape),
+            view.pet_unit,
+            view.zoom,
+            view.window_width,
+            view.window_center,
+        )
+
     def _initialize_mpr_viewport(self, view: ViewRecord) -> None:
         ensure_view_size(view)
 
@@ -1822,6 +2455,10 @@ class ViewerService:
             self._initialize_3d_viewport(view)
         elif self._is_fusion_view_type(view.view_type):
             self._reset_fusion_view_group(view)
+        elif self._is_pet_view_type(view.view_type):
+            view.pet_unit = FUSION_PET_UNIT_SUV_BW
+            view.pet_unit_label = FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SUV_BW]
+            self._initialize_pet_viewport(view)
         else:
             view.rotation_degrees = 0
             view.hor_flip = False
@@ -2045,6 +2682,166 @@ class ViewerService:
         except Exception:
             logger.debug("failed to schedule surface preview warmup view_id=%s", request.view_id, exc_info=True)
 
+    def _render_pet_view(
+        self,
+        view: ViewRecord,
+        image_format: ImageFormat = "png",
+        *,
+        fast_preview: bool = False,
+        metadata_mode: str = "full",
+        progress_callback: ViewRenderProgressCallback | None = None,
+    ) -> RenderedImageResult:
+        render_started_at = perf_counter()
+        ensure_view_size(view)
+
+        series = series_registry.get(view.series_id)
+        if not self._is_pet_series(series):
+            raise HTTPException(status_code=400, detail="PET view requires a PT/PET series")
+        self._emit_render_progress(progress_callback, "volume", progress_percent=8)
+        pet_volume = self._get_series_volume(series, progress_callback=progress_callback)
+        if not view.is_initialized:
+            self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
+            self._initialize_pet_viewport(view)
+            view.is_initialized = True
+
+        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        view.pet_unit = pet_display.unit
+        view.pet_unit_label = pet_display.unit_label
+        view.current_index = max(0, min(int(view.current_index), pet_display.volume.shape[0] - 1))
+        instance, cached = self._get_indexed_instance_and_cache(series, view.current_index)
+        if instance is None or cached is None:
+            raise HTTPException(status_code=400, detail="PET series does not contain renderable DICOM instances")
+
+        source_pixels = np.asarray(pet_display.volume[view.current_index], dtype=np.float32)
+        pixel_min = float(np.nanmin(source_pixels)) if source_pixels.size else 0.0
+        pixel_max = float(np.nanmax(source_pixels)) if source_pixels.size else 1.0
+        if not np.isfinite(pixel_min):
+            pixel_min = 0.0
+        if not np.isfinite(pixel_max) or pixel_max <= pixel_min:
+            pixel_max = pixel_min + 1.0
+
+        metadata_started_at = perf_counter()
+        render_plan = self._build_render_plan_for_shape(view, *source_pixels.shape[:2])
+        image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=source_pixels.shape[1],
+            image_height=source_pixels.shape[0],
+            canvas_width=render_plan.render_view.width or 0,
+            canvas_height=render_plan.render_view.height or 0,
+            view=render_plan.render_view,
+        )
+        scale_bar = self._build_scale_bar_info(
+            render_plan.render_view,
+            image_transform,
+            self._get_stack_spacing_xy(cached.dataset),
+        )
+        slice_corner_info = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            cached.dataset,
+            current_index=view.current_index,
+            total_slices=len(series.instances),
+            viewport_label="PET",
+        )
+        slice_corner_info = self._with_pet_window_corner_info(
+            slice_corner_info,
+            pet_display,
+            view.window_width,
+            view.window_center,
+        )
+        include_stack_overlay_payloads = not (fast_preview and metadata_mode == "stack-preview-lite")
+        visible_measurements = self._build_visible_measurements(view) if include_stack_overlay_payloads else ()
+        context = RenderContext(
+            view=render_plan.render_view,
+            source_pixels=source_pixels,
+            pixel_min=pixel_min,
+            pixel_max=pixel_max,
+            instance=instance,
+            cached=cached,
+            image_transform=image_transform,
+            measurements=visible_measurements,
+            corner_info=None,
+            orientation=None,
+        )
+        visible_presentation_measurements = (
+            self._build_visible_presentation_measurements(series, instance)
+            if include_stack_overlay_payloads
+            else ()
+        )
+        visible_presentation_annotations = (
+            self._build_visible_presentation_annotations(series, instance)
+            if include_stack_overlay_payloads
+            else ()
+        )
+        metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
+
+        image_started_at = perf_counter()
+        if fast_preview:
+            image = self._render_fast_preview(context)
+        else:
+            image = layered_renderer.render(context)
+        image_ms = (perf_counter() - image_started_at) * 1000.0
+
+        encode_started_at = perf_counter()
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        encode_ms = (perf_counter() - encode_started_at) * 1000.0
+
+        logger.debug(
+            "PET render timing view_id=%s index=%s unit=%s fast_preview=%s image_format=%s viewport=%sx%s render=%sx%s zoom=%.4f ww=%s wl=%s metadata_ms=%.1f image_ms=%.1f encode_ms=%.1f total_ms=%.1f",
+            view.view_id,
+            view.current_index,
+            view.pet_unit,
+            fast_preview,
+            image_format,
+            view.width,
+            view.height,
+            render_plan.render_view.width,
+            render_plan.render_view.height,
+            view.zoom,
+            view.window_width,
+            view.window_center,
+            metadata_ms,
+            image_ms,
+            encode_ms,
+            (perf_counter() - render_started_at) * 1000.0,
+        )
+
+        return RenderedImageResult(
+            meta=ViewImageResponse(
+                slice_info=SliceInfo(current=view.current_index, total=len(series.instances)),
+                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
+                imageFormat=image_format,
+                viewId=view.view_id,
+                color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
+                petInfo=PetInfo(
+                    seriesId=series.series_id,
+                    petUnit=pet_display.unit,
+                    petUnitLabel=pet_display.unit_label,
+                    petWindowMin=self._resolve_window_min(view.window_width, view.window_center),
+                    petWindowMax=self._resolve_window_max(view.window_width, view.window_center),
+                    pseudocolorPreset=view.pseudocolor_preset,
+                ),
+                scaleBar=scale_bar,
+                cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
+                measurements=[] if not include_stack_overlay_payloads else self._serialize_measurements(
+                    (*visible_measurements, *visible_presentation_measurements),
+                    image_transform=image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
+                annotations=[] if not include_stack_overlay_payloads else self._serialize_annotations(
+                    visible_presentation_annotations,
+                    image_transform=image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
+                transform=self._build_view_transform_payload(view),
+                orientation=self._serialize_orientation_overlay(
+                    self._build_stack_orientation_overlay(render_plan.render_view, cached.dataset)
+                ),
+            ),
+            image_bytes=image_bytes,
+        )
+
     def _render_view(
         self,
         view: ViewRecord,
@@ -2244,6 +3041,7 @@ class ViewerService:
         image_format: ImageFormat = "png",
         *,
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
@@ -4031,6 +4829,32 @@ class ViewerService:
     def _is_fusion_pet_display_role(role: str) -> bool:
         return role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}
 
+    @staticmethod
+    def _set_pet_window_range(
+        view: ViewRecord,
+        *,
+        min_value: float = 0.0,
+        max_value: float,
+    ) -> bool:
+        if not np.isfinite(float(min_value)) or not np.isfinite(float(max_value)):
+            raise HTTPException(status_code=400, detail="PET window range must be finite")
+        next_low = float(min_value)
+        next_high = float(max_value)
+        if next_high <= next_low:
+            raise HTTPException(status_code=400, detail="PET window max must be greater than min")
+        next_width = max(1e-6, next_high - next_low)
+        next_center = (next_low + next_high) / 2.0
+        if (
+            view.window_width is not None
+            and view.window_center is not None
+            and abs(float(view.window_width) - next_width) <= 1e-6
+            and abs(float(view.window_center) - next_center) <= 1e-6
+        ):
+            return False
+        view.window_width = next_width
+        view.window_center = next_center
+        return True
+
     def _set_fusion_pet_window_range(
         self,
         group: ViewGroupRecord,
@@ -4059,6 +4883,77 @@ class ViewerService:
     def _resolve_fusion_pet_window_drag_sensitivity(window_high: float | None) -> float:
         high = float(window_high) if window_high is not None and np.isfinite(float(window_high)) else 0.0
         return max(0.001, abs(high) * 0.01)
+
+    def _handle_pet_window(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        current_high = self._resolve_window_max(view.window_width, view.window_center)
+        if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
+            if payload.ww is not None and payload.wl is not None:
+                next_high = float(payload.wl) + float(payload.ww) / 2.0
+            elif payload.ww is not None:
+                next_high = float(payload.ww)
+            else:
+                next_high = float(payload.wl or 0.0) * 2.0
+            changed = self._set_pet_window_range(view, min_value=0.0, max_value=next_high)
+        elif payload.action_type == DRAG_ACTION_START:
+            view.drag_origin_window_width = float(
+                current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
+            )
+            view.drag_origin_window_center = 0.0
+            return True
+        elif payload.action_type == DRAG_ACTION_MOVE:
+            base_high = float(
+                view.drag_origin_window_width
+                if view.drag_origin_window_width is not None
+                else current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
+            )
+            delta = float(payload.x or 0.0) - float(payload.y or 0.0)
+            next_high = base_high + delta * self._resolve_fusion_pet_window_drag_sensitivity(base_high)
+            changed = self._set_pet_window_range(view, min_value=0.0, max_value=max(1e-6, next_high))
+        elif payload.action_type == DRAG_ACTION_END:
+            view.drag_origin_window_width = None
+            view.drag_origin_window_center = None
+            return True
+        else:
+            return False
+
+        if changed:
+            view.is_initialized = True
+        return changed
+
+    def _handle_pet_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        if not self._is_pet_view_type(view.view_type):
+            return False
+        changed = False
+        if payload.pet_unit is not None:
+            next_unit = self._normalize_fusion_pet_unit(payload.pet_unit)
+            if view.pet_unit != next_unit:
+                series = series_registry.get(view.series_id, workspace_id=view.workspace_id)
+                pet_volume = self._get_series_volume(series)
+                pet_display = self._build_fusion_pet_display_volume(series, pet_volume, next_unit)
+                view.pet_unit = pet_display.unit
+                view.pet_unit_label = pet_display.unit_label
+                pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+                view.window_width = pet_ww
+                view.window_center = pet_wl
+                changed = True
+        if payload.pet_window_min is not None or payload.pet_window_max is not None:
+            current_low = self._resolve_window_min(view.window_width, view.window_center)
+            current_high = self._resolve_window_max(view.window_width, view.window_center)
+            next_low = (
+                float(payload.pet_window_min)
+                if payload.pet_window_min is not None
+                else float(current_low if current_low is not None else 0.0)
+            )
+            next_high = (
+                float(payload.pet_window_max)
+                if payload.pet_window_max is not None
+                else float(current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX)
+            )
+            if self._set_pet_window_range(view, min_value=next_low, max_value=next_high):
+                changed = True
+        if changed:
+            view.is_initialized = True
+        return changed
 
     def _bump_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
         if group is None or str(group.group_type).lower() != "fusion":
@@ -4277,6 +5172,8 @@ class ViewerService:
             group.fusion_registration = FusionRegistrationState()
         elif sub_op == "save":
             view_group_registry.save_fusion_registration(group)
+        elif sub_op == "load":
+            return self._load_fusion_registration_sidecar(view, payload.fusion_registration_file)
         elif payload.action_type == DRAG_ACTION_START:
             group.rotation_drag = None
             group.crosshair_drag_origin_center = (
@@ -4285,7 +5182,7 @@ class ViewerService:
                 registration.rotation_degrees,
             )
             return True
-        elif payload.action_type == DRAG_ACTION_MOVE:
+        elif payload.action_type in {DRAG_ACTION_MOVE, DRAG_ACTION_END}:
             origin = group.crosshair_drag_origin_center or (
                 registration.translate_row_mm,
                 registration.translate_col_mm,
@@ -4300,10 +5197,92 @@ class ViewerService:
                 registration.translate_col_mm = origin_col + float(payload.x or 0.0) * plane.pixel_spacing_col_mm / zoom
                 registration.translate_row_mm = origin_row + float(payload.y or 0.0) * plane.pixel_spacing_row_mm / zoom
             registration.saved = False
-        elif payload.action_type == DRAG_ACTION_END:
-            group.crosshair_drag_origin_center = None
+            if payload.action_type == DRAG_ACTION_END:
+                group.crosshair_drag_origin_center = None
         else:
             return False
+        group.fusion_revision += 1
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+        return True
+
+    @staticmethod
+    def _require_fusion_registration_mapping(value: object, name: str) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=400, detail=f"{name} must be an object")
+        return value
+
+    @staticmethod
+    def _require_finite_fusion_registration_number(value: object, name: str) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"{name} must be a finite number") from exc
+        if not np.isfinite(number):
+            raise HTTPException(status_code=400, detail=f"{name} must be a finite number")
+        return number
+
+    @staticmethod
+    def _fusion_registration_sidecar_matches_series(sidecar_series: dict[str, object], series: SeriesRecord) -> bool:
+        sidecar_series_id = str(sidecar_series.get("seriesId") or "").strip()
+        sidecar_uid = str(sidecar_series.get("seriesInstanceUid") or "").strip()
+        current_uid = str(series.series_instance_uid or "").strip()
+        return bool(
+            (sidecar_series_id and sidecar_series_id == series.series_id)
+            or (sidecar_uid and current_uid and sidecar_uid == current_uid)
+        )
+
+    def _load_fusion_registration_sidecar(
+        self,
+        view: ViewRecord,
+        sidecar_payload: dict[str, Any] | None,
+    ) -> bool:
+        payload = self._require_fusion_registration_mapping(sidecar_payload, "fusionRegistrationFile")
+        if payload.get("format") != "DicomVisionFusionRegistration":
+            raise HTTPException(status_code=400, detail="Unsupported registration file format")
+
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_payload = self._require_fusion_registration_mapping(payload.get("ct"), "ct")
+        pet_payload = self._require_fusion_registration_mapping(payload.get("pet"), "pet")
+        if not self._fusion_registration_sidecar_matches_series(ct_payload, ct_series):
+            raise HTTPException(status_code=400, detail="Registration file CT series does not match the current fusion view")
+        if not self._fusion_registration_sidecar_matches_series(pet_payload, pet_series):
+            raise HTTPException(status_code=400, detail="Registration file PET series does not match the current fusion view")
+
+        registration_payload = self._require_fusion_registration_mapping(payload.get("registration"), "registration")
+        group.fusion_registration.translate_row_mm = self._require_finite_fusion_registration_number(
+            registration_payload.get("translateRowMm"),
+            "registration.translateRowMm",
+        )
+        group.fusion_registration.translate_col_mm = self._require_finite_fusion_registration_number(
+            registration_payload.get("translateColMm"),
+            "registration.translateColMm",
+        )
+        group.fusion_registration.rotation_degrees = self._require_finite_fusion_registration_number(
+            registration_payload.get("rotationDegrees"),
+            "registration.rotationDegrees",
+        )
+
+        pet_unit = pet_payload.get("unit")
+        if pet_unit is not None:
+            group.fusion_pet_unit = self._normalize_fusion_pet_unit(str(pet_unit))
+
+        window_payload = pet_payload.get("window")
+        if isinstance(window_payload, dict) and (
+            window_payload.get("min") is not None or window_payload.get("max") is not None
+        ):
+            window_min = self._require_finite_fusion_registration_number(
+                window_payload.get("min", 0.0),
+                "pet.window.min",
+            )
+            window_max = self._require_finite_fusion_registration_number(
+                window_payload.get("max"),
+                "pet.window.max",
+            )
+            self._set_fusion_pet_window_range(group, min_value=window_min, max_value=window_max)
+
+        view_group_registry.save_fusion_registration(group)
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
             self._sync_fusion_view_state_from_group(group_view)

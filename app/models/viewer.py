@@ -267,6 +267,8 @@ class ViewRecord:
     secondary_series_id: str | None = None
     fusion_pane_role: str | None = None
     pseudocolor_preset: str = "bw"
+    pet_unit: str = "SUVbw"
+    pet_unit_label: str = "g/ml (SUVbw)"
     width: int | None = None
     height: int | None = None
     current_index: int = 0

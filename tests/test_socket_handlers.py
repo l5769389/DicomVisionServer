@@ -221,6 +221,117 @@ def test_mpr_operation_queue_end_drops_pending_move(monkeypatch) -> None:
     assert asyncio.run(run()) == [("start", 0.1), ("end", 0.9)]
 
 
+def test_fusion_registration_queue_flushes_pending_move_before_end(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float | None]]:
+        handlers._mpr_operation_queues.clear()
+        server = _SocketServerStub()
+        calls: list[tuple[str, float | None]] = []
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def fake_process(operation):
+            calls.append((str(operation.payload.action_type), operation.payload.x))
+            if operation.payload.action_type == "start":
+                start_entered.set()
+                await release_start.wait()
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="FusionOverlayAxial"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(handlers, "_process_queued_mpr_operation", fake_process)
+
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {
+                "viewId": "fusion-overlay",
+                "opType": "fusionRegistration",
+                "actionType": "start",
+                "subOpType": "translate",
+                "x": 0.0,
+                "y": 0.0,
+            },
+        ) == {"ok": True}
+        await _wait_for(start_entered.is_set)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {
+                "viewId": "fusion-overlay",
+                "opType": "fusionRegistration",
+                "actionType": "move",
+                "subOpType": "translate",
+                "x": 0.4,
+                "y": 0.2,
+            },
+        ) == {"ok": True}
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {
+                "viewId": "fusion-overlay",
+                "opType": "fusionRegistration",
+                "actionType": "end",
+                "subOpType": "translate",
+                "x": 0.9,
+                "y": 0.4,
+            },
+        ) == {"ok": True}
+        release_start.set()
+        await _wait_for(lambda: calls == [("start", 0.0), ("move", 0.4), ("end", 0.9)])
+        return calls
+
+    assert asyncio.run(run()) == [("start", 0.0), ("move", 0.4), ("end", 0.9)]
+
+
+def test_queued_operation_runs_view_operation_off_event_loop(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, object, str | None]]]:
+        server = _SocketServerStub()
+        used_to_thread = False
+
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="FusionOverlayAxial"),
+        )
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: OperationRenderOutcome(),
+        )
+
+        async def fake_to_thread(func, *args):
+            nonlocal used_to_thread
+            used_to_thread = True
+            return func(*args)
+
+        monkeypatch.setattr(handlers.asyncio, "to_thread", fake_to_thread)
+        await handlers._process_queued_mpr_operation(
+            handlers._QueuedMprOperation(
+                payload=handlers.ViewOperationRequest(
+                    viewId="fusion-overlay",
+                    opType="fusionRegistration",
+                    actionType="move",
+                    subOpType="translate",
+                    x=1.0,
+                    y=0.0,
+                ),
+                server=server,  # type: ignore[arg-type]
+                sid="sid-1",
+                workspace_id="workspace-a",
+            )
+        )
+        return used_to_thread, server.events
+
+    used_to_thread, events = asyncio.run(run())
+    assert used_to_thread is True
+    assert events == []
+
+
 def test_handle_operation_returns_revision_and_schedules_preview_options(monkeypatch) -> None:
     async def run() -> tuple[dict[str, object], list[tuple[int | None, bool]], list[tuple[str, object, str | None]]]:
         server = _SocketServerStub()

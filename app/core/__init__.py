@@ -22,6 +22,7 @@ VIEW_OP_TYPE_MPR_STATE_SYNC: Final = "mprStateSync"
 VIEW_OP_TYPE_MEASUREMENT: Final = "measurement"
 VIEW_OP_TYPE_FUSION_REGISTRATION: Final = "fusionRegistration"
 VIEW_OP_TYPE_FUSION_CONFIG: Final = "fusionConfig"
+VIEW_OP_TYPE_PET_CONFIG: Final = "petConfig"
 
 DRAG_ACTION_START: Final = "start"
 DRAG_ACTION_MOVE: Final = "move"
