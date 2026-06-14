@@ -69,6 +69,9 @@ def reslice_plane(
     plane: PlanePose,
     mip: MipConfig | None,
     interpolation_order: int = 1,
+    *,
+    boundary_mode: str = "nearest",
+    boundary_cval: float = 0.0,
 ) -> np.ndarray:
     height, width = plane.output_shape
     col_grid_mm, row_grid_mm = _plane_offset_grids(
@@ -102,7 +105,8 @@ def reslice_plane(
             volume,
             coords,
             order=max(0, min(int(interpolation_order), 1)),
-            mode="nearest",
+            mode=boundary_mode,
+            cval=float(boundary_cval),
         ).astype(np.float32, copy=False)
 
     if slab_offsets_mm.size == 1:

@@ -60,6 +60,8 @@ class FusionRenderResult:
     col_world: np.ndarray | None
     pseudocolor_preset: str
     source_projection: FusionSourceProjection | None
+    ct_layer_pixels: np.ndarray | None = None
+    pet_layer_pixels: np.ndarray | None = None
 
 
 def _axis_direction_and_spacing(geometry: VolumeGeometry, axis_index: int) -> tuple[np.ndarray, float]:
@@ -195,6 +197,78 @@ def _mip_source_projection(
     )
 
 
+def _project_volume_extent_to_plane(
+    geometry: VolumeGeometry,
+    volume_shape: tuple[int, int, int],
+    plane: PlanePose,
+) -> tuple[float, float]:
+    row_world = np.asarray(plane.row_world, dtype=np.float64)
+    col_world = np.asarray(plane.col_world, dtype=np.float64)
+    center_world = np.asarray(plane.center_world, dtype=np.float64)
+    row_values: list[float] = []
+    col_values: list[float] = []
+    bounds = [(-0.5, float(size) - 0.5) for size in volume_shape]
+    for i_value in bounds[0]:
+        for j_value in bounds[1]:
+            for k_value in bounds[2]:
+                voxel = np.asarray([i_value, j_value, k_value, 1.0], dtype=np.float64)
+                world = np.asarray(geometry.ijk_to_world @ voxel, dtype=np.float64)[:3]
+                delta = world - center_world
+                row_values.append(float(np.dot(delta, row_world)))
+                col_values.append(float(np.dot(delta, col_world)))
+    # The render plane is expanded symmetrically around its center. A registered
+    # PET volume can be far from the center, so using only max-min would still
+    # clip one side. Use the largest absolute extent instead.
+    width_mm = 2.0 * max(abs(min(col_values)), abs(max(col_values)), 1e-6)
+    height_mm = 2.0 * max(abs(min(row_values)), abs(max(row_values)), 1e-6)
+    return width_mm, height_mm
+
+
+def _resize_plane_to_cover_extent(
+    plane: PlanePose,
+    *,
+    width_mm: float,
+    height_mm: float,
+) -> PlanePose:
+    min_width_pixels = int(np.ceil(max(float(width_mm), 1e-6) / max(float(plane.pixel_spacing_col_mm), 1e-6)))
+    min_height_pixels = int(np.ceil(max(float(height_mm), 1e-6) / max(float(plane.pixel_spacing_row_mm), 1e-6)))
+    next_width = max(int(plane.output_shape[1]), min_width_pixels)
+    next_height = max(int(plane.output_shape[0]), min_height_pixels)
+    return replace(plane, output_shape=(next_height, next_width))
+
+
+def _window_background_value(pixels: np.ndarray, ww: float | None, wl: float | None) -> float:
+    if ww is not None and wl is not None and float(ww) > 0.0:
+        return float(wl) - float(ww) / 2.0 - 1.0
+    return float(np.nanmin(pixels)) - 1.0 if pixels.size else 0.0
+
+
+def _center_slice_in_output(
+    source: np.ndarray,
+    output_shape: tuple[int, int],
+    *,
+    fill_value: float,
+) -> np.ndarray:
+    source_array = np.asarray(source, dtype=np.float32)
+    output_height, output_width = int(output_shape[0]), int(output_shape[1])
+    source_height, source_width = int(source_array.shape[0]), int(source_array.shape[1])
+    if output_height <= source_height and output_width <= source_width:
+        return source_array
+
+    output = np.full((output_height, output_width), float(fill_value), dtype=np.float32)
+    top = max(0, (output_height - source_height) // 2)
+    left = max(0, (output_width - source_width) // 2)
+    bottom = min(output_height, top + source_height)
+    right = min(output_width, left + source_width)
+    source_top = max(0, -top)
+    source_left = max(0, -left)
+    output[top:bottom, left:right] = source_array[
+        source_top:source_top + (bottom - top),
+        source_left:source_left + (right - left),
+    ]
+    return output
+
+
 def build_ct_axial_plane(
     ct_geometry: VolumeGeometry,
     ct_shape: tuple[int, int, int],
@@ -229,8 +303,37 @@ def build_ct_axial_plane(
     )
 
 
+def build_fusion_overlay_plane(
+    base_plane: PlanePose,
+    *,
+    ct_geometry: VolumeGeometry,
+    ct_shape: tuple[int, int, int],
+    pet_geometry: VolumeGeometry,
+    pet_shape: tuple[int, int, int],
+    registration: FusionRegistrationState,
+) -> PlanePose:
+    pet_plane = transform_pet_sampling_plane(base_plane, registration)
+    ct_width_mm = float(base_plane.output_shape[1]) * float(base_plane.pixel_spacing_col_mm)
+    ct_height_mm = float(base_plane.output_shape[0]) * float(base_plane.pixel_spacing_row_mm)
+    projected_ct_width_mm, projected_ct_height_mm = _project_volume_extent_to_plane(
+        ct_geometry,
+        ct_shape,
+        base_plane,
+    )
+    projected_pet_width_mm, projected_pet_height_mm = _project_volume_extent_to_plane(
+        pet_geometry,
+        pet_shape,
+        pet_plane,
+    )
+    return _resize_plane_to_cover_extent(
+        base_plane,
+        width_mm=max(ct_width_mm, projected_ct_width_mm, projected_pet_width_mm),
+        height_mm=max(ct_height_mm, projected_ct_height_mm, projected_pet_height_mm),
+    )
+
+
 def transform_pet_sampling_plane(plane: PlanePose, registration: FusionRegistrationState) -> PlanePose:
-    angle_rad = -np.deg2rad(float(registration.rotation_degrees))
+    angle_rad = np.deg2rad(float(registration.rotation_degrees))
     cos_angle = float(np.cos(angle_rad))
     sin_angle = float(np.sin(angle_rad))
     normal = np.asarray(plane.normal_world, dtype=np.float64)
@@ -297,14 +400,22 @@ def render_fusion_pixels(
     ct_has_patient_geometry: bool,
     pet_has_patient_geometry: bool,
     interpolation_order: int = 1,
+    overlay_pet_layer_only: bool = False,
 ) -> FusionRenderResult:
     ct_shape = tuple(int(value) for value in ct_volume.shape)
     pet_shape = tuple(int(value) for value in pet_volume.shape)
     axial_index = clamp_fusion_axial_index(axial_index, ct_shape)
     plane = build_ct_axial_plane(ct_geometry, ct_shape, axial_index)
-    pet_plane = transform_pet_sampling_plane(plane, registration)
+    if pane_role == FUSION_PANE_OVERLAY_AXIAL:
+        plane = build_fusion_overlay_plane(
+            plane,
+            ct_geometry=ct_geometry,
+            ct_shape=ct_shape,
+            pet_geometry=pet_geometry,
+            pet_shape=pet_shape,
+            registration=registration,
+        )
     reference_world = np.asarray(plane.cursor_center_world, dtype=np.float64)
-    pet_slice_index = _map_plane_center_to_volume_axis_index(pet_plane, pet_geometry, pet_shape)
 
     if pane_role == FUSION_PANE_PET_CORONAL_MIP:
         pet_mip = np.max(np.asarray(pet_volume, dtype=np.float32), axis=1)
@@ -330,13 +441,37 @@ def render_fusion_pixels(
             ),
         )
 
-    ct_slice = np.asarray(ct_volume[axial_index, :, :], dtype=np.float32)
+    ct_slice: np.ndarray | None = None
+    if not (pane_role == FUSION_PANE_OVERLAY_AXIAL and overlay_pet_layer_only):
+        ct_source_slice = np.asarray(ct_volume[axial_index, :, :], dtype=np.float32)
+        ct_slice = (
+            _center_slice_in_output(
+                ct_source_slice,
+                plane.output_shape,
+                fill_value=_window_background_value(ct_source_slice, ct_window_width, ct_window_center),
+            )
+            if pane_role == FUSION_PANE_OVERLAY_AXIAL
+            else ct_source_slice
+        )
+    pet_plane = (
+        transform_pet_sampling_plane(plane, registration)
+        if pane_role in {FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL}
+        else plane
+    )
+    pet_slice_index = _map_plane_center_to_volume_axis_index(pet_plane, pet_geometry, pet_shape)
+    pet_background_value = _window_background_value(
+        np.asarray(pet_volume, dtype=np.float32),
+        pet_window_width,
+        pet_window_center,
+    )
     pet_slice = reslice_plane(
         pet_volume,
         pet_geometry,
         pet_plane,
         MipConfig(enabled=False),
         interpolation_order=interpolation_order,
+        boundary_mode="constant",
+        boundary_cval=pet_background_value,
     )
     if pane_role == FUSION_PANE_CT_AXIAL:
         ct_uint8 = window_to_uint8(ct_slice, ct_window_width, ct_window_center)
@@ -376,12 +511,47 @@ def render_fusion_pixels(
 
     overlay_preset = normalize_pseudocolor_preset(pet_pseudocolor_preset)
     pet_rgb = apply_pseudocolor(pet_uint8, overlay_preset)
+    if overlay_pet_layer_only:
+        pet_alpha = np.clip(float(alpha), 0.0, 1.0)
+        pet_mask = (pet_uint8.astype(np.float32) / 255.0)
+        pet_rgba = np.concatenate(
+            [
+                pet_rgb.astype(np.uint8, copy=False),
+                np.clip(pet_alpha * pet_mask * 255.0, 0.0, 255.0).astype(np.uint8)[..., None],
+            ],
+            axis=-1,
+        )
+        return FusionRenderResult(
+            pixels=np.zeros((*pet_rgba.shape[:2], 3), dtype=np.uint8),
+            spacing_xy=(plane.pixel_spacing_col_mm, plane.pixel_spacing_row_mm),
+            slice_index=axial_index,
+            slice_total=ct_shape[0],
+            row_world=plane.row_world if ct_has_patient_geometry else None,
+            col_world=plane.col_world if ct_has_patient_geometry else None,
+            pseudocolor_preset=overlay_preset,
+            source_projection=_plane_source_projection(
+                plane,
+                has_patient_geometry=ct_has_patient_geometry,
+                reference_world=reference_world,
+            ),
+            pet_layer_pixels=pet_rgba,
+        )
+
+    if ct_slice is None:
+        ct_slice = np.asarray(ct_volume[axial_index, :, :], dtype=np.float32)
     ct_uint8 = window_to_uint8(ct_slice, ct_window_width, ct_window_center)
     ct_rgb = np.repeat(ct_uint8[..., None], 3, axis=-1)
     pet_alpha = np.clip(float(alpha), 0.0, 1.0)
     pet_mask = (pet_uint8.astype(np.float32) / 255.0)[..., None]
     blend_alpha = pet_alpha * pet_mask
     fused = ct_rgb.astype(np.float32) * (1.0 - blend_alpha) + pet_rgb.astype(np.float32) * blend_alpha
+    pet_rgba = np.concatenate(
+        [
+            pet_rgb.astype(np.uint8, copy=False),
+            np.clip(blend_alpha[..., 0] * 255.0, 0.0, 255.0).astype(np.uint8)[..., None],
+        ],
+        axis=-1,
+    )
     return FusionRenderResult(
         pixels=np.clip(fused, 0.0, 255.0).astype(np.uint8),
         spacing_xy=(plane.pixel_spacing_col_mm, plane.pixel_spacing_row_mm),
@@ -395,6 +565,8 @@ def render_fusion_pixels(
             has_patient_geometry=ct_has_patient_geometry,
             reference_world=reference_world,
         ),
+        ct_layer_pixels=ct_rgb.astype(np.uint8, copy=False),
+        pet_layer_pixels=pet_rgba,
     )
 
 
@@ -402,4 +574,6 @@ def image_from_pixels(pixels: np.ndarray) -> Image.Image:
     array = np.asarray(pixels)
     if array.ndim == 2:
         return Image.fromarray(array.astype(np.uint8, copy=False), mode="L")
+    if array.ndim == 3 and array.shape[-1] == 4:
+        return Image.fromarray(array.astype(np.uint8, copy=False), mode="RGBA")
     return Image.fromarray(array.astype(np.uint8, copy=False), mode="RGB")

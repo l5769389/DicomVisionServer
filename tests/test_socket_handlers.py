@@ -221,7 +221,7 @@ def test_mpr_operation_queue_end_drops_pending_move(monkeypatch) -> None:
     assert asyncio.run(run()) == [("start", 0.1), ("end", 0.9)]
 
 
-def test_fusion_registration_queue_flushes_pending_move_before_end(monkeypatch) -> None:
+def test_fusion_registration_queue_drops_pending_move_before_end(monkeypatch) -> None:
     async def run() -> list[tuple[str, float | None]]:
         handlers._mpr_operation_queues.clear()
         server = _SocketServerStub()
@@ -282,10 +282,10 @@ def test_fusion_registration_queue_flushes_pending_move_before_end(monkeypatch) 
             },
         ) == {"ok": True}
         release_start.set()
-        await _wait_for(lambda: calls == [("start", 0.0), ("move", 0.4), ("end", 0.9)])
+        await _wait_for(lambda: calls == [("start", 0.0), ("end", 0.9)])
         return calls
 
-    assert asyncio.run(run()) == [("start", 0.0), ("move", 0.4), ("end", 0.9)]
+    assert asyncio.run(run()) == [("start", 0.0), ("end", 0.9)]
 
 
 def test_queued_operation_runs_view_operation_off_event_loop(monkeypatch) -> None:

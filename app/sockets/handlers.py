@@ -251,8 +251,7 @@ def _enqueue_mpr_operation(queue_key: str, operation: _QueuedMprOperation) -> No
         state.pending_move = None
         state.pending_end = None
     elif action_type == DRAG_ACTION_END:
-        if operation.payload.op_type != VIEW_OP_TYPE_FUSION_REGISTRATION:
-            state.pending_move = None
+        state.pending_move = None
         state.pending_end = operation
     elif action_type == DRAG_ACTION_MOVE:
         if state.pending_end is None:

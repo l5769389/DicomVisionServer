@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 from pydicom import dcmread
 from pydicom.dataset import Dataset
 
@@ -173,11 +174,15 @@ def test_fusion_orientation_overlay_tracks_horizontal_flip() -> None:
     assert flipped.bottom == normal.bottom
 
 
-def test_pet_axial_orientation_tracks_manual_registration_rotation() -> None:
+def test_pet_axial_view_tracks_manual_registration_transform_with_pet_display() -> None:
     before = _render(FUSION_PANE_PET_AXIAL)
     after = _render(
         FUSION_PANE_PET_AXIAL,
-        registration=FusionRegistrationState(rotation_degrees=90),
+        registration=FusionRegistrationState(
+            translate_row_mm=8.0,
+            translate_col_mm=-6.0,
+            rotation_degrees=90.0,
+        ),
     )
 
     assert before.row_world is not None
@@ -186,6 +191,236 @@ def test_pet_axial_orientation_tracks_manual_registration_rotation() -> None:
     assert after.col_world is not None
     assert not np.allclose(before.row_world, after.row_world)
     assert not np.allclose(before.col_world, after.col_world)
+    assert before.source_projection is not None
+    assert after.source_projection is not None
+    assert not np.allclose(before.source_projection.world_to_source_x, after.source_projection.world_to_source_x)
+    assert not np.allclose(before.source_projection.world_to_source_y, after.source_projection.world_to_source_y)
+    assert after.pseudocolor_preset == "bwinverse"
+
+
+def test_pet_axial_view_keeps_fixed_canvas_when_registration_moves_pet() -> None:
+    before = _render(FUSION_PANE_PET_AXIAL)
+    after = _render(
+        FUSION_PANE_PET_AXIAL,
+        registration=FusionRegistrationState(
+            translate_row_mm=32.0,
+            translate_col_mm=-48.0,
+        ),
+    )
+
+    assert before.pixels.shape == after.pixels.shape
+
+
+def test_fusion_overlay_returns_ct_base_and_transparent_pet_layer() -> None:
+    ct_volume = np.full((5, 8, 8), 40.0, dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    pet_volume[:, 3:5, 3:5] = 12.0
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+
+    result = render_fusion_pixels(
+        pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        ct_volume=ct_volume,
+        ct_geometry=geometry,
+        pet_volume=pet_volume,
+        pet_geometry=geometry,
+        axial_index=2,
+        ct_window_width=400,
+        ct_window_center=40,
+        pet_window_width=8,
+        pet_window_center=4,
+        pet_pseudocolor_preset="petct-rainbow",
+        registration=FusionRegistrationState(),
+        alpha=0.52,
+        ct_has_patient_geometry=True,
+        pet_has_patient_geometry=True,
+    )
+
+    assert result.ct_layer_pixels is not None
+    assert result.pet_layer_pixels is not None
+    assert result.ct_layer_pixels.shape == result.pixels.shape
+    assert result.pet_layer_pixels.shape[:2] == result.pixels.shape[:2]
+    assert result.pet_layer_pixels.shape[-1] == 4
+    assert np.any(result.pet_layer_pixels[..., 3] == 0)
+    assert np.any(result.pet_layer_pixels[..., 3] > 0)
+
+    alpha = result.pet_layer_pixels[..., 3:4].astype(np.float32) / 255.0
+    composite = (
+        result.ct_layer_pixels.astype(np.float32) * (1.0 - alpha)
+        + result.pet_layer_pixels[..., :3].astype(np.float32) * alpha
+    )
+    assert np.max(np.abs(composite - result.pixels.astype(np.float32))) <= 1.5
+
+
+def test_fusion_overlay_registration_preview_only_returns_pet_layer(monkeypatch) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    ct_series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+    pet_series = SeriesRecord(
+        series_id="pet",
+        folder_path="",
+        series_instance_uid="pet-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="PT",
+        series_description="PET",
+    )
+    ct_volume = np.full((4, 4, 4), 40.0, dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    pet_volume[:, 1:3, 1:3] = 12.0
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda view: (group, ct_series, pet_series))
+    monkeypatch.setattr(service, "_get_series_volume", lambda series, **_: ct_volume if series.series_id == "ct" else pet_volume)
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda series, shape: geometry)
+    monkeypatch.setattr(service, "_get_series_patient_transform", lambda series: np.zeros(tuple(int(value) for value in ct_volume.shape)))
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda series, volume, unit: FusionPetDisplayVolume(
+            volume=np.asarray(volume, dtype=np.float32),
+            unit="SUVbw",
+            unit_label="g/ml (SUVbw)",
+        ),
+    )
+    monkeypatch.setattr(service, "_get_indexed_instance_and_cache", lambda series, index: (None, None))
+
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=64,
+        height=64,
+    )
+
+    result = service._render_fusion_view(
+        view,
+        fast_preview=True,
+        metadata_mode="fusion-registration-layer-preview",
+    )
+
+    assert result.meta.fusion_composite is not None
+    assert result.meta.fusion_composite.primary_image_unchanged is True
+    assert result.meta.fusion_composite.width > 0
+    assert result.meta.fusion_composite.height > 0
+    assert [layer.key for layer in result.meta.fusion_composite.layers] == ["pet"]
+    assert set(result.extra_image_bytes) == {"pet"}
+    assert Image.open(io.BytesIO(result.image_bytes)).size == (1, 1)
+    assert Image.open(io.BytesIO(result.extra_image_bytes["pet"])).size == (
+        result.meta.fusion_composite.width,
+        result.meta.fusion_composite.height,
+    )
+
+
+def test_pet_axial_registration_outside_volume_uses_constant_background() -> None:
+    ct_volume = np.zeros((5, 6, 7), dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    pet_volume[:, :, 0] = 100.0
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+
+    result = render_fusion_pixels(
+        pane_role=FUSION_PANE_PET_AXIAL,
+        ct_volume=ct_volume,
+        ct_geometry=geometry,
+        pet_volume=pet_volume,
+        pet_geometry=geometry,
+        axial_index=2,
+        ct_window_width=400,
+        ct_window_center=40,
+        pet_window_width=100,
+        pet_window_center=50,
+        pet_pseudocolor_preset="petct-rainbow",
+        registration=FusionRegistrationState(translate_col_mm=100.0),
+        alpha=0.52,
+        ct_has_patient_geometry=True,
+        pet_has_patient_geometry=True,
+    )
+
+    assert int(np.min(result.pixels)) >= 250
+
+
+def test_fusion_overlay_expands_source_plane_to_avoid_registered_pet_crop() -> None:
+    ct_volume = _volume((5, 6, 7))
+    pet_volume = _volume((5, 16, 18))
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+    result = render_fusion_pixels(
+        pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        ct_volume=ct_volume,
+        ct_geometry=geometry,
+        pet_volume=pet_volume,
+        pet_geometry=build_identity_geometry(tuple(int(value) for value in pet_volume.shape)),
+        axial_index=2,
+        ct_window_width=400,
+        ct_window_center=40,
+        pet_window_width=8,
+        pet_window_center=4,
+        pet_pseudocolor_preset="petct-rainbow",
+        registration=FusionRegistrationState(translate_col_mm=8.0),
+        alpha=0.52,
+        ct_has_patient_geometry=True,
+        pet_has_patient_geometry=True,
+    )
+
+    assert result.pixels.shape[0] > ct_volume.shape[1]
+    assert result.pixels.shape[1] > ct_volume.shape[2] + 8
+
+
+def test_fusion_overlay_positive_registration_rotation_is_screen_clockwise() -> None:
+    ct_volume = np.zeros((5, 101, 101), dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    pet_volume[:, 50, 70] = 12.0
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+
+    def pet_centroid(rotation_degrees: float) -> tuple[float, float]:
+        result = render_fusion_pixels(
+            pane_role=FUSION_PANE_OVERLAY_AXIAL,
+            ct_volume=ct_volume,
+            ct_geometry=geometry,
+            pet_volume=pet_volume,
+            pet_geometry=geometry,
+            axial_index=2,
+            ct_window_width=400,
+            ct_window_center=40,
+            pet_window_width=8,
+            pet_window_center=4,
+            pet_pseudocolor_preset="petct-rainbow",
+            registration=FusionRegistrationState(rotation_degrees=rotation_degrees),
+            alpha=1.0,
+            ct_has_patient_geometry=True,
+            pet_has_patient_geometry=True,
+            interpolation_order=0,
+        )
+        assert result.pet_layer_pixels is not None
+        alpha = result.pet_layer_pixels[..., 3].astype(np.float64)
+        rows, cols = np.indices(alpha.shape)
+        return float((cols * alpha).sum() / alpha.sum()), float((rows * alpha).sum() / alpha.sum())
+
+    x0, y0 = pet_centroid(0.0)
+    x90, y90 = pet_centroid(90.0)
+
+    assert x0 > 50.0
+    assert y0 == pytest.approx(50.0)
+    assert x90 == pytest.approx(50.0)
+    assert y90 > 50.0
 
 
 @pytest.mark.parametrize(
@@ -734,7 +969,7 @@ def test_fusion_pet_missing_required_suv_fields_falls_back_to_source() -> None:
     assert label == "BQML"
 
 
-def test_fusion_registration_move_uses_immediate_overlay_fast_preview() -> None:
+def test_fusion_registration_move_broadcasts_overlay_and_pet_fast_preview() -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     view = ViewRecord(
@@ -787,10 +1022,11 @@ def test_fusion_registration_move_uses_immediate_overlay_fast_preview() -> None:
         False,
     )
 
-    assert move.mode == "single"
+    assert move.mode == "broadcast"
     assert move.fast_preview is True
     assert move.fast_preview_full_resolution is False
-    assert move.broadcast_viewports is None
+    assert move.metadata_mode == "fusion-registration-layer-preview"
+    assert move.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
     assert end.mode == "broadcast"
     assert end.fast_preview is False
     assert end.broadcast_viewports is None
@@ -851,6 +1087,319 @@ def test_fusion_registration_end_applies_final_delta_without_move() -> None:
 
     assert end.mode == "broadcast"
     assert group.fusion_registration.rotation_degrees == pytest.approx(3.5)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_registration_translate_uses_view_transform_to_map_canvas_delta(monkeypatch) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    ct_series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+    pet_series = SeriesRecord(
+        series_id="pet",
+        folder_path="",
+        series_instance_uid="pet-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="PT",
+        series_description="PET",
+    )
+    ct_volume = np.zeros((5, 10, 20), dtype=np.float32)
+    geometry = _geometry_with_axes(
+        tuple(int(value) for value in ct_volume.shape),
+        axis_i=(1.0, 0.0, 0.0),
+        axis_j=(0.0, 2.0, 0.0),
+        axis_k=(0.0, 0.0, 4.0),
+    )
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda view: (group, ct_series, pet_series))
+    monkeypatch.setattr(service, "_get_series_volume", lambda series, **_: ct_volume)
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda series, shape: geometry)
+
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=800,
+        height=400,
+    )
+    view.zoom = 2.0
+    view.rotation_degrees = 90
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="translate",
+            x=0,
+            y=0,
+        ),
+    )
+    changed = service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="translate",
+            x=4,
+            y=0,
+        ),
+    )
+
+    assert changed is True
+    assert group.fusion_registration.translate_col_mm == pytest.approx(0.0, abs=1e-6)
+    assert group.fusion_registration.translate_row_mm == pytest.approx(-2.0)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_registration_rotate_tracks_pointer_angle_direction() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=200,
+        height=200,
+    )
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="rotate",
+            anchorX=150,
+            anchorY=100,
+            currentX=150,
+            currentY=100,
+        ),
+    )
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="move",
+            subOpType="rotate",
+            x=-50,
+            y=50,
+            anchorX=150,
+            anchorY=100,
+            currentX=100,
+            currentY=150,
+        ),
+    )
+
+    assert group.fusion_registration.rotation_degrees == pytest.approx(90.0)
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="rotate",
+            x=-50,
+            y=50,
+            anchorX=150,
+            anchorY=100,
+            currentX=100,
+            currentY=150,
+        ),
+    )
+
+    assert group.fusion_registration.rotation_degrees == pytest.approx(90.0)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_registration_rotate_prefers_explicit_delta_for_move_and_end() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_registration.rotation_degrees = 12.0
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=200,
+        height=200,
+    )
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="rotate",
+            rotationDeltaDegrees=0.0,
+        ),
+    )
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="move",
+            subOpType="rotate",
+            rotationDeltaDegrees=32.5,
+        ),
+    )
+
+    assert group.fusion_registration.rotation_degrees == pytest.approx(44.5)
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="rotate",
+            rotationDeltaDegrees=32.5,
+        ),
+    )
+
+    assert group.fusion_registration.rotation_degrees == pytest.approx(44.5)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_registration_rotate_after_translate_is_absolute_per_drag() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_registration.translate_row_mm = 8.0
+    group.fusion_registration.translate_col_mm = -3.0
+    group.fusion_registration.rotation_degrees = 15.0
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=200,
+        height=200,
+    )
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="rotate",
+            anchorX=150,
+            anchorY=100,
+            currentX=150,
+            currentY=100,
+        ),
+    )
+    for action_type in ("move", "move", "end"):
+        service._handle_fusion_registration(
+            view,
+            ViewOperationRequest(
+                viewId="overlay",
+                opType="fusionRegistration",
+                actionType=action_type,
+                subOpType="rotate",
+                anchorX=150,
+                anchorY=100,
+                currentX=100,
+                currentY=150,
+            ),
+        )
+
+    assert group.fusion_registration.translate_row_mm == pytest.approx(8.0)
+    assert group.fusion_registration.translate_col_mm == pytest.approx(-3.0)
+    assert group.fusion_registration.rotation_degrees == pytest.approx(105.0)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_registration_rotate_accumulates_across_angle_wrap() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=200,
+        height=200,
+    )
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="rotate",
+            anchorX=50.8,
+            anchorY=108.7,
+            currentX=50.8,
+            currentY=108.7,
+        ),
+    )
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="move",
+            subOpType="rotate",
+            x=0,
+            y=0,
+            anchorX=50.8,
+            anchorY=108.7,
+            currentX=50.8,
+            currentY=91.3,
+        ),
+    )
+
+    assert group.fusion_registration.rotation_degrees == pytest.approx(20.0, abs=0.2)
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="rotate",
+            x=0,
+            y=0,
+            anchorX=50.8,
+            anchorY=108.7,
+            currentX=50.8,
+            currentY=91.3,
+        ),
+    )
+
+    assert group.fusion_registration.rotation_degrees == pytest.approx(20.0, abs=0.2)
     assert group.crosshair_drag_origin_center is None
 
 

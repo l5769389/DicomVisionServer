@@ -393,6 +393,8 @@ class ViewSocketHub:
     @staticmethod
     def _build_image_update_payload(result_meta, request: RenderRequest) -> dict[str, object]:
         payload = result_meta.model_dump(by_alias=True)
+        payload["fastPreview"] = bool(request.fast_preview)
+        payload["fastPreviewFullResolution"] = bool(request.fast_preview_full_resolution)
         if request.metadata_mode == "stack-preview-lite":
             payload.pop("measurements", None)
             payload.pop("annotations", None)
@@ -401,6 +403,13 @@ class ViewSocketHub:
             payload.pop("orientation", None)
             payload.pop("measurements", None)
             payload.pop("annotations", None)
+        elif request.metadata_mode == "fusion-registration-layer-preview":
+            payload.pop("cornerInfo", None)
+            payload.pop("orientation", None)
+            payload.pop("scaleBar", None)
+            payload.pop("measurements", None)
+            payload.pop("annotations", None)
+            payload.pop("fusionProjection", None)
         return payload
 
     async def _emit_progress_message(self, view_id: str, sids: tuple[str, ...], payload: dict[str, object]) -> None:
@@ -471,7 +480,9 @@ class ViewSocketHub:
         )
         if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
             return False
-        message = (self._build_image_update_payload(result.meta, request), result.image_bytes)
+        payload = self._build_image_update_payload(result.meta, request)
+        extra_image_bytes = getattr(result, "extra_image_bytes", None) or {}
+        message = (payload, result.image_bytes, extra_image_bytes) if extra_image_bytes else (payload, result.image_bytes)
         for sid in sids:
             await self._server.emit("image_update", message, to=sid)
         if should_emit_progress:

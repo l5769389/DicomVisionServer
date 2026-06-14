@@ -7,6 +7,7 @@ from app.core import (
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
     FUSION_PANE_OVERLAY_AXIAL,
+    FUSION_PANE_PET_AXIAL,
     MPR_VIEWPORT_AXIAL,
     MPR_VIEWPORT_CORONAL,
     MPR_VIEWPORT_SAGITTAL,
@@ -237,6 +238,7 @@ def _should_bump_mpr_geometry_revision(payload: ViewOperationRequest) -> bool:
 
 
 MPR_VIEWPORT_ORDER = (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
+FUSION_REGISTRATION_PREVIEW_PANES = (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
 
 
 def _reference_mpr_viewports(service: ViewerService, view: ViewRecord) -> tuple[str, ...]:
@@ -738,7 +740,12 @@ def _handle_fusion_registration_operation(
     if payload.action_type == DRAG_ACTION_START:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_single("png", fast_preview=True)
+        return _render_broadcast(
+            "png",
+            fast_preview=True,
+            metadata_mode="fusion-registration-layer-preview",
+            viewports=FUSION_REGISTRATION_PREVIEW_PANES,
+        )
     return _render_broadcast()
 
 

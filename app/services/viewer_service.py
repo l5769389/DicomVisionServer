@@ -5,7 +5,7 @@ import zipfile
 from collections import OrderedDict
 from datetime import datetime
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from time import perf_counter
@@ -101,7 +101,9 @@ from app.schemas.view import (
     ViewQaWaterAnalyzeRequest,
     ViewQaWaterAnalyzeResponse,
     ViewTransformPayload,
+    FusionCompositeInfo,
     FusionInfo,
+    FusionCompositeLayerInfo,
     PetInfo,
     FusionProjectionInfo,
     FusionRegistrationInfo,
@@ -273,6 +275,7 @@ def _get_vtk_surface_renderer():
 class RenderedImageResult:
     meta: ViewImageResponse
     image_bytes: bytes
+    extra_image_bytes: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -3045,7 +3048,6 @@ class ViewerService:
         metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
-        del metadata_mode
         render_started_at = perf_counter()
         ensure_view_size(view)
         if not view.is_initialized:
@@ -3060,6 +3062,11 @@ class ViewerService:
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
         pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
         role = self._resolve_fusion_pane_role(view)
+        primary_image_unchanged = (
+            role == FUSION_PANE_OVERLAY_AXIAL
+            and fast_preview
+            and metadata_mode == "fusion-registration-layer-preview"
+        )
         self._sync_fusion_view_state_from_group(view)
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
 
@@ -3088,6 +3095,7 @@ class ViewerService:
                 == tuple(int(value) for value in pet_volume.shape)
             ),
             interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
+            overlay_pet_layer_only=primary_image_unchanged,
         )
         source_image = image_from_pixels(fusion_result.pixels)
         pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(fusion_result.spacing_xy)
@@ -3107,15 +3115,47 @@ class ViewerService:
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
-        transformed = viewport_transformer.apply_affine_array(
-            np.asarray(source_image),
-            render_plan.render_view.width or 0,
-            render_plan.render_view.height or 0,
-            image_transform,
-            order=0 if fast_preview else 1,
-            cval=0.0,
-        )
-        image = image_from_pixels(transformed)
+        interpolation_order = 0 if fast_preview else 1
+        canvas_width = render_plan.render_view.width or 0
+        canvas_height = render_plan.render_view.height or 0
+        fusion_composite: FusionCompositeInfo | None = None
+        extra_image_bytes: dict[str, bytes] = {}
+        if (
+            role == FUSION_PANE_OVERLAY_AXIAL
+            and fusion_result.pet_layer_pixels is not None
+            and (primary_image_unchanged or fusion_result.ct_layer_pixels is not None)
+        ):
+            transformed_pet = viewport_transformer.apply_affine_array(
+                fusion_result.pet_layer_pixels,
+                canvas_width,
+                canvas_height,
+                image_transform,
+                order=interpolation_order,
+                cval=0.0,
+            )
+            extra_image_bytes["pet"] = self._encode_image(image_from_pixels(transformed_pet), "png", fast_preview=False)
+            if primary_image_unchanged:
+                image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            else:
+                transformed_ct = viewport_transformer.apply_affine_array(
+                    fusion_result.ct_layer_pixels,
+                    canvas_width,
+                    canvas_height,
+                    image_transform,
+                    order=interpolation_order,
+                    cval=0.0,
+                )
+                image = image_from_pixels(transformed_ct)
+        else:
+            transformed = viewport_transformer.apply_affine_array(
+                np.asarray(source_image),
+                canvas_width,
+                canvas_height,
+                image_transform,
+                order=interpolation_order,
+                cval=0.0,
+            )
+            image = image_from_pixels(transformed)
         fusion_projection = self._build_fusion_projection_info(
             pane_role=role,
             source_projection=fusion_result.source_projection,
@@ -3152,6 +3192,25 @@ class ViewerService:
                 pet_display,
                 group.fusion_pet_window.window_width,
                 group.fusion_pet_window.window_center,
+            )
+        registration_info = FusionRegistrationInfo(
+            translateRowMm=float(group.fusion_registration.translate_row_mm),
+            translateColMm=float(group.fusion_registration.translate_col_mm),
+            rotationDegrees=float(group.fusion_registration.rotation_degrees),
+            saved=bool(group.fusion_registration.saved),
+        )
+        if extra_image_bytes:
+            fusion_composite = FusionCompositeInfo(
+                revision=int(group.fusion_revision),
+                alpha=float(group.fusion_alpha),
+                registration=registration_info,
+                width=int(canvas_width if primary_image_unchanged else image.width),
+                height=int(canvas_height if primary_image_unchanged else image.height),
+                layers=[
+                    *([] if primary_image_unchanged else [FusionCompositeLayerInfo(key="primary", role="ct", imageFormat=image_format)]),
+                    FusionCompositeLayerInfo(key="pet", role="pet", imageFormat="png"),
+                ],
+                primary_image_unchanged=primary_image_unchanged,
             )
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
         image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
@@ -3195,15 +3254,12 @@ class ViewerService:
                     ),
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
-                    registration=FusionRegistrationInfo(
-                        translateRowMm=float(group.fusion_registration.translate_row_mm),
-                        translateColMm=float(group.fusion_registration.translate_col_mm),
-                        rotationDegrees=float(group.fusion_registration.rotation_degrees),
-                        saved=bool(group.fusion_registration.saved),
-                    ),
+                    registration=registration_info,
                 ),
+                fusionComposite=fusion_composite,
             ),
             image_bytes=image_bytes,
+            extra_image_bytes=extra_image_bytes,
         )
 
     def _render_mpr_view(
@@ -4966,6 +5022,172 @@ class ViewerService:
             return None
         return int(group.fusion_revision)
 
+    def _map_fusion_registration_canvas_delta_to_plane_mm(
+        self,
+        view: ViewRecord,
+        *,
+        delta_x: float,
+        delta_y: float,
+    ) -> tuple[float, float]:
+        """Map a screen-space registration drag into the CT axial plane axes."""
+        try:
+            group, ct_series, _ = self._resolve_fusion_group_series(view)
+            ct_volume = self._get_series_volume(ct_series)
+            ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+            axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+            plane = build_ct_axial_plane(ct_geometry, tuple(int(value) for value in ct_volume.shape), axial_index)
+            pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(
+                (float(plane.pixel_spacing_col_mm), float(plane.pixel_spacing_row_mm))
+            )
+            image_transform = viewport_transformer.build_image_to_canvas_transform(
+                image_width=int(plane.output_shape[1]),
+                image_height=int(plane.output_shape[0]),
+                canvas_width=view.width or int(plane.output_shape[1]),
+                canvas_height=view.height or int(plane.output_shape[0]),
+                view=view,
+                pixel_aspect_x=pixel_aspect_x,
+                pixel_aspect_y=pixel_aspect_y,
+            )
+            inverse_linear, _ = image_transform.inverse_components()
+            source_delta = inverse_linear @ np.asarray([float(delta_x), float(delta_y)], dtype=np.float64)
+            col_mm = float(source_delta[0]) * float(plane.pixel_spacing_col_mm)
+            row_mm = float(source_delta[1]) * float(plane.pixel_spacing_row_mm)
+            if np.isfinite(col_mm) and np.isfinite(row_mm):
+                return row_mm, col_mm
+        except Exception:
+            logger.debug("failed to map fusion registration canvas delta; falling back to zoom", exc_info=True)
+
+        pixels_per_mm = max(float(view.zoom or 1.0), 1e-6)
+        return float(delta_y) / pixels_per_mm, float(delta_x) / pixels_per_mm
+
+    @staticmethod
+    def _normalize_fusion_registration_rotation_delta(delta_degrees: float) -> float:
+        return (float(delta_degrees) + 180.0) % 360.0 - 180.0
+
+    def _resolve_fusion_registration_pointer_angle_rad(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+    ) -> float | None:
+        current_x = payload.current_x
+        current_y = payload.current_y
+        if (
+            current_x is None
+            or current_y is None
+            or not view.width
+            or not view.height
+            or not np.isfinite(float(current_x))
+            or not np.isfinite(float(current_y))
+        ):
+            return None
+
+        pivot_x = payload.pivot_x
+        pivot_y = payload.pivot_y
+        if (
+            pivot_x is None
+            or pivot_y is None
+            or not np.isfinite(float(pivot_x))
+            or not np.isfinite(float(pivot_y))
+        ):
+            pivot_x = float(view.width) / 2.0
+            pivot_y = float(view.height) / 2.0
+        vector_x = float(current_x) - float(pivot_x)
+        vector_y = float(current_y) - float(pivot_y)
+        if float(np.hypot(vector_x, vector_y)) < 4.0:
+            return None
+        return float(np.arctan2(vector_y, vector_x))
+
+    def _resolve_fusion_registration_pointer_rotation_delta_degrees(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+    ) -> float | None:
+        anchor_x = payload.anchor_x
+        anchor_y = payload.anchor_y
+        current_x = payload.current_x
+        current_y = payload.current_y
+        if all(
+            value is not None and np.isfinite(float(value))
+            for value in (anchor_x, anchor_y, current_x, current_y)
+        ):
+            pivot_x = payload.pivot_x
+            pivot_y = payload.pivot_y
+            if (
+                pivot_x is None
+                or pivot_y is None
+                or not np.isfinite(float(pivot_x))
+                or not np.isfinite(float(pivot_y))
+            ):
+                pivot_x = float(view.width or 0.0) / 2.0
+                pivot_y = float(view.height or 0.0) / 2.0
+            start = np.asarray([float(anchor_x) - float(pivot_x), float(anchor_y) - float(pivot_y)], dtype=np.float64)
+            current = np.asarray([float(current_x) - float(pivot_x), float(current_y) - float(pivot_y)], dtype=np.float64)
+            if float(np.linalg.norm(start)) >= 4.0 and float(np.linalg.norm(current)) >= 4.0:
+                start_angle = float(np.degrees(np.arctan2(start[1], start[0])))
+                current_angle = float(np.degrees(np.arctan2(current[1], current[0])))
+                return self._normalize_fusion_registration_rotation_delta(current_angle - start_angle)
+
+        return None
+
+    def _resolve_fusion_registration_rotation_delta_degrees(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+    ) -> float:
+        pointer_delta = self._resolve_fusion_registration_pointer_rotation_delta_degrees(view, payload)
+        if pointer_delta is not None:
+            return pointer_delta
+        return float(payload.x or 0.0) * 0.35
+
+    def _apply_fusion_registration_rotation_drag(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+        registration: FusionRegistrationState,
+        *,
+        origin_rotation: float,
+    ) -> bool:
+        if payload.rotation_delta_degrees is not None and np.isfinite(float(payload.rotation_delta_degrees)):
+            registration.rotation_degrees = float(origin_rotation) + float(payload.rotation_delta_degrees)
+            if payload.action_type == DRAG_ACTION_END:
+                view.drag_origin_arcball_x = None
+                view.drag_origin_arcball_y = None
+            return True
+
+        absolute_pointer_delta = self._resolve_fusion_registration_pointer_rotation_delta_degrees(view, payload)
+        pointer_angle_rad = self._resolve_fusion_registration_pointer_angle_rad(view, payload)
+        previous_angle_rad = view.drag_origin_arcball_x
+        if payload.action_type == DRAG_ACTION_END:
+            view.drag_origin_arcball_x = None
+            view.drag_origin_arcball_y = None
+        elif pointer_angle_rad is not None:
+            view.drag_origin_arcball_x = pointer_angle_rad
+            view.drag_origin_arcball_y = None
+
+        if absolute_pointer_delta is not None:
+            registration.rotation_degrees = float(origin_rotation) + float(absolute_pointer_delta)
+            return True
+
+        if previous_angle_rad is not None and pointer_angle_rad is not None:
+            delta_angle_rad = self._normalize_screen_full_turn_delta(
+                float(pointer_angle_rad) - float(previous_angle_rad)
+            )
+            if abs(delta_angle_rad) < 1e-8:
+                return payload.action_type == DRAG_ACTION_END
+            registration.rotation_degrees = float(registration.rotation_degrees) + float(np.degrees(delta_angle_rad))
+            return True
+
+        if pointer_angle_rad is not None and payload.action_type != DRAG_ACTION_END:
+            view.drag_origin_arcball_x = pointer_angle_rad
+            view.drag_origin_arcball_y = None
+            return False
+
+        registration.rotation_degrees = (
+            origin_rotation
+            + self._resolve_fusion_registration_rotation_delta_degrees(view, payload)
+        )
+        return True
+
     def _handle_fusion_scroll(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         if payload.delta is None:
             return False
@@ -5181,6 +5403,12 @@ class ViewerService:
                 registration.translate_col_mm,
                 registration.rotation_degrees,
             )
+            view.drag_origin_arcball_x = (
+                self._resolve_fusion_registration_pointer_angle_rad(view, payload)
+                if sub_op == "rotate"
+                else None
+            )
+            view.drag_origin_arcball_y = None
             return True
         elif payload.action_type in {DRAG_ACTION_MOVE, DRAG_ACTION_END}:
             origin = group.crosshair_drag_origin_center or (
@@ -5190,15 +5418,27 @@ class ViewerService:
             )
             origin_row, origin_col, origin_rotation = (float(origin[0]), float(origin[1]), float(origin[2]))
             if sub_op == "rotate":
-                registration.rotation_degrees = origin_rotation + float(payload.x or 0.0) * 0.35
+                changed = self._apply_fusion_registration_rotation_drag(
+                    view,
+                    payload,
+                    registration,
+                    origin_rotation=origin_rotation,
+                )
+                if not changed:
+                    return payload.action_type == DRAG_ACTION_END
             else:
-                plane = self._get_fusion_reference_plane(view)
-                zoom = max(float(view.zoom or 1.0), 1e-6)
-                registration.translate_col_mm = origin_col + float(payload.x or 0.0) * plane.pixel_spacing_col_mm / zoom
-                registration.translate_row_mm = origin_row + float(payload.y or 0.0) * plane.pixel_spacing_row_mm / zoom
+                delta_row_mm, delta_col_mm = self._map_fusion_registration_canvas_delta_to_plane_mm(
+                    view,
+                    delta_x=float(payload.x or 0.0),
+                    delta_y=float(payload.y or 0.0),
+                )
+                registration.translate_col_mm = origin_col + delta_col_mm
+                registration.translate_row_mm = origin_row + delta_row_mm
             registration.saved = False
             if payload.action_type == DRAG_ACTION_END:
                 group.crosshair_drag_origin_center = None
+                view.drag_origin_arcball_x = None
+                view.drag_origin_arcball_y = None
         else:
             return False
         group.fusion_revision += 1

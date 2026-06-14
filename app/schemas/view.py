@@ -376,6 +376,27 @@ class FusionInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class FusionCompositeLayerInfo(BaseModel):
+    key: str
+    role: str
+    image_format: str = Field(default="png", alias="imageFormat")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionCompositeInfo(BaseModel):
+    mode: str = "ctPetLayers"
+    revision: int
+    alpha: float
+    registration: FusionRegistrationInfo
+    width: int
+    height: int
+    layers: list[FusionCompositeLayerInfo]
+    primary_image_unchanged: bool = Field(default=False, alias="primaryImageUnchanged")
+
+    model_config = {"populate_by_name": True}
+
+
 class PetInfo(BaseModel):
     series_id: str = Field(alias="seriesId")
     pet_unit: str = Field(default="SUVbw", alias="petUnit")
@@ -420,6 +441,7 @@ class ViewImageResponse(BaseModel):
     color: ViewColorInfo | None = None
     pet_info: PetInfo | None = Field(default=None, alias="petInfo")
     fusion_info: FusionInfo | None = Field(default=None, alias="fusionInfo")
+    fusion_composite: FusionCompositeInfo | None = Field(default=None, alias="fusionComposite")
     fusion_projection: FusionProjectionInfo | None = Field(default=None, alias="fusionProjection")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
@@ -482,6 +504,13 @@ class ViewOperationRequest(BaseModel):
     action_type: ViewActionType | None = Field(default=None, alias="actionType")
     x: float | None = None
     y: float | None = None
+    anchor_x: float | None = Field(default=None, alias="anchorX")
+    anchor_y: float | None = Field(default=None, alias="anchorY")
+    current_x: float | None = Field(default=None, alias="currentX")
+    current_y: float | None = Field(default=None, alias="currentY")
+    pivot_x: float | None = Field(default=None, alias="pivotX")
+    pivot_y: float | None = Field(default=None, alias="pivotY")
+    rotation_delta_degrees: float | None = Field(default=None, alias="rotationDeltaDegrees")
     line: MprCrosshairLine | None = None
     points: list[MeasurementPointPayload] | None = Field(default=None, description="Normalized points used by measurement and ROI operations.")
     zoom: float | None = None
