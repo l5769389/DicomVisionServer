@@ -637,10 +637,10 @@ def _handle_mpr_segmentation_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series
     if not is_mpr_view:
         return _render_none()
-    if not service._handle_mpr_segmentation_config(view, payload):
+    refresh_stats = payload.action_type != DRAG_ACTION_MOVE
+    if not service._handle_mpr_segmentation_config(view, payload, series=series, refresh_stats=refresh_stats):
         return _render_none()
     if payload.action_type == DRAG_ACTION_START:
         return _render_none()
