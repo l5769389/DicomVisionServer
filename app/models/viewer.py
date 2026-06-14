@@ -151,13 +151,78 @@ class MprSegmentationVoiBoxState:
 
 
 @dataclass
+class MprThresholdRegionStatsState:
+    hu_mean: float | None = None
+    hu_min: float | None = None
+    hu_max: float | None = None
+    hu_std_dev: float | None = None
+    volume_cm3: float = 0.0
+    sample_count: int = 0
+    effective_threshold_hu: float | None = None
+
+
+@dataclass
+class MprVoiSphereStatsState:
+    hu_mean: float | None = None
+    hu_min: float | None = None
+    hu_max: float | None = None
+    hu_std_dev: float | None = None
+    volume_cm3: float = 0.0
+    sample_count: int = 0
+
+
+@dataclass
+class MprThresholdRegionBoxState:
+    center_world: Vec3 = (0.0, 0.0, 0.0)
+    row_world: Vec3 = (0.0, 1.0, 0.0)
+    col_world: Vec3 = (0.0, 0.0, 1.0)
+    normal_world: Vec3 = (1.0, 0.0, 0.0)
+    width_mm: float = 1.0
+    height_mm: float = 1.0
+    depth_mm: float = 1.0
+    source_viewport: str = "mpr-ax"
+
+
+@dataclass
+class MprThresholdRegionState:
+    id: str
+    enabled: bool = True
+    label: str = ""
+    threshold_hu: float = 300.0
+    threshold_mode: str = "hu"
+    threshold_percentile: float = 80.0
+    color: str = "#ff4df8"
+    box: MprThresholdRegionBoxState = field(default_factory=MprThresholdRegionBoxState)
+    stats: MprThresholdRegionStatsState | None = None
+
+
+@dataclass
+class MprVoiSphereState:
+    id: str = ""
+    label: str = ""
+    enabled: bool = True
+    center_world: Vec3 = (0.0, 0.0, 0.0)
+    radius_mm: float = 10.0
+    color: str = "#22d3ee"
+    stats: MprVoiSphereStatsState | None = None
+
+
+@dataclass
 class MprSegmentationState:
     enabled: bool = False
+    client_revision: int = 0
+    selected_region_id: str | None = None
+    selected_voi: bool = False
+    selected_voi_id: str | None = None
+    threshold_regions: list[MprThresholdRegionState] = field(default_factory=list)
+    voi_spheres: list[MprVoiSphereState] = field(default_factory=list)
+    voi_sphere: MprVoiSphereState | None = None
     lower_hu: float = 300.0
     upper_hu: float = 3071.0
     opacity: float = 0.45
-    color: str = "#22d3ee"
-    voi_box: MprSegmentationVoiBoxState | None = field(default_factory=MprSegmentationVoiBoxState)
+    color: str = "#ff4df8"
+    voi_box: MprSegmentationVoiBoxState | None = None
+    legacy_enabled: bool = False
 
 
 @dataclass

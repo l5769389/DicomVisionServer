@@ -65,6 +65,11 @@ from app.models.viewer import (
     MprObliquePlaneState,
     MprRotationDragRecord,
     MprSegmentationState,
+    MprThresholdRegionBoxState,
+    MprThresholdRegionState,
+    MprThresholdRegionStatsState,
+    MprVoiSphereState,
+    MprVoiSphereStatsState,
     MprSegmentationVoiBoxState,
     PresentationAnnotationRecord,
     PresentationMeasurementRecord,
@@ -86,6 +91,15 @@ from app.schemas.view import (
     MprMipViewportConfig,
     MprPlaneInfo,
     MprSegmentationConfig,
+    MprSegmentationOverlay,
+    MprSegmentationOverlayRect,
+    MprSegmentationOverlayRegion,
+    MprSegmentationOverlaySamples,
+    MprThresholdRegion,
+    MprThresholdRegionBox,
+    MprThresholdRegionStats,
+    MprVoiSphere,
+    MprVoiSphereStats,
     MprSegmentationVoiBox,
     MeasurementOverlayPayload,
     OperationAcceptedResponse,
@@ -193,6 +207,7 @@ FUSION_PET_UNIT_SUV_BW = "SUVbw"
 FUSION_PET_UNIT_SUV_BSA = "SUVbsa"
 FUSION_PET_UNIT_SUL = "SUL"
 FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
+MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT = 120_000
 FUSION_PET_UNIT_LABELS: dict[str, str] = {
     FUSION_PET_UNIT_SOURCE: "source",
     FUSION_PET_UNIT_KBQML: "kBq/ml (uptake)",
@@ -283,6 +298,22 @@ class MprPoseContext:
     geometry: VolumeGeometry
     cursor: MprCursorState
     poses: dict[str, PlanePose]
+
+
+@dataclass(frozen=True)
+class MprThresholdPlaneGrid:
+    row_grid_mm: np.ndarray
+    col_grid_mm: np.ndarray
+    center_world: np.ndarray
+    row_world: np.ndarray
+    col_world: np.ndarray
+
+
+@dataclass(frozen=True)
+class MprThresholdPlaneMask:
+    region_id: str
+    mask: np.ndarray
+    color: str
 
 
 @dataclass(frozen=True)
@@ -3308,6 +3339,7 @@ class ViewerService:
         metadata_started_at = perf_counter()
         payload_pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
         target_plane_pose = payload_pose_context.poses[target_viewport]
+        segmentation_plane_pose = self._pose_for_sampled_mpr_plane(target_plane_pose, plane_pixels.shape[:2])
         plane_state = self._plane_state_from_pose(target_plane_pose) if view.view_group is not None else None
         pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(target_plane_pose)
         full_plane_height, full_plane_width = target_plane_pose.output_shape
@@ -3396,15 +3428,28 @@ class ViewerService:
             )
         else:
             image = layered_renderer.render(context)
-        image = self._apply_mpr_segmentation_overlay(
-            image,
-            view.mpr_segmentation,
+        mpr_segmentation_overlay = self._build_mpr_segmentation_overlay_payload(
             plane_pixels,
+            view.mpr_segmentation,
             target_viewport,
-            render_image_transform,
-            render_plan.render_view.width or 0,
-            render_plan.render_view.height or 0,
+            segmentation_plane_pose,
+            include_samples=not fast_preview,
         )
+        has_local_segmentation_samples = bool(
+            mpr_segmentation_overlay
+            and any(region.samples is not None for region in mpr_segmentation_overlay.regions)
+        )
+        if not has_local_segmentation_samples:
+            image = self._apply_mpr_segmentation_overlay(
+                image,
+                view.mpr_segmentation,
+                plane_pixels,
+                target_viewport,
+                segmentation_plane_pose,
+                render_image_transform,
+                render_plan.render_view.width or 0,
+                render_plan.render_view.height or 0,
+            )
         image_ms = (perf_counter() - image_started_at) * 1000.0
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
@@ -3440,9 +3485,12 @@ class ViewerService:
                     view,
                     target_viewport,
                     plane_pose=target_plane_pose,
+                    geometry=payload_pose_context.geometry,
+                    image_transform=metadata_image_transform,
                 ),
                 mprMipConfig=self._serialize_mpr_mip_config(view.mpr_mip),
                 mprSegmentationConfig=self._serialize_mpr_segmentation_config(view.mpr_segmentation),
+                mprSegmentationOverlay=mpr_segmentation_overlay,
                 mprCrosshairMode=self._get_mpr_crosshair_mode(view.view_group),
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
@@ -3778,29 +3826,108 @@ class ViewerService:
 
     @staticmethod
     def _serialize_mpr_segmentation_config(state: MprSegmentationState) -> MprSegmentationConfig:
-        voi_box = state.voi_box
+        def serialize_stats(stats: MprThresholdRegionStatsState | None) -> MprThresholdRegionStats | None:
+            if stats is None:
+                return None
+            return MprThresholdRegionStats(
+                huMean=stats.hu_mean,
+                huMin=stats.hu_min,
+                huMax=stats.hu_max,
+                huStdDev=stats.hu_std_dev,
+                volumeCm3=float(stats.volume_cm3),
+                sampleCount=int(stats.sample_count),
+                effectiveThresholdHu=stats.effective_threshold_hu,
+            )
+
+        def serialize_region(region: MprThresholdRegionState) -> MprThresholdRegion:
+            return MprThresholdRegion(
+                id=str(region.id),
+                enabled=bool(region.enabled),
+                label=str(region.label or ""),
+                thresholdHu=float(region.threshold_hu),
+                thresholdMode=str(region.threshold_mode or "hu"),
+                thresholdPercentile=float(region.threshold_percentile),
+                color=str(region.color or "#ff4df8"),
+                box=MprThresholdRegionBox(
+                    centerWorld=ViewerService._vector_payload(region.box.center_world),
+                    rowWorld=ViewerService._vector_payload(region.box.row_world),
+                    colWorld=ViewerService._vector_payload(region.box.col_world),
+                    normalWorld=ViewerService._vector_payload(region.box.normal_world),
+                    widthMm=float(region.box.width_mm),
+                    heightMm=float(region.box.height_mm),
+                    depthMm=float(region.box.depth_mm),
+                    sourceViewport=str(region.box.source_viewport or MPR_VIEWPORT_AXIAL),
+                ),
+                stats=serialize_stats(region.stats),
+            )
+
+        def serialize_voi_stats(stats: MprVoiSphereStatsState | None) -> MprVoiSphereStats | None:
+            if stats is None:
+                return None
+            return MprVoiSphereStats(
+                huMean=stats.hu_mean,
+                huMin=stats.hu_min,
+                huMax=stats.hu_max,
+                huStdDev=stats.hu_std_dev,
+                volumeCm3=float(stats.volume_cm3),
+                sampleCount=int(stats.sample_count),
+            )
+
+        def serialize_voi_sphere(sphere: MprVoiSphereState) -> MprVoiSphere:
+            return MprVoiSphere(
+                id=str(sphere.id or ""),
+                label=str(sphere.label or ""),
+                enabled=bool(sphere.enabled),
+                centerWorld=ViewerService._vector_payload(sphere.center_world),
+                radiusMm=float(sphere.radius_mm),
+                color=str(sphere.color or "#22d3ee"),
+                stats=serialize_voi_stats(sphere.stats),
+            )
+
+        legacy_voi_box = state.voi_box
+        voi_spheres = ViewerService._get_mpr_voi_spheres(state)
+        selected_voi_id = state.selected_voi_id if any(sphere.id == state.selected_voi_id for sphere in voi_spheres) else None
+        selected_voi_sphere = next((sphere for sphere in voi_spheres if sphere.id == selected_voi_id), None)
+        legacy_voi_sphere = selected_voi_sphere or (voi_spheres[0] if voi_spheres else None)
         return MprSegmentationConfig(
             enabled=bool(state.enabled),
+            clientRevision=max(0, int(state.client_revision)),
+            selectedRegionId=state.selected_region_id,
+            selectedVoi=bool(selected_voi_id),
+            selectedVoiId=selected_voi_id,
+            thresholdRegions=[serialize_region(region) for region in state.threshold_regions],
+            voiSpheres=[serialize_voi_sphere(sphere) for sphere in voi_spheres],
+            voiSphere=None if legacy_voi_sphere is None else serialize_voi_sphere(legacy_voi_sphere),
             lowerHu=float(state.lower_hu),
             upperHu=float(state.upper_hu),
             opacity=float(state.opacity),
-            color=str(state.color or "#22d3ee"),
-            voiBox=None if voi_box is None else MprSegmentationVoiBox(
-                xMin=float(voi_box.x_min),
-                xMax=float(voi_box.x_max),
-                yMin=float(voi_box.y_min),
-                yMax=float(voi_box.y_max),
-                zMin=float(voi_box.z_min),
-                zMax=float(voi_box.z_max),
+            color=str(state.color or "#ff4df8"),
+            voiBox=None if legacy_voi_box is None else MprSegmentationVoiBox(
+                xMin=float(legacy_voi_box.x_min),
+                xMax=float(legacy_voi_box.x_max),
+                yMin=float(legacy_voi_box.y_min),
+                yMax=float(legacy_voi_box.y_max),
+                zMin=float(legacy_voi_box.z_min),
+                zMax=float(legacy_voi_box.z_max),
             ),
         )
 
-    def _handle_mpr_segmentation_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+    def _handle_mpr_segmentation_config(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+        *,
+        series: SeriesRecord | None = None,
+        refresh_stats: bool = True,
+    ) -> bool:
         if not self._is_mpr_view_type(view.view_type) or view.view_group is None:
             return False
         if payload.mpr_segmentation_config is None:
             return False
-        view.view_group.mpr_segmentation = self._normalize_mpr_segmentation_state(payload.mpr_segmentation_config)
+        next_state = self._normalize_mpr_segmentation_state(payload.mpr_segmentation_config)
+        if refresh_stats:
+            self._refresh_mpr_segmentation_stats_for_view(view, next_state, series=series)
+        view.view_group.mpr_segmentation = next_state
         return True
 
     @classmethod
@@ -3809,14 +3936,201 @@ class ViewerService:
         upper_hu = cls._clamp_float(config.upper_hu, -1024.0, 3071.0, 3071.0)
         if lower_hu > upper_hu:
             lower_hu, upper_hu = upper_hu, lower_hu
+        threshold_regions = [
+            normalized
+            for region in config.threshold_regions
+            if (normalized := cls._normalize_mpr_threshold_region(region)) is not None
+        ]
+        selected_region_id = str(config.selected_region_id).strip() if config.selected_region_id else None
+        if selected_region_id and not any(region.id == selected_region_id for region in threshold_regions):
+            selected_region_id = threshold_regions[0].id if threshold_regions else None
+        voi_spheres = cls._normalize_mpr_voi_spheres(config)
+        selected_voi_id = str(config.selected_voi_id).strip() if config.selected_voi_id else None
+        if selected_voi_id and not any(sphere.id == selected_voi_id for sphere in voi_spheres):
+            selected_voi_id = None
+        if selected_voi_id is None and config.selected_voi and voi_spheres:
+            legacy_selected_id = str(getattr(config.voi_sphere, "id", "") or "").strip() if config.voi_sphere is not None else ""
+            selected_voi_id = legacy_selected_id if any(sphere.id == legacy_selected_id for sphere in voi_spheres) else voi_spheres[0].id
+        selected_voi = bool(selected_voi_id)
+        selected_voi_sphere = next((sphere for sphere in voi_spheres if sphere.id == selected_voi_id), None)
+        if selected_voi_id:
+            selected_region_id = None
+        legacy_enabled = (
+            not threshold_regions
+            and (
+                config.lower_hu is not None
+                or config.upper_hu is not None
+                or config.voi_box is not None
+            )
+        )
         return MprSegmentationState(
             enabled=bool(config.enabled),
+            client_revision=max(0, int(cls._clamp_float(config.client_revision, 0.0, float(2**31 - 1), 0.0))),
+            selected_region_id=selected_region_id,
+            selected_voi=selected_voi,
+            selected_voi_id=selected_voi_id,
+            threshold_regions=threshold_regions,
+            voi_spheres=voi_spheres,
+            voi_sphere=selected_voi_sphere or (voi_spheres[0] if voi_spheres else None),
             lower_hu=lower_hu,
             upper_hu=upper_hu,
             opacity=cls._clamp_float(config.opacity, 0.0, 1.0, 0.45),
             color=cls._normalize_mpr_segmentation_color(config.color),
             voi_box=cls._normalize_mpr_segmentation_voi_box(config.voi_box),
+            legacy_enabled=legacy_enabled,
         )
+
+    @classmethod
+    def _normalize_mpr_threshold_region(
+        cls,
+        region: MprThresholdRegion | MprThresholdRegionState | None,
+    ) -> MprThresholdRegionState | None:
+        if region is None:
+            return None
+        region_id = str(getattr(region, "id", "") or "").strip()
+        if not region_id:
+            return None
+        box = cls._normalize_mpr_threshold_region_box(getattr(region, "box", None))
+        if box is None:
+            return None
+        return MprThresholdRegionState(
+            id=region_id,
+            enabled=bool(getattr(region, "enabled", True)),
+            label=str(getattr(region, "label", "") or ""),
+            threshold_hu=cls._clamp_float(getattr(region, "threshold_hu", 300.0), -1024.0, 3071.0, 300.0),
+            threshold_mode=cls._normalize_mpr_threshold_mode(getattr(region, "threshold_mode", "hu")),
+            threshold_percentile=cls._clamp_float(getattr(region, "threshold_percentile", 80.0), 0.0, 100.0, 80.0),
+            color=cls._normalize_mpr_segmentation_color(getattr(region, "color", "#ff4df8"), fallback="#ff4df8"),
+            box=box,
+            stats=cls._normalize_mpr_threshold_region_stats(getattr(region, "stats", None)),
+        )
+
+    @classmethod
+    def _normalize_mpr_threshold_region_box(
+        cls,
+        box: MprThresholdRegionBox | MprThresholdRegionBoxState | None,
+    ) -> MprThresholdRegionBoxState | None:
+        if box is None:
+            return None
+        return MprThresholdRegionBoxState(
+            center_world=cls._normalize_mpr_vec3(getattr(box, "center_world", None), (0.0, 0.0, 0.0)),
+            row_world=cls._normalize_world_unit_vector(getattr(box, "row_world", None), (0.0, 1.0, 0.0)),
+            col_world=cls._normalize_world_unit_vector(getattr(box, "col_world", None), (0.0, 0.0, 1.0)),
+            normal_world=cls._normalize_world_unit_vector(getattr(box, "normal_world", None), (1.0, 0.0, 0.0)),
+            width_mm=cls._clamp_float(getattr(box, "width_mm", 1.0), 1e-3, 10000.0, 1.0),
+            height_mm=cls._clamp_float(getattr(box, "height_mm", 1.0), 1e-3, 10000.0, 1.0),
+            depth_mm=cls._clamp_float(getattr(box, "depth_mm", 1.0), 1e-3, 10000.0, 1.0),
+            source_viewport=cls._normalize_mpr_viewport_key(getattr(box, "source_viewport", MPR_VIEWPORT_AXIAL)),
+        )
+
+    @classmethod
+    def _normalize_mpr_threshold_region_stats(
+        cls,
+        stats: MprThresholdRegionStats | MprThresholdRegionStatsState | None,
+    ) -> MprThresholdRegionStatsState | None:
+        if stats is None:
+            return None
+        sample_count = int(cls._clamp_float(getattr(stats, "sample_count", 0), 0.0, float(2**31 - 1), 0.0))
+        return MprThresholdRegionStatsState(
+            hu_mean=cls._optional_finite_float(getattr(stats, "hu_mean", None)),
+            hu_min=cls._optional_finite_float(getattr(stats, "hu_min", None)),
+            hu_max=cls._optional_finite_float(getattr(stats, "hu_max", None)),
+            hu_std_dev=cls._optional_finite_float(getattr(stats, "hu_std_dev", None)),
+            volume_cm3=cls._clamp_float(getattr(stats, "volume_cm3", 0.0), 0.0, float("inf"), 0.0),
+            sample_count=sample_count,
+            effective_threshold_hu=cls._optional_finite_float(getattr(stats, "effective_threshold_hu", None)),
+        )
+
+    @classmethod
+    def _normalize_mpr_voi_spheres(cls, config: MprSegmentationConfig) -> list[MprVoiSphereState]:
+        raw_spheres: list[MprVoiSphere | MprVoiSphereState] = list(config.voi_spheres or [])
+        if not raw_spheres and config.voi_sphere is not None:
+            raw_spheres = [config.voi_sphere]
+        normalized_spheres: list[MprVoiSphereState] = []
+        used_ids: set[str] = set()
+        for index, sphere in enumerate(raw_spheres, start=1):
+            normalized = cls._normalize_mpr_voi_sphere(sphere, default_index=index)
+            if normalized is None:
+                continue
+            base_id = normalized.id or f"voi-{index}"
+            sphere_id = base_id
+            suffix = 2
+            while sphere_id in used_ids:
+                sphere_id = f"{base_id}-{suffix}"
+                suffix += 1
+            normalized.id = sphere_id
+            if not normalized.label:
+                normalized.label = str(len(normalized_spheres) + 1)
+            used_ids.add(sphere_id)
+            normalized_spheres.append(normalized)
+        return normalized_spheres
+
+    @classmethod
+    def _normalize_mpr_voi_sphere(
+        cls,
+        sphere: MprVoiSphere | MprVoiSphereState | None,
+        *,
+        default_index: int = 1,
+    ) -> MprVoiSphereState | None:
+        if sphere is None:
+            return None
+        sphere_id = str(getattr(sphere, "id", "") or "").strip() or f"voi-{default_index}"
+        label = str(getattr(sphere, "label", "") or "").strip() or str(default_index)
+        return MprVoiSphereState(
+            id=sphere_id,
+            label=label,
+            enabled=bool(getattr(sphere, "enabled", True)),
+            center_world=cls._normalize_mpr_vec3(getattr(sphere, "center_world", None), (0.0, 0.0, 0.0)),
+            radius_mm=cls._clamp_float(getattr(sphere, "radius_mm", 10.0), 1e-3, 10000.0, 10.0),
+            color=cls._normalize_mpr_segmentation_color(getattr(sphere, "color", "#22d3ee"), fallback="#22d3ee"),
+            stats=cls._normalize_mpr_voi_sphere_stats(getattr(sphere, "stats", None)),
+        )
+
+    @classmethod
+    def _normalize_mpr_voi_sphere_stats(
+        cls,
+        stats: MprVoiSphereStats | MprVoiSphereStatsState | None,
+    ) -> MprVoiSphereStatsState | None:
+        if stats is None:
+            return None
+        sample_count = int(cls._clamp_float(getattr(stats, "sample_count", 0), 0.0, float(2**31 - 1), 0.0))
+        return MprVoiSphereStatsState(
+            hu_mean=cls._optional_finite_float(getattr(stats, "hu_mean", None)),
+            hu_min=cls._optional_finite_float(getattr(stats, "hu_min", None)),
+            hu_max=cls._optional_finite_float(getattr(stats, "hu_max", None)),
+            hu_std_dev=cls._optional_finite_float(getattr(stats, "hu_std_dev", None)),
+            volume_cm3=cls._clamp_float(getattr(stats, "volume_cm3", 0.0), 0.0, float("inf"), 0.0),
+            sample_count=sample_count,
+        )
+
+    @staticmethod
+    def _normalize_mpr_threshold_mode(value: object) -> str:
+        return "percentile" if str(value or "hu").strip().lower() == "percentile" else "hu"
+
+    @staticmethod
+    def _normalize_mpr_vec3(value: object, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
+        try:
+            vector = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return fallback
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            return fallback
+        return tuple(float(component) for component in vector)
+
+    @classmethod
+    def _normalize_world_unit_vector(cls, value: object, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
+        vector = np.asarray(cls._normalize_mpr_vec3(value, fallback), dtype=np.float64)
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm) or norm <= 1e-6:
+            return fallback
+        return tuple(float(component) for component in (vector / norm))
+
+    @staticmethod
+    def _normalize_mpr_viewport_key(value: object) -> str:
+        text = str(value or "").strip()
+        if text in {MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL}:
+            return text
+        return MPR_VIEWPORT_AXIAL
 
     @classmethod
     def _normalize_mpr_segmentation_voi_box(
@@ -3846,11 +4160,394 @@ class ViewerService:
         )
 
     @staticmethod
-    def _normalize_mpr_segmentation_color(color: object) -> str:
+    def _normalize_mpr_segmentation_color(color: object, fallback: str = "#ff4df8") -> str:
         text = str(color or "").strip()
         if len(text) == 7 and text.startswith("#") and all(ch in "0123456789abcdefABCDEF" for ch in text[1:]):
             return text.lower()
-        return "#22d3ee"
+        return fallback
+
+    @staticmethod
+    def _optional_finite_float(value: object) -> float | None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if np.isfinite(numeric) else None
+
+    @staticmethod
+    def _pose_for_sampled_mpr_plane(plane_pose: PlanePose, sampled_shape: tuple[int, int]) -> PlanePose:
+        sampled_height = max(1, int(sampled_shape[0]))
+        sampled_width = max(1, int(sampled_shape[1]))
+        full_height = max(1, int(plane_pose.output_shape[0]))
+        full_width = max(1, int(plane_pose.output_shape[1]))
+        if (sampled_height, sampled_width) == (full_height, full_width):
+            return plane_pose
+        return replace(
+            plane_pose,
+            output_shape=(sampled_height, sampled_width),
+            pixel_spacing_row_mm=float(plane_pose.pixel_spacing_row_mm) * float(full_height) / float(sampled_height),
+            pixel_spacing_col_mm=float(plane_pose.pixel_spacing_col_mm) * float(full_width) / float(sampled_width),
+        )
+
+    @staticmethod
+    def _get_mpr_voi_spheres(state: MprSegmentationState) -> list[MprVoiSphereState]:
+        if state.voi_spheres:
+            return state.voi_spheres
+        return [state.voi_sphere] if state.voi_sphere is not None else []
+
+    def _refresh_mpr_segmentation_stats_for_view(
+        self,
+        view: ViewRecord,
+        state: MprSegmentationState,
+        *,
+        series: SeriesRecord | None = None,
+    ) -> None:
+        if not state.threshold_regions and not self._get_mpr_voi_spheres(state):
+            return
+        try:
+            series_record = series if series is not None else series_registry.get(view.series_id)
+            if not getattr(series_record, "instances", None):
+                return
+            volume = self._get_series_volume(series_record)
+            geometry = self._get_series_volume_geometry(series_record, volume.shape)
+            self._refresh_mpr_segmentation_stats(state, volume, geometry)
+        except Exception:
+            logger.debug("failed to refresh MPR segmentation stats view_id=%s", view.view_id, exc_info=True)
+
+    @classmethod
+    def _refresh_mpr_segmentation_stats(
+        cls,
+        state: MprSegmentationState,
+        volume: np.ndarray,
+        geometry: VolumeGeometry,
+    ) -> None:
+        cls._refresh_mpr_segmentation_region_stats(state, volume, geometry)
+        for sphere in cls._get_mpr_voi_spheres(state):
+            sphere.stats = (
+                cls._empty_mpr_voi_sphere_stats()
+                if not sphere.enabled
+                else cls._compute_mpr_voi_sphere_stats(volume, geometry, sphere)
+            )
+
+    @classmethod
+    def _refresh_mpr_segmentation_region_stats(
+        cls,
+        state: MprSegmentationState,
+        volume: np.ndarray,
+        geometry: VolumeGeometry,
+    ) -> None:
+        if not state.threshold_regions:
+            return
+        for region in state.threshold_regions:
+            region.stats = (
+                cls._empty_mpr_threshold_region_stats()
+                if not region.enabled
+                else cls._compute_mpr_threshold_region_stats(volume, geometry, region)
+            )
+
+    @classmethod
+    def _empty_mpr_threshold_region_stats(cls, effective_threshold_hu: float | None = None) -> MprThresholdRegionStatsState:
+        return MprThresholdRegionStatsState(
+            hu_mean=None,
+            hu_min=None,
+            hu_max=None,
+            hu_std_dev=None,
+            volume_cm3=0.0,
+            sample_count=0,
+            effective_threshold_hu=effective_threshold_hu,
+        )
+
+    @classmethod
+    def _empty_mpr_voi_sphere_stats(cls) -> MprVoiSphereStatsState:
+        return MprVoiSphereStatsState(
+            hu_mean=None,
+            hu_min=None,
+            hu_max=None,
+            hu_std_dev=None,
+            volume_cm3=0.0,
+            sample_count=0,
+        )
+
+    @staticmethod
+    def _get_geometry_voxel_volume_mm3(geometry: VolumeGeometry) -> float:
+        affine = np.asarray(geometry.ijk_to_world, dtype=np.float64)
+        voxel_volume_mm3 = float(abs(np.linalg.det(affine[:3, :3])))
+        if not np.isfinite(voxel_volume_mm3) or voxel_volume_mm3 <= 0.0:
+            voxel_volume_mm3 = float(np.prod(np.asarray(geometry.spacing_hint_mm, dtype=np.float64)))
+        if not np.isfinite(voxel_volume_mm3) or voxel_volume_mm3 <= 0.0:
+            return 1.0
+        return voxel_volume_mm3
+
+    @classmethod
+    def _get_mpr_threshold_region_effective_threshold_hu(cls, region: MprThresholdRegionState) -> float:
+        if cls._normalize_mpr_threshold_mode(region.threshold_mode) == "percentile":
+            stats_threshold = None if region.stats is None else region.stats.effective_threshold_hu
+            if stats_threshold is not None and np.isfinite(stats_threshold):
+                return float(stats_threshold)
+        return cls._clamp_float(region.threshold_hu, -1024.0, 3071.0, 300.0)
+
+    @classmethod
+    def _compute_mpr_threshold_region_stats(
+        cls,
+        volume: np.ndarray,
+        geometry: VolumeGeometry,
+        region: MprThresholdRegionState,
+    ) -> MprThresholdRegionStatsState:
+        threshold_mode = cls._normalize_mpr_threshold_mode(region.threshold_mode)
+        threshold_hu = cls._clamp_float(region.threshold_hu, -1024.0, 3071.0, 300.0)
+        empty_stats = cls._empty_mpr_threshold_region_stats(threshold_hu)
+        voxels = np.asarray(volume)
+        if voxels.ndim != 3 or any(int(size) <= 0 for size in voxels.shape[:3]):
+            return empty_stats
+
+        box = region.box
+        center = np.asarray(box.center_world, dtype=np.float64)
+        row = np.asarray(box.row_world, dtype=np.float64)
+        col = np.asarray(box.col_world, dtype=np.float64)
+        normal = np.asarray(box.normal_world, dtype=np.float64)
+        half_row = row * (float(box.height_mm) / 2.0)
+        half_col = col * (float(box.width_mm) / 2.0)
+        half_normal = normal * (float(box.depth_mm) / 2.0)
+        corners_world = np.asarray(
+            [
+                center + row_sign * half_row + col_sign * half_col + normal_sign * half_normal
+                for row_sign in (-1.0, 1.0)
+                for col_sign in (-1.0, 1.0)
+                for normal_sign in (-1.0, 1.0)
+            ],
+            dtype=np.float64,
+        )
+        try:
+            corners_ijk = np.asarray([world_to_ijk_point(geometry, corner) for corner in corners_world], dtype=np.float64)
+        except (TypeError, ValueError):
+            return empty_stats
+        if corners_ijk.shape != (8, 3) or not np.all(np.isfinite(corners_ijk)):
+            return empty_stats
+
+        shape = np.asarray(voxels.shape[:3], dtype=np.int64)
+        min_index = np.maximum(0, np.floor(np.min(corners_ijk, axis=0) - 1.0).astype(np.int64))
+        max_index = np.minimum(shape - 1, np.ceil(np.max(corners_ijk, axis=0) + 1.0).astype(np.int64))
+        if bool(np.any(min_index > max_index)):
+            return empty_stats
+
+        affine = np.asarray(geometry.ijk_to_world, dtype=np.float64)
+        voxel_volume_mm3 = cls._get_geometry_voxel_volume_mm3(geometry)
+
+        sample_count = 0
+        value_sum = 0.0
+        value_sum_sq = 0.0
+        hu_min: float | None = None
+        hu_max: float | None = None
+        inside_value_blocks: list[np.ndarray] = []
+        block_depth = 16
+        i_start = int(min_index[0])
+        i_stop = int(max_index[0])
+        j_start = int(min_index[1])
+        j_stop = int(max_index[1])
+        k_start = int(min_index[2])
+        k_stop = int(max_index[2])
+
+        for block_i_start in range(i_start, i_stop + 1, block_depth):
+            block_i_stop = min(i_stop, block_i_start + block_depth - 1)
+            block = np.asarray(
+                voxels[block_i_start : block_i_stop + 1, j_start : j_stop + 1, k_start : k_stop + 1],
+                dtype=np.float64,
+            )
+            if block.size == 0:
+                continue
+            indices = np.indices(block.shape, dtype=np.float64)
+            ii = indices[0] + float(block_i_start)
+            jj = indices[1] + float(j_start)
+            kk = indices[2] + float(k_start)
+            world_x = affine[0, 0] * ii + affine[0, 1] * jj + affine[0, 2] * kk + affine[0, 3]
+            world_y = affine[1, 0] * ii + affine[1, 1] * jj + affine[1, 2] * kk + affine[1, 3]
+            world_z = affine[2, 0] * ii + affine[2, 1] * jj + affine[2, 2] * kk + affine[2, 3]
+            delta_x = world_x - center[0]
+            delta_y = world_y - center[1]
+            delta_z = world_z - center[2]
+            row_distance = delta_x * row[0] + delta_y * row[1] + delta_z * row[2]
+            col_distance = delta_x * col[0] + delta_y * col[1] + delta_z * col[2]
+            normal_distance = delta_x * normal[0] + delta_y * normal[1] + delta_z * normal[2]
+            inside_box = (
+                (np.abs(row_distance) <= float(box.height_mm) / 2.0 + 1e-6)
+                & (np.abs(col_distance) <= float(box.width_mm) / 2.0 + 1e-6)
+                & (np.abs(normal_distance) <= float(box.depth_mm) / 2.0 + 1e-6)
+            )
+            finite_inside = inside_box & np.isfinite(block)
+            if not bool(np.any(finite_inside)):
+                continue
+            inside_values = block[finite_inside]
+            if threshold_mode == "percentile":
+                inside_value_blocks.append(np.asarray(inside_values, dtype=np.float64))
+                continue
+            values = inside_values[inside_values > threshold_hu]
+            if values.size <= 0:
+                continue
+            count = int(values.size)
+            sample_count += count
+            value_sum += float(np.sum(values, dtype=np.float64))
+            value_sum_sq += float(np.sum(values * values, dtype=np.float64))
+            block_min = float(np.min(values))
+            block_max = float(np.max(values))
+            hu_min = block_min if hu_min is None else min(hu_min, block_min)
+            hu_max = block_max if hu_max is None else max(hu_max, block_max)
+
+        effective_threshold_hu = threshold_hu
+        if threshold_mode == "percentile":
+            if not inside_value_blocks:
+                return empty_stats
+            inside_values = np.concatenate(inside_value_blocks)
+            if inside_values.size <= 0:
+                return empty_stats
+            effective_threshold_hu = float(
+                np.percentile(
+                    inside_values,
+                    cls._clamp_float(region.threshold_percentile, 0.0, 100.0, 80.0),
+                )
+            )
+            values = inside_values[inside_values > effective_threshold_hu]
+            sample_count = int(values.size)
+            if sample_count > 0:
+                value_sum = float(np.sum(values, dtype=np.float64))
+                value_sum_sq = float(np.sum(values * values, dtype=np.float64))
+                hu_min = float(np.min(values))
+                hu_max = float(np.max(values))
+
+        if sample_count <= 0:
+            return cls._empty_mpr_threshold_region_stats(effective_threshold_hu)
+        hu_mean = value_sum / float(sample_count)
+        variance = max(0.0, value_sum_sq / float(sample_count) - hu_mean * hu_mean)
+        return MprThresholdRegionStatsState(
+            hu_mean=hu_mean,
+            hu_min=hu_min,
+            hu_max=hu_max,
+            hu_std_dev=float(np.sqrt(variance)),
+            volume_cm3=float(sample_count) * voxel_volume_mm3 / 1000.0,
+            sample_count=sample_count,
+            effective_threshold_hu=effective_threshold_hu,
+        )
+
+    @classmethod
+    def _compute_mpr_voi_sphere_stats(
+        cls,
+        volume: np.ndarray,
+        geometry: VolumeGeometry,
+        sphere: MprVoiSphereState,
+    ) -> MprVoiSphereStatsState:
+        empty_stats = cls._empty_mpr_voi_sphere_stats()
+        voxels = np.asarray(volume)
+        if voxels.ndim != 3 or any(int(size) <= 0 for size in voxels.shape[:3]):
+            return empty_stats
+
+        center = np.asarray(sphere.center_world, dtype=np.float64)
+        radius_mm = max(1e-6, float(sphere.radius_mm))
+        corners_world = np.asarray(
+            [
+                center + np.asarray((x_sign * radius_mm, y_sign * radius_mm, z_sign * radius_mm), dtype=np.float64)
+                for x_sign in (-1.0, 1.0)
+                for y_sign in (-1.0, 1.0)
+                for z_sign in (-1.0, 1.0)
+            ],
+            dtype=np.float64,
+        )
+        try:
+            corners_ijk = np.asarray([world_to_ijk_point(geometry, corner) for corner in corners_world], dtype=np.float64)
+        except (TypeError, ValueError):
+            return empty_stats
+        if corners_ijk.shape != (8, 3) or not np.all(np.isfinite(corners_ijk)):
+            return empty_stats
+
+        shape = np.asarray(voxels.shape[:3], dtype=np.int64)
+        min_index = np.maximum(0, np.floor(np.min(corners_ijk, axis=0) - 1.0).astype(np.int64))
+        max_index = np.minimum(shape - 1, np.ceil(np.max(corners_ijk, axis=0) + 1.0).astype(np.int64))
+        if bool(np.any(min_index > max_index)):
+            return empty_stats
+
+        affine = np.asarray(geometry.ijk_to_world, dtype=np.float64)
+        voxel_volume_mm3 = cls._get_geometry_voxel_volume_mm3(geometry)
+        sample_count = 0
+        value_sum = 0.0
+        value_sum_sq = 0.0
+        hu_min: float | None = None
+        hu_max: float | None = None
+        radius_sq = radius_mm * radius_mm
+        block_depth = 16
+        i_start = int(min_index[0])
+        i_stop = int(max_index[0])
+        j_start = int(min_index[1])
+        j_stop = int(max_index[1])
+        k_start = int(min_index[2])
+        k_stop = int(max_index[2])
+
+        for block_i_start in range(i_start, i_stop + 1, block_depth):
+            block_i_stop = min(i_stop, block_i_start + block_depth - 1)
+            block = np.asarray(
+                voxels[block_i_start : block_i_stop + 1, j_start : j_stop + 1, k_start : k_stop + 1],
+                dtype=np.float64,
+            )
+            if block.size == 0:
+                continue
+            indices = np.indices(block.shape, dtype=np.float64)
+            ii = indices[0] + float(block_i_start)
+            jj = indices[1] + float(j_start)
+            kk = indices[2] + float(k_start)
+            world_x = affine[0, 0] * ii + affine[0, 1] * jj + affine[0, 2] * kk + affine[0, 3]
+            world_y = affine[1, 0] * ii + affine[1, 1] * jj + affine[1, 2] * kk + affine[1, 3]
+            world_z = affine[2, 0] * ii + affine[2, 1] * jj + affine[2, 2] * kk + affine[2, 3]
+            distance_sq = (
+                (world_x - center[0]) * (world_x - center[0])
+                + (world_y - center[1]) * (world_y - center[1])
+                + (world_z - center[2]) * (world_z - center[2])
+            )
+            finite_inside = (distance_sq <= radius_sq + 1e-6) & np.isfinite(block)
+            if not bool(np.any(finite_inside)):
+                continue
+            values = block[finite_inside]
+            count = int(values.size)
+            sample_count += count
+            value_sum += float(np.sum(values, dtype=np.float64))
+            value_sum_sq += float(np.sum(values * values, dtype=np.float64))
+            block_min = float(np.min(values))
+            block_max = float(np.max(values))
+            hu_min = block_min if hu_min is None else min(hu_min, block_min)
+            hu_max = block_max if hu_max is None else max(hu_max, block_max)
+
+        if sample_count <= 0:
+            return empty_stats
+        hu_mean = value_sum / float(sample_count)
+        variance = max(0.0, value_sum_sq / float(sample_count) - hu_mean * hu_mean)
+        return MprVoiSphereStatsState(
+            hu_mean=hu_mean,
+            hu_min=hu_min,
+            hu_max=hu_max,
+            hu_std_dev=float(np.sqrt(variance)),
+            volume_cm3=float(sample_count) * voxel_volume_mm3 / 1000.0,
+            sample_count=sample_count,
+        )
+
+    @staticmethod
+    def _project_mpr_voi_sphere_to_plane(
+        sphere: MprVoiSphereState,
+        plane_pose: PlanePose,
+    ) -> dict[str, float | bool | tuple[float, float]]:
+        center = np.asarray(sphere.center_world, dtype=np.float64)
+        delta = center - np.asarray(plane_pose.center_world, dtype=np.float64)
+        row_mm = float(np.dot(delta, np.asarray(plane_pose.row_world, dtype=np.float64)))
+        col_mm = float(np.dot(delta, np.asarray(plane_pose.col_world, dtype=np.float64)))
+        normal_mm = float(np.dot(delta, np.asarray(plane_pose.normal_world, dtype=np.float64)))
+        radius_mm = max(1e-6, float(sphere.radius_mm))
+        intersects = abs(normal_mm) <= radius_mm
+        display_radius_mm = (
+            float(np.sqrt(max(0.0, radius_mm * radius_mm - normal_mm * normal_mm)))
+            if intersects
+            else radius_mm
+        )
+        return {
+            "centerMm": (row_mm, col_mm),
+            "distanceToPlaneMm": normal_mm,
+            "radiusMm": display_radius_mm,
+            "intersects": bool(intersects),
+        }
 
     @staticmethod
     def _clamp_float(value: object, minimum: float, maximum: float, fallback: float) -> float:
@@ -3869,34 +4566,40 @@ class ViewerService:
         state: MprSegmentationState,
         source_pixels: np.ndarray,
         viewport_key: str,
+        plane_pose: PlanePose | None,
         image_transform,
         canvas_width: int,
         canvas_height: int,
     ) -> Image.Image:
         if canvas_width <= 0 or canvas_height <= 0:
             return image
-        mask = cls._build_mpr_segmentation_plane_mask(source_pixels, state, viewport_key)
-        if mask is None or not bool(np.any(mask)):
+        masks = cls._build_mpr_segmentation_region_plane_masks(source_pixels, state, viewport_key, plane_pose)
+        if not masks:
             return image
 
-        transformed_mask = viewport_transformer.apply_affine_array(
-            mask.astype(np.uint8) * 255,
-            int(canvas_width),
-            int(canvas_height),
-            image_transform,
-            order=0,
-            cval=0.0,
-        )
-        overlay_mask = transformed_mask > 0
-        if not bool(np.any(overlay_mask)):
-            return image
-
-        alpha = cls._clamp_float(state.opacity, 0.0, 1.0, 0.45)
-        if alpha <= 0.0:
-            return image
-        color = np.asarray(cls._parse_hex_rgb(state.color), dtype=np.float32)
         pixels = np.asarray(image.convert("RGBA"), dtype=np.float32).copy()
-        pixels[overlay_mask, :3] = pixels[overlay_mask, :3] * (1.0 - alpha) + color * alpha
+        any_overlay = False
+        for region_mask in masks:
+            if region_mask.mask is None or not bool(np.any(region_mask.mask)):
+                continue
+            transformed_mask = viewport_transformer.apply_affine_array(
+                region_mask.mask.astype(np.uint8) * 255,
+                int(canvas_width),
+                int(canvas_height),
+                image_transform,
+                order=0,
+                cval=0.0,
+            )
+            overlay_mask = cls._apply_segmentation_dot_pattern(transformed_mask > 0)
+            if not bool(np.any(overlay_mask)):
+                continue
+            any_overlay = True
+            color = np.asarray(cls._parse_hex_rgb(region_mask.color), dtype=np.float32)
+            alpha = 0.88
+            pixels[overlay_mask, :3] = pixels[overlay_mask, :3] * (1.0 - alpha) + color * alpha
+            pixels[overlay_mask, 3] = 255.0
+        if not any_overlay:
+            return image
         return Image.fromarray(np.clip(pixels, 0, 255).astype(np.uint8))
 
     @classmethod
@@ -3905,23 +4608,295 @@ class ViewerService:
         source_pixels: np.ndarray,
         state: MprSegmentationState,
         viewport_key: str,
+        plane_pose: PlanePose | None = None,
     ) -> np.ndarray | None:
-        if not state.enabled:
+        masks = cls._build_mpr_segmentation_region_plane_masks(source_pixels, state, viewport_key, plane_pose)
+        if not masks:
             return None
-        if state.opacity <= 0.0:
+        combined = np.zeros(np.asarray(source_pixels).shape[:2], dtype=bool)
+        for region_mask in masks:
+            combined |= region_mask.mask
+        return combined
+
+    @classmethod
+    def _build_mpr_segmentation_overlay_payload(
+        cls,
+        source_pixels: np.ndarray,
+        state: MprSegmentationState,
+        viewport_key: str,
+        plane_pose: PlanePose | None = None,
+        *,
+        include_samples: bool = True,
+    ) -> MprSegmentationOverlay | None:
+        if not state.enabled or not state.threshold_regions:
             return None
         pixels = np.asarray(source_pixels)
-        if pixels.ndim < 2:
+        if pixels.ndim >= 3:
+            pixels = pixels[..., 0]
+        plane_grid = (
+            cls._build_mpr_threshold_plane_grid(plane_pose, pixels.shape[:2])
+            if plane_pose is not None and pixels.ndim >= 2
+            else None
+        )
+        masks = cls._build_mpr_segmentation_region_plane_masks(source_pixels, state, viewport_key, plane_pose)
+        masks_by_region_id = {mask.region_id: mask.mask for mask in masks}
+        regions: list[MprSegmentationOverlayRegion] = []
+        for region in state.threshold_regions:
+            mask = masks_by_region_id.get(str(region.id))
+            rect = cls._build_mpr_segmentation_mask_rect(mask) if mask is not None else None
+            samples: MprSegmentationOverlaySamples | None = None
+            sample_revision = 0
+            if region.enabled and plane_pose is not None and plane_grid is not None:
+                geometry_mask = cls._build_mpr_threshold_region_plane_mask(
+                    region,
+                    plane_pose,
+                    pixels.shape[:2],
+                    plane_grid,
+                )
+                sample_revision = cls._build_mpr_segmentation_sample_revision(region, plane_pose, pixels.shape[:2])
+                if include_samples:
+                    samples = cls._build_mpr_segmentation_overlay_samples(pixels, geometry_mask)
+            regions.append(
+                MprSegmentationOverlayRegion(
+                    regionId=str(region.id),
+                    visible=rect is not None,
+                    rect=rect,
+                    sampleRevision=sample_revision,
+                    samples=samples,
+                )
+            )
+        return MprSegmentationOverlay(regions=regions)
+
+    @staticmethod
+    def _build_mpr_segmentation_sample_revision(
+        region: MprThresholdRegionState,
+        plane_pose: PlanePose,
+        shape: tuple[int, int],
+    ) -> int:
+        box = region.box
+
+        def vector_payload(values: tuple[float, float, float] | np.ndarray) -> list[float]:
+            return [round(float(value), 6) for value in values]
+
+        payload = {
+            "box": {
+                "center": vector_payload(box.center_world),
+                "row": vector_payload(box.row_world),
+                "col": vector_payload(box.col_world),
+                "normal": vector_payload(box.normal_world),
+                "width": round(float(box.width_mm), 6),
+                "height": round(float(box.height_mm), 6),
+                "depth": round(float(box.depth_mm), 6),
+                "sourceViewport": str(box.source_viewport or ""),
+            },
+            "plane": {
+                "center": vector_payload(plane_pose.center_world),
+                "row": vector_payload(plane_pose.row_world),
+                "col": vector_payload(plane_pose.col_world),
+                "normal": vector_payload(plane_pose.normal_world),
+                "rowSpacing": round(float(plane_pose.pixel_spacing_row_mm), 6),
+                "colSpacing": round(float(plane_pose.pixel_spacing_col_mm), 6),
+            },
+            "shape": [int(shape[0]), int(shape[1])],
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return int.from_bytes(hashlib.blake2b(encoded, digest_size=4).digest(), "big")
+
+    @staticmethod
+    def _build_mpr_segmentation_overlay_samples(
+        pixels: np.ndarray,
+        geometry_mask: np.ndarray,
+    ) -> MprSegmentationOverlaySamples | None:
+        pixel_array = np.asarray(pixels)
+        mask_array = np.asarray(geometry_mask, dtype=bool)
+        if pixel_array.ndim != 2 or mask_array.ndim != 2 or pixel_array.shape[:2] != mask_array.shape[:2]:
             return None
+        finite_mask = mask_array & np.isfinite(pixel_array)
+        if not bool(np.any(finite_mask)):
+            return None
+
+        rows, cols = np.nonzero(finite_mask)
+        total_count = int(rows.size)
+        if total_count <= 0:
+            return None
+
+        if total_count > MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT:
+            row_hash = rows.astype(np.uint64) * np.uint64(0x9E3779B185EBCA87)
+            col_hash = cols.astype(np.uint64) * np.uint64(0xC2B2AE3D27D4EB4F)
+            hashes = row_hash ^ col_hash ^ ((row_hash >> np.uint64(17)) + (col_hash << np.uint64(7)))
+            selected = np.argpartition(hashes, MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT - 1)[:MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT]
+            selected = selected[np.argsort(hashes[selected])]
+            rows = rows[selected]
+            cols = cols[selected]
+
+        values = pixel_array[rows, cols].astype(np.float32, copy=False)
+        points = np.empty(int(values.size) * 3, dtype=np.float32)
+        points[0::3] = cols.astype(np.float32, copy=False) + np.float32(0.5)
+        points[1::3] = rows.astype(np.float32, copy=False) + np.float32(0.5)
+        points[2::3] = values
+        return MprSegmentationOverlaySamples(
+            points=points.tolist(),
+            totalCount=total_count,
+            sampledCount=int(values.size),
+        )
+
+    @staticmethod
+    def _build_mpr_segmentation_mask_rect(mask: np.ndarray | None) -> MprSegmentationOverlayRect | None:
+        if mask is None:
+            return None
+        mask_array = np.asarray(mask, dtype=bool)
+        if mask_array.ndim != 2 or not bool(np.any(mask_array)):
+            return None
+        height, width = mask_array.shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+        rows, cols = np.where(mask_array)
+        if rows.size <= 0 or cols.size <= 0:
+            return None
+        return MprSegmentationOverlayRect(
+            xMin=max(0.0, min(1.0, float(np.min(cols)) / float(width))),
+            yMin=max(0.0, min(1.0, float(np.min(rows)) / float(height))),
+            xMax=max(0.0, min(1.0, float(np.max(cols) + 1) / float(width))),
+            yMax=max(0.0, min(1.0, float(np.max(rows) + 1) / float(height))),
+        )
+
+    @classmethod
+    def _build_mpr_segmentation_region_plane_masks(
+        cls,
+        source_pixels: np.ndarray,
+        state: MprSegmentationState,
+        viewport_key: str,
+        plane_pose: PlanePose | None = None,
+    ) -> list[MprThresholdPlaneMask]:
+        if not state.enabled:
+            return []
+        pixels = np.asarray(source_pixels)
+        if pixels.ndim < 2:
+            return []
         if pixels.ndim == 3:
             pixels = pixels[..., 0]
+        if state.threshold_regions and plane_pose is not None:
+            masks: list[MprThresholdPlaneMask] = []
+            plane_grid = cls._build_mpr_threshold_plane_grid(plane_pose, pixels.shape[:2])
+            threshold_masks: dict[float, np.ndarray] = {}
+            for region in state.threshold_regions:
+                if not region.enabled:
+                    continue
+                region_mask = cls._build_mpr_threshold_region_plane_mask(region, plane_pose, pixels.shape[:2], plane_grid)
+                if not bool(np.any(region_mask)):
+                    continue
+                threshold_hu = cls._get_mpr_threshold_region_effective_threshold_hu(region)
+                threshold_mask = threshold_masks.get(threshold_hu)
+                if threshold_mask is None:
+                    threshold_mask = pixels > threshold_hu
+                    threshold_masks[threshold_hu] = threshold_mask
+                mask = threshold_mask & region_mask
+                if bool(np.any(mask)):
+                    masks.append(MprThresholdPlaneMask(region_id=str(region.id), mask=mask, color=region.color))
+            return masks
+
+        if not state.legacy_enabled:
+            return []
+        legacy_mask = cls._build_legacy_mpr_segmentation_plane_mask(pixels, state, viewport_key)
+        return [] if legacy_mask is None else [MprThresholdPlaneMask(region_id="legacy", mask=legacy_mask, color=state.color)]
+
+    @staticmethod
+    def _build_mpr_threshold_plane_grid(
+        plane_pose: PlanePose,
+        shape: tuple[int, int],
+    ) -> MprThresholdPlaneGrid:
+        height, width = int(shape[0]), int(shape[1])
+        row_offsets_mm = (np.arange(height, dtype=np.float64) - (float(height) - 1.0) / 2.0) * float(plane_pose.pixel_spacing_row_mm)
+        col_offsets_mm = (np.arange(width, dtype=np.float64) - (float(width) - 1.0) / 2.0) * float(plane_pose.pixel_spacing_col_mm)
+        col_grid_mm, row_grid_mm = np.meshgrid(col_offsets_mm, row_offsets_mm)
+        return MprThresholdPlaneGrid(
+            row_grid_mm=row_grid_mm,
+            col_grid_mm=col_grid_mm,
+            center_world=np.asarray(plane_pose.center_world, dtype=np.float64),
+            row_world=np.asarray(plane_pose.row_world, dtype=np.float64),
+            col_world=np.asarray(plane_pose.col_world, dtype=np.float64),
+        )
+
+    @classmethod
+    def _build_legacy_mpr_segmentation_plane_mask(
+        cls,
+        pixels: np.ndarray,
+        state: MprSegmentationState,
+        viewport_key: str,
+    ) -> np.ndarray | None:
+        if state.opacity <= 0.0:
+            return None
         lower_hu = cls._clamp_float(state.lower_hu, -1024.0, 3071.0, 300.0)
         upper_hu = cls._clamp_float(state.upper_hu, -1024.0, 3071.0, 3071.0)
         if lower_hu > upper_hu:
             lower_hu, upper_hu = upper_hu, lower_hu
-
         mask = (pixels >= lower_hu) & (pixels <= upper_hu)
         return cls._apply_voi_box_to_mpr_plane_mask(mask, state.voi_box, viewport_key)
+
+    @classmethod
+    def _build_mpr_threshold_region_plane_mask(
+        cls,
+        region: MprThresholdRegionState,
+        plane_pose: PlanePose,
+        shape: tuple[int, int],
+        plane_grid: MprThresholdPlaneGrid | None = None,
+    ) -> np.ndarray:
+        height, width = int(shape[0]), int(shape[1])
+        if height <= 0 or width <= 0:
+            return np.zeros((max(0, height), max(0, width)), dtype=bool)
+        grid = plane_grid or cls._build_mpr_threshold_plane_grid(plane_pose, (height, width))
+        box = region.box
+        delta_center = grid.center_world - np.asarray(box.center_world, dtype=np.float64)
+        box_row = np.asarray(box.row_world, dtype=np.float64)
+        box_col = np.asarray(box.col_world, dtype=np.float64)
+        box_normal = np.asarray(box.normal_world, dtype=np.float64)
+
+        row_distance = (
+            float(np.dot(delta_center, box_row))
+            + grid.row_grid_mm * float(np.dot(grid.row_world, box_row))
+            + grid.col_grid_mm * float(np.dot(grid.col_world, box_row))
+        )
+        col_distance = (
+            float(np.dot(delta_center, box_col))
+            + grid.row_grid_mm * float(np.dot(grid.row_world, box_col))
+            + grid.col_grid_mm * float(np.dot(grid.col_world, box_col))
+        )
+        normal_distance = (
+            float(np.dot(delta_center, box_normal))
+            + grid.row_grid_mm * float(np.dot(grid.row_world, box_normal))
+            + grid.col_grid_mm * float(np.dot(grid.col_world, box_normal))
+        )
+        epsilon = 1e-6
+        return (
+            (np.abs(col_distance) <= float(box.width_mm) / 2.0 + epsilon)
+            & (np.abs(row_distance) <= float(box.height_mm) / 2.0 + epsilon)
+            & (np.abs(normal_distance) <= float(box.depth_mm) / 2.0 + epsilon)
+        )
+
+    @staticmethod
+    def _apply_segmentation_dot_pattern(mask: np.ndarray) -> np.ndarray:
+        mask_array = np.asarray(mask, dtype=bool)
+        if mask_array.ndim != 2 or not bool(np.any(mask_array)):
+            return np.zeros(mask_array.shape[:2], dtype=bool)
+        sample_count = int(np.count_nonzero(mask_array))
+        if sample_count <= 16:
+            return mask_array
+        height, width = mask_array.shape[:2]
+        row_index, col_index = np.indices((height, width), dtype=np.uint32)
+        # Hash in canvas space so zoom/flip transforms do not amplify source-space diagonal striping.
+        hashed = (
+            (row_index * np.uint32(0x45D9F3B))
+            ^ (col_index * np.uint32(0x119DE1F3))
+            ^ ((row_index + col_index) * np.uint32(0x27D4EB2D))
+        )
+        hashed ^= hashed >> np.uint32(15)
+        hashed *= np.uint32(0x2C1B3C6D)
+        hashed ^= hashed >> np.uint32(12)
+        pattern = (hashed % np.uint32(100)) < np.uint32(52)
+        dotted = mask_array & pattern
+        if bool(np.any(dotted)):
+            return dotted
+        return mask_array
 
     @classmethod
     def _apply_voi_box_to_mpr_plane_mask(
@@ -3967,7 +4942,7 @@ class ViewerService:
 
     @staticmethod
     def _parse_hex_rgb(color: str) -> tuple[int, int, int]:
-        normalized = ViewerService._normalize_mpr_segmentation_color(color)
+        normalized = ViewerService._normalize_mpr_segmentation_color(color, fallback="#ff4df8")
         return (
             int(normalized[1:3], 16),
             int(normalized[3:5], 16),
@@ -7244,6 +8219,18 @@ class ViewerService:
         return tuple(float(value) for value in np.asarray(vector, dtype=np.float64))
 
     @staticmethod
+    def _matrix3_payload(matrix: object | None) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None:
+        if matrix is None:
+            return None
+        values = np.asarray(matrix, dtype=np.float64)
+        if values.shape != (3, 3) or not np.all(np.isfinite(values)):
+            return None
+        return tuple(
+            tuple(float(values[row_index, col_index]) for col_index in range(3))
+            for row_index in range(3)
+        )
+
+    @staticmethod
     def _build_mpr_cursor_payload(cursor: MprCursorState | None) -> MprCursorInfo | None:
         if cursor is None:
             return None
@@ -7273,6 +8260,8 @@ class ViewerService:
         viewport_key: str,
         *,
         plane_pose: PlanePose | None = None,
+        geometry: VolumeGeometry | None = None,
+        image_transform: Any | None = None,
     ) -> MprPlaneInfo | None:
         if view.view_group is None:
             return None
@@ -7283,6 +8272,11 @@ class ViewerService:
         col_world = plane_pose.col_world if plane_pose is not None else plane.col
         normal_world = plane_pose.normal_world if plane_pose is not None else plane.normal
         output_shape = plane_pose.output_shape if plane_pose is not None else (0, 0)
+        pixel_spacing_normal_mm = (
+            spacing_along_world_direction(geometry, normal_world)
+            if geometry is not None
+            else 1.0
+        )
         return MprPlaneInfo(
             viewport=viewport_key,
             centerWorld=self._vector_payload(center_world),
@@ -7292,10 +8286,12 @@ class ViewerService:
             normalWorld=self._vector_payload(normal_world),
             pixelSpacingRowMm=float(plane_pose.pixel_spacing_row_mm) if plane_pose is not None else 1.0,
             pixelSpacingColMm=float(plane_pose.pixel_spacing_col_mm) if plane_pose is not None else 1.0,
+            pixelSpacingNormalMm=float(pixel_spacing_normal_mm),
             outputShape=(int(output_shape[0]), int(output_shape[1])),
             row=tuple(float(value) for value in plane.row),
             col=tuple(float(value) for value in plane.col),
             normal=tuple(float(value) for value in plane.normal),
+            imageToCanvasMatrix=self._matrix3_payload(getattr(image_transform, "matrix", None)),
             isOblique=bool(plane_pose.is_oblique if plane_pose is not None else plane.is_oblique),
         )
 

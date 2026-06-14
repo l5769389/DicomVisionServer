@@ -155,10 +155,16 @@ class MprPlaneInfo(BaseModel):
     normal_world: tuple[float, float, float] = Field(alias="normalWorld")
     pixel_spacing_row_mm: float = Field(alias="pixelSpacingRowMm")
     pixel_spacing_col_mm: float = Field(alias="pixelSpacingColMm")
+    pixel_spacing_normal_mm: float = Field(default=1.0, alias="pixelSpacingNormalMm")
     output_shape: tuple[int, int] = Field(alias="outputShape")
     row: tuple[float, float, float]
     col: tuple[float, float, float]
     normal: tuple[float, float, float]
+    image_to_canvas_matrix: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] | None = Field(default=None, alias="imageToCanvasMatrix")
     is_oblique: bool = Field(alias="isOblique")
 
     model_config = {"populate_by_name": True}
@@ -340,13 +346,115 @@ class MprSegmentationVoiBox(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprThresholdRegionStats(BaseModel):
+    hu_mean: float | None = Field(default=None, alias="huMean")
+    hu_min: float | None = Field(default=None, alias="huMin")
+    hu_max: float | None = Field(default=None, alias="huMax")
+    hu_std_dev: float | None = Field(default=None, alias="huStdDev")
+    volume_cm3: float = Field(default=0.0, ge=0.0, alias="volumeCm3")
+    sample_count: int = Field(default=0, ge=0, alias="sampleCount")
+    effective_threshold_hu: float | None = Field(default=None, alias="effectiveThresholdHu")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprThresholdRegionBox(BaseModel):
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    row_world: tuple[float, float, float] = Field(alias="rowWorld")
+    col_world: tuple[float, float, float] = Field(alias="colWorld")
+    normal_world: tuple[float, float, float] = Field(alias="normalWorld")
+    width_mm: float = Field(default=1.0, gt=0.0, alias="widthMm")
+    height_mm: float = Field(default=1.0, gt=0.0, alias="heightMm")
+    depth_mm: float = Field(default=1.0, gt=0.0, alias="depthMm")
+    source_viewport: str = Field(default="mpr-ax", alias="sourceViewport")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprThresholdRegion(BaseModel):
+    id: str
+    enabled: bool = True
+    label: str = ""
+    threshold_hu: float = Field(default=300.0, ge=-1024.0, le=3071.0, alias="thresholdHu")
+    threshold_mode: str = Field(default="hu", alias="thresholdMode")
+    threshold_percentile: float = Field(default=80.0, ge=0.0, le=100.0, alias="thresholdPercentile")
+    color: str = "#ff4df8"
+    box: MprThresholdRegionBox
+    stats: MprThresholdRegionStats | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class MprVoiSphereStats(BaseModel):
+    hu_mean: float | None = Field(default=None, alias="huMean")
+    hu_min: float | None = Field(default=None, alias="huMin")
+    hu_max: float | None = Field(default=None, alias="huMax")
+    hu_std_dev: float | None = Field(default=None, alias="huStdDev")
+    volume_cm3: float = Field(default=0.0, ge=0.0, alias="volumeCm3")
+    sample_count: int = Field(default=0, ge=0, alias="sampleCount")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprVoiSphere(BaseModel):
+    id: str | None = None
+    label: str = ""
+    enabled: bool = True
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    radius_mm: float = Field(default=10.0, gt=0.0, alias="radiusMm")
+    color: str = "#22d3ee"
+    stats: MprVoiSphereStats | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 class MprSegmentationConfig(BaseModel):
     enabled: bool = False
-    lower_hu: float = Field(default=300.0, ge=-1024.0, le=3071.0, alias="lowerHu")
-    upper_hu: float = Field(default=3071.0, ge=-1024.0, le=3071.0, alias="upperHu")
+    client_revision: int = Field(default=0, ge=0, alias="clientRevision")
+    selected_region_id: str | None = Field(default=None, alias="selectedRegionId")
+    selected_voi: bool = Field(default=False, alias="selectedVoi")
+    selected_voi_id: str | None = Field(default=None, alias="selectedVoiId")
+    threshold_regions: list[MprThresholdRegion] = Field(default_factory=list, alias="thresholdRegions")
+    voi_spheres: list[MprVoiSphere] = Field(default_factory=list, alias="voiSpheres")
+    voi_sphere: MprVoiSphere | None = Field(default=None, alias="voiSphere")
+    lower_hu: float | None = Field(default=None, ge=-1024.0, le=3071.0, alias="lowerHu")
+    upper_hu: float | None = Field(default=None, ge=-1024.0, le=3071.0, alias="upperHu")
     opacity: float = Field(default=0.45, ge=0.0, le=1.0)
-    color: str = "#22d3ee"
-    voi_box: MprSegmentationVoiBox | None = Field(default_factory=MprSegmentationVoiBox, alias="voiBox")
+    color: str = "#ff4df8"
+    voi_box: MprSegmentationVoiBox | None = Field(default=None, alias="voiBox")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlayRect(BaseModel):
+    x_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="xMin")
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="yMin")
+    x_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="xMax")
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="yMax")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlaySamples(BaseModel):
+    points: list[float] = Field(default_factory=list)
+    total_count: int = Field(default=0, ge=0, alias="totalCount")
+    sampled_count: int = Field(default=0, ge=0, alias="sampledCount")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlayRegion(BaseModel):
+    region_id: str = Field(alias="regionId")
+    visible: bool = False
+    rect: MprSegmentationOverlayRect | None = None
+    sample_revision: int = Field(default=0, ge=0, alias="sampleRevision")
+    samples: MprSegmentationOverlaySamples | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlay(BaseModel):
+    regions: list[MprSegmentationOverlayRegion] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -445,6 +553,7 @@ class ViewImageResponse(BaseModel):
     fusion_projection: FusionProjectionInfo | None = Field(default=None, alias="fusionProjection")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
+    mpr_segmentation_overlay: MprSegmentationOverlay | None = Field(default=None, alias="mprSegmentationOverlay")
     mpr_crosshair_mode: MprCrosshairMode = Field(default="orthogonal", alias="mprCrosshairMode")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
