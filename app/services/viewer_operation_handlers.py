@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Literal
 
 from app.core import (
+    DRAG_ACTION_END,
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
     FUSION_PANE_OVERLAY_AXIAL,
@@ -740,7 +741,7 @@ def _handle_fusion_registration_operation(
         return _render_none()
     if payload.action_type == DRAG_ACTION_START:
         return _render_none()
-    if payload.action_type == DRAG_ACTION_MOVE:
+    if payload.action_type in {DRAG_ACTION_MOVE, DRAG_ACTION_END}:
         return _render_broadcast(
             "png",
             fast_preview=True,

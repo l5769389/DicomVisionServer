@@ -3483,13 +3483,8 @@ class ViewerService:
         drag: FusionRegistrationPreviewDrag,
         pet_center_canvas: tuple[float, float] | None,
     ) -> FusionRegistrationPreviewDrag:
-        if drag.sub_op_type != "rotate" or pet_center_canvas is None:
-            return drag
-        return replace(
-            drag,
-            pivot_x=float(pet_center_canvas[0]),
-            pivot_y=float(pet_center_canvas[1]),
-        )
+        del pet_center_canvas
+        return drag
 
     def _apply_fusion_registration_preview_transform(
         self,
@@ -7114,6 +7109,8 @@ class ViewerService:
         pivot_x: float | None = None,
         pivot_y: float | None = None,
     ) -> float:
+        if payload.rotation_delta_degrees is not None and np.isfinite(float(payload.rotation_delta_degrees)):
+            return float(payload.rotation_delta_degrees)
         pointer_delta = self._resolve_fusion_registration_pointer_rotation_delta_degrees(
             view,
             payload,
@@ -7122,8 +7119,6 @@ class ViewerService:
         )
         if pointer_delta is not None:
             return pointer_delta
-        if payload.rotation_delta_degrees is not None and np.isfinite(float(payload.rotation_delta_degrees)):
-            return float(payload.rotation_delta_degrees)
         return float(payload.x or 0.0) * 0.35
 
     def _apply_fusion_registration_rotation_drag(
@@ -7140,14 +7135,6 @@ class ViewerService:
         group = view.view_group
 
         def resolve_rotation_pivot_canvas() -> tuple[float | None, float | None]:
-            if group is not None:
-                pet_center = self._resolve_fusion_registration_pet_center_canvas(
-                    view,
-                    group,
-                    origin_registration,
-                )
-                if pet_center is not None:
-                    return float(pet_center[0]), float(pet_center[1])
             return payload.pivot_x, payload.pivot_y
 
         pivot_x, pivot_y = resolve_rotation_pivot_canvas()
@@ -7588,7 +7575,7 @@ class ViewerService:
                 registration.translate_col_mm = origin_col + delta_col_mm
                 registration.translate_row_mm = origin_row + delta_row_mm
             registration.saved = False
-            if payload.action_type == DRAG_ACTION_MOVE:
+            if payload.action_type in {DRAG_ACTION_MOVE, DRAG_ACTION_END}:
                 effective_rotation_delta = (
                     float(registration.rotation_degrees) - float(origin_rotation)
                     if sub_op == "rotate"
