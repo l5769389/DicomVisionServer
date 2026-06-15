@@ -62,6 +62,8 @@ class FusionRenderResult:
     source_projection: FusionSourceProjection | None
     ct_layer_pixels: np.ndarray | None = None
     pet_layer_pixels: np.ndarray | None = None
+    plane_pose: PlanePose | None = None
+    pet_plane_pose: PlanePose | None = None
 
 
 def _axis_direction_and_spacing(geometry: VolumeGeometry, axis_index: int) -> tuple[np.ndarray, float]:
@@ -401,19 +403,24 @@ def render_fusion_pixels(
     pet_has_patient_geometry: bool,
     interpolation_order: int = 1,
     overlay_pet_layer_only: bool = False,
+    overlay_plane_override: PlanePose | None = None,
 ) -> FusionRenderResult:
     ct_shape = tuple(int(value) for value in ct_volume.shape)
     pet_shape = tuple(int(value) for value in pet_volume.shape)
     axial_index = clamp_fusion_axial_index(axial_index, ct_shape)
     plane = build_ct_axial_plane(ct_geometry, ct_shape, axial_index)
     if pane_role == FUSION_PANE_OVERLAY_AXIAL:
-        plane = build_fusion_overlay_plane(
-            plane,
-            ct_geometry=ct_geometry,
-            ct_shape=ct_shape,
-            pet_geometry=pet_geometry,
-            pet_shape=pet_shape,
-            registration=registration,
+        plane = (
+            overlay_plane_override
+            if overlay_plane_override is not None
+            else build_fusion_overlay_plane(
+                plane,
+                ct_geometry=ct_geometry,
+                ct_shape=ct_shape,
+                pet_geometry=pet_geometry,
+                pet_shape=pet_shape,
+                registration=registration,
+            )
         )
     reference_world = np.asarray(plane.cursor_center_world, dtype=np.float64)
 
@@ -439,6 +446,8 @@ def render_fusion_pixels(
                 has_patient_geometry=pet_has_patient_geometry,
                 reference_world=reference_world,
             ),
+            plane_pose=None,
+            pet_plane_pose=None,
         )
 
     ct_slice: np.ndarray | None = None
@@ -488,6 +497,8 @@ def render_fusion_pixels(
                 has_patient_geometry=ct_has_patient_geometry,
                 reference_world=reference_world,
             ),
+            plane_pose=plane,
+            pet_plane_pose=None,
         )
 
     pet_uint8 = window_to_uint8(pet_slice, pet_window_width, pet_window_center)
@@ -507,6 +518,8 @@ def render_fusion_pixels(
                 has_patient_geometry=pet_has_patient_geometry,
                 reference_world=reference_world,
             ),
+            plane_pose=pet_plane,
+            pet_plane_pose=pet_plane,
         )
 
     overlay_preset = normalize_pseudocolor_preset(pet_pseudocolor_preset)
@@ -535,6 +548,8 @@ def render_fusion_pixels(
                 reference_world=reference_world,
             ),
             pet_layer_pixels=pet_rgba,
+            plane_pose=plane,
+            pet_plane_pose=pet_plane,
         )
 
     if ct_slice is None:
@@ -567,6 +582,8 @@ def render_fusion_pixels(
         ),
         ct_layer_pixels=ct_rgb.astype(np.uint8, copy=False),
         pet_layer_pixels=pet_rgba,
+        plane_pose=plane,
+        pet_plane_pose=pet_plane,
     )
 
 

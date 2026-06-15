@@ -173,7 +173,7 @@ from app.services.representative_slice_selector import (
 )
 from app.services.series_volume_cache import SeriesVolumeCache
 from app.services.series_registry import series_registry
-from app.services.viewport_transformer import viewport_transformer
+from app.services.viewport_transformer import AffineTransform, viewport_transformer
 from app.services.view_group_registry import view_group_registry
 from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
@@ -229,6 +229,44 @@ class FusionPetDisplayVolume:
     source_units: str | None = None
     scale: float = 1.0
 
+
+@dataclass(frozen=True)
+class FusionRegistrationPreviewDrag:
+    group_id: str
+    origin_registration: FusionRegistrationState
+    sub_op_type: str
+    delta_x: float
+    delta_y: float
+    pivot_x: float
+    pivot_y: float
+    rotation_delta_degrees: float
+
+
+@dataclass(frozen=True)
+class FusionRegistrationCanvasMapping:
+    col_mm_from_canvas: tuple[float, float, float]
+    row_mm_from_canvas: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class FusionRegistrationOverlayRenderFrame:
+    plane: PlanePose
+    cache_key: tuple[object, ...]
+    canvas_mapping: FusionRegistrationCanvasMapping | None = None
+    pet_center_canvas: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class FusionRegistrationPetLayerCacheEntry:
+    image: Image.Image
+    slice_index: int
+    slice_total: int
+    pet_unit_label: str
+    canvas_mapping: FusionRegistrationCanvasMapping | None = None
+    overlay_frame: FusionRegistrationOverlayRenderFrame | None = None
+    pet_center_canvas: tuple[float, float] | None = None
+
+
 CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
@@ -238,6 +276,7 @@ MPR_FAST_PREVIEW_SCALE = 0.33
 MPR_FAST_PREVIEW_MIN_SIDE = 96
 MPR_PLANE_CACHE_MAX_ITEMS = 48
 FAST_BASE_PIXELS_CACHE_MAX_ITEMS = 64
+FUSION_REGISTRATION_PET_LAYER_CACHE_MAX_ITEMS = 32
 MPR_CROSSHAIR_MODE_ORTHOGONAL = "orthogonal"
 MPR_CROSSHAIR_MODE_DOUBLE_OBLIQUE = "double-oblique"
 MPR_CROSSHAIR_MODES = {
@@ -357,6 +396,20 @@ class ViewerService:
         )
         self._mpr_plane_cache: OrderedDict[tuple[object, ...], tuple[np.ndarray, int, int]] = OrderedDict()
         self._fast_base_pixels_cache: OrderedDict[tuple[object, ...], np.ndarray] = OrderedDict()
+        self._fusion_registration_pet_layer_cache: OrderedDict[
+            tuple[object, ...],
+            FusionRegistrationPetLayerCacheEntry,
+        ] = OrderedDict()
+        self._fusion_registration_preview_drags: dict[str, FusionRegistrationPreviewDrag] = {}
+        self._fusion_registration_overlay_frame_locks: dict[
+            tuple[str, str],
+            FusionRegistrationOverlayRenderFrame,
+        ] = {}
+        self._fusion_registration_transparent_primary_png = self._encode_image(
+            Image.new("RGBA", (1, 1), (0, 0, 0, 0)),
+            "png",
+            fast_preview=True,
+        )
         self._mtf_analysis_service = MtfAnalysisService(self)
         self._water_phantom_qa_service = WaterPhantomQaService(self)
         self._logger = logger
@@ -386,8 +439,15 @@ class ViewerService:
             raise HTTPException(status_code=400, detail="opType must be setSize")
 
         view = view_registry.get(payload.view_id, workspace_id=workspace_id)
+        previous_width = view.width
+        previous_height = view.height
         view.width = payload.size.width
         view.height = payload.size.height
+        if (
+            self._is_fusion_view_type(view.view_type)
+            and (previous_width != view.width or previous_height != view.height)
+        ):
+            self._clear_fusion_registration_overlay_frame_locks(view.view_group)
         logger.info(
             "set view size view_id=%s width=%s height=%s",
             view.view_id,
@@ -2464,6 +2524,8 @@ class ViewerService:
         if group is None:
             self._initialize_fusion_viewport(view)
             return
+        self._clear_fusion_registration_overlay_frame_locks(group)
+        self._fusion_registration_preview_drags.pop(group.group_id, None)
         group.fusion_initialized = False
         group.fusion_pet_pseudocolor_preset = "petct-rainbow"
         group.fusion_pet_unit = FUSION_PET_UNIT_SUV_BW
@@ -3069,6 +3131,631 @@ class ViewerService:
             worldToNormalizedY=vector4(world_to_normalized_y),
         )
 
+    @staticmethod
+    def _copy_fusion_registration_state(registration: FusionRegistrationState) -> FusionRegistrationState:
+        return FusionRegistrationState(
+            translate_row_mm=float(registration.translate_row_mm),
+            translate_col_mm=float(registration.translate_col_mm),
+            rotation_degrees=float(registration.rotation_degrees),
+            saved=bool(registration.saved),
+        )
+
+    @staticmethod
+    def _fusion_registration_visual_key(registration: FusionRegistrationState) -> tuple[float, float, float]:
+        return (
+            float(registration.translate_row_mm),
+            float(registration.translate_col_mm),
+            float(registration.rotation_degrees),
+        )
+
+    def _build_fusion_registration_pet_layer_cache_key(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        registration: FusionRegistrationState,
+    ) -> tuple[object, ...]:
+        return (
+            str(group.workspace_id),
+            str(group.group_id),
+            str(view.view_id),
+            self._resolve_fusion_pane_role(view),
+            str(ct_series.series_id),
+            str(ct_series.volume_cache_key or ct_series.series_instance_uid or ""),
+            str(pet_series.series_id),
+            str(pet_series.volume_cache_key or pet_series.series_instance_uid or ""),
+            int(group.fusion_axial_index),
+            int(view.width or 0),
+            int(view.height or 0),
+            float(view.zoom),
+            float(view.offset_x),
+            float(view.offset_y),
+            int(view.rotation_degrees),
+            bool(view.hor_flip),
+            bool(view.ver_flip),
+            str(group.fusion_pet_unit),
+            str(group.fusion_pet_pseudocolor_preset),
+            None if group.fusion_pet_window.window_width is None else float(group.fusion_pet_window.window_width),
+            None if group.fusion_pet_window.window_center is None else float(group.fusion_pet_window.window_center),
+            float(group.fusion_alpha),
+            self._fusion_registration_visual_key(registration),
+        )
+
+    @staticmethod
+    def _build_fusion_registration_overlay_frame_lock_key(
+        view: ViewRecord,
+        group: ViewGroupRecord,
+    ) -> tuple[str, str]:
+        return str(group.group_id), str(view.view_id)
+
+    def _clear_fusion_registration_overlay_frame_locks(
+        self,
+        group: ViewGroupRecord | None = None,
+        *,
+        view: ViewRecord | None = None,
+    ) -> None:
+        if group is None:
+            self._fusion_registration_overlay_frame_locks.clear()
+            return
+        if view is not None:
+            self._fusion_registration_overlay_frame_locks.pop(
+                self._build_fusion_registration_overlay_frame_lock_key(view, group),
+                None,
+            )
+            return
+        group_id = str(group.group_id)
+        for lock_key in [
+            key for key in self._fusion_registration_overlay_frame_locks
+            if key[0] == group_id
+        ]:
+            self._fusion_registration_overlay_frame_locks.pop(lock_key, None)
+
+    def _lock_fusion_registration_overlay_frame(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        frame: FusionRegistrationOverlayRenderFrame | None,
+    ) -> None:
+        if frame is None:
+            return
+        self._fusion_registration_overlay_frame_locks[
+            self._build_fusion_registration_overlay_frame_lock_key(view, group)
+        ] = frame
+
+    def _get_locked_fusion_registration_overlay_frame(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+    ) -> FusionRegistrationOverlayRenderFrame | None:
+        return self._fusion_registration_overlay_frame_locks.get(
+            self._build_fusion_registration_overlay_frame_lock_key(view, group)
+        )
+
+    def _get_fusion_registration_pet_layer_cache(
+        self,
+        cache_key: tuple[object, ...],
+    ) -> FusionRegistrationPetLayerCacheEntry | None:
+        cached = self._fusion_registration_pet_layer_cache.get(cache_key)
+        if cached is None:
+            return None
+        self._fusion_registration_pet_layer_cache.move_to_end(cache_key)
+        return cached
+
+    @staticmethod
+    def _resolve_fusion_registration_image_center_canvas(image: Image.Image) -> tuple[float, float]:
+        width, height = image.size
+        return (max(float(width) / 2.0, 0.0), max(float(height) / 2.0, 0.0))
+
+    @staticmethod
+    def _project_fusion_pet_geometry_center_to_canvas(
+        *,
+        pet_geometry: VolumeGeometry,
+        pet_shape: tuple[int, int, int],
+        pet_plane: PlanePose | None,
+        image_transform: AffineTransform,
+    ) -> tuple[float, float] | None:
+        if pet_plane is None:
+            return None
+        try:
+            center_ijk = np.asarray(
+                [
+                    (float(pet_shape[0]) - 1.0) / 2.0,
+                    (float(pet_shape[1]) - 1.0) / 2.0,
+                    (float(pet_shape[2]) - 1.0) / 2.0,
+                    1.0,
+                ],
+                dtype=np.float64,
+            )
+            center_world = np.asarray(pet_geometry.ijk_to_world, dtype=np.float64) @ center_ijk
+            delta_world = center_world[:3] - np.asarray(pet_plane.center_world, dtype=np.float64)
+            source_x = (
+                float(np.dot(delta_world, np.asarray(pet_plane.col_world, dtype=np.float64)))
+                / max(float(pet_plane.pixel_spacing_col_mm), 1e-6)
+                + (float(pet_plane.output_shape[1]) - 1.0) / 2.0
+            )
+            source_y = (
+                float(np.dot(delta_world, np.asarray(pet_plane.row_world, dtype=np.float64)))
+                / max(float(pet_plane.pixel_spacing_row_mm), 1e-6)
+                + (float(pet_plane.output_shape[0]) - 1.0) / 2.0
+            )
+            canvas_point = np.asarray(image_transform.matrix, dtype=np.float64) @ np.asarray(
+                [source_x, source_y, 1.0],
+                dtype=np.float64,
+            )
+            center_x = float(canvas_point[0])
+            center_y = float(canvas_point[1])
+            if np.isfinite(center_x) and np.isfinite(center_y):
+                return center_x, center_y
+        except Exception:
+            logger.debug("failed to project fusion PET geometry center", exc_info=True)
+        return None
+
+    def _store_fusion_registration_pet_layer_cache(
+        self,
+        cache_key: tuple[object, ...],
+        *,
+        image: Image.Image,
+        slice_index: int,
+        slice_total: int,
+        pet_unit_label: str,
+        canvas_mapping: FusionRegistrationCanvasMapping | None = None,
+        overlay_plane: PlanePose | None = None,
+        pet_center_canvas: tuple[float, float] | None = None,
+    ) -> FusionRegistrationPetLayerCacheEntry:
+        cached_image = image.convert("RGBA").copy()
+        resolved_pet_center_canvas = (
+            pet_center_canvas
+            if pet_center_canvas is not None
+            else self._resolve_fusion_registration_image_center_canvas(cached_image)
+        )
+        overlay_frame = (
+            FusionRegistrationOverlayRenderFrame(
+                plane=overlay_plane,
+                cache_key=cache_key,
+                canvas_mapping=canvas_mapping,
+                pet_center_canvas=resolved_pet_center_canvas,
+            )
+            if overlay_plane is not None
+            else None
+        )
+        cached_entry = FusionRegistrationPetLayerCacheEntry(
+            image=cached_image,
+            slice_index=int(slice_index),
+            slice_total=max(1, int(slice_total)),
+            pet_unit_label=str(pet_unit_label),
+            canvas_mapping=canvas_mapping,
+            overlay_frame=overlay_frame,
+            pet_center_canvas=resolved_pet_center_canvas,
+        )
+        self._fusion_registration_pet_layer_cache[cache_key] = cached_entry
+        self._fusion_registration_pet_layer_cache.move_to_end(cache_key)
+        while len(self._fusion_registration_pet_layer_cache) > FUSION_REGISTRATION_PET_LAYER_CACHE_MAX_ITEMS:
+            self._fusion_registration_pet_layer_cache.popitem(last=False)
+        return cached_entry
+
+    @staticmethod
+    def _build_fusion_registration_canvas_mapping(
+        *,
+        source_projection: FusionSourceProjection | None,
+        image_transform: Any,
+        row_world: np.ndarray | None,
+        col_world: np.ndarray | None,
+    ) -> FusionRegistrationCanvasMapping | None:
+        if source_projection is None or row_world is None or col_world is None:
+            return None
+        try:
+            image_to_source = np.linalg.inv(np.asarray(image_transform.matrix, dtype=np.float64))
+            source_to_world_origin = np.asarray(source_projection.source_to_world_origin, dtype=np.float64)
+            source_to_world_x = np.asarray(source_projection.source_to_world_x, dtype=np.float64)
+            source_to_world_y = np.asarray(source_projection.source_to_world_y, dtype=np.float64)
+            reference_world = np.asarray(source_projection.reference_world, dtype=np.float64)
+            row_direction = np.asarray(row_world, dtype=np.float64)
+            col_direction = np.asarray(col_world, dtype=np.float64)
+
+            def canvas_to_col_row(canvas_x: float, canvas_y: float) -> tuple[float, float]:
+                source = image_to_source @ np.asarray([float(canvas_x), float(canvas_y), 1.0], dtype=np.float64)
+                world = (
+                    source_to_world_origin
+                    + source_to_world_x * float(source[0])
+                    + source_to_world_y * float(source[1])
+                )
+                delta_world = world - reference_world
+                col_mm = float(np.dot(delta_world, col_direction))
+                row_mm = float(np.dot(delta_world, row_direction))
+                return col_mm, row_mm
+
+            origin_col, origin_row = canvas_to_col_row(0.0, 0.0)
+            x_col, x_row = canvas_to_col_row(1.0, 0.0)
+            y_col, y_row = canvas_to_col_row(0.0, 1.0)
+            col_coefficients = (
+                float(x_col - origin_col),
+                float(y_col - origin_col),
+                float(origin_col),
+            )
+            row_coefficients = (
+                float(x_row - origin_row),
+                float(y_row - origin_row),
+                float(origin_row),
+            )
+            if all(np.isfinite(value) for value in (*col_coefficients, *row_coefficients)):
+                return FusionRegistrationCanvasMapping(
+                    col_mm_from_canvas=col_coefficients,
+                    row_mm_from_canvas=row_coefficients,
+                )
+        except Exception:
+            logger.debug("failed to build fusion registration canvas mapping", exc_info=True)
+        return None
+
+    @staticmethod
+    def _map_fusion_registration_canvas_point_with_mapping(
+        mapping: FusionRegistrationCanvasMapping,
+        *,
+        canvas_x: float,
+        canvas_y: float,
+    ) -> tuple[float, float]:
+        col = mapping.col_mm_from_canvas
+        row = mapping.row_mm_from_canvas
+        col_mm = float(col[0]) * float(canvas_x) + float(col[1]) * float(canvas_y) + float(col[2])
+        row_mm = float(row[0]) * float(canvas_x) + float(row[1]) * float(canvas_y) + float(row[2])
+        return row_mm, col_mm
+
+    @staticmethod
+    def _map_fusion_registration_canvas_delta_with_mapping(
+        mapping: FusionRegistrationCanvasMapping,
+        *,
+        delta_x: float,
+        delta_y: float,
+    ) -> tuple[float, float]:
+        col = mapping.col_mm_from_canvas
+        row = mapping.row_mm_from_canvas
+        col_mm = float(col[0]) * float(delta_x) + float(col[1]) * float(delta_y)
+        row_mm = float(row[0]) * float(delta_x) + float(row[1]) * float(delta_y)
+        return row_mm, col_mm
+
+    @staticmethod
+    def _translate_fusion_registration_preview_image(
+        image: Image.Image,
+        dx: int,
+        dy: int,
+    ) -> Image.Image:
+        width, height = image.size
+        result = Image.new(image.mode, (width, height), (0, 0, 0, 0) if image.mode == "RGBA" else 0)
+        copy_width = width - abs(int(dx))
+        copy_height = height - abs(int(dy))
+        if copy_width <= 0 or copy_height <= 0:
+            return result
+        source_left = max(0, -int(dx))
+        source_top = max(0, -int(dy))
+        target_left = max(0, int(dx))
+        target_top = max(0, int(dy))
+        crop = image.crop((source_left, source_top, source_left + copy_width, source_top + copy_height))
+        result.paste(crop, (target_left, target_top))
+        return result
+
+    @staticmethod
+    def _build_fusion_registration_preview_transform(drag: FusionRegistrationPreviewDrag) -> AffineTransform:
+        if drag.sub_op_type == "rotate":
+            radians = np.deg2rad(float(drag.rotation_delta_degrees))
+            cos_theta = float(np.cos(radians))
+            sin_theta = float(np.sin(radians))
+            pivot_x = float(drag.pivot_x)
+            pivot_y = float(drag.pivot_y)
+            translate_to_origin = np.asarray(
+                [
+                    [1.0, 0.0, -pivot_x],
+                    [0.0, 1.0, -pivot_y],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            rotate = np.asarray(
+                [
+                    [cos_theta, -sin_theta, 0.0],
+                    [sin_theta, cos_theta, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            translate_back = np.asarray(
+                [
+                    [1.0, 0.0, pivot_x],
+                    [0.0, 1.0, pivot_y],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            return AffineTransform(matrix=translate_back @ rotate @ translate_to_origin)
+
+        return AffineTransform(
+            matrix=np.asarray(
+                [
+                    [1.0, 0.0, float(drag.delta_x)],
+                    [0.0, 1.0, float(drag.delta_y)],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+        )
+
+    @staticmethod
+    def _with_fusion_registration_preview_rotation_center(
+        drag: FusionRegistrationPreviewDrag,
+        pet_center_canvas: tuple[float, float] | None,
+    ) -> FusionRegistrationPreviewDrag:
+        if drag.sub_op_type != "rotate" or pet_center_canvas is None:
+            return drag
+        return replace(
+            drag,
+            pivot_x=float(pet_center_canvas[0]),
+            pivot_y=float(pet_center_canvas[1]),
+        )
+
+    def _apply_fusion_registration_preview_transform(
+        self,
+        image: Image.Image,
+        drag: FusionRegistrationPreviewDrag,
+    ) -> Image.Image:
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return image.copy()
+
+        if drag.sub_op_type != "rotate":
+            dx = float(drag.delta_x)
+            dy = float(drag.delta_y)
+            rounded_dx = int(round(dx))
+            rounded_dy = int(round(dy))
+            if abs(dx - rounded_dx) <= 1e-3 and abs(dy - rounded_dy) <= 1e-3:
+                if rounded_dx == 0 and rounded_dy == 0:
+                    return image.copy()
+                return self._translate_fusion_registration_preview_image(image, rounded_dx, rounded_dy)
+
+        if drag.sub_op_type == "rotate" and abs(float(drag.rotation_delta_degrees)) <= 1e-6:
+            return image.copy()
+
+        return viewport_transformer.apply_affine(
+            image,
+            int(width),
+            int(height),
+            self._build_fusion_registration_preview_transform(drag),
+            resample=Image.Resampling.BILINEAR,
+        )
+
+    def _build_fusion_registration_layer_preview_result(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        *,
+        pet_image: Image.Image,
+        image_format: ImageFormat,
+        slice_index: int,
+        slice_total: int,
+        pet_unit_label: str,
+        render_started_at: float,
+        cache_hit: bool,
+        transform_ms: float | None = None,
+    ) -> RenderedImageResult:
+        canvas_width, canvas_height = pet_image.size
+        registration_info = FusionRegistrationInfo(
+            translateRowMm=float(group.fusion_registration.translate_row_mm),
+            translateColMm=float(group.fusion_registration.translate_col_mm),
+            rotationDegrees=float(group.fusion_registration.rotation_degrees),
+            saved=bool(group.fusion_registration.saved),
+        )
+        fusion_composite = FusionCompositeInfo(
+            revision=int(group.fusion_revision),
+            alpha=float(group.fusion_alpha),
+            registration=registration_info,
+            width=int(canvas_width),
+            height=int(canvas_height),
+            layers=[FusionCompositeLayerInfo(key="pet", role="pet", imageFormat="png")],
+            primary_image_unchanged=True,
+        )
+        pet_encode_started_at = perf_counter()
+        pet_bytes = self._encode_image(pet_image, "png", fast_preview=False)
+        pet_encode_ms = (perf_counter() - pet_encode_started_at) * 1000.0
+        extra_image_bytes = {
+            "pet": pet_bytes
+        }
+        logger.info(
+            (
+                "fusion registration preview layer view_id=%s role=%s cache_hit=%s "
+                "render=%sx%s transform_ms=%s pet_encode_ms=%.1f total_ms=%.1f pet_bytes=%s"
+            ),
+            view.view_id,
+            FUSION_PANE_OVERLAY_AXIAL,
+            cache_hit,
+            canvas_width,
+            canvas_height,
+            None if transform_ms is None else round(float(transform_ms), 1),
+            pet_encode_ms,
+            (perf_counter() - render_started_at) * 1000.0,
+            len(pet_bytes),
+        )
+        return RenderedImageResult(
+            meta=ViewImageResponse(
+                slice_info=SliceInfo(current=int(slice_index) + 1, total=max(1, int(slice_total))),
+                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
+                imageFormat=image_format,
+                viewId=view.view_id,
+                transform=self._build_view_transform_payload(view),
+                color=ViewColorInfo(pseudocolorPreset=group.fusion_pet_pseudocolor_preset),
+                fusionInfo=FusionInfo(
+                    paneRole=FUSION_PANE_OVERLAY_AXIAL,
+                    ctSeriesId=ct_series.series_id,
+                    petSeriesId=pet_series.series_id,
+                    petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petUnit=group.fusion_pet_unit,
+                    petUnitLabel=pet_unit_label,
+                    petWindowMin=self._resolve_window_min(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    petWindowMax=self._resolve_window_max(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    alpha=float(group.fusion_alpha),
+                    revision=int(group.fusion_revision),
+                    registration=registration_info,
+                ),
+                fusionComposite=fusion_composite,
+            ),
+            image_bytes=self._fusion_registration_transparent_primary_png,
+            extra_image_bytes=extra_image_bytes,
+        )
+
+    def _build_fusion_registration_primary_preview_result(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        *,
+        role: str,
+        image: Image.Image,
+        image_format: ImageFormat,
+        slice_index: int,
+        slice_total: int,
+        pet_unit_label: str,
+        render_started_at: float,
+        cache_hit: bool,
+        transform_ms: float | None = None,
+    ) -> RenderedImageResult:
+        registration_info = FusionRegistrationInfo(
+            translateRowMm=float(group.fusion_registration.translate_row_mm),
+            translateColMm=float(group.fusion_registration.translate_col_mm),
+            rotationDegrees=float(group.fusion_registration.rotation_degrees),
+            saved=bool(group.fusion_registration.saved),
+        )
+        encode_started_at = perf_counter()
+        image_bytes = self._encode_image(image, image_format, fast_preview=False)
+        encode_ms = (perf_counter() - encode_started_at) * 1000.0
+        logger.info(
+            (
+                "fusion registration preview primary view_id=%s role=%s cache_hit=%s "
+                "render=%sx%s transform_ms=%s encode_ms=%.1f total_ms=%.1f bytes=%s"
+            ),
+            view.view_id,
+            role,
+            cache_hit,
+            image.width,
+            image.height,
+            None if transform_ms is None else round(float(transform_ms), 1),
+            encode_ms,
+            (perf_counter() - render_started_at) * 1000.0,
+            len(image_bytes),
+        )
+        return RenderedImageResult(
+            meta=ViewImageResponse(
+                slice_info=SliceInfo(current=int(slice_index) + 1, total=max(1, int(slice_total))),
+                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
+                imageFormat=image_format,
+                viewId=view.view_id,
+                transform=self._build_view_transform_payload(view),
+                color=ViewColorInfo(
+                    pseudocolorPreset=(
+                        FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+                        if role == FUSION_PANE_PET_AXIAL
+                        else group.fusion_pet_pseudocolor_preset
+                    )
+                ),
+                fusionInfo=FusionInfo(
+                    paneRole=role,
+                    ctSeriesId=ct_series.series_id,
+                    petSeriesId=pet_series.series_id,
+                    petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petUnit=group.fusion_pet_unit,
+                    petUnitLabel=pet_unit_label,
+                    petWindowMin=self._resolve_window_min(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    petWindowMax=self._resolve_window_max(
+                        group.fusion_pet_window.window_width,
+                        group.fusion_pet_window.window_center,
+                    ),
+                    alpha=float(group.fusion_alpha),
+                    revision=int(group.fusion_revision),
+                    registration=registration_info,
+                ),
+            ),
+            image_bytes=image_bytes,
+        )
+
+    def _try_render_cached_fusion_registration_layer_preview(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        *,
+        image_format: ImageFormat,
+        render_started_at: float,
+    ) -> RenderedImageResult | None:
+        drag = self._fusion_registration_preview_drags.get(group.group_id)
+        if drag is None:
+            return None
+        role = self._resolve_fusion_pane_role(view)
+        if role not in {FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL}:
+            return None
+        cache_key = self._build_fusion_registration_pet_layer_cache_key(
+            view,
+            group,
+            ct_series,
+            pet_series,
+            drag.origin_registration,
+        )
+        cached = self._get_fusion_registration_pet_layer_cache(cache_key)
+        if cached is None:
+            logger.info(
+                "fusion registration preview cache miss view_id=%s group_id=%s role=%s",
+                view.view_id,
+                group.group_id,
+                role,
+            )
+            return None
+        self._lock_fusion_registration_overlay_frame(view, group, cached.overlay_frame)
+        transform_started_at = perf_counter()
+        preview_drag = self._with_fusion_registration_preview_rotation_center(
+            drag,
+            cached.pet_center_canvas,
+        )
+        transformed_pet = self._apply_fusion_registration_preview_transform(cached.image, preview_drag)
+        transform_ms = (perf_counter() - transform_started_at) * 1000.0
+        if role == FUSION_PANE_PET_AXIAL:
+            return self._build_fusion_registration_primary_preview_result(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                role=role,
+                image=transformed_pet,
+                image_format=image_format,
+                slice_index=cached.slice_index,
+                slice_total=cached.slice_total,
+                pet_unit_label=cached.pet_unit_label,
+                render_started_at=render_started_at,
+                cache_hit=True,
+                transform_ms=transform_ms,
+            )
+        return self._build_fusion_registration_layer_preview_result(
+            view,
+            group,
+            ct_series,
+            pet_series,
+            pet_image=transformed_pet,
+            image_format=image_format,
+            slice_index=cached.slice_index,
+            slice_total=cached.slice_total,
+            pet_unit_label=cached.pet_unit_label,
+            render_started_at=render_started_at,
+            cache_hit=True,
+            transform_ms=transform_ms,
+        )
+
     def _render_fusion_view(
         self,
         view: ViewRecord,
@@ -3085,6 +3772,33 @@ class ViewerService:
             self._initialize_fusion_viewport(view)
 
         group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        role = self._resolve_fusion_pane_role(view)
+        registration_preview = (
+            fast_preview
+            and metadata_mode == "fusion-registration-layer-preview"
+            and role in {FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL}
+        )
+        primary_image_unchanged = registration_preview and role == FUSION_PANE_OVERLAY_AXIAL
+        self._sync_fusion_view_state_from_group(view)
+        if registration_preview:
+            cached_preview = self._try_render_cached_fusion_registration_layer_preview(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                image_format=image_format,
+                render_started_at=render_started_at,
+            )
+            if cached_preview is not None:
+                return cached_preview
+
+        preview_volume_ms: float | None = None
+        preview_fusion_ms: float | None = None
+        preview_pet_canvas_ms: float | None = None
+        preview_transform_ms: float | None = None
+        preview_pet_encode_ms: float | None = None
+        preview_pet_bytes: int | None = None
+        preview_volume_started_at = perf_counter() if primary_image_unchanged else None
         ct_volume = self._get_series_volume(ct_series, progress_callback=progress_callback)
         pet_volume = self._get_series_volume(pet_series, progress_callback=progress_callback)
         pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
@@ -3092,15 +3806,41 @@ class ViewerService:
         pet_transform = self._get_series_patient_transform(pet_series)
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
         pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
-        role = self._resolve_fusion_pane_role(view)
-        primary_image_unchanged = (
-            role == FUSION_PANE_OVERLAY_AXIAL
-            and fast_preview
-            and metadata_mode == "fusion-registration-layer-preview"
+        if preview_volume_started_at is not None:
+            preview_volume_ms = (perf_counter() - preview_volume_started_at) * 1000.0
+        registration_drag = self._fusion_registration_preview_drags.get(group.group_id)
+        preview_drag = registration_drag if registration_preview else None
+        render_registration = preview_drag.origin_registration if preview_drag is not None else group.fusion_registration
+        locked_overlay_frame = (
+            self._resolve_fusion_registration_overlay_render_frame(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                registration_drag.origin_registration,
+            )
+            if role == FUSION_PANE_OVERLAY_AXIAL and registration_drag is not None
+            else None
         )
-        self._sync_fusion_view_state_from_group(view)
+        overlay_plane_override = (
+            locked_overlay_frame.plane
+            if primary_image_unchanged and locked_overlay_frame is not None
+            else None
+        )
+        if (
+            role == FUSION_PANE_OVERLAY_AXIAL
+            and registration_drag is not None
+            and locked_overlay_frame is None
+            and primary_image_unchanged
+        ):
+            logger.warning(
+                "fusion registration locked overlay frame missing view_id=%s group_id=%s; using current overlay plane",
+                view.view_id,
+                group.group_id,
+            )
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
 
+        preview_fusion_started_at = perf_counter() if primary_image_unchanged else None
         fusion_result = render_fusion_pixels(
             pane_role=role,
             ct_volume=ct_volume,
@@ -3113,7 +3853,7 @@ class ViewerService:
             pet_window_width=group.fusion_pet_window.window_width,
             pet_window_center=group.fusion_pet_window.window_center,
             pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
-            registration=group.fusion_registration,
+            registration=render_registration,
             alpha=group.fusion_alpha,
             ct_has_patient_geometry=(
                 ct_transform is not None
@@ -3127,7 +3867,10 @@ class ViewerService:
             ),
             interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
             overlay_pet_layer_only=primary_image_unchanged,
+            overlay_plane_override=overlay_plane_override,
         )
+        if preview_fusion_started_at is not None:
+            preview_fusion_ms = (perf_counter() - preview_fusion_started_at) * 1000.0
         source_image = image_from_pixels(fusion_result.pixels)
         pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(fusion_result.spacing_xy)
         render_plan = self._build_render_plan_for_shape(
@@ -3156,6 +3899,7 @@ class ViewerService:
             and fusion_result.pet_layer_pixels is not None
             and (primary_image_unchanged or fusion_result.ct_layer_pixels is not None)
         ):
+            preview_pet_canvas_started_at = perf_counter() if primary_image_unchanged else None
             transformed_pet = viewport_transformer.apply_affine_array(
                 fusion_result.pet_layer_pixels,
                 canvas_width,
@@ -3164,7 +3908,57 @@ class ViewerService:
                 order=interpolation_order,
                 cval=0.0,
             )
-            extra_image_bytes["pet"] = self._encode_image(image_from_pixels(transformed_pet), "png", fast_preview=False)
+            if preview_pet_canvas_started_at is not None:
+                preview_pet_canvas_ms = (perf_counter() - preview_pet_canvas_started_at) * 1000.0
+            transformed_pet_image = image_from_pixels(transformed_pet)
+            cache_key = self._build_fusion_registration_pet_layer_cache_key(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                render_registration,
+            )
+            canvas_mapping = self._build_fusion_registration_canvas_mapping(
+                source_projection=fusion_result.source_projection,
+                image_transform=image_transform,
+                row_world=fusion_result.row_world,
+                col_world=fusion_result.col_world,
+            )
+            pet_center_canvas = self._project_fusion_pet_geometry_center_to_canvas(
+                pet_geometry=pet_geometry,
+                pet_shape=tuple(int(value) for value in pet_display.volume.shape),
+                pet_plane=fusion_result.pet_plane_pose,
+                image_transform=image_transform,
+            )
+            cached_entry = self._store_fusion_registration_pet_layer_cache(
+                cache_key,
+                image=transformed_pet_image,
+                slice_index=fusion_result.slice_index,
+                slice_total=fusion_result.slice_total,
+                pet_unit_label=pet_display.unit_label,
+                canvas_mapping=canvas_mapping,
+                overlay_plane=fusion_result.plane_pose,
+                pet_center_canvas=pet_center_canvas,
+            )
+            self._lock_fusion_registration_overlay_frame(view, group, cached_entry.overlay_frame)
+            if primary_image_unchanged and preview_drag is not None:
+                preview_transform_started_at = perf_counter()
+                preview_drag_for_transform = self._with_fusion_registration_preview_rotation_center(
+                    preview_drag,
+                    cached_entry.pet_center_canvas,
+                )
+                transformed_pet_image = self._apply_fusion_registration_preview_transform(
+                    transformed_pet_image,
+                    preview_drag_for_transform,
+                )
+                preview_transform_ms = (perf_counter() - preview_transform_started_at) * 1000.0
+            elif not primary_image_unchanged:
+                self._fusion_registration_preview_drags.pop(group.group_id, None)
+            preview_pet_encode_started_at = perf_counter() if primary_image_unchanged else None
+            extra_image_bytes["pet"] = self._encode_image(transformed_pet_image, "png", fast_preview=False)
+            if preview_pet_encode_started_at is not None:
+                preview_pet_encode_ms = (perf_counter() - preview_pet_encode_started_at) * 1000.0
+                preview_pet_bytes = len(extra_image_bytes["pet"])
             if primary_image_unchanged:
                 image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
             else:
@@ -3187,6 +3981,42 @@ class ViewerService:
                 cval=0.0,
             )
             image = image_from_pixels(transformed)
+            if role == FUSION_PANE_PET_AXIAL:
+                cache_key = self._build_fusion_registration_pet_layer_cache_key(
+                    view,
+                    group,
+                    ct_series,
+                    pet_series,
+                    render_registration,
+                )
+                pet_center_canvas = self._project_fusion_pet_geometry_center_to_canvas(
+                    pet_geometry=pet_geometry,
+                    pet_shape=tuple(int(value) for value in pet_display.volume.shape),
+                    pet_plane=fusion_result.pet_plane_pose,
+                    image_transform=image_transform,
+                )
+                cached_entry = self._store_fusion_registration_pet_layer_cache(
+                    cache_key,
+                    image=image,
+                    slice_index=fusion_result.slice_index,
+                    slice_total=fusion_result.slice_total,
+                    pet_unit_label=pet_display.unit_label,
+                    canvas_mapping=None,
+                    overlay_plane=fusion_result.plane_pose,
+                    pet_center_canvas=pet_center_canvas,
+                )
+                self._lock_fusion_registration_overlay_frame(view, group, cached_entry.overlay_frame)
+                if registration_preview and preview_drag is not None:
+                    preview_transform_started_at = perf_counter()
+                    preview_drag_for_transform = self._with_fusion_registration_preview_rotation_center(
+                        preview_drag,
+                        cached_entry.pet_center_canvas,
+                    )
+                    image = self._apply_fusion_registration_preview_transform(
+                        image,
+                        preview_drag_for_transform,
+                    )
+                    preview_transform_ms = (perf_counter() - preview_transform_started_at) * 1000.0
         fusion_projection = self._build_fusion_projection_info(
             pane_role=role,
             source_projection=fusion_result.source_projection,
@@ -3244,7 +4074,11 @@ class ViewerService:
                 primary_image_unchanged=primary_image_unchanged,
             )
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
-        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        image_bytes = (
+            self._fusion_registration_transparent_primary_png
+            if primary_image_unchanged
+            else self._encode_image(image, image_format, fast_preview=fast_preview)
+        )
         logger.debug(
             "fusion render timing view_id=%s role=%s fast_preview=%s image_format=%s source_shape=%s render=%sx%s total_ms=%.1f",
             view.view_id,
@@ -3256,6 +4090,25 @@ class ViewerService:
             render_plan.render_view.height,
             (perf_counter() - render_started_at) * 1000.0,
         )
+        if primary_image_unchanged:
+            logger.info(
+                (
+                    "fusion registration preview fallback view_id=%s role=%s cache_hit=False "
+                    "render=%sx%s volume_ms=%s fusion_ms=%s pet_canvas_ms=%s "
+                    "preview_transform_ms=%s pet_encode_ms=%s total_ms=%.1f pet_bytes=%s"
+                ),
+                view.view_id,
+                role,
+                canvas_width,
+                canvas_height,
+                None if preview_volume_ms is None else round(preview_volume_ms, 1),
+                None if preview_fusion_ms is None else round(preview_fusion_ms, 1),
+                None if preview_pet_canvas_ms is None else round(preview_pet_canvas_ms, 1),
+                None if preview_transform_ms is None else round(preview_transform_ms, 1),
+                None if preview_pet_encode_ms is None else round(preview_pet_encode_ms, 1),
+                (perf_counter() - render_started_at) * 1000.0,
+                preview_pet_bytes,
+            )
         return RenderedImageResult(
             meta=ViewImageResponse(
                 slice_info=SliceInfo(current=fusion_result.slice_index + 1, total=max(1, fusion_result.slice_total)),
@@ -6003,8 +6856,18 @@ class ViewerService:
         *,
         delta_x: float,
         delta_y: float,
+        origin_registration: FusionRegistrationState | None = None,
     ) -> tuple[float, float]:
         """Map a screen-space registration drag into the CT axial plane axes."""
+        cached_mapping = self._resolve_fusion_registration_cached_canvas_mapping(view, origin_registration)
+        if cached_mapping is not None:
+            row_mm, col_mm = self._map_fusion_registration_canvas_delta_with_mapping(
+                cached_mapping,
+                delta_x=delta_x,
+                delta_y=delta_y,
+            )
+            if np.isfinite(row_mm) and np.isfinite(col_mm):
+                return row_mm, col_mm
         try:
             group, ct_series, _ = self._resolve_fusion_group_series(view)
             ct_volume = self._get_series_volume(ct_series)
@@ -6035,9 +6898,145 @@ class ViewerService:
         pixels_per_mm = max(float(view.zoom or 1.0), 1e-6)
         return float(delta_y) / pixels_per_mm, float(delta_x) / pixels_per_mm
 
+    def _map_fusion_registration_canvas_point_to_plane_mm(
+        self,
+        view: ViewRecord,
+        *,
+        canvas_x: float | None,
+        canvas_y: float | None,
+        origin_registration: FusionRegistrationState | None = None,
+    ) -> tuple[float, float]:
+        """Map a rendered overlay canvas point to row/col mm from the CT axial center."""
+        if canvas_x is None or canvas_y is None:
+            return 0.0, 0.0
+        cached_mapping = self._resolve_fusion_registration_cached_canvas_mapping(view, origin_registration)
+        if cached_mapping is not None:
+            row_mm, col_mm = self._map_fusion_registration_canvas_point_with_mapping(
+                cached_mapping,
+                canvas_x=float(canvas_x),
+                canvas_y=float(canvas_y),
+            )
+            if np.isfinite(row_mm) and np.isfinite(col_mm):
+                return row_mm, col_mm
+        try:
+            group, ct_series, _ = self._resolve_fusion_group_series(view)
+            ct_volume = self._get_series_volume(ct_series)
+            ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+            axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+            plane = build_ct_axial_plane(ct_geometry, tuple(int(value) for value in ct_volume.shape), axial_index)
+            pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(
+                (float(plane.pixel_spacing_col_mm), float(plane.pixel_spacing_row_mm))
+            )
+            image_transform = viewport_transformer.build_image_to_canvas_transform(
+                image_width=int(plane.output_shape[1]),
+                image_height=int(plane.output_shape[0]),
+                canvas_width=view.width or int(plane.output_shape[1]),
+                canvas_height=view.height or int(plane.output_shape[0]),
+                view=view,
+                pixel_aspect_x=pixel_aspect_x,
+                pixel_aspect_y=pixel_aspect_y,
+            )
+            inverse_linear, inverse_offset = image_transform.inverse_components()
+            source_point = inverse_linear @ np.asarray([float(canvas_x), float(canvas_y)], dtype=np.float64) + inverse_offset
+            col_mm = (float(source_point[0]) - float(plane.output_shape[1]) / 2.0) * float(plane.pixel_spacing_col_mm)
+            row_mm = (float(source_point[1]) - float(plane.output_shape[0]) / 2.0) * float(plane.pixel_spacing_row_mm)
+            if np.isfinite(row_mm) and np.isfinite(col_mm):
+                return row_mm, col_mm
+        except Exception:
+            logger.debug("failed to map fusion registration canvas pivot; falling back to viewport center", exc_info=True)
+
+        pixels_per_mm = max(float(view.zoom or 1.0), 1e-6)
+        center_x = float(view.width or 0.0) / 2.0 + float(view.offset_x or 0.0)
+        center_y = float(view.height or 0.0) / 2.0 + float(view.offset_y or 0.0)
+        return (float(canvas_y) - center_y) / pixels_per_mm, (float(canvas_x) - center_x) / pixels_per_mm
+
     @staticmethod
     def _normalize_fusion_registration_rotation_delta(delta_degrees: float) -> float:
         return (float(delta_degrees) + 180.0) % 360.0 - 180.0
+
+    def _resolve_fusion_registration_cached_canvas_mapping(
+        self,
+        view: ViewRecord,
+        origin_registration: FusionRegistrationState | None,
+    ) -> FusionRegistrationCanvasMapping | None:
+        if origin_registration is None:
+            return None
+        try:
+            group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+            cache_key = self._build_fusion_registration_pet_layer_cache_key(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                origin_registration,
+            )
+            cached = self._get_fusion_registration_pet_layer_cache(cache_key)
+            if cached is not None and cached.canvas_mapping is not None:
+                return cached.canvas_mapping
+            locked_frame = self._get_locked_fusion_registration_overlay_frame(view, group)
+            return locked_frame.canvas_mapping if locked_frame is not None else None
+        except Exception:
+            logger.debug("failed to resolve fusion registration cached canvas mapping", exc_info=True)
+            return None
+
+    def _resolve_fusion_registration_overlay_render_frame(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        ct_series: SeriesRecord,
+        pet_series: SeriesRecord,
+        origin_registration: FusionRegistrationState | None,
+    ) -> FusionRegistrationOverlayRenderFrame | None:
+        locked_frame = self._get_locked_fusion_registration_overlay_frame(view, group)
+        if locked_frame is not None:
+            return locked_frame
+        if origin_registration is None:
+            return None
+        try:
+            cache_key = self._build_fusion_registration_pet_layer_cache_key(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                origin_registration,
+            )
+            cached = self._get_fusion_registration_pet_layer_cache(cache_key)
+            if cached is None or cached.overlay_frame is None:
+                return None
+            self._lock_fusion_registration_overlay_frame(view, group, cached.overlay_frame)
+            return cached.overlay_frame
+        except Exception:
+            logger.debug("failed to resolve fusion registration overlay render frame", exc_info=True)
+            return None
+
+    def _resolve_fusion_registration_pet_center_canvas(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        origin_registration: FusionRegistrationState | None,
+    ) -> tuple[float, float] | None:
+        locked_frame = self._get_locked_fusion_registration_overlay_frame(view, group)
+        if locked_frame is not None and locked_frame.pet_center_canvas is not None:
+            return locked_frame.pet_center_canvas
+        if origin_registration is None:
+            return None
+        try:
+            _, ct_series, pet_series = self._resolve_fusion_group_series(view)
+            cache_key = self._build_fusion_registration_pet_layer_cache_key(
+                view,
+                group,
+                ct_series,
+                pet_series,
+                origin_registration,
+            )
+            cached = self._get_fusion_registration_pet_layer_cache(cache_key)
+            if cached is None:
+                return None
+            self._lock_fusion_registration_overlay_frame(view, group, cached.overlay_frame)
+            return cached.pet_center_canvas
+        except Exception:
+            logger.debug("failed to resolve fusion registration PET center", exc_info=True)
+            return None
 
     def _resolve_fusion_registration_pointer_angle_rad(
         self,
@@ -6076,6 +7075,9 @@ class ViewerService:
         self,
         view: ViewRecord,
         payload: ViewOperationRequest,
+        *,
+        pivot_x: float | None = None,
+        pivot_y: float | None = None,
     ) -> float | None:
         anchor_x = payload.anchor_x
         anchor_y = payload.anchor_y
@@ -6085,8 +7087,8 @@ class ViewerService:
             value is not None and np.isfinite(float(value))
             for value in (anchor_x, anchor_y, current_x, current_y)
         ):
-            pivot_x = payload.pivot_x
-            pivot_y = payload.pivot_y
+            pivot_x = payload.pivot_x if pivot_x is None else pivot_x
+            pivot_y = payload.pivot_y if pivot_y is None else pivot_y
             if (
                 pivot_x is None
                 or pivot_y is None
@@ -6108,10 +7110,20 @@ class ViewerService:
         self,
         view: ViewRecord,
         payload: ViewOperationRequest,
+        *,
+        pivot_x: float | None = None,
+        pivot_y: float | None = None,
     ) -> float:
-        pointer_delta = self._resolve_fusion_registration_pointer_rotation_delta_degrees(view, payload)
+        pointer_delta = self._resolve_fusion_registration_pointer_rotation_delta_degrees(
+            view,
+            payload,
+            pivot_x=pivot_x,
+            pivot_y=pivot_y,
+        )
         if pointer_delta is not None:
             return pointer_delta
+        if payload.rotation_delta_degrees is not None and np.isfinite(float(payload.rotation_delta_degrees)):
+            return float(payload.rotation_delta_degrees)
         return float(payload.x or 0.0) * 0.35
 
     def _apply_fusion_registration_rotation_drag(
@@ -6120,16 +7132,96 @@ class ViewerService:
         payload: ViewOperationRequest,
         registration: FusionRegistrationState,
         *,
+        origin_registration: FusionRegistrationState,
+        origin_row: float,
+        origin_col: float,
         origin_rotation: float,
     ) -> bool:
-        if payload.rotation_delta_degrees is not None and np.isfinite(float(payload.rotation_delta_degrees)):
-            registration.rotation_degrees = float(origin_rotation) + float(payload.rotation_delta_degrees)
+        group = view.view_group
+
+        def resolve_rotation_pivot_canvas() -> tuple[float | None, float | None]:
+            if group is not None:
+                pet_center = self._resolve_fusion_registration_pet_center_canvas(
+                    view,
+                    group,
+                    origin_registration,
+                )
+                if pet_center is not None:
+                    return float(pet_center[0]), float(pet_center[1])
+            return payload.pivot_x, payload.pivot_y
+
+        pivot_x, pivot_y = resolve_rotation_pivot_canvas()
+
+        def apply_absolute_delta(delta_degrees: float) -> None:
+            pivot_row, pivot_col = self._map_fusion_registration_canvas_point_to_plane_mm(
+                view,
+                canvas_x=pivot_x,
+                canvas_y=pivot_y,
+                origin_registration=origin_registration,
+            )
+            angle_rad = float(np.deg2rad(float(delta_degrees)))
+            cos_angle = float(np.cos(angle_rad))
+            sin_angle = float(np.sin(angle_rad))
+            origin_vector_col = float(origin_col) - pivot_col
+            origin_vector_row = float(origin_row) - pivot_row
+            registration.translate_col_mm = (
+                pivot_col
+                + cos_angle * origin_vector_col
+                - sin_angle * origin_vector_row
+            )
+            registration.translate_row_mm = (
+                pivot_row
+                + sin_angle * origin_vector_col
+                + cos_angle * origin_vector_row
+            )
+            registration.rotation_degrees = float(origin_rotation) + float(delta_degrees)
+
+        def apply_incremental_delta(delta_degrees: float) -> None:
+            pivot_row, pivot_col = self._map_fusion_registration_canvas_point_to_plane_mm(
+                view,
+                canvas_x=pivot_x,
+                canvas_y=pivot_y,
+                origin_registration=origin_registration,
+            )
+            angle_rad = float(np.deg2rad(float(delta_degrees)))
+            cos_angle = float(np.cos(angle_rad))
+            sin_angle = float(np.sin(angle_rad))
+            current_vector_col = float(registration.translate_col_mm) - pivot_col
+            current_vector_row = float(registration.translate_row_mm) - pivot_row
+            registration.translate_col_mm = (
+                pivot_col
+                + cos_angle * current_vector_col
+                - sin_angle * current_vector_row
+            )
+            registration.translate_row_mm = (
+                pivot_row
+                + sin_angle * current_vector_col
+                + cos_angle * current_vector_row
+            )
+            registration.rotation_degrees = float(registration.rotation_degrees) + float(delta_degrees)
+
+        absolute_delta = self._resolve_fusion_registration_rotation_delta_degrees(
+            view,
+            payload,
+            pivot_x=pivot_x,
+            pivot_y=pivot_y,
+        )
+        if (
+            payload.rotation_delta_degrees is not None
+            or self._resolve_fusion_registration_pointer_rotation_delta_degrees(
+                view,
+                payload,
+                pivot_x=pivot_x,
+                pivot_y=pivot_y,
+            ) is not None
+        ):
+            apply_absolute_delta(float(absolute_delta))
             if payload.action_type == DRAG_ACTION_END:
                 view.drag_origin_arcball_x = None
                 view.drag_origin_arcball_y = None
             return True
 
-        absolute_pointer_delta = self._resolve_fusion_registration_pointer_rotation_delta_degrees(view, payload)
+        absolute_pointer_delta = None
         pointer_angle_rad = self._resolve_fusion_registration_pointer_angle_rad(view, payload)
         previous_angle_rad = view.drag_origin_arcball_x
         if payload.action_type == DRAG_ACTION_END:
@@ -6140,7 +7232,7 @@ class ViewerService:
             view.drag_origin_arcball_y = None
 
         if absolute_pointer_delta is not None:
-            registration.rotation_degrees = float(origin_rotation) + float(absolute_pointer_delta)
+            apply_absolute_delta(float(absolute_pointer_delta))
             return True
 
         if previous_angle_rad is not None and pointer_angle_rad is not None:
@@ -6149,7 +7241,7 @@ class ViewerService:
             )
             if abs(delta_angle_rad) < 1e-8:
                 return payload.action_type == DRAG_ACTION_END
-            registration.rotation_degrees = float(registration.rotation_degrees) + float(np.degrees(delta_angle_rad))
+            apply_incremental_delta(float(np.degrees(delta_angle_rad)))
             return True
 
         if pointer_angle_rad is not None and payload.action_type != DRAG_ACTION_END:
@@ -6157,10 +7249,7 @@ class ViewerService:
             view.drag_origin_arcball_y = None
             return False
 
-        registration.rotation_degrees = (
-            origin_rotation
-            + self._resolve_fusion_registration_rotation_delta_degrees(view, payload)
-        )
+        apply_absolute_delta(absolute_delta)
         return True
 
     def _handle_fusion_scroll(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
@@ -6169,6 +7258,7 @@ class ViewerService:
         group, ct_series, _ = self._resolve_fusion_group_series(view)
         ct_shape = self._get_series_volume(ct_series).shape
         group.fusion_axial_index = max(0, min(int(group.fusion_axial_index) + int(payload.delta), ct_shape[0] - 1))
+        self._clear_fusion_registration_overlay_frame_locks(group)
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
             self._sync_fusion_view_state_from_group(group_view)
@@ -6191,6 +7281,7 @@ class ViewerService:
                 group_view.offset_y = float(base_y) + float(payload.y or 0.0)
                 group_view.is_initialized = True
             if group is not None:
+                self._clear_fusion_registration_overlay_frame_locks(group)
                 group.fusion_revision += 1
             return
         if payload.action_type == DRAG_ACTION_END:
@@ -6213,6 +7304,7 @@ class ViewerService:
                 group_view.zoom = viewport_transformer.clamp_zoom(float(base_zoom) * zoom_factor)
                 group_view.is_initialized = True
             if group is not None:
+                self._clear_fusion_registration_overlay_frame_locks(group)
                 group.fusion_revision += 1
             return
         if payload.action_type == DRAG_ACTION_END:
@@ -6261,6 +7353,7 @@ class ViewerService:
 
             if not changed:
                 return False
+            self._clear_fusion_registration_overlay_frame_locks(group)
             group.fusion_revision += 1
             for group_view in self._get_group_views(view):
                 self._sync_fusion_view_state_from_group(group_view)
@@ -6304,6 +7397,7 @@ class ViewerService:
         if group.fusion_pet_pseudocolor_preset == next_preset:
             return False
         group.fusion_pet_pseudocolor_preset = next_preset
+        self._clear_fusion_registration_overlay_frame_locks(group)
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
             self._sync_fusion_view_state_from_group(group_view)
@@ -6353,11 +7447,67 @@ class ViewerService:
             if self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high):
                 changed = True
         if changed:
+            self._clear_fusion_registration_overlay_frame_locks(group)
             group.fusion_revision += 1
             for group_view in self._get_group_views(view):
                 self._sync_fusion_view_state_from_group(group_view)
                 group_view.is_initialized = True
         return changed or should_finalize_drag
+
+    @staticmethod
+    def _finite_or_default(value: float | int | None, default: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return number if np.isfinite(number) else float(default)
+
+    def _set_fusion_registration_preview_drag(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+        payload: ViewOperationRequest,
+        *,
+        sub_op_type: str,
+        origin_registration: FusionRegistrationState,
+        rotation_delta_degrees: float | None = None,
+    ) -> None:
+        self._fusion_registration_preview_drags[group.group_id] = FusionRegistrationPreviewDrag(
+            group_id=str(group.group_id),
+            origin_registration=self._copy_fusion_registration_state(origin_registration),
+            sub_op_type=sub_op_type,
+            delta_x=self._finite_or_default(payload.x, 0.0),
+            delta_y=self._finite_or_default(payload.y, 0.0),
+            pivot_x=self._finite_or_default(payload.pivot_x, float(view.width or 0) / 2.0),
+            pivot_y=self._finite_or_default(payload.pivot_y, float(view.height or 0) / 2.0),
+            rotation_delta_degrees=self._finite_or_default(
+                rotation_delta_degrees if rotation_delta_degrees is not None else payload.rotation_delta_degrees,
+                0.0,
+            ),
+        )
+
+    def _prime_fusion_registration_preview_cache(
+        self,
+        view: ViewRecord,
+        group: ViewGroupRecord,
+    ) -> None:
+        for group_view in self._get_group_views(view):
+            if not group_view.width or not group_view.height:
+                continue
+            if self._resolve_fusion_pane_role(group_view) not in {
+                FUSION_PANE_OVERLAY_AXIAL,
+                FUSION_PANE_PET_AXIAL,
+            }:
+                continue
+            try:
+                self._render_fusion_view(group_view, image_format="png", fast_preview=False)
+            except Exception:
+                logger.warning(
+                    "failed to prime fusion registration preview cache view_id=%s group_id=%s",
+                    group_view.view_id,
+                    group.group_id,
+                    exc_info=True,
+                )
 
     def _handle_fusion_registration(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         group = view.view_group
@@ -6366,17 +7516,31 @@ class ViewerService:
         sub_op = str(payload.sub_op_type or "translate").strip().lower()
         registration = group.fusion_registration
         if sub_op == "reset":
+            self._fusion_registration_preview_drags.pop(group.group_id, None)
+            self._clear_fusion_registration_overlay_frame_locks(group)
             group.fusion_registration = FusionRegistrationState()
         elif sub_op == "save":
+            self._fusion_registration_preview_drags.pop(group.group_id, None)
             view_group_registry.save_fusion_registration(group)
         elif sub_op == "load":
+            self._fusion_registration_preview_drags.pop(group.group_id, None)
+            self._clear_fusion_registration_overlay_frame_locks(group)
             return self._load_fusion_registration_sidecar(view, payload.fusion_registration_file)
         elif payload.action_type == DRAG_ACTION_START:
             group.rotation_drag = None
+            origin_registration = self._copy_fusion_registration_state(registration)
             group.crosshair_drag_origin_center = (
                 registration.translate_row_mm,
                 registration.translate_col_mm,
                 registration.rotation_degrees,
+            )
+            self._prime_fusion_registration_preview_cache(view, group)
+            self._set_fusion_registration_preview_drag(
+                view,
+                group,
+                payload,
+                sub_op_type=sub_op,
+                origin_registration=origin_registration,
             )
             view.drag_origin_arcball_x = (
                 self._resolve_fusion_registration_pointer_angle_rad(view, payload)
@@ -6392,24 +7556,52 @@ class ViewerService:
                 registration.rotation_degrees,
             )
             origin_row, origin_col, origin_rotation = (float(origin[0]), float(origin[1]), float(origin[2]))
+            origin_registration = FusionRegistrationState(
+                translate_row_mm=origin_row,
+                translate_col_mm=origin_col,
+                rotation_degrees=origin_rotation,
+                saved=bool(registration.saved),
+            )
             if sub_op == "rotate":
                 changed = self._apply_fusion_registration_rotation_drag(
                     view,
                     payload,
                     registration,
+                    origin_registration=origin_registration,
+                    origin_row=origin_row,
+                    origin_col=origin_col,
                     origin_rotation=origin_rotation,
                 )
                 if not changed:
+                    if payload.action_type == DRAG_ACTION_END:
+                        group.crosshair_drag_origin_center = None
+                        view.drag_origin_arcball_x = None
+                        view.drag_origin_arcball_y = None
                     return payload.action_type == DRAG_ACTION_END
             else:
                 delta_row_mm, delta_col_mm = self._map_fusion_registration_canvas_delta_to_plane_mm(
                     view,
                     delta_x=float(payload.x or 0.0),
                     delta_y=float(payload.y or 0.0),
+                    origin_registration=origin_registration,
                 )
                 registration.translate_col_mm = origin_col + delta_col_mm
                 registration.translate_row_mm = origin_row + delta_row_mm
             registration.saved = False
+            if payload.action_type == DRAG_ACTION_MOVE:
+                effective_rotation_delta = (
+                    float(registration.rotation_degrees) - float(origin_rotation)
+                    if sub_op == "rotate"
+                    else None
+                )
+                self._set_fusion_registration_preview_drag(
+                    view,
+                    group,
+                    payload,
+                    sub_op_type=sub_op,
+                    origin_registration=origin_registration,
+                    rotation_delta_degrees=effective_rotation_delta,
+                )
             if payload.action_type == DRAG_ACTION_END:
                 group.crosshair_drag_origin_center = None
                 view.drag_origin_arcball_x = None
@@ -6478,6 +7670,7 @@ class ViewerService:
             registration_payload.get("rotationDegrees"),
             "registration.rotationDegrees",
         )
+        self._clear_fusion_registration_overlay_frame_locks(group)
 
         pet_unit = pet_payload.get("unit")
         if pet_unit is not None:

@@ -238,7 +238,6 @@ def _should_bump_mpr_geometry_revision(payload: ViewOperationRequest) -> bool:
 
 
 MPR_VIEWPORT_ORDER = (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL)
-FUSION_REGISTRATION_PREVIEW_PANES = (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
 
 
 def _reference_mpr_viewports(service: ViewerService, view: ViewRecord) -> tuple[str, ...]:
@@ -507,9 +506,11 @@ def _handle_transform_2d_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del service, view, series, is_mpr_view
+    del series, is_mpr_view
     if payload.rotation_degrees is None and payload.hor_flip is None and payload.ver_flip is None:
         return _render_none()
+    if service._is_fusion_view_type(view.view_type):
+        service._clear_fusion_registration_overlay_frame_locks(view.view_group)
     return _render_single()
 
 
@@ -744,7 +745,7 @@ def _handle_fusion_registration_operation(
             "png",
             fast_preview=True,
             metadata_mode="fusion-registration-layer-preview",
-            viewports=FUSION_REGISTRATION_PREVIEW_PANES,
+            viewports=(FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL),
         )
     return _render_broadcast()
 

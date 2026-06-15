@@ -7,10 +7,12 @@ from time import perf_counter
 import socketio
 
 from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
+from app.core.logging import get_logger
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 
 MPR_PREVIEW_BATCH_MIN_INTERVAL_SECONDS = 0.0
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -469,6 +471,7 @@ class ViewSocketHub:
             )
             future.add_done_callback(self._consume_progress_future)
 
+        render_started_at = perf_counter()
         result = await asyncio.to_thread(
             viewer_service.render_view_by_id,
             view_id,
@@ -478,13 +481,30 @@ class ViewSocketHub:
             metadata_mode=request.metadata_mode,
             progress_callback=progress_callback if should_emit_progress else None,
         )
+        render_ms = (perf_counter() - render_started_at) * 1000.0
         if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
             return False
         payload = self._build_image_update_payload(result.meta, request)
         extra_image_bytes = getattr(result, "extra_image_bytes", None) or {}
         message = (payload, result.image_bytes, extra_image_bytes) if extra_image_bytes else (payload, result.image_bytes)
+        emit_started_at = perf_counter()
         for sid in sids:
             await self._server.emit("image_update", message, to=sid)
+        emit_ms = (perf_counter() - emit_started_at) * 1000.0
+        if request.metadata_mode == "fusion-registration-layer-preview":
+            logger.info(
+                (
+                    "fusion registration preview socket view_id=%s sids=%s render_ms=%.1f "
+                    "emit_ms=%.1f total_ms=%.1f primary_bytes=%s extra_pet_bytes=%s"
+                ),
+                view_id,
+                len(sids),
+                render_ms,
+                emit_ms,
+                (perf_counter() - render_started_at) * 1000.0,
+                len(result.image_bytes),
+                len(extra_image_bytes.get("pet", b"")) if extra_image_bytes else 0,
+            )
         if should_emit_progress:
             await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
         return True
