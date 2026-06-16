@@ -208,6 +208,7 @@ FUSION_PET_UNIT_SUV_BSA = "SUVbsa"
 FUSION_PET_UNIT_SUL = "SUL"
 FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
 MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT = 120_000
+FUSION_PET_STANDALONE_BACKGROUND_CVAL = 255.0
 FUSION_PET_UNIT_LABELS: dict[str, str] = {
     FUSION_PET_UNIT_SOURCE: "source",
     FUSION_PET_UNIT_KBQML: "kBq/ml (uptake)",
@@ -3414,13 +3415,25 @@ class ViewerService:
         return row_mm, col_mm
 
     @staticmethod
+    def _fusion_pet_standalone_fill_color(image: Image.Image) -> int | tuple[int, int, int] | tuple[int, int, int, int]:
+        if image.mode == "RGBA":
+            return (255, 255, 255, 255)
+        if image.mode == "RGB":
+            return (255, 255, 255)
+        return 255
+
+    @staticmethod
     def _translate_fusion_registration_preview_image(
         image: Image.Image,
         dx: int,
         dy: int,
+        *,
+        fillcolor: object | None = None,
     ) -> Image.Image:
         width, height = image.size
-        result = Image.new(image.mode, (width, height), (0, 0, 0, 0) if image.mode == "RGBA" else 0)
+        if fillcolor is None:
+            fillcolor = (0, 0, 0, 0) if image.mode == "RGBA" else 0
+        result = Image.new(image.mode, (width, height), fillcolor)
         copy_width = width - abs(int(dx))
         copy_height = height - abs(int(dy))
         if copy_width <= 0 or copy_height <= 0:
@@ -3495,6 +3508,8 @@ class ViewerService:
         self,
         image: Image.Image,
         drag: FusionRegistrationPreviewDrag,
+        *,
+        fillcolor: object | None = None,
     ) -> Image.Image:
         width, height = image.size
         if width <= 0 or height <= 0:
@@ -3508,7 +3523,12 @@ class ViewerService:
             if abs(dx - rounded_dx) <= 1e-3 and abs(dy - rounded_dy) <= 1e-3:
                 if rounded_dx == 0 and rounded_dy == 0:
                     return image.copy()
-                return self._translate_fusion_registration_preview_image(image, rounded_dx, rounded_dy)
+                return self._translate_fusion_registration_preview_image(
+                    image,
+                    rounded_dx,
+                    rounded_dy,
+                    fillcolor=fillcolor,
+                )
 
         if drag.sub_op_type == "rotate" and abs(float(drag.rotation_delta_degrees)) <= 1e-6:
             return image.copy()
@@ -3519,6 +3539,7 @@ class ViewerService:
             int(height),
             self._build_fusion_registration_preview_transform(drag),
             resample=Image.Resampling.BILINEAR,
+            fillcolor=fillcolor,
         )
 
     def _build_fusion_registration_layer_preview_result(
@@ -3723,7 +3744,16 @@ class ViewerService:
             drag,
             cached.pet_center_canvas,
         )
-        transformed_pet = self._apply_fusion_registration_preview_transform(cached.image, preview_drag)
+        preview_fillcolor = (
+            self._fusion_pet_standalone_fill_color(cached.image)
+            if role == FUSION_PANE_PET_AXIAL
+            else None
+        )
+        transformed_pet = self._apply_fusion_registration_preview_transform(
+            cached.image,
+            preview_drag,
+            fillcolor=preview_fillcolor,
+        )
         transform_ms = (perf_counter() - transform_started_at) * 1000.0
         if role == FUSION_PANE_PET_AXIAL:
             return self._build_fusion_registration_primary_preview_result(
@@ -3894,6 +3924,7 @@ class ViewerService:
         canvas_height = render_plan.render_view.height or 0
         fusion_composite: FusionCompositeInfo | None = None
         extra_image_bytes: dict[str, bytes] = {}
+        pet_standalone_primary = role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}
         if (
             role == FUSION_PANE_OVERLAY_AXIAL
             and fusion_result.pet_layer_pixels is not None
@@ -3978,7 +4009,7 @@ class ViewerService:
                 canvas_height,
                 image_transform,
                 order=interpolation_order,
-                cval=0.0,
+                cval=FUSION_PET_STANDALONE_BACKGROUND_CVAL if pet_standalone_primary else 0.0,
             )
             image = image_from_pixels(transformed)
             if role == FUSION_PANE_PET_AXIAL:
@@ -4015,6 +4046,7 @@ class ViewerService:
                     image = self._apply_fusion_registration_preview_transform(
                         image,
                         preview_drag_for_transform,
+                        fillcolor=self._fusion_pet_standalone_fill_color(image),
                     )
                     preview_transform_ms = (perf_counter() - preview_transform_started_at) * 1000.0
         fusion_projection = self._build_fusion_projection_info(

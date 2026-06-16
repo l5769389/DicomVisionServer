@@ -22,7 +22,12 @@ from app.services.mpr import VolumeGeometry, build_identity_geometry
 from app.services.render_layers.render_context import CornerInfoOverlay
 from app.services.viewer_fusion import render_fusion_pixels
 from app.services.viewer_operation_handlers import _handle_fusion_registration_operation
-from app.services.viewer_service import FusionPetDisplayVolume, FusionRegistrationCanvasMapping, ViewerService
+from app.services.viewer_service import (
+    FusionPetDisplayVolume,
+    FusionRegistrationCanvasMapping,
+    FusionRegistrationPreviewDrag,
+    ViewerService,
+)
 from app.schemas.view import FusionRegistrationArtifactExportRequest, FusionRegistrationExportRequest, ViewOperationRequest, ViewSetSizeRequest, ViewSize
 
 
@@ -58,6 +63,10 @@ def _alpha_centroid(image: Image.Image) -> tuple[float, float]:
     assert total > 0.0
     y_grid, x_grid = np.indices(alpha.shape, dtype=np.float64)
     return float((x_grid * alpha).sum() / total), float((y_grid * alpha).sum() / total)
+
+
+def _assert_near_white(region: np.ndarray) -> None:
+    assert int(np.min(region)) >= 250
 
 
 def _render(role: str, *, registration: FusionRegistrationState | None = None, has_geometry: bool = True):
@@ -332,7 +341,9 @@ def test_fusion_overlay_registration_preview_only_returns_pet_layer(monkeypatch)
     assert result.meta.fusion_composite.height > 0
     assert [layer.key for layer in result.meta.fusion_composite.layers] == ["pet"]
     assert set(result.extra_image_bytes) == {"pet"}
-    assert Image.open(io.BytesIO(result.image_bytes)).size == (1, 1)
+    primary = Image.open(io.BytesIO(result.image_bytes)).convert("RGBA")
+    assert primary.size == (1, 1)
+    assert primary.getpixel((0, 0)) == (0, 0, 0, 0)
     assert Image.open(io.BytesIO(result.extra_image_bytes["pet"])).size == (
         result.meta.fusion_composite.width,
         result.meta.fusion_composite.height,
@@ -574,8 +585,40 @@ def test_fusion_registration_pet_axial_preview_reuses_cached_bitmap_without_volu
 
     assert result.meta.fusion_info is not None
     assert result.meta.fusion_info.pane_role == FUSION_PANE_PET_AXIAL
-    assert Image.open(io.BytesIO(result.image_bytes)).size == (64, 64)
+    preview = Image.open(io.BytesIO(result.image_bytes)).convert("RGB")
+    assert preview.size == (64, 64)
+    _assert_near_white(np.asarray(preview)[:, :4])
     assert result.extra_image_bytes == {}
+
+
+def test_fusion_registration_pet_axial_rotation_preview_fills_exposed_canvas_white() -> None:
+    service = ViewerService()
+    image = Image.new("RGB", (48, 48), (255, 255, 255))
+    for x in range(18, 30):
+        for y in range(12, 36):
+            image.putpixel((x, y), (24, 24, 24))
+    drag = FusionRegistrationPreviewDrag(
+        group_id="fusion-group",
+        origin_registration=FusionRegistrationState(),
+        sub_op_type="rotate",
+        delta_x=0.0,
+        delta_y=0.0,
+        pivot_x=24.0,
+        pivot_y=24.0,
+        rotation_delta_degrees=35.0,
+    )
+
+    rotated = service._apply_fusion_registration_preview_transform(
+        image,
+        drag,
+        fillcolor=service._fusion_pet_standalone_fill_color(image),
+    )
+    pixels = np.asarray(rotated.convert("RGB"))
+
+    _assert_near_white(pixels[:4, :4])
+    _assert_near_white(pixels[:4, -4:])
+    _assert_near_white(pixels[-4:, :4])
+    _assert_near_white(pixels[-4:, -4:])
 
 
 def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monkeypatch) -> None:
@@ -1000,6 +1043,90 @@ def test_pet_only_zero_background_maps_to_white_with_inverse_grayscale() -> None
     )
 
     assert tuple(int(channel) for channel in result.pixels[0, 0]) == (255, 255, 255)
+
+
+@pytest.mark.parametrize(
+    ("role", "view_type"),
+    [
+        (FUSION_PANE_PET_AXIAL, "FusionPETAxial"),
+        (FUSION_PANE_PET_CORONAL_MIP, "FusionPETCoronalMip"),
+    ],
+)
+def test_pet_only_rendered_canvas_padding_is_white(monkeypatch, role: str, view_type: str) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    group.window.window_width = 400.0
+    group.window.window_center = 40.0
+    group.fusion_pet_window.window_width = 12.0
+    group.fusion_pet_window.window_center = 6.0
+    group.fusion_axial_index = 10
+    ct_series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+    pet_series = SeriesRecord(
+        series_id="pet",
+        folder_path="",
+        series_instance_uid="pet-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="PT",
+        series_description="PET",
+    )
+    ct_volume = np.full((21, 31, 31), 40.0, dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    pet_volume[:, 12:19, 12:19] = 12.0
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+    view = ViewRecord(
+        view_id=f"{role}-view",
+        series_id="ct",
+        view_type=view_type,
+        fusion_pane_role=role,
+        view_group=group,
+        width=160,
+        height=48,
+    )
+    view.is_initialized = True
+    view.zoom = 2.5
+
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda _view: (group, ct_series, pet_series))
+    monkeypatch.setattr(service, "_get_series_volume", lambda series, **_: ct_volume if series.series_id == "ct" else pet_volume)
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda _series, _shape: geometry)
+    monkeypatch.setattr(service, "_get_series_patient_transform", lambda _series: np.zeros(tuple(int(value) for value in ct_volume.shape)))
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda _series, volume, unit: FusionPetDisplayVolume(
+            volume=np.asarray(volume, dtype=np.float32),
+            unit="SUVbw",
+            unit_label="g/ml (SUVbw)",
+        ),
+    )
+    monkeypatch.setattr(service, "_get_indexed_instance_and_cache", lambda _series, _index: (None, None))
+
+    result = service._render_fusion_view(view)
+    pixels = np.asarray(Image.open(io.BytesIO(result.image_bytes)).convert("RGB"))
+
+    assert pixels.shape[:2] == (48, 160)
+    _assert_near_white(pixels[:4, :4])
+    _assert_near_white(pixels[:4, -4:])
+    _assert_near_white(pixels[-4:, :4])
+    _assert_near_white(pixels[-4:, -4:])
 
 
 def test_pet_coronal_mip_uses_physical_spacing_and_head_first_direction() -> None:

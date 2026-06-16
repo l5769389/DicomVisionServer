@@ -181,8 +181,10 @@ class ViewportTransformer:
         transform: AffineTransform,
         *,
         resample: Image.Resampling,
+        fillcolor: object | None = None,
     ) -> Image.Image:
-        fillcolor = (0, 0, 0, 0) if image.mode == "RGBA" else 0
+        if fillcolor is None:
+            fillcolor = (0, 0, 0, 0) if image.mode == "RGBA" else 0
         return image.transform(
             (canvas_width, canvas_height),
             Image.Transform.AFFINE,
