@@ -208,6 +208,7 @@ FUSION_PET_UNIT_SUV_BSA = "SUVbsa"
 FUSION_PET_UNIT_SUL = "SUL"
 FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
 MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT = 120_000
+MPR_SEGMENTATION_OVERLAY_PREVIEW_SAMPLE_LIMIT = 12_000
 FUSION_PET_UNIT_LABELS: dict[str, str] = {
     FUSION_PET_UNIT_SOURCE: "source",
     FUSION_PET_UNIT_KBQML: "kBq/ml (uptake)",
@@ -2844,7 +2845,10 @@ class ViewerService:
             view.window_width,
             view.window_center,
         )
-        include_stack_overlay_payloads = not (fast_preview and metadata_mode == "stack-preview-lite")
+        include_stack_overlay_payloads = not (
+            fast_preview
+            and metadata_mode in {"stack-preview-lite", "stack-pixel-preview"}
+        )
         visible_measurements = self._build_visible_measurements(view) if include_stack_overlay_payloads else ()
         context = RenderContext(
             view=render_plan.render_view,
@@ -2979,7 +2983,10 @@ class ViewerService:
             total_slices=len(series.instances),
             viewport_label="Stack",
         )
-        include_stack_overlay_payloads = not (fast_preview and metadata_mode == "stack-preview-lite")
+        include_stack_overlay_payloads = not (
+            fast_preview
+            and metadata_mode in {"stack-preview-lite", "stack-pixel-preview"}
+        )
         visible_measurements = self._build_visible_measurements(view) if include_stack_overlay_payloads else ()
         context = RenderContext(
             view=render_plan.render_view,
@@ -4252,7 +4259,8 @@ class ViewerService:
                 cursor=payload_pose_context.cursor,
             )
         )
-        visible_measurements = [] if fast_preview else self._build_visible_measurements(view)
+        include_mpr_measurement_payloads = not fast_preview or metadata_mode == "mpr-pan-zoom-preview"
+        visible_measurements = self._build_visible_measurements(view) if include_mpr_measurement_payloads else []
         context = RenderContext(
             view=render_plan.render_view,
             source_pixels=plane_pixels,
@@ -4276,18 +4284,28 @@ class ViewerService:
             )
         else:
             image = layered_renderer.render(context)
-        mpr_segmentation_overlay = self._build_mpr_segmentation_overlay_payload(
-            plane_pixels,
-            view.mpr_segmentation,
-            target_viewport,
-            segmentation_plane_pose,
-            include_samples=not fast_preview,
+        include_mpr_segmentation_overlay = not fast_preview or metadata_mode == "mpr-segmentation-preview"
+        mpr_segmentation_overlay = (
+            self._build_mpr_segmentation_overlay_payload(
+                plane_pixels,
+                view.mpr_segmentation,
+                target_viewport,
+                segmentation_plane_pose,
+                include_samples=not fast_preview or metadata_mode == "mpr-segmentation-preview",
+                sample_limit=(
+                    MPR_SEGMENTATION_OVERLAY_PREVIEW_SAMPLE_LIMIT
+                    if fast_preview and metadata_mode == "mpr-segmentation-preview"
+                    else MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT
+                ),
+            )
+            if include_mpr_segmentation_overlay
+            else None
         )
         has_local_segmentation_samples = bool(
             mpr_segmentation_overlay
             and any(region.samples is not None for region in mpr_segmentation_overlay.regions)
         )
-        if not has_local_segmentation_samples:
+        if include_mpr_segmentation_overlay and not has_local_segmentation_samples:
             image = self._apply_mpr_segmentation_overlay(
                 image,
                 view.mpr_segmentation,
@@ -4343,7 +4361,7 @@ class ViewerService:
                 mpr_crosshair=self._build_mpr_crosshair_info(mpr_crosshair_overlay),
                 scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info) if slice_corner_info is not None else None,
-                measurements=[] if fast_preview else self._serialize_measurements(
+                measurements=[] if not include_mpr_measurement_payloads else self._serialize_measurements(
                     visible_measurements,
                     image_transform=metadata_image_transform,
                     canvas_width=render_plan.render_view.width or 0,
@@ -5475,6 +5493,7 @@ class ViewerService:
         plane_pose: PlanePose | None = None,
         *,
         include_samples: bool = True,
+        sample_limit: int = MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT,
     ) -> MprSegmentationOverlay | None:
         if not state.enabled or not state.threshold_regions:
             return None
@@ -5503,7 +5522,11 @@ class ViewerService:
                 )
                 sample_revision = cls._build_mpr_segmentation_sample_revision(region, plane_pose, pixels.shape[:2])
                 if include_samples:
-                    samples = cls._build_mpr_segmentation_overlay_samples(pixels, geometry_mask)
+                    samples = cls._build_mpr_segmentation_overlay_samples(
+                        pixels,
+                        geometry_mask,
+                        sample_limit=sample_limit,
+                    )
             regions.append(
                 MprSegmentationOverlayRegion(
                     regionId=str(region.id),
@@ -5554,6 +5577,8 @@ class ViewerService:
     def _build_mpr_segmentation_overlay_samples(
         pixels: np.ndarray,
         geometry_mask: np.ndarray,
+        *,
+        sample_limit: int = MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT,
     ) -> MprSegmentationOverlaySamples | None:
         pixel_array = np.asarray(pixels)
         mask_array = np.asarray(geometry_mask, dtype=bool)
@@ -5568,11 +5593,12 @@ class ViewerService:
         if total_count <= 0:
             return None
 
-        if total_count > MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT:
+        resolved_sample_limit = max(1, int(sample_limit))
+        if total_count > resolved_sample_limit:
             row_hash = rows.astype(np.uint64) * np.uint64(0x9E3779B185EBCA87)
             col_hash = cols.astype(np.uint64) * np.uint64(0xC2B2AE3D27D4EB4F)
             hashes = row_hash ^ col_hash ^ ((row_hash >> np.uint64(17)) + (col_hash << np.uint64(7)))
-            selected = np.argpartition(hashes, MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT - 1)[:MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT]
+            selected = np.argpartition(hashes, resolved_sample_limit - 1)[:resolved_sample_limit]
             selected = selected[np.argsort(hashes[selected])]
             rows = rows[selected]
             cols = cols[selected]

@@ -131,6 +131,8 @@ def test_fast_preview_render_skips_progress_messages(monkeypatch) -> None:
                     "imageFormat": "png",
                     "fastPreview": True,
                     "fastPreviewFullResolution": False,
+                    "metadataMode": "full",
+                    "renderIntent": "geometry-preview",
                 },
                 b"image",
             ),
@@ -151,27 +153,51 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
         }
     )
 
-    stack_payload = ViewSocketHub._build_image_update_payload(
+    stack_pixel_payload = ViewSocketHub._build_image_update_payload(
         meta,
-        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-preview-lite"),
+        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-pixel-preview", render_revision=12),
+    )
+    stack_geometry_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-geometry-preview"),
     )
     mpr_payload = ViewSocketHub._build_image_update_payload(
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="mpr-pan-zoom-preview"),
     )
 
-    assert "measurements" not in stack_payload
-    assert "annotations" not in stack_payload
-    assert stack_payload["fastPreview"] is True
-    assert stack_payload["fastPreviewFullResolution"] is False
-    assert "cornerInfo" in stack_payload
-    assert "orientation" in stack_payload
-    assert "measurements" not in mpr_payload
-    assert "annotations" not in mpr_payload
+    assert "measurements" not in stack_pixel_payload
+    assert "annotations" not in stack_pixel_payload
+    assert stack_pixel_payload["fastPreview"] is True
+    assert stack_pixel_payload["fastPreviewFullResolution"] is False
+    assert stack_pixel_payload["metadataMode"] == "stack-pixel-preview"
+    assert stack_pixel_payload["renderIntent"] == "pixel-only"
+    assert stack_pixel_payload["renderRevision"] == 12
+    assert "cornerInfo" in stack_pixel_payload
+    assert "orientation" in stack_pixel_payload
+    assert stack_geometry_payload["measurements"] == [{"measurementId": "m"}]
+    assert stack_geometry_payload["annotations"] == [{"annotationId": "a"}]
+    assert stack_geometry_payload["renderIntent"] == "geometry-preview"
+    assert mpr_payload["measurements"] == [{"measurementId": "m"}]
+    assert mpr_payload["annotations"] == [{"annotationId": "a"}]
     assert mpr_payload["fastPreview"] is True
     assert mpr_payload["fastPreviewFullResolution"] is False
+    assert mpr_payload["metadataMode"] == "mpr-pan-zoom-preview"
+    assert mpr_payload["renderIntent"] == "geometry-preview"
     assert "cornerInfo" not in mpr_payload
     assert "orientation" not in mpr_payload
+
+
+def test_render_request_revision_is_assigned_at_schedule_time() -> None:
+    hub = ViewSocketHub()
+
+    first = hub.make_render_request("view-1")
+    second = hub.make_render_request("view-1")
+    other = hub.make_render_request("view-2")
+
+    assert first.render_revision == 1
+    assert second.render_revision == 2
+    assert other.render_revision == 1
 
 
 def test_non_mpr_preview_worker_keeps_latest_pending_request(monkeypatch) -> None:

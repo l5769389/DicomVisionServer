@@ -1134,7 +1134,9 @@ def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) ->
         view_registry._view_by_id.update(previous_views)
 
     assert crosshair_outcome.mpr_revision == 1
+    assert crosshair_outcome.broadcast_metadata_mode == "mpr-pan-zoom-preview"
     assert window_outcome.mpr_revision == 1
+    assert window_outcome.broadcast_metadata_mode == "mpr-pixel-preview"
     assert group.mpr_revision == 1
 
 
@@ -1179,6 +1181,7 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert window_move.deferred_view_ids == (view.view_id,)
     assert window_move.deferred_image_format == "png"
     assert window_move.deferred_fast_preview is True
+    assert window_move.deferred_metadata_mode == "stack-pixel-preview"
     assert window_end.primary_result is None
     assert window_end.deferred_view_ids == (view.view_id,)
     assert window_end.deferred_image_format == "png"
@@ -1187,6 +1190,7 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert zoom_move.deferred_view_ids == (view.view_id,)
     assert zoom_move.deferred_image_format == "png"
     assert zoom_move.deferred_fast_preview is True
+    assert zoom_move.deferred_metadata_mode == "stack-geometry-preview"
     assert zoom_end.primary_result is None
     assert zoom_end.deferred_view_ids == (view.view_id,)
     assert zoom_end.deferred_image_format == "png"
@@ -1221,6 +1225,7 @@ def test_stack_pan_move_uses_png_render(monkeypatch) -> None:
     assert pan_move.deferred_view_ids == (view.view_id,)
     assert pan_move.deferred_image_format == "png"
     assert pan_move.deferred_fast_preview is True
+    assert pan_move.deferred_metadata_mode == "stack-geometry-preview"
     assert pan_end.primary_result is None
     assert pan_end.deferred_view_ids == (view.view_id,)
     assert pan_end.deferred_image_format == "png"
@@ -1257,6 +1262,7 @@ def test_mpr_pan_move_schedules_deferred_full_resolution_preview(monkeypatch) ->
     assert move_outcome.deferred_image_format == "png"
     assert move_outcome.deferred_fast_preview is True
     assert move_outcome.deferred_fast_preview_full_resolution is True
+    assert move_outcome.deferred_metadata_mode == "mpr-pan-zoom-preview"
     assert end_outcome.primary_result is None
     assert end_outcome.deferred_view_ids == (axial_view.view_id,)
     assert end_outcome.deferred_image_format == "png"
