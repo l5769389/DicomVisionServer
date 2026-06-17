@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
+from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL, ZOOM_MAX, ZOOM_MIN
 from app.models.viewer import MprMipViewportState, MprRotationDragRecord, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
 from app.services.mpr import build_geometry_from_patient_transform, ijk_to_world_point
@@ -103,6 +103,18 @@ def test_png_encoding_always_uses_low_compression_without_changing_format(monkey
     assert save_calls[0]["compress_level"] == 1
     assert save_calls[1]["format"] == "PNG"
     assert save_calls[1]["compress_level"] == 1
+
+
+def test_view_transform_payload_reports_clamped_zoom() -> None:
+    view = ViewRecord(view_id="v", series_id="s", view_type="Stack")
+
+    view.zoom = ZOOM_MAX * 4
+    payload = ViewerService._build_view_transform_payload(view)
+    assert payload.zoom == ZOOM_MAX
+
+    view.zoom = ZOOM_MIN / 4
+    payload = ViewerService._build_view_transform_payload(view)
+    assert payload.zoom == ZOOM_MIN
 
 
 def test_mpr_plane_cache_reuses_reslice_when_only_pan_zoom_changes(monkeypatch) -> None:
@@ -1182,6 +1194,8 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert window_move.deferred_image_format == "png"
     assert window_move.deferred_fast_preview is True
     assert window_move.deferred_metadata_mode == "stack-pixel-preview"
+    assert view.window_width == pytest.approx(412.0)
+    assert view.window_center == pytest.approx(48.0)
     assert window_end.primary_result is None
     assert window_end.deferred_view_ids == (view.view_id,)
     assert window_end.deferred_image_format == "png"
@@ -1195,6 +1209,33 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert zoom_end.deferred_view_ids == (view.view_id,)
     assert zoom_end.deferred_image_format == "png"
     assert zoom_end.deferred_fast_preview is False
+
+
+def test_window_drag_sensitivity_scales_with_current_width(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
+    view.window_width = 8.0
+    view.window_center = 4.0
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
+        )
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="move", x=100, y=-50)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert view.window_width == pytest.approx(10.0)
+    assert view.window_center == pytest.approx(5.0)
 
 
 def test_stack_pan_move_uses_png_render(monkeypatch) -> None:

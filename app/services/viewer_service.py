@@ -45,6 +45,8 @@ from app.core import (
     VIEW_OP_TYPE_VOLUME_CONFIG,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
     WINDOW_DRAG_SENSITIVITY,
+    WINDOW_DRAG_MIN_SENSITIVITY,
+    WINDOW_DRAG_REFERENCE_WIDTH,
     WINDOW_WIDTH_MIN,
     ZOOM_DRAG_FACTOR_MIN,
     ZOOM_DRAG_SENSITIVITY,
@@ -56,6 +58,7 @@ from app.core import (
 from app.core.logging import get_logger
 from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import (
+    AnnotationRecord,
     FusionRegistrationState,
     InstanceRecord,
     MprCursorRecord,
@@ -1623,6 +1626,96 @@ class ViewerService:
         view.is_initialized = True
         return True
 
+    @staticmethod
+    def _resolve_annotation_tool_type(payload: ViewOperationRequest) -> str | None:
+        tool_type = str(payload.tool_type or payload.sub_op_type or "").strip().lower()
+        return tool_type if tool_type in {"arrow"} else None
+
+    def _resolve_annotation_image_points(
+        self,
+        view: ViewRecord,
+        payload: ViewOperationRequest,
+    ) -> tuple[MeasurementPoint, ...]:
+        return tuple(
+            self._resolve_normalized_point_to_image_point(view, point.x, point.y)
+            for point in (payload.points or [])
+        )
+
+    @staticmethod
+    def _is_empty_annotation(points: tuple[MeasurementPoint, ...]) -> bool:
+        if len(points) < 2:
+            return True
+        start, end = points[:2]
+        return abs(end.x - start.x) < 1e-3 and abs(end.y - start.y) < 1e-3
+
+    @staticmethod
+    def _normalize_annotation_size(value: str | None) -> str:
+        size = str(value or "").strip().lower()
+        return size if size in {"sm", "md", "lg"} else "md"
+
+    @staticmethod
+    def _normalize_annotation_color(value: str | None) -> str:
+        color = str(value or "").strip()
+        return color or "#ffd166"
+
+    def _handle_annotation(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        tool_type = self._resolve_annotation_tool_type(payload)
+        if tool_type is None:
+            raise HTTPException(status_code=400, detail="Unsupported annotation tool type")
+        if not payload.points:
+            raise HTTPException(status_code=400, detail="Annotation points are required")
+
+        image_points = self._resolve_annotation_image_points(view, payload)
+        if self._is_empty_annotation(image_points):
+            return False
+
+        _, _, slice_context = self._resolve_measurement_source_context(view)
+        annotation_id = str(payload.annotation_id or payload.measurement_id or "").strip() or str(uuid4())
+        next_annotation = AnnotationRecord(
+            annotation_id=annotation_id,
+            tool_type=tool_type,
+            points=image_points,
+            slice_context=slice_context,
+            text=str(payload.text or ""),
+            color=self._normalize_annotation_color(payload.color),
+            size=self._normalize_annotation_size(payload.size),
+        )
+        existing_index = next(
+            (index for index, annotation in enumerate(view.annotations) if annotation.annotation_id == annotation_id),
+            None,
+        )
+        if existing_index is None:
+            view.annotations.append(next_annotation)
+        else:
+            view.annotations[existing_index] = next_annotation
+        view.is_initialized = True
+        return True
+
+    @staticmethod
+    def _delete_annotation(view: ViewRecord, annotation_id: str | None) -> bool:
+        target_annotation_id = str(annotation_id or "").strip()
+        if not target_annotation_id or not view.annotations:
+            return False
+
+        existing_count = len(view.annotations)
+        view.annotations = [
+            annotation for annotation in view.annotations if annotation.annotation_id != target_annotation_id
+        ]
+        if len(view.annotations) == existing_count:
+            return False
+
+        view.is_initialized = True
+        return True
+
+    @staticmethod
+    def _clear_annotations(view: ViewRecord) -> bool:
+        if not view.annotations:
+            return False
+
+        view.annotations = []
+        view.is_initialized = True
+        return True
+
     def _build_visible_measurements(self, view: ViewRecord) -> tuple[MeasurementRecord, ...]:
         if not view.measurements:
             return ()
@@ -1636,6 +1729,21 @@ class ViewerService:
                 continue
             if self._is_mpr_view_type(view.view_type) and measurement.slice_context.slice_index == current_slice:
                 visible.append(measurement)
+        return tuple(visible)
+
+    def _build_visible_annotations(self, view: ViewRecord) -> tuple[AnnotationRecord, ...]:
+        if not view.annotations:
+            return ()
+
+        current_slice = self._resolve_current_measurement_slice_index(view)
+        visible: list[AnnotationRecord] = []
+        for annotation in view.annotations:
+            if annotation.slice_context.kind == "stack":
+                if not self._is_mpr_view_type(view.view_type) and annotation.slice_context.slice_index == current_slice:
+                    visible.append(annotation)
+                continue
+            if self._is_mpr_view_type(view.view_type) and annotation.slice_context.slice_index == current_slice:
+                visible.append(annotation)
         return tuple(visible)
 
     @staticmethod
@@ -1702,7 +1810,7 @@ class ViewerService:
 
     @staticmethod
     def _serialize_annotations(
-        annotations: tuple[PresentationAnnotationRecord, ...],
+        annotations: tuple[Any, ...],
         *,
         image_transform: Any,
         canvas_width: int,
@@ -2850,6 +2958,7 @@ class ViewerService:
             and metadata_mode in {"stack-preview-lite", "stack-pixel-preview"}
         )
         visible_measurements = self._build_visible_measurements(view) if include_stack_overlay_payloads else ()
+        visible_annotations = self._build_visible_annotations(view) if include_stack_overlay_payloads else ()
         context = RenderContext(
             view=render_plan.render_view,
             source_pixels=source_pixels,
@@ -2929,7 +3038,7 @@ class ViewerService:
                     canvas_height=render_plan.render_view.height or 0,
                 ),
                 annotations=[] if not include_stack_overlay_payloads else self._serialize_annotations(
-                    visible_presentation_annotations,
+                    (*visible_annotations, *visible_presentation_annotations),
                     image_transform=image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
@@ -2988,6 +3097,7 @@ class ViewerService:
             and metadata_mode in {"stack-preview-lite", "stack-pixel-preview"}
         )
         visible_measurements = self._build_visible_measurements(view) if include_stack_overlay_payloads else ()
+        visible_annotations = self._build_visible_annotations(view) if include_stack_overlay_payloads else ()
         context = RenderContext(
             view=render_plan.render_view,
             source_pixels=cached.source_pixels,
@@ -3060,7 +3170,7 @@ class ViewerService:
                     canvas_height=render_plan.render_view.height or 0,
                 ),
                 annotations=[] if not include_stack_overlay_payloads else self._serialize_annotations(
-                    visible_presentation_annotations,
+                    (*visible_annotations, *visible_presentation_annotations),
                     image_transform=image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
@@ -4056,6 +4166,11 @@ class ViewerService:
                 group.fusion_pet_window.window_width,
                 group.fusion_pet_window.window_center,
             )
+        include_fusion_annotation_payloads = not (
+            fast_preview
+            and metadata_mode in {"mpr-pixel-preview", "stack-pixel-preview", "fusion-registration-layer-preview"}
+        )
+        visible_annotations = self._build_visible_annotations(view) if include_fusion_annotation_payloads else ()
         registration_info = FusionRegistrationInfo(
             translateRowMm=float(group.fusion_registration.translate_row_mm),
             translateColMm=float(group.fusion_registration.translate_col_mm),
@@ -4122,6 +4237,12 @@ class ViewerService:
                 orientation=self._serialize_orientation_overlay(orientation_overlay),
                 transform=self._build_view_transform_payload(view),
                 color=ViewColorInfo(pseudocolorPreset=fusion_result.pseudocolor_preset),
+                annotations=[] if not include_fusion_annotation_payloads else self._serialize_annotations(
+                    visible_annotations,
+                    image_transform=image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
                 fusionProjection=fusion_projection,
                 fusionInfo=FusionInfo(
                     paneRole=role,
@@ -4261,6 +4382,7 @@ class ViewerService:
         )
         include_mpr_measurement_payloads = not fast_preview or metadata_mode == "mpr-pan-zoom-preview"
         visible_measurements = self._build_visible_measurements(view) if include_mpr_measurement_payloads else []
+        visible_annotations = self._build_visible_annotations(view) if include_mpr_measurement_payloads else []
         context = RenderContext(
             view=render_plan.render_view,
             source_pixels=plane_pixels,
@@ -4363,6 +4485,12 @@ class ViewerService:
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info) if slice_corner_info is not None else None,
                 measurements=[] if not include_mpr_measurement_payloads else self._serialize_measurements(
                     visible_measurements,
+                    image_transform=metadata_image_transform,
+                    canvas_width=render_plan.render_view.width or 0,
+                    canvas_height=render_plan.render_view.height or 0,
+                ),
+                annotations=[] if not include_mpr_measurement_payloads else self._serialize_annotations(
+                    tuple(visible_annotations),
                     image_transform=metadata_image_transform,
                     canvas_width=render_plan.render_view.width or 0,
                     canvas_height=render_plan.render_view.height or 0,
@@ -6680,8 +6808,9 @@ class ViewerService:
             base_wl = float(base_wl or 0.0)
             delta_x = float(payload.x or 0.0)
             delta_y = float(payload.y or 0.0)
-            view.window_width = base_ww + delta_x * WINDOW_DRAG_SENSITIVITY
-            view.window_center = base_wl - delta_y * WINDOW_DRAG_SENSITIVITY
+            sensitivity = self._resolve_window_drag_sensitivity(base_ww)
+            view.window_width = base_ww + delta_x * sensitivity
+            view.window_center = base_wl - delta_y * sensitivity
             view.is_initialized = True
             return
 
@@ -6703,6 +6832,14 @@ class ViewerService:
             return [view]
         group_views = view_registry.list_view_group(view.view_group.group_id)
         return group_views or [view]
+
+    @staticmethod
+    def _resolve_window_drag_sensitivity(window_width: float | None) -> float:
+        width = abs(float(window_width or 0.0))
+        if not np.isfinite(width) or width <= 0:
+            return 1.0
+        scaled = width / max(float(WINDOW_DRAG_REFERENCE_WIDTH), 1.0)
+        return max(float(WINDOW_DRAG_MIN_SENSITIVITY), min(float(WINDOW_DRAG_SENSITIVITY), scaled))
 
     def _get_group_views(self, view: ViewRecord) -> list[ViewRecord]:
         if view.view_group is None:
@@ -7387,8 +7524,9 @@ class ViewerService:
         elif payload.action_type == DRAG_ACTION_MOVE:
             base_ww = float(group.drag_origin_window_width if group.drag_origin_window_width is not None else target_window.window_width or 0.0)
             base_wl = float(group.drag_origin_window_center if group.drag_origin_window_center is not None else target_window.window_center or 0.0)
-            target_window.window_width = base_ww + float(payload.x or 0.0) * WINDOW_DRAG_SENSITIVITY
-            target_window.window_center = base_wl - float(payload.y or 0.0) * WINDOW_DRAG_SENSITIVITY
+            sensitivity = self._resolve_window_drag_sensitivity(base_ww)
+            target_window.window_width = base_ww + float(payload.x or 0.0) * sensitivity
+            target_window.window_center = base_wl - float(payload.y or 0.0) * sensitivity
         elif payload.action_type == DRAG_ACTION_END:
             group.drag_origin_window_width = None
             group.drag_origin_window_center = None
@@ -9403,7 +9541,7 @@ class ViewerService:
             rotationDegrees=viewport_transformer.normalize_rotation_degrees(view.rotation_degrees),
             horFlip=bool(view.hor_flip),
             verFlip=bool(view.ver_flip),
-            zoom=float(view.zoom),
+            zoom=float(viewport_transformer.clamp_zoom(view.zoom)),
             offsetX=float(view.offset_x),
             offsetY=float(view.offset_y),
         )

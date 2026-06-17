@@ -34,6 +34,7 @@ from app.core import (
     VIEW_OP_TYPE_MPR_CROSSHAIR_MODE,
     VIEW_OP_TYPE_MPR_STATE_SYNC,
     VIEW_OP_TYPE_MEASUREMENT,
+    VIEW_OP_TYPE_ANNOTATION,
 )
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ImageFormat, ViewOperationRequest
@@ -545,15 +546,21 @@ def _handle_reset_operation(
             return _render_none()
         return _render_broadcast() if is_mpr_view else _render_single()
 
+    if reset_target == "annotations":
+        if not service._clear_annotations(view):
+            return _render_none()
+        return _render_broadcast() if is_mpr_view else _render_single()
+
     if service._is_fusion_view_type(view.view_type):
         service._reset_view(view)
         return _render_broadcast()
 
-    if reset_target in {"mtf", "annotations"}:
+    if reset_target in {"mtf"}:
         return _render_broadcast() if is_mpr_view else _render_single()
 
     if reset_target == "all":
         service._clear_measurements(view)
+        service._clear_annotations(view)
         service._reset_view(view)
         return _render_broadcast() if is_mpr_view else _render_single()
 
@@ -626,6 +633,27 @@ def _handle_measurement_operation(
     if payload.action_type == "end":
         if service._handle_measurement(view, payload):
             return _render_single()
+        return _render_none()
+    return _render_none()
+
+
+def _handle_annotation_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series
+    if payload.action_type == "delete":
+        if service._delete_annotation(view, payload.annotation_id or payload.measurement_id):
+            return _render_broadcast() if is_mpr_view else _render_single()
+        return _render_none()
+    if payload.action_type in {"start", "move"}:
+        return _render_none()
+    if payload.action_type == "end" or payload.action_type is None:
+        if service._handle_annotation(view, payload):
+            return _render_broadcast() if is_mpr_view else _render_single()
         return _render_none()
     return _render_none()
 
@@ -823,6 +851,7 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_FUSION_REGISTRATION: _handle_fusion_registration_operation,
     VIEW_OP_TYPE_PET_CONFIG: _handle_pet_config_operation,
     VIEW_OP_TYPE_MEASUREMENT: _handle_measurement_operation,
+    VIEW_OP_TYPE_ANNOTATION: _handle_annotation_operation,
 }
 
 

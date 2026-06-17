@@ -274,7 +274,7 @@ async def _dispatch_operation_result(
         await server.emit("measurement_draft", result.draft_measurement, to=sid)
     if result.primary_result is not None:
         primary_request = view_socket_hub.make_render_request(
-            result.primary_result.meta.viewId,
+            result.primary_result.meta.view_id,
             image_format=result.primary_image_format,
             fast_preview=result.primary_fast_preview,
             fast_preview_full_resolution=result.primary_fast_preview_full_resolution,
