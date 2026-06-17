@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 from app.core.workspace import DEFAULT_WORKSPACE_ID
-from app.models.measurement import MeasurementPoint, MeasurementRecord
+from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 
 
 Quaternion = tuple[float, float, float, float]
@@ -47,6 +47,17 @@ class PresentationAnnotationRecord:
     annotation_id: str
     tool_type: str
     points: tuple[MeasurementPoint, ...]
+    text: str = ""
+    color: str = "#ffd166"
+    size: str = "md"
+
+
+@dataclass(frozen=True)
+class AnnotationRecord:
+    annotation_id: str
+    tool_type: str
+    points: tuple[MeasurementPoint, ...]
+    slice_context: MeasurementSliceContext
     text: str = ""
     color: str = "#ffd166"
     size: str = "md"
@@ -342,6 +353,7 @@ class ViewRecord:
     drag: DragState = field(default_factory=DragState)
     view_group: ViewGroupRecord | None = None
     measurements: list[MeasurementRecord] = field(default_factory=list)
+    annotations: list[AnnotationRecord] = field(default_factory=list)
     is_initialized: bool = False
 
     @property

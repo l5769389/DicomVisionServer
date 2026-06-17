@@ -19,6 +19,7 @@ from app.schemas.view import MprSegmentationConfig, ViewOperationRequest
 from app.services import viewer_service as viewer_service_module
 from app.services.mpr import PlanePose, build_identity_geometry
 from app.services.view_registry import view_registry
+from app.services.viewer_operation_handlers import _handle_mpr_segmentation_operation
 from app.services.viewer_service import ViewerService
 from app.services.viewport_transformer import viewport_transformer
 
@@ -522,8 +523,7 @@ def test_mpr_segmentation_overlay_sample_revision_ignores_threshold_but_tracks_g
     assert first.regions[0].sample_revision != depth_changed.regions[0].sample_revision
 
 
-def test_mpr_segmentation_overlay_samples_are_capped_with_stable_sampling(monkeypatch) -> None:
-    monkeypatch.setattr(viewer_service_module, "MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT", 5)
+def test_mpr_segmentation_overlay_samples_are_capped_with_stable_sampling() -> None:
     source_pixels = np.arange(25, dtype=np.float32).reshape(5, 5)
     state = MprSegmentationState(
         enabled=True,
@@ -535,12 +535,14 @@ def test_mpr_segmentation_overlay_samples_are_capped_with_stable_sampling(monkey
         state,
         MPR_VIEWPORT_AXIAL,
         _plane_pose(MPR_VIEWPORT_AXIAL),
+        sample_limit=5,
     )
     second = ViewerService._build_mpr_segmentation_overlay_payload(
         source_pixels,
         state,
         MPR_VIEWPORT_AXIAL,
         _plane_pose(MPR_VIEWPORT_AXIAL),
+        sample_limit=5,
     )
 
     assert first is not None
@@ -549,6 +551,40 @@ def test_mpr_segmentation_overlay_samples_are_capped_with_stable_sampling(monkey
     assert first.regions[0].samples.total_count == 25
     assert first.regions[0].samples.sampled_count == 5
     assert first.regions[0].samples.points == second.regions[0].samples.points
+
+
+def test_mpr_segmentation_preview_overlay_includes_limited_samples() -> None:
+    source_pixels = np.arange(100, dtype=np.float32).reshape(10, 10)
+    state = MprSegmentationState(
+        enabled=True,
+        threshold_regions=[_region("r1", threshold_hu=-1000.0, width_mm=10.0, height_mm=10.0)],
+    )
+
+    overlay = ViewerService._build_mpr_segmentation_overlay_payload(
+        source_pixels,
+        state,
+        MPR_VIEWPORT_AXIAL,
+        PlanePose(
+            viewport=MPR_VIEWPORT_AXIAL,
+            center_world=np.asarray((0.0, 4.5, 4.5), dtype=np.float64),
+            cursor_center_world=np.asarray((0.0, 4.5, 4.5), dtype=np.float64),
+            row_world=np.asarray((0.0, 1.0, 0.0), dtype=np.float64),
+            col_world=np.asarray((0.0, 0.0, 1.0), dtype=np.float64),
+            normal_world=np.asarray((1.0, 0.0, 0.0), dtype=np.float64),
+            pixel_spacing_row_mm=1.0,
+            pixel_spacing_col_mm=1.0,
+            output_shape=(10, 10),
+            is_oblique=False,
+        ),
+        include_samples=True,
+        sample_limit=7,
+    )
+
+    assert overlay is not None
+    samples = overlay.regions[0].samples
+    assert samples is not None
+    assert samples.total_count == 64
+    assert samples.sampled_count == 7
 
 
 def test_mpr_voi_sphere_projection_reports_intersection_and_dashed_projection_state() -> None:
@@ -787,6 +823,49 @@ def test_mpr_segmentation_move_does_not_refresh_stats(monkeypatch) -> None:
     assert service._handle_mpr_segmentation_config(view, payload, refresh_stats=False) is True
 
     assert calls["count"] == 0
+
+
+def test_mpr_segmentation_move_schedules_current_view_preview_with_samples_metadata() -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id=series.series_id)
+    view = ViewRecord(view_id="v-ax", series_id=series.series_id, view_type="MPR", view_group=group)
+    payload = ViewOperationRequest(
+        viewId=view.view_id,
+        opType="mprSegmentation",
+        actionType="move",
+        mprSegmentationConfig={
+            "enabled": True,
+            "selectedRegionId": "r1",
+            "thresholdRegions": [
+                {
+                    "id": "r1",
+                    "enabled": True,
+                    "label": "1",
+                    "thresholdHu": 350,
+                    "color": "#ff4df8",
+                    "box": {
+                        "centerWorld": [0, 1, 1],
+                        "rowWorld": [0, 1, 0],
+                        "colWorld": [0, 0, 1],
+                        "normalWorld": [1, 0, 0],
+                        "widthMm": 12,
+                        "heightMm": 8,
+                        "depthMm": 2,
+                        "sourceViewport": MPR_VIEWPORT_AXIAL,
+                    },
+                }
+            ],
+        },
+    )
+
+    outcome = _handle_mpr_segmentation_operation(service, view, series, payload, True)
+
+    assert outcome.mode == "single"
+    assert outcome.fast_preview is True
+    assert outcome.fast_preview_full_resolution is True
+    assert outcome.defer_single is True
+    assert outcome.metadata_mode == "mpr-segmentation-preview"
 
 
 def test_legacy_mpr_segmentation_operation_input_sets_legacy_state(monkeypatch) -> None:

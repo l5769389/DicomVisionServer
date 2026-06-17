@@ -20,6 +20,7 @@ VIEW_OP_TYPE_MPR_OBLIQUE: Final = "mprOblique"
 VIEW_OP_TYPE_MPR_CROSSHAIR_MODE: Final = "mprCrosshairMode"
 VIEW_OP_TYPE_MPR_STATE_SYNC: Final = "mprStateSync"
 VIEW_OP_TYPE_MEASUREMENT: Final = "measurement"
+VIEW_OP_TYPE_ANNOTATION: Final = "annotation"
 VIEW_OP_TYPE_FUSION_REGISTRATION: Final = "fusionRegistration"
 VIEW_OP_TYPE_FUSION_CONFIG: Final = "fusionConfig"
 VIEW_OP_TYPE_PET_CONFIG: Final = "petConfig"
@@ -42,6 +43,8 @@ ZOOM_MIN_3D: Final = 0.65
 ZOOM_MAX_3D: Final = 2.35
 WINDOW_WIDTH_MIN: Final = 1.0
 WINDOW_DRAG_SENSITIVITY: Final = 2.0
+WINDOW_DRAG_REFERENCE_WIDTH: Final = 400.0
+WINDOW_DRAG_MIN_SENSITIVITY: Final = 0.01
 
 MPR_VIEWPORT_AXIAL: Final = "mpr-ax"
 MPR_VIEWPORT_CORONAL: Final = "mpr-cor"

@@ -1664,8 +1664,9 @@ def test_fusion_registration_move_broadcasts_overlay_and_pet_axial_backend_previ
     assert move.metadata_mode == "fusion-registration-layer-preview"
     assert move.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
     assert end.mode == "broadcast"
-    assert end.fast_preview is False
-    assert end.broadcast_viewports is None
+    assert end.fast_preview is True
+    assert end.metadata_mode == "fusion-registration-layer-preview"
+    assert end.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
 
 
 def test_fusion_registration_end_applies_final_delta_without_move() -> None:
@@ -1905,6 +1906,12 @@ def test_fusion_registration_rotate_prefers_explicit_delta_for_move_and_end() ->
             opType="fusionRegistration",
             actionType="move",
             subOpType="rotate",
+            anchorX=150,
+            anchorY=100,
+            currentX=100,
+            currentY=150,
+            pivotX=100,
+            pivotY=100,
             rotationDeltaDegrees=32.5,
         ),
     )
@@ -1918,6 +1925,12 @@ def test_fusion_registration_rotate_prefers_explicit_delta_for_move_and_end() ->
             opType="fusionRegistration",
             actionType="end",
             subOpType="rotate",
+            anchorX=150,
+            anchorY=100,
+            currentX=100,
+            currentY=150,
+            pivotX=100,
+            pivotY=100,
             rotationDeltaDegrees=32.5,
         ),
     )
@@ -2030,7 +2043,7 @@ def test_fusion_registration_rotate_around_non_center_pivot_updates_translation(
     assert group.crosshair_drag_origin_center is None
 
 
-def test_fusion_registration_rotate_uses_pet_layer_center_canvas_mapping(monkeypatch) -> None:
+def test_fusion_registration_rotate_uses_frontend_pivot_not_pet_layer_center(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -2109,6 +2122,7 @@ def test_fusion_registration_rotate_uses_pet_layer_center_canvas_mapping(monkeyp
             col_mm_from_canvas=(2.0, 0.0, -200.0),
             row_mm_from_canvas=(0.0, 2.0, -200.0),
         ),
+        pet_center_canvas=(100.0, 100.0),
     )
 
     service._handle_fusion_registration(
@@ -2125,8 +2139,68 @@ def test_fusion_registration_rotate_uses_pet_layer_center_canvas_mapping(monkeyp
     )
 
     assert group.fusion_registration.rotation_degrees == pytest.approx(105.0)
-    assert group.fusion_registration.translate_col_mm == pytest.approx(-8.0)
-    assert group.fusion_registration.translate_row_mm == pytest.approx(-3.0)
+    assert group.fusion_registration.translate_col_mm == pytest.approx(92.0)
+    assert group.fusion_registration.translate_row_mm == pytest.approx(-103.0)
+    assert group.crosshair_drag_origin_center is None
+
+
+def test_fusion_registration_end_updates_preview_drag_for_final_layer() -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    view = ViewRecord(
+        view_id="overlay",
+        series_id="ct",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=200,
+        height=200,
+    )
+
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="start",
+            subOpType="translate",
+            x=0,
+            y=0,
+            pivotX=100,
+            pivotY=100,
+        ),
+    )
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="move",
+            subOpType="translate",
+            x=4,
+            y=2,
+            pivotX=100,
+            pivotY=100,
+        ),
+    )
+    service._handle_fusion_registration(
+        view,
+        ViewOperationRequest(
+            viewId="overlay",
+            opType="fusionRegistration",
+            actionType="end",
+            subOpType="translate",
+            x=12,
+            y=6,
+            pivotX=100,
+            pivotY=100,
+        ),
+    )
+
+    preview_drag = service._fusion_registration_preview_drags[group.group_id]
+    assert preview_drag.sub_op_type == "translate"
+    assert preview_drag.delta_x == pytest.approx(12.0)
+    assert preview_drag.delta_y == pytest.approx(6.0)
     assert group.crosshair_drag_origin_center is None
 
 

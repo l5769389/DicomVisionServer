@@ -273,9 +273,18 @@ async def _dispatch_operation_result(
     if result.draft_measurement is not None:
         await server.emit("measurement_draft", result.draft_measurement, to=sid)
     if result.primary_result is not None:
+        primary_request = view_socket_hub.make_render_request(
+            result.primary_result.meta.view_id,
+            image_format=result.primary_image_format,
+            fast_preview=result.primary_fast_preview,
+            fast_preview_full_resolution=result.primary_fast_preview_full_resolution,
+            metadata_mode=result.primary_metadata_mode,
+            mpr_revision=result.mpr_revision,
+        )
+        primary_payload = view_socket_hub.build_image_update_payload(result.primary_result.meta, primary_request)
         await server.emit(
             "image_update",
-            (result.primary_result.meta.model_dump(by_alias=True), result.primary_result.image_bytes),
+            (primary_payload, result.primary_result.image_bytes),
             to=sid,
         )
     is_mpr_view = view.view_type in MPR_VIEW_TYPES

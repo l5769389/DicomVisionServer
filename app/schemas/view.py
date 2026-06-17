@@ -22,7 +22,7 @@ ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 FusionRegistrationExportMode = Literal["newDicom", "br"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "fusionRegistration", "fusionConfig", "petConfig"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "annotation", "fusionRegistration", "fusionConfig", "petConfig"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -608,6 +608,7 @@ class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="Server-side view ID that receives the interaction.")
     op_type: ViewOperationType = Field(alias="opType", description="Interaction type such as scroll, window, crosshair, or measurement.")
     measurement_id: str | None = Field(default=None, alias="measurementId")
+    annotation_id: str | None = Field(default=None, alias="annotationId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")
     sub_op_type: str | None = Field(default=None, alias="subOpType")
     action_type: ViewActionType | None = Field(default=None, alias="actionType")
@@ -639,6 +640,10 @@ class ViewOperationRequest(BaseModel):
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
     mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")
+    tool_type: str | None = Field(default=None, alias="toolType")
+    text: str | None = None
+    color: str | None = None
+    size: str | None = None
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
