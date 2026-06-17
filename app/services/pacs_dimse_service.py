@@ -1,20 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path
 import re
 from typing import Any
 
 from pydicom.dataset import Dataset
 from pydicom.multival import MultiValue
-from pynetdicom import AE, StoragePresentationContexts, build_role, evt
-from pynetdicom.sop_class import (
-    PatientRootQueryRetrieveInformationModelFind,
-    PatientRootQueryRetrieveInformationModelGet,
-    StudyRootQueryRetrieveInformationModelFind,
-    StudyRootQueryRetrieveInformationModelGet,
-    Verification,
-)
 
 from app.schemas.pacs import (
     PacsDimseProfile,
@@ -33,6 +26,30 @@ DIMSE_SUCCESS_STATUS = 0x0000
 DIMSE_WARNING_STATUSES = {0xB000, 0xB006, 0xB007}
 
 
+@lru_cache(maxsize=1)
+def _load_pynetdicom_symbols() -> dict[str, Any]:
+    from pynetdicom import AE, StoragePresentationContexts, build_role, evt
+    from pynetdicom.sop_class import (
+        PatientRootQueryRetrieveInformationModelFind,
+        PatientRootQueryRetrieveInformationModelGet,
+        StudyRootQueryRetrieveInformationModelFind,
+        StudyRootQueryRetrieveInformationModelGet,
+        Verification,
+    )
+
+    return {
+        "AE": AE,
+        "StoragePresentationContexts": StoragePresentationContexts,
+        "build_role": build_role,
+        "evt": evt,
+        "PatientRootQueryRetrieveInformationModelFind": PatientRootQueryRetrieveInformationModelFind,
+        "PatientRootQueryRetrieveInformationModelGet": PatientRootQueryRetrieveInformationModelGet,
+        "StudyRootQueryRetrieveInformationModelFind": StudyRootQueryRetrieveInformationModelFind,
+        "StudyRootQueryRetrieveInformationModelGet": StudyRootQueryRetrieveInformationModelGet,
+        "Verification": Verification,
+    }
+
+
 class PacsDimseError(RuntimeError):
     pass
 
@@ -43,7 +60,7 @@ class PacsDimseService:
 
     def test_connection(self, profile: PacsDimseProfile) -> PacsDicomwebTestResponse:
         try:
-            association = self._associate(profile, [Verification])
+            association = self._associate(profile, [_load_pynetdicom_symbols()["Verification"]])
             if not association.is_established:
                 return PacsDicomwebTestResponse(ok=False, statusCode=None, message="DIMSE association was rejected or timed out.")
 
@@ -107,12 +124,14 @@ class PacsDimseService:
                 progress_callback(received_count, expected_total)
             return 0x0000
 
-        ext_neg = [build_role(cx.abstract_syntax, scp_role=True) for cx in StoragePresentationContexts]
+        pynetdicom_symbols = _load_pynetdicom_symbols()
+        storage_presentation_contexts = pynetdicom_symbols["StoragePresentationContexts"]
+        ext_neg = [pynetdicom_symbols["build_role"](cx.abstract_syntax, scp_role=True) for cx in storage_presentation_contexts]
         association = self._associate(
             profile,
-            [context, *(cx.abstract_syntax for cx in StoragePresentationContexts)],
+            [context, *(cx.abstract_syntax for cx in storage_presentation_contexts)],
             ext_neg=ext_neg,
-            evt_handlers=[(evt.EVT_C_STORE, handle_store)],
+            evt_handlers=[(pynetdicom_symbols["evt"].EVT_C_STORE, handle_store)],
         )
         if not association.is_established:
             raise PacsDimseError("DIMSE association was rejected or timed out.")
@@ -203,20 +222,22 @@ class PacsDimseService:
             raise PacsDimseError(f"DIMSE association failed: {exc}") from exc
 
     @staticmethod
-    def _create_ae(client_ae_title: str) -> AE:
-        return AE(ae_title=client_ae_title)
+    def _create_ae(client_ae_title: str) -> Any:
+        return _load_pynetdicom_symbols()["AE"](ae_title=client_ae_title)
 
     @staticmethod
     def _query_model_context(profile: PacsDimseProfile) -> Any:
+        pynetdicom_symbols = _load_pynetdicom_symbols()
         if profile.query_model == "patient-root":
-            return PatientRootQueryRetrieveInformationModelFind
-        return StudyRootQueryRetrieveInformationModelFind
+            return pynetdicom_symbols["PatientRootQueryRetrieveInformationModelFind"]
+        return pynetdicom_symbols["StudyRootQueryRetrieveInformationModelFind"]
 
     @staticmethod
     def _query_model_get_context(profile: PacsDimseProfile) -> Any:
+        pynetdicom_symbols = _load_pynetdicom_symbols()
         if profile.query_model == "patient-root":
-            return PatientRootQueryRetrieveInformationModelGet
-        return StudyRootQueryRetrieveInformationModelGet
+            return pynetdicom_symbols["PatientRootQueryRetrieveInformationModelGet"]
+        return pynetdicom_symbols["StudyRootQueryRetrieveInformationModelGet"]
 
     @staticmethod
     def _store_c_get_dataset(event: Any, output_dir: Path, index: int) -> Path:

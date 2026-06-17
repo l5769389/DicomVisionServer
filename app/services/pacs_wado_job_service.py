@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import shutil
 import tempfile
 import threading
+from time import monotonic
 from typing import Literal
 from urllib.parse import quote
 from uuid import uuid4
@@ -76,17 +77,20 @@ class PacsWadoDownloadJobService:
         )
         self._cleanup_stop_event = threading.Event()
         self._cleanup_thread: threading.Thread | None = None
+        self._cleanup_schedule_lock = threading.Lock()
+        self._cleanup_future: Future[None] | None = None
+        self._last_cleanup_started_at = 0.0
         self._cache_root.mkdir(parents=True, exist_ok=True)
-        self.cleanup_cache()
         if start_cleanup_worker:
             self._start_cleanup_worker()
+        self._schedule_cache_cleanup(force=True)
 
     def create_job(
         self,
         payload: PacsWadoSeriesDownloadRequest,
         workspace_id: str = DEFAULT_WORKSPACE_ID,
     ) -> PacsWadoSeriesDownloadJobStatusResponse:
-        self.cleanup_cache()
+        self._schedule_cache_cleanup()
         job_id = uuid4().hex
         normalized_workspace_id = normalize_workspace_id(workspace_id)
         job = PacsWadoDownloadJob(
@@ -141,6 +145,8 @@ class PacsWadoDownloadJobService:
             self._jobs.clear()
 
     def cleanup_cache(self) -> None:
+        with self._cleanup_schedule_lock:
+            self._last_cleanup_started_at = monotonic()
         self._prune_expired_jobs()
         self._delete_stale_cache_dirs()
 
@@ -367,6 +373,16 @@ class PacsWadoDownloadJobService:
     def _cleanup_loop(self) -> None:
         while not self._cleanup_stop_event.wait(self._cleanup_interval_seconds):
             self.cleanup_cache()
+
+    def _schedule_cache_cleanup(self, *, force: bool = False) -> None:
+        now = monotonic()
+        with self._cleanup_schedule_lock:
+            if self._cleanup_future is not None and not self._cleanup_future.done():
+                return
+            if not force and now - self._last_cleanup_started_at < self._cleanup_interval_seconds:
+                return
+            self._last_cleanup_started_at = now
+            self._cleanup_future = self._executor.submit(self.cleanup_cache)
 
     def _get_job_locked(self, job_id: str, workspace_id: str | None = None) -> PacsWadoDownloadJob | None:
         job = self._jobs.get(job_id)
