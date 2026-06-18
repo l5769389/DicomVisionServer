@@ -212,6 +212,7 @@ FUSION_PET_UNIT_SUL = "SUL"
 FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
 MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT = 120_000
 FUSION_PET_STANDALONE_BACKGROUND_CVAL = 255.0
+PET_STANDALONE_PSEUDOCOLOR_PRESET = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
 MPR_SEGMENTATION_OVERLAY_PREVIEW_SAMPLE_LIMIT = 12_000
 FUSION_PET_UNIT_LABELS: dict[str, str] = {
     FUSION_PET_UNIT_SOURCE: "source",
@@ -2069,10 +2070,9 @@ class ViewerService:
         view.rotation_degrees = 0
         view.hor_flip = False
         view.ver_flip = False
-        view.pseudocolor_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
-        pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
-        view.window_width = pet_ww
-        view.window_center = pet_wl
+        view.pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        view.window_width = FUSION_DEFAULT_SUV_WINDOW_MAX - FUSION_DEFAULT_SUV_WINDOW_MIN
+        view.window_center = (FUSION_DEFAULT_SUV_WINDOW_MAX + FUSION_DEFAULT_SUV_WINDOW_MIN) / 2.0
         self._reset_drag_state(view)
         logger.info(
             "PET viewport initialized view_id=%s volume=%s unit=%s zoom=%.4f ww=%s wl=%s",
@@ -2417,6 +2417,44 @@ class ViewerService:
         if not np.isfinite(high) or high <= low:
             high = low + 1.0
         return (max(WINDOW_WIDTH_MIN, high - low), (high + low) / 2.0)
+
+    @staticmethod
+    def _prepare_pet_standalone_source_pixels(
+        source_pixels: np.ndarray,
+        window_width: float | None,
+        window_center: float | None,
+    ) -> np.ndarray:
+        low = ViewerService._resolve_window_min(window_width, window_center)
+        high = ViewerService._resolve_window_max(window_width, window_center)
+        if low is None or high is None or not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            return source_pixels
+
+        pixels = np.asarray(source_pixels, dtype=np.float32)
+        if pixels.ndim < 2 or pixels.size == 0:
+            return pixels
+
+        edge_pixels = np.concatenate(
+            (
+                pixels[0, :].ravel(),
+                pixels[-1, :].ravel(),
+                pixels[:, 0].ravel(),
+                pixels[:, -1].ravel(),
+            )
+        )
+        edge_pixels = edge_pixels[np.isfinite(edge_pixels)]
+        if edge_pixels.size == 0:
+            return pixels
+
+        window_span = float(high) - float(low)
+        edge_threshold = float(np.nanpercentile(edge_pixels, 75.0))
+        threshold = min(edge_threshold, float(low) + window_span * 0.35)
+        if not np.isfinite(threshold) or threshold <= float(low):
+            return pixels
+
+        background_value = float(low) - max(1.0, window_span * 0.02)
+        prepared = pixels.copy()
+        prepared[prepared <= threshold] = background_value
+        return prepared
 
     def _derive_default_window_for_volume(self, series: SeriesRecord, volume: np.ndarray) -> tuple[float, float]:
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
@@ -2909,6 +2947,8 @@ class ViewerService:
             self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_pet_viewport(view)
             view.is_initialized = True
+        if view.pseudocolor_preset != PET_STANDALONE_PSEUDOCOLOR_PRESET:
+            view.pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
 
         pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
         view.pet_unit = pet_display.unit
@@ -2918,7 +2958,11 @@ class ViewerService:
         if instance is None or cached is None:
             raise HTTPException(status_code=400, detail="PET series does not contain renderable DICOM instances")
 
-        source_pixels = np.asarray(pet_display.volume[view.current_index], dtype=np.float32)
+        source_pixels = self._prepare_pet_standalone_source_pixels(
+            np.asarray(pet_display.volume[view.current_index], dtype=np.float32),
+            view.window_width,
+            view.window_center,
+        )
         pixel_min = float(np.nanmin(source_pixels)) if source_pixels.size else 0.0
         pixel_max = float(np.nanmax(source_pixels)) if source_pixels.size else 1.0
         if not np.isfinite(pixel_min):
@@ -2971,6 +3015,7 @@ class ViewerService:
             measurements=visible_measurements,
             corner_info=None,
             orientation=None,
+            background_cval=FUSION_PET_STANDALONE_BACKGROUND_CVAL,
         )
         visible_presentation_measurements = (
             self._build_visible_presentation_measurements(series, instance)
@@ -4551,17 +4596,24 @@ class ViewerService:
 
     def _render_cached_fast_base_image(self, context: RenderContext, *, order: int = 1) -> Image.Image:
         base_pixels = self._get_cached_fast_base_pixels(context)
+        if context.view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
+            transformed_color = viewport_transformer.apply_affine_array(
+                apply_pseudocolor(base_pixels, context.view.pseudocolor_preset),
+                context.view.width or 0,
+                context.view.height or 0,
+                context.image_transform,
+                order=order,
+                cval=context.background_cval,
+            )
+            return Image.fromarray(transformed_color)
         transformed = viewport_transformer.apply_affine_array(
             base_pixels,
             context.view.width or 0,
             context.view.height or 0,
             context.image_transform,
             order=order,
-            cval=0.0,
+            cval=context.background_cval,
         )
-        if context.view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
-            transformed = apply_pseudocolor(transformed, context.view.pseudocolor_preset)
-            return Image.fromarray(transformed)
         return Image.fromarray(transformed)
 
     def _get_cached_fast_base_pixels(self, context: RenderContext) -> np.ndarray:
@@ -6998,6 +7050,10 @@ class ViewerService:
         if not self._is_pet_view_type(view.view_type):
             return False
         changed = False
+        next_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        if view.pseudocolor_preset != next_preset:
+            view.pseudocolor_preset = next_preset
+            changed = True
         if payload.pet_unit is not None:
             next_unit = self._normalize_fusion_pet_unit(payload.pet_unit)
             if view.pet_unit != next_unit:
