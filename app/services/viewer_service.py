@@ -186,6 +186,7 @@ from app.services.viewer_fusion import (
     FUSION_VIEW_TYPES,
     FUSION_VIEW_TYPE_TO_PANE_ROLE,
     FusionSourceProjection,
+    build_fusion_axial_display_plane,
     build_ct_axial_plane,
     image_from_pixels,
     render_fusion_pixels,
@@ -447,11 +448,22 @@ class ViewerService:
         view = view_registry.get(payload.view_id, workspace_id=workspace_id)
         previous_width = view.width
         previous_height = view.height
+        size_changed = previous_width != payload.size.width or previous_height != payload.size.height
+        should_refit_fusion = (
+            self._is_fusion_view_type(view.view_type)
+            and view.is_initialized
+            and size_changed
+            and self._is_fusion_view_at_auto_fit_size(
+                view,
+                canvas_width=previous_width,
+                canvas_height=previous_height,
+            )
+        )
         view.width = payload.size.width
         view.height = payload.size.height
         if (
             self._is_fusion_view_type(view.view_type)
-            and (previous_width != view.width or previous_height != view.height)
+            and size_changed
         ):
             self._clear_fusion_registration_overlay_frame_locks(view.view_group)
         logger.info(
@@ -470,6 +482,8 @@ class ViewerService:
             elif not (self._is_mpr_view_type(view.view_type) or self._is_3d_view_type(view.view_type)):
                 self._initialize_viewport(view)
                 view.is_initialized = True
+        elif should_refit_fusion:
+            self._fit_initialized_fusion_view_to_source(view)
 
         return OperationAcceptedResponse(message="View size updated", viewId=view.view_id)
 
@@ -2508,42 +2522,40 @@ class ViewerService:
         *,
         width_mm: float,
         height_mm: float,
+        canvas_width: int | None = None,
+        canvas_height: int | None = None,
     ) -> float:
         width = max(float(width_mm), 1e-6)
         height = max(float(height_mm), 1e-6)
         return viewport_transformer.calculate_contain_zoom(
             image_width=1,
             image_height=1,
-            canvas_width=view.width or 1,
-            canvas_height=view.height or 1,
+            canvas_width=canvas_width or view.width or 1,
+            canvas_height=canvas_height or view.height or 1,
             pixel_aspect_x=width,
             pixel_aspect_y=height,
         )
 
-    @staticmethod
-    def _project_volume_extent_to_plane(
+    def _build_fusion_axial_display_plane_for_view(
+        self,
+        view: ViewRecord,
         *,
-        volume_shape: tuple[int, int, int],
-        geometry: VolumeGeometry,
-        plane: PlanePose,
-    ) -> tuple[float, float]:
-        row_world = np.asarray(plane.row_world, dtype=np.float64)
-        col_world = np.asarray(plane.col_world, dtype=np.float64)
-        center_world = np.asarray(plane.center_world, dtype=np.float64)
-        row_values: list[float] = []
-        col_values: list[float] = []
-        bounds = [(-0.5, float(size) - 0.5) for size in volume_shape]
-        for i_value in bounds[0]:
-            for j_value in bounds[1]:
-                for k_value in bounds[2]:
-                    voxel = np.asarray([i_value, j_value, k_value, 1.0], dtype=np.float64)
-                    world = np.asarray(geometry.ijk_to_world @ voxel, dtype=np.float64)[:3]
-                    delta = world - center_world
-                    row_values.append(float(np.dot(delta, row_world)))
-                    col_values.append(float(np.dot(delta, col_world)))
-        width_mm = max(max(col_values) - min(col_values), 1e-6)
-        height_mm = max(max(row_values) - min(row_values), 1e-6)
-        return width_mm, height_mm
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+    ) -> PlanePose:
+        group = view.view_group
+        axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
+        registration = group.fusion_registration if group is not None else FusionRegistrationState()
+        return build_fusion_axial_display_plane(
+            ct_geometry=ct_geometry,
+            ct_shape=tuple(int(value) for value in ct_volume.shape),
+            pet_geometry=pet_geometry,
+            pet_shape=tuple(int(value) for value in pet_volume.shape),
+            axial_index=axial_index,
+            registration=registration,
+        )
 
     def _calculate_fusion_axial_shared_fit_zoom(
         self,
@@ -2553,22 +2565,111 @@ class ViewerService:
         ct_geometry: VolumeGeometry,
         pet_volume: np.ndarray,
         pet_geometry: VolumeGeometry,
+        canvas_width: int | None = None,
+        canvas_height: int | None = None,
     ) -> float:
-        group = view.view_group
-        axial_index = group.fusion_axial_index if group is not None else int(ct_volume.shape[0]) // 2
-        plane = build_ct_axial_plane(ct_geometry, ct_volume.shape, axial_index)
-        ct_width_mm = max(float(plane.output_shape[1]) * float(plane.pixel_spacing_col_mm), 1e-6)
-        ct_height_mm = max(float(plane.output_shape[0]) * float(plane.pixel_spacing_row_mm), 1e-6)
-        pet_width_mm, pet_height_mm = self._project_volume_extent_to_plane(
-            volume_shape=tuple(int(value) for value in pet_volume.shape),
-            geometry=pet_geometry,
-            plane=plane,
+        plane = self._build_fusion_axial_display_plane_for_view(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
         )
         return self._calculate_fusion_physical_contain_zoom(
             view,
-            width_mm=max(ct_width_mm, pet_width_mm),
-            height_mm=max(ct_height_mm, pet_height_mm),
+            width_mm=max(float(plane.output_shape[1]) * float(plane.pixel_spacing_col_mm), 1e-6),
+            height_mm=max(float(plane.output_shape[0]) * float(plane.pixel_spacing_row_mm), 1e-6),
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
         )
+
+    def _calculate_fusion_fit_zoom_for_size(
+        self,
+        view: ViewRecord,
+        *,
+        ct_volume: np.ndarray,
+        ct_geometry: VolumeGeometry,
+        pet_volume: np.ndarray,
+        pet_geometry: VolumeGeometry,
+        canvas_width: int | None = None,
+        canvas_height: int | None = None,
+    ) -> float:
+        if self._resolve_fusion_pane_role(view) != FUSION_PANE_PET_CORONAL_MIP:
+            return self._calculate_fusion_axial_shared_fit_zoom(
+                view,
+                ct_volume=ct_volume,
+                ct_geometry=ct_geometry,
+                pet_volume=pet_volume,
+                pet_geometry=pet_geometry,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
+
+        image_height, image_width, spacing_xy = self._get_fusion_source_shape_and_spacing(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+        )
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
+        return viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=canvas_width or view.width or image_width,
+            canvas_height=canvas_height or view.height or image_height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+
+    def _is_fusion_view_at_auto_fit_size(
+        self,
+        view: ViewRecord,
+        *,
+        canvas_width: int | None,
+        canvas_height: int | None,
+    ) -> bool:
+        if not canvas_width or not canvas_height:
+            return False
+        if (
+            abs(float(view.offset_x)) > 1e-6
+            or abs(float(view.offset_y)) > 1e-6
+            or int(view.rotation_degrees) != 0
+            or bool(view.hor_flip)
+            or bool(view.ver_flip)
+        ):
+            return False
+        _group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        pet_volume = self._get_series_volume(pet_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
+        expected_zoom = self._calculate_fusion_fit_zoom_for_size(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
+        tolerance = max(1e-3, abs(float(expected_zoom)) * 1e-3)
+        return abs(float(view.zoom) - float(expected_zoom)) <= tolerance
+
+    def _fit_initialized_fusion_view_to_source(self, view: ViewRecord) -> None:
+        _group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        pet_volume = self._get_series_volume(pet_series)
+        ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
+        pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
+        self._fit_fusion_view_to_source(
+            view,
+            ct_volume=ct_volume,
+            ct_geometry=ct_geometry,
+            pet_volume=pet_volume,
+            pet_geometry=pet_geometry,
+        )
+        self._sync_fusion_view_state_from_group(view)
 
     def _fit_fusion_view_to_source(
         self,

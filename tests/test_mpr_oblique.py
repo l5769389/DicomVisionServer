@@ -108,6 +108,9 @@ def test_png_encoding_always_uses_low_compression_without_changing_format(monkey
 def test_view_transform_payload_reports_clamped_zoom() -> None:
     view = ViewRecord(view_id="v", series_id="s", view_type="Stack")
 
+    assert ZOOM_MIN == pytest.approx(0.1)
+    assert ZOOM_MAX == pytest.approx(10.0)
+
     view.zoom = ZOOM_MAX * 4
     payload = ViewerService._build_view_transform_payload(view)
     assert payload.zoom == ZOOM_MAX

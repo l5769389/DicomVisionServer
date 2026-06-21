@@ -215,7 +215,7 @@ def test_pet_axial_view_tracks_manual_registration_transform_with_pet_display() 
     assert after.pseudocolor_preset == "bwinverse"
 
 
-def test_pet_axial_view_keeps_fixed_canvas_when_registration_moves_pet() -> None:
+def test_pet_axial_view_expands_canvas_when_registration_moves_pet() -> None:
     before = _render(FUSION_PANE_PET_AXIAL)
     after = _render(
         FUSION_PANE_PET_AXIAL,
@@ -225,7 +225,8 @@ def test_pet_axial_view_keeps_fixed_canvas_when_registration_moves_pet() -> None
         ),
     )
 
-    assert before.pixels.shape == after.pixels.shape
+    assert after.pixels.shape[0] > before.pixels.shape[0]
+    assert after.pixels.shape[1] > before.pixels.shape[1]
 
 
 def test_fusion_overlay_returns_ct_base_and_transparent_pet_layer() -> None:
@@ -870,7 +871,7 @@ def test_fusion_registration_end_expands_overlay_frame_after_large_translate(mon
     assert set(final.extra_image_bytes) == {"pet"}
 
 
-def test_pet_axial_registration_outside_volume_uses_constant_background() -> None:
+def test_pet_axial_registration_expands_canvas_and_keeps_background() -> None:
     ct_volume = np.zeros((5, 6, 7), dtype=np.float32)
     pet_volume = np.zeros_like(ct_volume)
     pet_volume[:, :, 0] = 100.0
@@ -894,7 +895,9 @@ def test_pet_axial_registration_outside_volume_uses_constant_background() -> Non
         pet_has_patient_geometry=True,
     )
 
-    assert int(np.min(result.pixels)) >= 250
+    assert result.pixels.shape[1] > ct_volume.shape[2]
+    assert np.any(np.all(result.pixels >= 250, axis=-1))
+    assert int(np.min(result.pixels)) < 10
 
 
 def test_fusion_overlay_expands_source_plane_to_avoid_registered_pet_crop() -> None:
@@ -1264,7 +1267,131 @@ def test_fusion_axial_initial_fit_uses_shared_ct_pet_physical_extent(view_type: 
         pet_geometry=pet_geometry,
     )
 
-    assert view.zoom == pytest.approx(3.0)
+    assert view.zoom == pytest.approx(2.0)
+
+
+def test_fusion_axial_panes_share_expanded_registered_pet_canvas() -> None:
+    ct_volume = np.full((5, 8, 8), 40.0, dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    pet_volume[:, 2:6, 2:6] = 12.0
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+    registration = FusionRegistrationState(translate_col_mm=12.0)
+
+    shapes = {}
+    for role in (FUSION_PANE_CT_AXIAL, FUSION_PANE_PET_AXIAL, FUSION_PANE_OVERLAY_AXIAL):
+        result = render_fusion_pixels(
+            pane_role=role,
+            ct_volume=ct_volume,
+            ct_geometry=geometry,
+            pet_volume=pet_volume,
+            pet_geometry=geometry,
+            axial_index=2,
+            ct_window_width=400,
+            ct_window_center=40,
+            pet_window_width=8,
+            pet_window_center=4,
+            pet_pseudocolor_preset="petct-rainbow",
+            registration=registration,
+            alpha=0.52,
+            ct_has_patient_geometry=True,
+            pet_has_patient_geometry=True,
+        )
+        shapes[role] = result.pixels.shape[:2]
+
+    assert len(set(shapes.values())) == 1
+    assert shapes[FUSION_PANE_CT_AXIAL][1] > ct_volume.shape[2]
+
+
+def test_fusion_set_size_refits_only_while_at_auto_fit(monkeypatch) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    group.fusion_initialized = True
+    group.fusion_axial_index = 2
+    ct_series = SeriesRecord(
+        series_id="ct",
+        folder_path="",
+        series_instance_uid="ct-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="CT",
+        series_description="CT",
+    )
+    pet_series = SeriesRecord(
+        series_id="pet",
+        folder_path="",
+        series_instance_uid="pet-uid",
+        study_instance_uid="study",
+        patient_id=None,
+        patient_name=None,
+        study_date=None,
+        study_description=None,
+        accession_number=None,
+        modality="PT",
+        series_description="PET",
+    )
+    ct_volume = np.full((5, 100, 100), 40.0, dtype=np.float32)
+    pet_volume = np.zeros_like(ct_volume)
+    geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
+    view = ViewRecord(
+        view_id="fusion-overlay",
+        series_id="ct",
+        secondary_series_id="pet",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=100,
+        height=200,
+    )
+    view.is_initialized = True
+
+    monkeypatch.setattr("app.services.viewer_service.view_registry.get", lambda *_args, **_kwargs: view)
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda _view: (group, ct_series, pet_series))
+    monkeypatch.setattr(
+        service,
+        "_get_series_volume",
+        lambda series, **_: ct_volume if series.series_id == "ct" else pet_volume,
+    )
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda _series, _shape: geometry)
+
+    service._fit_fusion_view_to_source(
+        view,
+        ct_volume=ct_volume,
+        ct_geometry=geometry,
+        pet_volume=pet_volume,
+        pet_geometry=geometry,
+    )
+    old_zoom = view.zoom
+
+    service.set_view_size(
+        ViewSetSizeRequest(
+            viewId="fusion-overlay",
+            opType="setSize",
+            size=ViewSize(width=200, height=200),
+        )
+    )
+
+    assert view.zoom > old_zoom
+    assert view.offset_x == 0.0
+    assert view.offset_y == 0.0
+
+    refit_zoom = view.zoom
+    view.offset_x = 11.0
+    service.set_view_size(
+        ViewSetSizeRequest(
+            viewId="fusion-overlay",
+            opType="setSize",
+            size=ViewSize(width=300, height=200),
+        )
+    )
+
+    assert view.zoom == refit_zoom
+    assert view.offset_x == 11.0
 
 
 @pytest.mark.parametrize(

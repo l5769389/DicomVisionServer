@@ -334,6 +334,26 @@ def build_fusion_overlay_plane(
     )
 
 
+def build_fusion_axial_display_plane(
+    *,
+    ct_geometry: VolumeGeometry,
+    ct_shape: tuple[int, int, int],
+    pet_geometry: VolumeGeometry,
+    pet_shape: tuple[int, int, int],
+    axial_index: int,
+    registration: FusionRegistrationState,
+) -> PlanePose:
+    base_plane = build_ct_axial_plane(ct_geometry, ct_shape, axial_index)
+    return build_fusion_overlay_plane(
+        base_plane,
+        ct_geometry=ct_geometry,
+        ct_shape=ct_shape,
+        pet_geometry=pet_geometry,
+        pet_shape=pet_shape,
+        registration=registration,
+    )
+
+
 def transform_pet_sampling_plane(plane: PlanePose, registration: FusionRegistrationState) -> PlanePose:
     angle_rad = np.deg2rad(float(registration.rotation_degrees))
     cos_angle = float(np.cos(angle_rad))
@@ -409,16 +429,16 @@ def render_fusion_pixels(
     pet_shape = tuple(int(value) for value in pet_volume.shape)
     axial_index = clamp_fusion_axial_index(axial_index, ct_shape)
     plane = build_ct_axial_plane(ct_geometry, ct_shape, axial_index)
-    if pane_role == FUSION_PANE_OVERLAY_AXIAL:
+    if pane_role in {FUSION_PANE_CT_AXIAL, FUSION_PANE_PET_AXIAL, FUSION_PANE_OVERLAY_AXIAL}:
         plane = (
             overlay_plane_override
             if overlay_plane_override is not None
-            else build_fusion_overlay_plane(
-                plane,
+            else build_fusion_axial_display_plane(
                 ct_geometry=ct_geometry,
                 ct_shape=ct_shape,
                 pet_geometry=pet_geometry,
                 pet_shape=pet_shape,
+                axial_index=axial_index,
                 registration=registration,
             )
         )
@@ -459,7 +479,7 @@ def render_fusion_pixels(
                 plane.output_shape,
                 fill_value=_window_background_value(ct_source_slice, ct_window_width, ct_window_center),
             )
-            if pane_role == FUSION_PANE_OVERLAY_AXIAL
+            if pane_role in {FUSION_PANE_CT_AXIAL, FUSION_PANE_OVERLAY_AXIAL}
             else ct_source_slice
         )
     pet_plane = (
