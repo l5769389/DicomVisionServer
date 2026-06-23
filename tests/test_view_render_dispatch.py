@@ -59,6 +59,31 @@ class _RenderServiceSpy:
         self.calls.append(("3d", view.view_id, image_format, fast_preview, None, "full"))
         return "3d-result"
 
+    def _render_pet_view(
+        self,
+        view: ViewRecord,
+        *,
+        image_format: str,
+        fast_preview: bool,
+        metadata_mode: str = "full",
+        progress_callback=None,
+    ) -> str:
+        self.calls.append(("pet", view.view_id, image_format, fast_preview, None, metadata_mode))
+        return "pet-result"
+
+    def _render_fusion_view(
+        self,
+        view: ViewRecord,
+        *,
+        image_format: str,
+        fast_preview: bool,
+        fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
+        progress_callback=None,
+    ) -> str:
+        self.calls.append(("fusion", view.view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode))
+        return "fusion-result"
+
     def _render_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, metadata_mode: str = "full") -> str:
         self.calls.append(("stack", view.view_id, image_format, fast_preview, None, metadata_mode))
         return "stack-result"
@@ -79,10 +104,23 @@ def test_render_by_view_type_dispatches_to_matching_renderer() -> None:
         == "mpr-result"
     )
     assert render_by_view_type(service, _view("3D"), image_format="png", fast_preview=False) == "3d-result"
+    assert (
+        render_by_view_type(
+            service,
+            _view("FusionOverlayAxial"),
+            image_format="png",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+        )
+        == "fusion-result"
+    )
+    assert render_by_view_type(service, _view("PET"), image_format="png", fast_preview=False) == "pet-result"
     assert render_by_view_type(service, _view("Stack"), image_format="webp", fast_preview=True) == "stack-result"
 
     assert service.calls == [
         ("mpr", "ax-view", "jpeg", True, True, "mpr-pan-zoom-preview"),
         ("3d", "3d-view", "png", False, None, "full"),
+        ("fusion", "fusionoverlayaxial-view", "png", True, True, "full"),
+        ("pet", "pet-view", "png", False, None, "full"),
         ("stack", "stack-view", "webp", True, None, "full"),
     ]

@@ -7,10 +7,12 @@ from time import perf_counter
 import socketio
 
 from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
+from app.core.logging import get_logger
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 
 MPR_PREVIEW_BATCH_MIN_INTERVAL_SECONDS = 0.0
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -21,6 +23,7 @@ class RenderRequest:
     metadata_mode: str = "full"
     target_sids: tuple[str, ...] | None = None
     mpr_revision: int | None = None
+    render_revision: int | None = None
 
 
 class ViewSocketHub:
@@ -36,6 +39,7 @@ class ViewSocketHub:
         self._last_mpr_preview_batch_started_at: dict[str, float] = {}
         self._mpr_final_preemption_tokens: dict[str, int] = {}
         self._mpr_final_preemption_revisions: dict[str, int] = {}
+        self._render_revisions: dict[str, int] = defaultdict(int)
 
     def attach_server(self, server: socketio.AsyncServer) -> None:
         self._server = server
@@ -96,7 +100,7 @@ class ViewSocketHub:
             view = view_registry.get(view_id)
         except Exception:
             return f"view:{view_id}"
-        if view.view_group is not None and str(view.view_group.group_type).lower() == "mpr":
+        if view.view_group is not None and str(view.view_group.group_type).lower() in {"mpr", "fusion"}:
             return f"mpr-group:{view.view_group.group_id}"
         return f"view:{view_id}"
 
@@ -148,6 +152,33 @@ class ViewSocketHub:
             mpr_revision=chosen.mpr_revision
             if chosen.mpr_revision is not None
             else ViewSocketHub._choose_render_mpr_revision(current.mpr_revision, incoming.mpr_revision),
+            render_revision=chosen.render_revision,
+        )
+
+    def next_render_revision(self, view_id: str) -> int:
+        self._render_revisions[view_id] += 1
+        return self._render_revisions[view_id]
+
+    def make_render_request(
+        self,
+        view_id: str,
+        *,
+        image_format: str = "png",
+        fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
+        target_sids: tuple[str, ...] | None = None,
+        mpr_revision: int | None = None,
+        render_revision: int | None = None,
+    ) -> RenderRequest:
+        return RenderRequest(
+            image_format=image_format,
+            fast_preview=fast_preview,
+            fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
+            target_sids=target_sids,
+            mpr_revision=mpr_revision,
+            render_revision=render_revision if render_revision is not None else self.next_render_revision(view_id),
         )
 
     @staticmethod
@@ -391,17 +422,50 @@ class ViewSocketHub:
                 self._preview_worker_tasks.pop(queue_key, None)
 
     @staticmethod
-    def _build_image_update_payload(result_meta, request: RenderRequest) -> dict[str, object]:
+    def _resolve_render_intent(request: RenderRequest) -> str:
+        if request.metadata_mode in {"stack-pixel-preview", "mpr-pixel-preview"}:
+            return "pixel-only"
+        if request.metadata_mode in {"stack-geometry-preview", "mpr-pan-zoom-preview", "stack-preview-lite"}:
+            return "geometry-preview"
+        if request.metadata_mode in {"mpr-segmentation-preview", "fusion-registration-layer-preview"}:
+            return "overlay-preview"
+        if request.fast_preview:
+            return "geometry-preview"
+        return "full"
+
+    @classmethod
+    def build_image_update_payload(cls, result_meta, request: RenderRequest) -> dict[str, object]:
         payload = result_meta.model_dump(by_alias=True)
-        if request.metadata_mode == "stack-preview-lite":
+        payload["fastPreview"] = bool(request.fast_preview)
+        payload["fastPreviewFullResolution"] = bool(request.fast_preview_full_resolution)
+        payload["metadataMode"] = request.metadata_mode
+        payload["renderIntent"] = cls._resolve_render_intent(request)
+        if request.render_revision is not None:
+            payload["renderRevision"] = int(request.render_revision)
+
+        if request.metadata_mode in {"stack-preview-lite", "stack-pixel-preview"}:
             payload.pop("measurements", None)
             payload.pop("annotations", None)
+        elif request.metadata_mode == "mpr-pixel-preview":
+            payload.pop("measurements", None)
+            payload.pop("annotations", None)
+            payload.pop("mprSegmentationOverlay", None)
+            payload.pop("mpr_segmentation_overlay", None)
         elif request.metadata_mode == "mpr-pan-zoom-preview":
             payload.pop("cornerInfo", None)
             payload.pop("orientation", None)
+        elif request.metadata_mode == "fusion-registration-layer-preview":
+            payload.pop("cornerInfo", None)
+            payload.pop("orientation", None)
+            payload.pop("scaleBar", None)
             payload.pop("measurements", None)
             payload.pop("annotations", None)
+            payload.pop("fusionProjection", None)
         return payload
+
+    @staticmethod
+    def _build_image_update_payload(result_meta, request: RenderRequest) -> dict[str, object]:
+        return ViewSocketHub.build_image_update_payload(result_meta, request)
 
     async def _emit_progress_message(self, view_id: str, sids: tuple[str, ...], payload: dict[str, object]) -> None:
         if self._server is None or not sids:
@@ -460,6 +524,7 @@ class ViewSocketHub:
             )
             future.add_done_callback(self._consume_progress_future)
 
+        render_started_at = perf_counter()
         result = await asyncio.to_thread(
             viewer_service.render_view_by_id,
             view_id,
@@ -469,11 +534,30 @@ class ViewSocketHub:
             metadata_mode=request.metadata_mode,
             progress_callback=progress_callback if should_emit_progress else None,
         )
+        render_ms = (perf_counter() - render_started_at) * 1000.0
         if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
             return False
-        message = (self._build_image_update_payload(result.meta, request), result.image_bytes)
+        payload = self._build_image_update_payload(result.meta, request)
+        extra_image_bytes = getattr(result, "extra_image_bytes", None) or {}
+        message = (payload, result.image_bytes, extra_image_bytes) if extra_image_bytes else (payload, result.image_bytes)
+        emit_started_at = perf_counter()
         for sid in sids:
             await self._server.emit("image_update", message, to=sid)
+        emit_ms = (perf_counter() - emit_started_at) * 1000.0
+        if request.metadata_mode == "fusion-registration-layer-preview":
+            logger.info(
+                (
+                    "fusion registration preview socket view_id=%s sids=%s render_ms=%.1f "
+                    "emit_ms=%.1f total_ms=%.1f primary_bytes=%s extra_pet_bytes=%s"
+                ),
+                view_id,
+                len(sids),
+                render_ms,
+                emit_ms,
+                (perf_counter() - render_started_at) * 1000.0,
+                len(result.image_bytes),
+                len(extra_image_bytes.get("pet", b"")) if extra_image_bytes else 0,
+            )
         if should_emit_progress:
             await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
         return True
@@ -549,6 +633,7 @@ class ViewSocketHub:
                 metadata_mode=metadata_mode,
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
+                render_revision=self.next_render_revision(view_id),
             )
 
         emitted = False
@@ -581,8 +666,10 @@ class ViewSocketHub:
                         image_format=request.image_format,
                         fast_preview=request.fast_preview,
                         fast_preview_full_resolution=request.fast_preview_full_resolution,
+                        metadata_mode=request.metadata_mode,
                         target_sids=request.target_sids,
                         mpr_revision=request.mpr_revision,
+                        render_revision=request.render_revision,
                     )
                     for view_id, request in request_batch.items()
                 )
@@ -601,6 +688,7 @@ class ViewSocketHub:
         metadata_mode: str = "full",
         target_sids: tuple[str, ...] | None = None,
         mpr_revision: int | None = None,
+        render_revision: int | None = None,
     ) -> bool:
         if self._server is None:
             return False
@@ -614,6 +702,7 @@ class ViewSocketHub:
             metadata_mode=metadata_mode,
             target_sids=target_sids,
             mpr_revision=mpr_revision,
+            render_revision=render_revision if render_revision is not None else self.next_render_revision(view_id),
         )
         if self._is_mpr_group_queue(queue_key) and self._is_final_render_request(incoming_request):
             self._mark_mpr_final_preemption(queue_key)

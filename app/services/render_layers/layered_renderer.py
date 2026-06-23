@@ -25,7 +25,7 @@ class LayeredRenderer:
             canvas_height,
             context.image_transform,
             order=1,
-            cval=0.0,
+            cval=context.background_cval,
         )
 
         base_image = self._build_base_image(transformed_base)

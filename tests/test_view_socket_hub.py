@@ -123,7 +123,21 @@ def test_fast_preview_render_skips_progress_messages(monkeypatch) -> None:
         return server.events
 
     assert asyncio.run(run()) == [
-        ("image_update", ({"viewId": "view-1", "imageFormat": "png"}, b"image"), "sid-1"),
+        (
+            "image_update",
+            (
+                {
+                    "viewId": "view-1",
+                    "imageFormat": "png",
+                    "fastPreview": True,
+                    "fastPreviewFullResolution": False,
+                    "metadataMode": "full",
+                    "renderIntent": "geometry-preview",
+                },
+                b"image",
+            ),
+            "sid-1",
+        ),
     ]
 
 
@@ -139,23 +153,51 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
         }
     )
 
-    stack_payload = ViewSocketHub._build_image_update_payload(
+    stack_pixel_payload = ViewSocketHub._build_image_update_payload(
         meta,
-        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-preview-lite"),
+        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-pixel-preview", render_revision=12),
+    )
+    stack_geometry_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-geometry-preview"),
     )
     mpr_payload = ViewSocketHub._build_image_update_payload(
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="mpr-pan-zoom-preview"),
     )
 
-    assert "measurements" not in stack_payload
-    assert "annotations" not in stack_payload
-    assert "cornerInfo" in stack_payload
-    assert "orientation" in stack_payload
-    assert "measurements" not in mpr_payload
-    assert "annotations" not in mpr_payload
+    assert "measurements" not in stack_pixel_payload
+    assert "annotations" not in stack_pixel_payload
+    assert stack_pixel_payload["fastPreview"] is True
+    assert stack_pixel_payload["fastPreviewFullResolution"] is False
+    assert stack_pixel_payload["metadataMode"] == "stack-pixel-preview"
+    assert stack_pixel_payload["renderIntent"] == "pixel-only"
+    assert stack_pixel_payload["renderRevision"] == 12
+    assert "cornerInfo" in stack_pixel_payload
+    assert "orientation" in stack_pixel_payload
+    assert stack_geometry_payload["measurements"] == [{"measurementId": "m"}]
+    assert stack_geometry_payload["annotations"] == [{"annotationId": "a"}]
+    assert stack_geometry_payload["renderIntent"] == "geometry-preview"
+    assert mpr_payload["measurements"] == [{"measurementId": "m"}]
+    assert mpr_payload["annotations"] == [{"annotationId": "a"}]
+    assert mpr_payload["fastPreview"] is True
+    assert mpr_payload["fastPreviewFullResolution"] is False
+    assert mpr_payload["metadataMode"] == "mpr-pan-zoom-preview"
+    assert mpr_payload["renderIntent"] == "geometry-preview"
     assert "cornerInfo" not in mpr_payload
     assert "orientation" not in mpr_payload
+
+
+def test_render_request_revision_is_assigned_at_schedule_time() -> None:
+    hub = ViewSocketHub()
+
+    first = hub.make_render_request("view-1")
+    second = hub.make_render_request("view-1")
+    other = hub.make_render_request("view-2")
+
+    assert first.render_revision == 1
+    assert second.render_revision == 2
+    assert other.render_revision == 1
 
 
 def test_non_mpr_preview_worker_keeps_latest_pending_request(monkeypatch) -> None:
@@ -482,6 +524,47 @@ def test_mpr_final_preempts_locked_preview_and_suppresses_preview_emit(monkeypat
     image_updates = [payload for event_name, payload, _ in events if event_name == "image_update"]
     assert len(image_updates) == 1
     assert image_updates[0][0]["imageFormat"] == "png"
+
+
+def test_emit_render_message_sends_extra_image_bytes_as_third_socket_argument(monkeypatch) -> None:
+    async def run() -> list[tuple[str, dict[str, object], str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "fusion-overlay")
+
+        class _Meta:
+            def model_dump(self, *, by_alias: bool = False):
+                del by_alias
+                return {
+                    "viewId": "fusion-overlay",
+                    "imageFormat": "png",
+                    "fusionComposite": {"mode": "ctPetLayers", "revision": 1},
+                }
+
+        async def fake_to_thread(func, view_id: str, **kwargs):
+            del func, view_id, kwargs
+            return SimpleNamespace(
+                meta=_Meta(),
+                image_bytes=b"ct",
+                extra_image_bytes={"pet": b"pet"},
+            )
+
+        monkeypatch.setattr("app.sockets.runtime.asyncio.to_thread", fake_to_thread)
+        await hub.emit_render_for_view(
+            "fusion-overlay",
+            image_format="png",
+            fast_preview=False,
+            target_sids=("sid-1",),
+        )
+        return server.events
+
+    events = asyncio.run(run())
+    image_updates = [payload for event_name, payload, _ in events if event_name == "image_update"]
+    assert len(image_updates) == 1
+    assert image_updates[0][0]["fusionComposite"]["mode"] == "ctPetLayers"
+    assert image_updates[0][1] == b"ct"
+    assert image_updates[0][2] == {"pet": b"pet"}
 
 
 def test_mpr_low_resolution_preview_below_final_revision_is_dropped_before_render(monkeypatch) -> None:

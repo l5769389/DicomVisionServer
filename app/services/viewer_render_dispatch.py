@@ -7,6 +7,13 @@ if TYPE_CHECKING:
     from app.services.viewer_service import RenderedImageResult, ViewerService
 
 ViewRenderProgressCallback = Callable[[dict[str, object]], None]
+FUSION_VIEW_TYPES = {
+    "FusionCTAxial",
+    "FusionPETAxial",
+    "FusionOverlayAxial",
+    "FusionPETCoronalMip",
+}
+PET_VIEW_TYPES = {"PET"}
 
 
 def render_by_view_type(
@@ -35,6 +42,23 @@ def render_by_view_type(
             view,
             image_format=image_format,
             fast_preview=fast_preview,
+            progress_callback=progress_callback,
+        )
+    if view.view_type in FUSION_VIEW_TYPES:
+        return service._render_fusion_view(
+            view,
+            image_format=image_format,
+            fast_preview=fast_preview,
+            fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
+            progress_callback=progress_callback,
+        )
+    if view.view_type in PET_VIEW_TYPES:
+        return service._render_pet_view(
+            view,
+            image_format=image_format,
+            fast_preview=fast_preview,
+            metadata_mode=metadata_mode,
             progress_callback=progress_callback,
         )
     return service._render_view(

@@ -7,10 +7,15 @@ from app.core import (
     DRAG_ACTION_MOVE,
     DRAG_ACTION_START,
     VIEW_OP_TYPE_CROSSHAIR,
+    VIEW_OP_TYPE_FUSION_CONFIG,
+    VIEW_OP_TYPE_FUSION_REGISTRATION,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
+    VIEW_OP_TYPE_MPR_SEGMENTATION,
     VIEW_OP_TYPE_MPR_OBLIQUE,
     VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_PSEUDOCOLOR,
     VIEW_OP_TYPE_ROTATE_3D,
+    VIEW_OP_TYPE_SCROLL,
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
 )
@@ -33,6 +38,7 @@ logger = get_logger(__name__)
 MPR_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
+    VIEW_OP_TYPE_MPR_SEGMENTATION,
     VIEW_OP_TYPE_MPR_OBLIQUE,
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_ROTATE_3D,
@@ -40,6 +46,21 @@ MPR_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_ZOOM,
 }
 MPR_VIEW_TYPES = {"MPR", "AX", "COR", "SAG"}
+FUSION_VIEW_TYPES = {
+    "FusionCTAxial",
+    "FusionPETAxial",
+    "FusionOverlayAxial",
+    "FusionPETCoronalMip",
+}
+FUSION_LOW_LATENCY_OPERATION_TYPES = {
+    VIEW_OP_TYPE_FUSION_CONFIG,
+    VIEW_OP_TYPE_FUSION_REGISTRATION,
+    VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_PSEUDOCOLOR,
+    VIEW_OP_TYPE_SCROLL,
+    VIEW_OP_TYPE_WINDOW,
+    VIEW_OP_TYPE_ZOOM,
+}
 
 
 @dataclass
@@ -173,9 +194,13 @@ def _schedule_render_batch_for_views(
 
 
 def _should_queue_mpr_operation(view_type: str, payload: ViewOperationRequest) -> bool:
-    if view_type not in MPR_VIEW_TYPES:
+    if view_type in MPR_VIEW_TYPES:
+        allowed_operation_types = MPR_LOW_LATENCY_OPERATION_TYPES
+    elif view_type in FUSION_VIEW_TYPES:
+        allowed_operation_types = FUSION_LOW_LATENCY_OPERATION_TYPES
+    else:
         return False
-    if payload.op_type not in MPR_LOW_LATENCY_OPERATION_TYPES:
+    if payload.op_type not in allowed_operation_types:
         return False
     # High-frequency MPR drags are lossy: start/end are preserved, while move
     # events are coalesced to the latest payload by the group operation queue.
@@ -198,6 +223,14 @@ def _pop_next_mpr_operation(state: _MprOperationQueueState) -> _QueuedMprOperati
     if state.pending_start is not None:
         operation = state.pending_start
         state.pending_start = None
+        return operation
+    if (
+        state.pending_end is not None
+        and state.pending_move is not None
+        and state.pending_move.payload.op_type == VIEW_OP_TYPE_FUSION_REGISTRATION
+    ):
+        operation = state.pending_move
+        state.pending_move = None
         return operation
     if state.pending_end is not None:
         operation = state.pending_end
@@ -240,9 +273,18 @@ async def _dispatch_operation_result(
     if result.draft_measurement is not None:
         await server.emit("measurement_draft", result.draft_measurement, to=sid)
     if result.primary_result is not None:
+        primary_request = view_socket_hub.make_render_request(
+            result.primary_result.meta.view_id,
+            image_format=result.primary_image_format,
+            fast_preview=result.primary_fast_preview,
+            fast_preview_full_resolution=result.primary_fast_preview_full_resolution,
+            metadata_mode=result.primary_metadata_mode,
+            mpr_revision=result.mpr_revision,
+        )
+        primary_payload = view_socket_hub.build_image_update_payload(result.primary_result.meta, primary_request)
         await server.emit(
             "image_update",
-            (result.primary_result.meta.model_dump(by_alias=True), result.primary_result.image_bytes),
+            (primary_payload, result.primary_result.image_bytes),
             to=sid,
         )
     is_mpr_view = view.view_type in MPR_VIEW_TYPES
@@ -314,7 +356,10 @@ async def _dispatch_operation_result(
 async def _process_queued_mpr_operation(operation: _QueuedMprOperation) -> None:
     try:
         view = view_registry.get(operation.payload.view_id, workspace_id=operation.workspace_id)
-        result = viewer_service.handle_view_operation(operation.payload, operation.workspace_id)
+        if view.view_type in FUSION_VIEW_TYPES:
+            result = await asyncio.to_thread(viewer_service.handle_view_operation, operation.payload, operation.workspace_id)
+        else:
+            result = viewer_service.handle_view_operation(operation.payload, operation.workspace_id)
         await _dispatch_operation_result(operation.server, operation.sid, view, operation.payload, result)
     except Exception as exc:
         logger.exception("socket queued MPR operation failed sid=%s view_id=%s", operation.sid, operation.payload.view_id)

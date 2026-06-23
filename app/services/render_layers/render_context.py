@@ -67,6 +67,7 @@ class RenderContext:
     mpr_crosshair: MprCrosshairOverlay | None = None
     corner_info: CornerInfoOverlay | None = None
     orientation: OrientationOverlay | None = None
+    background_cval: float = 0.0
 
 
 class RenderLayer(Protocol):

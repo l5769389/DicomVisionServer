@@ -3,7 +3,15 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
+from app.core import (
+    FUSION_PANE_CT_AXIAL,
+    FUSION_PANE_OVERLAY_AXIAL,
+    FUSION_PANE_PET_AXIAL,
+    FUSION_PANE_PET_CORONAL_MIP,
+    MPR_VIEWPORT_AXIAL,
+    MPR_VIEWPORT_CORONAL,
+    MPR_VIEWPORT_SAGITTAL,
+)
 from app.core.logging import get_logger
 from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
 from app.models.viewer import ViewRecord
@@ -22,6 +30,32 @@ def _resolve_mpr_active_viewport(view_type: str) -> str:
     return MPR_VIEWPORT_AXIAL
 
 
+FUSION_VIEW_TYPE_TO_PANE_ROLE = {
+    "FusionCTAxial": FUSION_PANE_CT_AXIAL,
+    "FusionPETAxial": FUSION_PANE_PET_AXIAL,
+    "FusionOverlayAxial": FUSION_PANE_OVERLAY_AXIAL,
+    "FusionPETCoronalMip": FUSION_PANE_PET_CORONAL_MIP,
+}
+
+
+def _is_ct_series(series) -> bool:
+    return str(series.modality or "").strip().upper() == "CT"
+
+
+def _is_pet_series(series) -> bool:
+    return str(series.modality or "").strip().upper() in {"PT", "PET"}
+
+
+def _resolve_fusion_pair(primary_series_id: str, secondary_series_id: str, workspace_id: str):
+    primary = series_registry.get(primary_series_id, workspace_id=workspace_id)
+    secondary = series_registry.get(secondary_series_id, workspace_id=workspace_id)
+    if _is_ct_series(primary) and _is_pet_series(secondary):
+        return primary, secondary
+    if _is_pet_series(primary) and _is_ct_series(secondary):
+        return secondary, primary
+    raise HTTPException(status_code=400, detail="PET/CT fusion requires one CT series and one PT/PET series")
+
+
 class ViewRegistry:
     def __init__(self) -> None:
         self._view_by_id: dict[str, ViewRecord] = {}
@@ -29,19 +63,45 @@ class ViewRegistry:
 
     def create(self, payload: ViewCreateRequest, workspace_id: str = DEFAULT_WORKSPACE_ID) -> ViewCreateResponse:
         normalized_workspace_id = normalize_workspace_id(workspace_id)
-        series_registry.get(payload.series_id, workspace_id=normalized_workspace_id)
+        is_fusion_view = payload.view_type in FUSION_VIEW_TYPE_TO_PANE_ROLE
+        if is_fusion_view:
+            if not payload.secondary_series_id:
+                raise HTTPException(status_code=400, detail="PET/CT fusion requires secondarySeriesId")
+            ct_series, pet_series = _resolve_fusion_pair(
+                payload.series_id,
+                payload.secondary_series_id,
+                normalized_workspace_id,
+            )
+            create_series_id = ct_series.series_id
+            create_secondary_series_id = pet_series.series_id
+        else:
+            series = series_registry.get(payload.series_id, workspace_id=normalized_workspace_id)
+            if payload.view_type == "PET" and not _is_pet_series(series):
+                raise HTTPException(status_code=400, detail="PET view requires a PT/PET series")
+            create_series_id = payload.series_id
+            create_secondary_series_id = payload.secondary_series_id
 
         with self._lock:
             view = ViewRecord(
                 view_id=str(uuid4()),
-                series_id=payload.series_id,
+                series_id=create_series_id,
                 view_type=payload.view_type,
                 workspace_id=normalized_workspace_id,
+                secondary_series_id=create_secondary_series_id,
+                fusion_pane_role=payload.fusion_pane_role
+                or FUSION_VIEW_TYPE_TO_PANE_ROLE.get(payload.view_type),
             )
             if payload.view_type in {"MPR", "AX", "COR", "SAG"}:
                 view.view_group = view_group_registry.get_or_create_mpr_group_for_series(
                     payload.series_id,
                     active_viewport=_resolve_mpr_active_viewport(payload.view_type),
+                    view_group_key=payload.view_group_key,
+                    workspace_id=normalized_workspace_id,
+                )
+            elif is_fusion_view and create_secondary_series_id is not None:
+                view.view_group = view_group_registry.get_or_create_fusion_group_for_pair(
+                    create_series_id,
+                    create_secondary_series_id,
                     view_group_key=payload.view_group_key,
                     workspace_id=normalized_workspace_id,
                 )

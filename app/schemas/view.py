@@ -1,15 +1,28 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from app.schemas.dicom import CornerInfoPayload
 
 
-ViewType = Literal["Stack", "MPR", "3D", "AX", "COR", "SAG"]
+ViewType = Literal[
+    "Stack",
+    "MPR",
+    "3D",
+    "PET",
+    "AX",
+    "COR",
+    "SAG",
+    "FusionCTAxial",
+    "FusionPETAxial",
+    "FusionOverlayAxial",
+    "FusionPETCoronalMip",
+]
 ImageFormat = Literal["png", "jpeg"]
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
+FusionRegistrationExportMode = Literal["newDicom", "br"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "annotation", "fusionRegistration", "fusionConfig", "petConfig"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
@@ -22,10 +35,20 @@ MprCrosshairMode = Literal["orthogonal", "double-oblique"]
 class ViewCreateRequest(BaseModel):
     series_id: str = Field(alias="seriesId", description="Registered series ID to view.")
     view_type: ViewType = Field(alias="viewType", description="Requested view type: Stack, MPR, 3D, or a concrete MPR viewport.")
+    secondary_series_id: str | None = Field(
+        default=None,
+        alias="secondarySeriesId",
+        description="Optional second series ID for paired views such as PET/CT fusion.",
+    )
+    fusion_pane_role: str | None = Field(
+        default=None,
+        alias="fusionPaneRole",
+        description="Optional frontend pane role for PET/CT fusion routing.",
+    )
     view_group_key: str | None = Field(
         default=None,
         alias="viewGroupKey",
-        description="Optional key for sharing MPR state across AX/COR/SAG views or 4D phases.",
+        description="Optional key for sharing MPR or fusion state across related views.",
     )
     four_d_phase_index: int | None = Field(
         default=None,
@@ -132,10 +155,16 @@ class MprPlaneInfo(BaseModel):
     normal_world: tuple[float, float, float] = Field(alias="normalWorld")
     pixel_spacing_row_mm: float = Field(alias="pixelSpacingRowMm")
     pixel_spacing_col_mm: float = Field(alias="pixelSpacingColMm")
+    pixel_spacing_normal_mm: float = Field(default=1.0, alias="pixelSpacingNormalMm")
     output_shape: tuple[int, int] = Field(alias="outputShape")
     row: tuple[float, float, float]
     col: tuple[float, float, float]
     normal: tuple[float, float, float]
+    image_to_canvas_matrix: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] | None = Field(default=None, alias="imageToCanvasMatrix")
     is_oblique: bool = Field(alias="isOblique")
 
     model_config = {"populate_by_name": True}
@@ -186,6 +215,35 @@ class ViewExportRequest(BaseModel):
         alias="preserveSourceDicom",
         description="When possible, copy patient/study metadata into Secondary Capture exports.",
     )
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionRegistrationExportRequest(BaseModel):
+    view_id: str = Field(alias="viewId", description="Overlay fusion view ID whose registration state should be exported.")
+    mode: FusionRegistrationExportMode = Field(description="Registration export mode: new derived DICOM series or .br sidecar.")
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+    output_directory: str = Field(alias="outputDirectory")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionRegistrationArtifactExportRequest(BaseModel):
+    view_id: str = Field(alias="viewId", description="Overlay fusion view ID whose registration state should be exported.")
+    mode: FusionRegistrationExportMode = Field(description="Registration export mode: new derived DICOM series zip or .br sidecar.")
+    series_description: str | None = Field(default=None, alias="seriesDescription")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionRegistrationExportResponse(BaseModel):
+    mode: FusionRegistrationExportMode
+    directory_path: str = Field(alias="directoryPath")
+    file_path: str | None = Field(default=None, alias="filePath")
+    file_count: int = Field(alias="fileCount")
+    series_description: str = Field(alias="seriesDescription")
+    pet_unit: str = Field(alias="petUnit")
+    pet_unit_label: str = Field(alias="petUnitLabel")
 
     model_config = {"populate_by_name": True}
 
@@ -277,6 +335,201 @@ class MprMipConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprSegmentationVoiBox(BaseModel):
+    x_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="xMin")
+    x_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="xMax")
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="yMin")
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="yMax")
+    z_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="zMin")
+    z_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="zMax")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprThresholdRegionStats(BaseModel):
+    hu_mean: float | None = Field(default=None, alias="huMean")
+    hu_min: float | None = Field(default=None, alias="huMin")
+    hu_max: float | None = Field(default=None, alias="huMax")
+    hu_std_dev: float | None = Field(default=None, alias="huStdDev")
+    volume_cm3: float = Field(default=0.0, ge=0.0, alias="volumeCm3")
+    sample_count: int = Field(default=0, ge=0, alias="sampleCount")
+    effective_threshold_hu: float | None = Field(default=None, alias="effectiveThresholdHu")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprThresholdRegionBox(BaseModel):
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    row_world: tuple[float, float, float] = Field(alias="rowWorld")
+    col_world: tuple[float, float, float] = Field(alias="colWorld")
+    normal_world: tuple[float, float, float] = Field(alias="normalWorld")
+    width_mm: float = Field(default=1.0, gt=0.0, alias="widthMm")
+    height_mm: float = Field(default=1.0, gt=0.0, alias="heightMm")
+    depth_mm: float = Field(default=1.0, gt=0.0, alias="depthMm")
+    source_viewport: str = Field(default="mpr-ax", alias="sourceViewport")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprThresholdRegion(BaseModel):
+    id: str
+    enabled: bool = True
+    label: str = ""
+    threshold_hu: float = Field(default=300.0, ge=-1024.0, le=3071.0, alias="thresholdHu")
+    threshold_mode: str = Field(default="hu", alias="thresholdMode")
+    threshold_percentile: float = Field(default=80.0, ge=0.0, le=100.0, alias="thresholdPercentile")
+    color: str = "#ff4df8"
+    box: MprThresholdRegionBox
+    stats: MprThresholdRegionStats | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class MprVoiSphereStats(BaseModel):
+    hu_mean: float | None = Field(default=None, alias="huMean")
+    hu_min: float | None = Field(default=None, alias="huMin")
+    hu_max: float | None = Field(default=None, alias="huMax")
+    hu_std_dev: float | None = Field(default=None, alias="huStdDev")
+    volume_cm3: float = Field(default=0.0, ge=0.0, alias="volumeCm3")
+    sample_count: int = Field(default=0, ge=0, alias="sampleCount")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprVoiSphere(BaseModel):
+    id: str | None = None
+    label: str = ""
+    enabled: bool = True
+    center_world: tuple[float, float, float] = Field(alias="centerWorld")
+    radius_mm: float = Field(default=10.0, gt=0.0, alias="radiusMm")
+    color: str = "#22d3ee"
+    stats: MprVoiSphereStats | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationConfig(BaseModel):
+    enabled: bool = False
+    client_revision: int = Field(default=0, ge=0, alias="clientRevision")
+    selected_region_id: str | None = Field(default=None, alias="selectedRegionId")
+    selected_voi: bool = Field(default=False, alias="selectedVoi")
+    selected_voi_id: str | None = Field(default=None, alias="selectedVoiId")
+    threshold_regions: list[MprThresholdRegion] = Field(default_factory=list, alias="thresholdRegions")
+    voi_spheres: list[MprVoiSphere] = Field(default_factory=list, alias="voiSpheres")
+    voi_sphere: MprVoiSphere | None = Field(default=None, alias="voiSphere")
+    lower_hu: float | None = Field(default=None, ge=-1024.0, le=3071.0, alias="lowerHu")
+    upper_hu: float | None = Field(default=None, ge=-1024.0, le=3071.0, alias="upperHu")
+    opacity: float = Field(default=0.45, ge=0.0, le=1.0)
+    color: str = "#ff4df8"
+    voi_box: MprSegmentationVoiBox | None = Field(default=None, alias="voiBox")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlayRect(BaseModel):
+    x_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="xMin")
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0, alias="yMin")
+    x_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="xMax")
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0, alias="yMax")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlaySamples(BaseModel):
+    points: list[float] = Field(default_factory=list)
+    total_count: int = Field(default=0, ge=0, alias="totalCount")
+    sampled_count: int = Field(default=0, ge=0, alias="sampledCount")
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlayRegion(BaseModel):
+    region_id: str = Field(alias="regionId")
+    visible: bool = False
+    rect: MprSegmentationOverlayRect | None = None
+    sample_revision: int = Field(default=0, ge=0, alias="sampleRevision")
+    samples: MprSegmentationOverlaySamples | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class MprSegmentationOverlay(BaseModel):
+    regions: list[MprSegmentationOverlayRegion] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionRegistrationInfo(BaseModel):
+    translate_row_mm: float = Field(default=0.0, alias="translateRowMm")
+    translate_col_mm: float = Field(default=0.0, alias="translateColMm")
+    rotation_degrees: float = Field(default=0.0, alias="rotationDegrees")
+    saved: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionInfo(BaseModel):
+    pane_role: str = Field(alias="paneRole")
+    ct_series_id: str = Field(alias="ctSeriesId")
+    pet_series_id: str = Field(alias="petSeriesId")
+    pet_pseudocolor_preset: str = Field(alias="petPseudocolorPreset")
+    pet_unit: str = Field(default="SUVbw", alias="petUnit")
+    pet_unit_label: str = Field(default="g/ml (SUVbw)", alias="petUnitLabel")
+    pet_window_min: float | None = Field(default=None, alias="petWindowMin")
+    pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    alpha: float
+    revision: int
+    registration: FusionRegistrationInfo
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionCompositeLayerInfo(BaseModel):
+    key: str
+    role: str
+    image_format: str = Field(default="png", alias="imageFormat")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionCompositeInfo(BaseModel):
+    mode: str = "ctPetLayers"
+    revision: int
+    alpha: float
+    registration: FusionRegistrationInfo
+    width: int
+    height: int
+    layers: list[FusionCompositeLayerInfo]
+    primary_image_unchanged: bool = Field(default=False, alias="primaryImageUnchanged")
+
+    model_config = {"populate_by_name": True}
+
+
+class PetInfo(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    pet_unit: str = Field(default="SUVbw", alias="petUnit")
+    pet_unit_label: str = Field(default="g/ml (SUVbw)", alias="petUnitLabel")
+    pet_window_min: float | None = Field(default=None, alias="petWindowMin")
+    pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    pseudocolor_preset: str = Field(default="bwinverse", alias="pseudocolorPreset")
+
+    model_config = {"populate_by_name": True}
+
+
+class FusionProjectionInfo(BaseModel):
+    pane_role: str = Field(alias="paneRole")
+    reference_world: tuple[float, float, float] = Field(alias="referenceWorld")
+    reference_x: float = Field(alias="referenceX")
+    reference_y: float = Field(alias="referenceY")
+    normalized_to_world_origin: tuple[float, float, float] = Field(alias="normalizedToWorldOrigin")
+    normalized_to_world_x: tuple[float, float, float] = Field(alias="normalizedToWorldX")
+    normalized_to_world_y: tuple[float, float, float] = Field(alias="normalizedToWorldY")
+    world_to_normalized_x: tuple[float, float, float, float] = Field(alias="worldToNormalizedX")
+    world_to_normalized_y: tuple[float, float, float, float] = Field(alias="worldToNormalizedY")
+
+    model_config = {"populate_by_name": True}
+
+
 class ViewImageResponse(BaseModel):
     slice_info: SliceInfo = Field(alias="slice_info")
     window_info: WindowInfo = Field(alias="window_info")
@@ -294,7 +547,13 @@ class ViewImageResponse(BaseModel):
     orientation: OrientationInfo | None = None
     transform: ViewTransformPayload | None = None
     color: ViewColorInfo | None = None
+    pet_info: PetInfo | None = Field(default=None, alias="petInfo")
+    fusion_info: FusionInfo | None = Field(default=None, alias="fusionInfo")
+    fusion_composite: FusionCompositeInfo | None = Field(default=None, alias="fusionComposite")
+    fusion_projection: FusionProjectionInfo | None = Field(default=None, alias="fusionProjection")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
+    mpr_segmentation_overlay: MprSegmentationOverlay | None = Field(default=None, alias="mprSegmentationOverlay")
     mpr_crosshair_mode: MprCrosshairMode = Field(default="orthogonal", alias="mprCrosshairMode")
     volume_preset: str | None = Field(default=None, alias="volumePreset")
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
@@ -349,11 +608,19 @@ class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="Server-side view ID that receives the interaction.")
     op_type: ViewOperationType = Field(alias="opType", description="Interaction type such as scroll, window, crosshair, or measurement.")
     measurement_id: str | None = Field(default=None, alias="measurementId")
+    annotation_id: str | None = Field(default=None, alias="annotationId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")
     sub_op_type: str | None = Field(default=None, alias="subOpType")
     action_type: ViewActionType | None = Field(default=None, alias="actionType")
     x: float | None = None
     y: float | None = None
+    anchor_x: float | None = Field(default=None, alias="anchorX")
+    anchor_y: float | None = Field(default=None, alias="anchorY")
+    current_x: float | None = Field(default=None, alias="currentX")
+    current_y: float | None = Field(default=None, alias="currentY")
+    pivot_x: float | None = Field(default=None, alias="pivotX")
+    pivot_y: float | None = Field(default=None, alias="pivotY")
+    rotation_delta_degrees: float | None = Field(default=None, alias="rotationDeltaDegrees")
     line: MprCrosshairLine | None = None
     points: list[MeasurementPointPayload] | None = Field(default=None, description="Normalized points used by measurement and ROI operations.")
     zoom: float | None = None
@@ -361,8 +628,22 @@ class ViewOperationRequest(BaseModel):
     ww: float | None = None
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
+    fusion_alpha: float | None = Field(default=None, alias="fusionAlpha")
+    fusion_manual_registration: bool | None = Field(default=None, alias="fusionManualRegistration")
+    fusion_pet_unit: str | None = Field(default=None, alias="fusionPetUnit")
+    fusion_pet_window_min: float | None = Field(default=None, alias="fusionPetWindowMin")
+    fusion_pet_window_max: float | None = Field(default=None, alias="fusionPetWindowMax")
+    pet_unit: str | None = Field(default=None, alias="petUnit")
+    pet_window_min: float | None = Field(default=None, alias="petWindowMin")
+    pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    fusion_registration_file: dict[str, Any] | None = Field(default=None, alias="fusionRegistrationFile")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
+    mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")
     mpr_crosshair_mode: MprCrosshairMode | None = Field(default=None, alias="mprCrosshairMode")
+    tool_type: str | None = Field(default=None, alias="toolType")
+    text: str | None = None
+    color: str | None = None
+    size: str | None = None
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
