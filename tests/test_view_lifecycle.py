@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import fastapi_app
-from app.models.viewer import SeriesRecord
+from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
 from app.sockets.runtime import view_socket_hub
 from app.services.series_registry import series_registry
@@ -70,6 +70,12 @@ def _register_series(series_id: str = "series-1") -> str:
         series_description="Lifecycle test",
     )
     return series_id
+
+
+def _register_stack_view(series_id: str, view_id: str = "view-1") -> ViewRecord:
+    view = ViewRecord(view_id=view_id, series_id=series_id, view_type="Stack", width=128, height=128)
+    view_registry._view_by_id[view.view_id] = view
+    return view
 
 
 def _create_view(client: TestClient, series_id: str, view_type: str, view_group_key: str | None = None) -> str:
@@ -143,6 +149,135 @@ def test_mpr_state_sync_operation_accepts_source_view_alias() -> None:
 
     assert payload.view_id == "target-view"
     assert payload.source_view_id == "source-view"
+
+
+def test_transform2d_resets_pan_absolute_and_renders(monkeypatch) -> None:
+    series_id = _register_series()
+    view = _register_stack_view(series_id)
+    view.offset_x = 42.0
+    view.offset_y = -17.0
+    view.zoom = 2.5
+    view.rotation_degrees = 90
+    view.hor_flip = True
+    view.drag_origin_offset_x = 42.0
+    view.drag_origin_offset_y = -17.0
+    render_result = object()
+    monkeypatch.setattr(viewer_service, "_render_by_view_type", lambda *args, **kwargs: render_result)
+
+    result = viewer_service.handle_view_operation(
+        ViewOperationRequest.model_validate({"viewId": view.view_id, "opType": "transform2d", "x": 0, "y": 0})
+    )
+
+    assert result.primary_result is render_result
+    assert view.offset_x == 0.0
+    assert view.offset_y == 0.0
+    assert view.zoom == 2.5
+    assert view.rotation_degrees == 90
+    assert view.hor_flip is True
+    assert view.drag_origin_offset_x is None
+    assert view.drag_origin_offset_y is None
+    assert view.is_initialized is True
+
+
+def test_transform2d_resets_zoom_absolute_and_renders(monkeypatch) -> None:
+    series_id = _register_series()
+    view = _register_stack_view(series_id)
+    view.offset_x = 12.0
+    view.offset_y = 8.0
+    view.zoom = 3.25
+    view.drag_origin_zoom = 3.25
+    render_result = object()
+    monkeypatch.setattr(viewer_service, "_render_by_view_type", lambda *args, **kwargs: render_result)
+
+    result = viewer_service.handle_view_operation(
+        ViewOperationRequest.model_validate({"viewId": view.view_id, "opType": "transform2d", "zoom": 1})
+    )
+
+    assert result.primary_result is render_result
+    assert view.offset_x == 12.0
+    assert view.offset_y == 8.0
+    assert view.zoom == 1.0
+    assert view.drag_origin_zoom is None
+    assert view.is_initialized is True
+
+
+def test_transform2d_applies_all_transform_fields_absolute(monkeypatch) -> None:
+    series_id = _register_series()
+    view = _register_stack_view(series_id)
+    view.offset_x = 10.0
+    view.offset_y = 11.0
+    view.zoom = 1.5
+    view.rotation_degrees = 270
+    view.hor_flip = True
+    view.ver_flip = False
+    render_result = object()
+    monkeypatch.setattr(viewer_service, "_render_by_view_type", lambda *args, **kwargs: render_result)
+
+    result = viewer_service.handle_view_operation(
+        ViewOperationRequest.model_validate(
+            {
+                "viewId": view.view_id,
+                "opType": "transform2d",
+                "x": 5,
+                "y": -6,
+                "zoom": 2,
+                "rotationDegrees": 450,
+                "hor_flip": False,
+                "ver_flip": True,
+            }
+        )
+    )
+
+    assert result.primary_result is render_result
+    assert view.offset_x == 5.0
+    assert view.offset_y == -6.0
+    assert view.zoom == 2.0
+    assert view.rotation_degrees == 90
+    assert view.hor_flip is False
+    assert view.ver_flip is True
+
+
+def test_empty_transform2d_does_not_render_or_mutate(monkeypatch) -> None:
+    series_id = _register_series()
+    view = _register_stack_view(series_id)
+    view.offset_x = 7.0
+    view.offset_y = -9.0
+    view.zoom = 1.75
+    render_calls = 0
+
+    def render_stub(*args, **kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return object()
+
+    monkeypatch.setattr(viewer_service, "_render_by_view_type", render_stub)
+
+    result = viewer_service.handle_view_operation(
+        ViewOperationRequest.model_validate({"viewId": view.view_id, "opType": "transform2d"})
+    )
+
+    assert render_calls == 0
+    assert result.primary_result is None
+    assert view.offset_x == 7.0
+    assert view.offset_y == -9.0
+    assert view.zoom == 1.75
+    assert view.is_initialized is False
+
+
+def test_non_transform2d_xy_mutations_remain_incremental() -> None:
+    series_id = _register_series()
+    view = _register_stack_view(series_id)
+    view.offset_x = 2.0
+    view.offset_y = 4.0
+
+    result = viewer_service.handle_view_operation(
+        ViewOperationRequest.model_validate({"viewId": view.view_id, "opType": "pseudocolor", "x": 3, "y": -1})
+    )
+
+    assert result.primary_result is None
+    assert view.offset_x == 5.0
+    assert view.offset_y == 3.0
+    assert view.is_initialized is True
 
 
 def test_mpr_state_sync_broadcast_skips_unsized_group_views(monkeypatch) -> None:

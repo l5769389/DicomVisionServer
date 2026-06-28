@@ -113,7 +113,7 @@ def handle_view_operation(
     active_viewport_changed = _sync_mpr_active_viewport(service, view) if is_mpr_view else False
     operation_handler = _get_operation_handler(payload)
     render_decision = operation_handler(service, view, series, payload, is_mpr_view)
-    _apply_shared_view_mutations(view, payload)
+    _apply_shared_view_mutations(service, view, payload)
 
     if is_mpr_view and active_viewport_changed and render_decision.mode != "none":
         render_decision = _promote_render_decision_to_broadcast(render_decision)
@@ -524,7 +524,14 @@ def _handle_transform_2d_operation(
     is_mpr_view: bool,
 ) -> RenderDecision:
     del series, is_mpr_view
-    if payload.rotation_degrees is None and payload.hor_flip is None and payload.ver_flip is None:
+    if (
+        payload.x is None
+        and payload.y is None
+        and payload.zoom is None
+        and payload.rotation_degrees is None
+        and payload.hor_flip is None
+        and payload.ver_flip is None
+    ):
         return _render_none()
     if service._is_fusion_view_type(view.view_type):
         service._clear_fusion_registration_overlay_frame_locks(view.view_group)
@@ -855,7 +862,7 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
 }
 
 
-def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest) -> None:
+def _apply_shared_view_mutations(service: ViewerService, view: ViewRecord, payload: ViewOperationRequest) -> None:
     handled_drag_ops = {
         VIEW_OP_TYPE_CROSSHAIR,
         VIEW_OP_TYPE_FUSION_CONFIG,
@@ -866,21 +873,41 @@ def _apply_shared_view_mutations(view: ViewRecord, payload: ViewOperationRequest
         VIEW_OP_TYPE_PAN,
         VIEW_OP_TYPE_ROTATE_3D,
     }
-    if payload.x is not None and payload.op_type not in handled_drag_ops:
-        view.offset_x += float(payload.x)
-        view.is_initialized = True
-    if payload.y is not None and payload.op_type not in handled_drag_ops:
-        view.offset_y += float(payload.y)
-        view.is_initialized = True
+    is_transform_2d = payload.op_type == VIEW_OP_TYPE_TRANSFORM_2D
+    mutated = False
+    if payload.x is not None:
+        if is_transform_2d:
+            view.offset_x = float(payload.x)
+            mutated = True
+        elif payload.op_type not in handled_drag_ops:
+            view.offset_x += float(payload.x)
+            mutated = True
+    if payload.y is not None:
+        if is_transform_2d:
+            view.offset_y = float(payload.y)
+            mutated = True
+        elif payload.op_type not in handled_drag_ops:
+            view.offset_y += float(payload.y)
+            mutated = True
+    if payload.zoom is not None and is_transform_2d:
+        next_zoom = viewport_transformer.clamp_zoom(float(payload.zoom))
+        if service._is_3d_view_type(view.view_type):
+            next_zoom = service._clamp_3d_zoom(next_zoom)
+        view.zoom = next_zoom
+        mutated = True
     if payload.hor_flip is not None:
         view.hor_flip = payload.hor_flip
-        view.is_initialized = True
+        mutated = True
     if payload.ver_flip is not None:
         view.ver_flip = payload.ver_flip
-        view.is_initialized = True
+        mutated = True
     if payload.rotation_degrees is not None:
         view.rotation_degrees = viewport_transformer.normalize_rotation_degrees(payload.rotation_degrees)
+        mutated = True
+    if mutated:
         view.is_initialized = True
+        if is_transform_2d:
+            service._reset_drag_state(view)
 
 
 def _log_view_operation_state(service: ViewerService, view: ViewRecord, payload: ViewOperationRequest) -> None:
@@ -1006,7 +1033,6 @@ def _build_operation_render_outcome(
             metadata_mode=render_decision.metadata_mode,
         )
     )
-
 
 
 
