@@ -1,6 +1,6 @@
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.dicom import CornerInfoPayload
 
@@ -18,7 +18,17 @@ ViewType = Literal[
     "FusionOverlayAxial",
     "FusionPETCoronalMip",
 ]
-ImageFormat = Literal["png", "jpeg"]
+ImageFormat = Literal["png", "jpeg", "webp"]
+VIEW_IMAGE_FORMATS = {"png", "jpeg", "webp"}
+
+
+def normalize_image_format(value: Any, default: ImageFormat = "png") -> ImageFormat:
+    text = str(value or default).strip().lower()
+    if text == "jpg":
+        text = "jpeg"
+    if text in VIEW_IMAGE_FORMATS:
+        return cast(ImageFormat, text)
+    return default
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 FusionRegistrationExportMode = Literal["newDicom", "br"]
 ViewSetSizeOperationType = Literal["setSize"]
@@ -88,6 +98,12 @@ class ViewSetSizeRequest(BaseModel):
     op_type: ViewSetSizeOperationType = Field(alias="opType", description="Operation name, always setSize for this endpoint.")
     size: ViewSize = Field(description="Current frontend viewport size in CSS pixels.")
     view_id: str = Field(alias="viewId", description="Server-side view ID returned by /view/create.")
+    image_format: ImageFormat = Field(default="png", alias="imageFormat")
+
+    @field_validator("image_format", mode="before")
+    @classmethod
+    def _normalize_image_format(cls, value: Any) -> ImageFormat:
+        return normalize_image_format(value)
 
     model_config = {"populate_by_name": True}
 
@@ -611,6 +627,7 @@ class AnnotationOverlayPayload(BaseModel):
 class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="Server-side view ID that receives the interaction.")
     op_type: ViewOperationType = Field(alias="opType", description="Interaction type such as scroll, window, crosshair, or measurement.")
+    image_format: ImageFormat = Field(default="png", alias="imageFormat")
     measurement_id: str | None = Field(default=None, alias="measurementId")
     annotation_id: str | None = Field(default=None, alias="annotationId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")
@@ -657,6 +674,11 @@ class ViewOperationRequest(BaseModel):
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig", description="3D transfer-function and lighting settings.")
     render_3d_mode: Render3DMode | None = Field(default=None, alias="render3dMode", description="3D renderer mode: volume or surface.")
     surface_config: SurfaceRenderConfig | None = Field(default=None, alias="surfaceConfig", description="3D surface extraction and material settings.")
+
+    @field_validator("image_format", mode="before")
+    @classmethod
+    def _normalize_image_format(cls, value: Any) -> ImageFormat:
+        return normalize_image_format(value)
 
     model_config = {"populate_by_name": True}
 

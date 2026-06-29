@@ -1327,6 +1327,133 @@ class ViewerService:
         row, col = self._resolve_hover_row_col(view, payload.x, payload.y)
         return ViewHoverResponse(viewId=view.view_id, row=row, col=col)
 
+    def build_mpr_state_update_payload(
+        self,
+        view_id: str,
+        *,
+        workspace_id: str | None = None,
+        mpr_revision: int | None = None,
+    ) -> dict[str, object] | None:
+        return self.build_mpr_state_update_payloads(
+            (view_id,),
+            workspace_id=workspace_id,
+            mpr_revision=mpr_revision,
+        ).get(view_id)
+
+    def build_mpr_state_update_payloads(
+        self,
+        view_ids: tuple[str, ...],
+        *,
+        workspace_id: str | None = None,
+        mpr_revision: int | None = None,
+    ) -> dict[str, dict[str, object]]:
+        grouped_views: OrderedDict[tuple[str, str], list[ViewRecord]] = OrderedDict()
+        for view_id in dict.fromkeys(view_ids):
+            view = view_registry.get(view_id, workspace_id=workspace_id)
+            if not self._is_mpr_view_type(view.view_type):
+                continue
+            group_key = view.view_group.group_id if view.view_group is not None else view.view_id
+            grouped_views.setdefault((str(group_key), view.series_id), []).append(view)
+
+        payloads: dict[str, dict[str, object]] = {}
+        for views in grouped_views.values():
+            if not views:
+                continue
+            source_view = views[0]
+            series = series_registry.get(source_view.series_id, workspace_id=workspace_id)
+            volume = self._get_series_volume(series)
+            for view in views:
+                ensure_view_size(view)
+                if not view.is_initialized:
+                    self._initialize_mpr_viewport(view)
+                    view.is_initialized = True
+            pose_context = self._build_mpr_pose_context(source_view, volume.shape, series=series)
+            for view in views:
+                payload = self._build_mpr_state_update_payload_from_context(
+                    view,
+                    volume_shape=volume.shape,
+                    pose_context=pose_context,
+                    mpr_revision=mpr_revision,
+                )
+                if payload is not None:
+                    payloads[view.view_id] = payload
+        return payloads
+
+    def _build_mpr_state_update_payload_from_context(
+        self,
+        view: ViewRecord,
+        *,
+        volume_shape: tuple[int, int, int],
+        pose_context: MprPoseContext,
+        mpr_revision: int | None = None,
+    ) -> dict[str, object] | None:
+        if not self._is_mpr_view_type(view.view_type):
+            return None
+
+        ensure_view_size(view)
+
+        target_viewport = self._resolve_mpr_viewport(view)
+        target_plane_pose = pose_context.poses[target_viewport]
+        pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(target_plane_pose)
+        full_plane_height, full_plane_width = target_plane_pose.output_shape
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            full_plane_height,
+            full_plane_width,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        metadata_image_transform = viewport_transformer.build_image_to_canvas_transform(
+            image_width=full_plane_width,
+            image_height=full_plane_height,
+            canvas_width=render_plan.render_view.width or 0,
+            canvas_height=render_plan.render_view.height or 0,
+            view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+        current, total = self._get_mpr_viewport_index_info(
+            view,
+            volume_shape,
+            target_viewport,
+            cursor=pose_context.cursor,
+            geometry=pose_context.geometry,
+        )
+        if target_viewport == MPR_VIEWPORT_AXIAL:
+            view.current_index = current
+        mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(
+            render_plan.render_view,
+            volume_shape,
+            target_plane_pose.output_shape,
+            metadata_image_transform,
+            pose_context=pose_context,
+        )
+        frame_payload = self._build_mpr_frame_payload(pose_context.cursor, pose_context.geometry)
+        cursor_payload = self._build_mpr_cursor_payload(pose_context.cursor)
+        plane_payload = self._build_mpr_plane_payload(
+            view,
+            target_viewport,
+            plane_pose=target_plane_pose,
+            geometry=pose_context.geometry,
+            image_transform=metadata_image_transform,
+        )
+        crosshair_payload = self._build_mpr_crosshair_info(mpr_crosshair_overlay)
+        payload: dict[str, object] = {
+            "viewId": view.view_id,
+            "slice_info": SliceInfo(current=current, total=total).model_dump(by_alias=True),
+            "mprRevision": mpr_revision if mpr_revision is not None else self._get_mpr_revision(view.view_group),
+            "mprCrosshairMode": self._get_mpr_crosshair_mode(view.view_group),
+        }
+        if frame_payload is not None:
+            payload["mprFrame"] = frame_payload.model_dump(by_alias=True)
+        if cursor_payload is not None:
+            payload["mprCursor"] = cursor_payload.model_dump(by_alias=True)
+        if plane_payload is not None:
+            payload["mprPlane"] = plane_payload.model_dump(by_alias=True)
+        if crosshair_payload is not None:
+            payload["mpr_crosshair"] = crosshair_payload.model_dump(by_alias=True)
+        return payload
+
     def get_series_corner_info(
         self,
         payload: CornerInfoRequest,
@@ -4570,7 +4697,9 @@ class ViewerService:
             target_plane_pose.output_shape,
             metadata_image_transform,
         )
-        include_static_preview_metadata = not (fast_preview and metadata_mode == "mpr-pan-zoom-preview")
+        include_static_preview_metadata = not (
+            fast_preview and metadata_mode in {"mpr-pan-zoom-preview", "mpr-crosshair-preview"}
+        )
         reference_instance, reference_cached = (
             (None, None)
             if fast_preview
@@ -8754,6 +8883,8 @@ class ViewerService:
         volume_shape: tuple[int, int, int],
         plane_shape: tuple[int, int],
         image_transform,
+        *,
+        pose_context: MprPoseContext | None = None,
     ) -> MprCrosshairOverlay:
         plane_height, plane_width = plane_shape
         canvas_width = view.width or plane_width
@@ -8761,11 +8892,12 @@ class ViewerService:
         target_viewport = self._resolve_mpr_viewport(view)
         is_active = view.mpr_active_viewport == target_viewport
         line_alpha = 255
-        try:
-            series = series_registry.get(view.series_id)
-        except Exception:
-            series = None
-        pose_context = self._build_mpr_pose_context(view, volume_shape, series=series)
+        if pose_context is None:
+            try:
+                series = series_registry.get(view.series_id)
+            except Exception:
+                series = None
+            pose_context = self._build_mpr_pose_context(view, volume_shape, series=series)
         plane_pose = pose_context.poses[target_viewport]
         horizontal_angle, vertical_angle = self._get_mpr_visible_crosshair_line_angles(
             view.view_group,
@@ -10198,6 +10330,8 @@ class ViewerService:
             # JPEG is only used for transient interaction previews. Settled frames
             # stay PNG so overlays and measurements align with lossless pixels.
             image.convert("RGB").save(output, format="JPEG", quality=FAST_PREVIEW_JPEG_QUALITY)
+        elif image_format == "webp":
+            image.save(output, format="WEBP", lossless=True)
         else:
             # PNG is lossless at every compression level. Keep all viewer PNG
             # frames at a low compression level to reduce encode latency and

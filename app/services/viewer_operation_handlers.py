@@ -67,6 +67,7 @@ class OperationRenderOutcome:
     deferred_fast_preview: bool = False
     deferred_fast_preview_full_resolution: bool = False
     deferred_metadata_mode: str = "full"
+    mpr_state_view_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class RenderDecision:
     metadata_mode: str = "full"
     draft_measurement: dict[str, object] | None = None
     broadcast_viewports: tuple[str, ...] | None = None
+    emit_mpr_state_update: bool = False
 
 
 OperationHandler = Callable[
@@ -123,7 +125,13 @@ def handle_view_operation(
 
     _log_view_operation_state(service, view, payload)
     mpr_revision = _resolve_operation_revision_for_render(service, view, payload, is_mpr_view, is_fusion_view)
-    return _build_operation_render_outcome(service, view, render_decision, mpr_revision=mpr_revision)
+    return _build_operation_render_outcome(
+        service,
+        view,
+        render_decision,
+        mpr_revision=mpr_revision,
+        image_format=payload.image_format,
+    )
 
 
 def _render_none() -> RenderDecision:
@@ -155,6 +163,7 @@ def _render_broadcast(
     fast_preview_full_resolution: bool = False,
     metadata_mode: str = "full",
     viewports: tuple[str, ...] | None = None,
+    emit_mpr_state_update: bool = False,
 ) -> RenderDecision:
     return RenderDecision(
         mode="broadcast",
@@ -163,6 +172,7 @@ def _render_broadcast(
         fast_preview_full_resolution=fast_preview_full_resolution,
         metadata_mode=metadata_mode,
         broadcast_viewports=viewports,
+        emit_mpr_state_update=emit_mpr_state_update,
     )
 
 
@@ -190,6 +200,20 @@ def _render_full_resolution_preview_broadcast(
     )
 
 
+def _render_mpr_crosshair_preview_broadcast(
+    *,
+    viewports: tuple[str, ...] | None = None,
+) -> RenderDecision:
+    return _render_broadcast(
+        "png",
+        fast_preview=True,
+        fast_preview_full_resolution=False,
+        metadata_mode="mpr-crosshair-preview",
+        viewports=viewports,
+        emit_mpr_state_update=True,
+    )
+
+
 def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> RenderDecision:
     if render_decision.mode == "broadcast":
         return render_decision
@@ -200,6 +224,7 @@ def _promote_render_decision_to_broadcast(render_decision: RenderDecision) -> Re
         fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
         metadata_mode=render_decision.metadata_mode,
         broadcast_viewports=render_decision.broadcast_viewports,
+        emit_mpr_state_update=render_decision.emit_mpr_state_update,
     )
 
 
@@ -338,8 +363,7 @@ def _handle_crosshair_operation(
     if not should_broadcast_group:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_full_resolution_preview_broadcast(
-            metadata_mode="mpr-pan-zoom-preview",
+        return _render_mpr_crosshair_preview_broadcast(
             viewports=_reference_mpr_viewports(service, view),
         )
     if payload.action_type == "end":
@@ -716,8 +740,7 @@ def _handle_mpr_oblique_operation(
     if not service._handle_mpr_oblique(view, payload):
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_full_resolution_preview_broadcast(
-            metadata_mode="mpr-pan-zoom-preview",
+        return _render_mpr_crosshair_preview_broadcast(
             viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
         )
     if payload.action_type == "end":
@@ -956,6 +979,7 @@ def _build_operation_render_outcome(
     render_decision: RenderDecision,
     *,
     mpr_revision: int | None = None,
+    image_format: ImageFormat = "png",
 ) -> OperationRenderOutcome:
     if render_decision.mode == "none":
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
@@ -977,7 +1001,7 @@ def _build_operation_render_outcome(
             return OperationRenderOutcome(
                 mpr_revision=mpr_revision,
                 broadcast_view_ids=sized_group_view_ids,
-                broadcast_image_format=render_decision.image_format,
+                broadcast_image_format=image_format,
                 broadcast_fast_preview=render_decision.fast_preview,
                 broadcast_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
                 broadcast_metadata_mode=render_decision.metadata_mode,
@@ -999,10 +1023,11 @@ def _build_operation_render_outcome(
         return OperationRenderOutcome(
             mpr_revision=mpr_revision,
             broadcast_view_ids=sized_group_view_ids,
-            broadcast_image_format=render_decision.image_format,
+            broadcast_image_format=image_format,
             broadcast_fast_preview=render_decision.fast_preview,
             broadcast_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
             broadcast_metadata_mode=render_decision.metadata_mode,
+            mpr_state_view_ids=sized_group_view_ids if render_decision.emit_mpr_state_update else (),
         )
 
     if service._is_3d_view_type(view.view_type) or render_decision.defer_single:
@@ -1012,7 +1037,7 @@ def _build_operation_render_outcome(
         return OperationRenderOutcome(
             mpr_revision=mpr_revision,
             deferred_view_ids=(view.view_id,),
-            deferred_image_format=render_decision.image_format,
+            deferred_image_format=image_format,
             deferred_fast_preview=render_decision.fast_preview,
             deferred_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
             deferred_metadata_mode=render_decision.metadata_mode,
@@ -1021,19 +1046,15 @@ def _build_operation_render_outcome(
     return OperationRenderOutcome(
         draft_measurement=render_decision.draft_measurement,
         mpr_revision=mpr_revision,
-        primary_image_format=render_decision.image_format,
+        primary_image_format=image_format,
         primary_fast_preview=render_decision.fast_preview,
         primary_fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
         primary_metadata_mode=render_decision.metadata_mode,
         primary_result=service._render_by_view_type(
             view,
-            image_format=render_decision.image_format,
+            image_format=image_format,
             fast_preview=render_decision.fast_preview,
             fast_preview_full_resolution=render_decision.fast_preview_full_resolution,
             metadata_mode=render_decision.metadata_mode,
         )
     )
-
-
-
-

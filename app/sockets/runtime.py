@@ -56,6 +56,9 @@ class ViewSocketHub:
         self._view_sids[view_id].add(sid)
         self._sid_views[sid].add(view_id)
 
+    def get_view_sids(self, view_id: str, target_sids: tuple[str, ...] | None = None) -> tuple[str, ...]:
+        return self._resolve_target_sids(view_id, target_sids)
+
     def unbind_sid(self, sid: str) -> None:
         self._sid_workspaces.pop(sid, None)
         view_ids = self._sid_views.pop(sid, set())
@@ -114,7 +117,7 @@ class ViewSocketHub:
 
     @staticmethod
     def _is_final_render_request(request: RenderRequest) -> bool:
-        return request.image_format == "png" and not request.fast_preview
+        return request.image_format in {"png", "webp"} and not request.fast_preview
 
     @classmethod
     def _is_preview_render_batch(cls, request_batch: dict[str, RenderRequest]) -> bool:
@@ -425,7 +428,7 @@ class ViewSocketHub:
     def _resolve_render_intent(request: RenderRequest) -> str:
         if request.metadata_mode in {"stack-pixel-preview", "mpr-pixel-preview"}:
             return "pixel-only"
-        if request.metadata_mode in {"stack-geometry-preview", "mpr-pan-zoom-preview", "stack-preview-lite"}:
+        if request.metadata_mode in {"stack-geometry-preview", "mpr-pan-zoom-preview", "mpr-crosshair-preview", "stack-preview-lite"}:
             return "geometry-preview"
         if request.metadata_mode in {"mpr-segmentation-preview", "fusion-registration-layer-preview"}:
             return "overlay-preview"
@@ -454,6 +457,14 @@ class ViewSocketHub:
         elif request.metadata_mode == "mpr-pan-zoom-preview":
             payload.pop("cornerInfo", None)
             payload.pop("orientation", None)
+        elif request.metadata_mode == "mpr-crosshair-preview":
+            payload.pop("cornerInfo", None)
+            payload.pop("orientation", None)
+            payload.pop("scaleBar", None)
+            payload.pop("measurements", None)
+            payload.pop("annotations", None)
+            payload.pop("mprSegmentationOverlay", None)
+            payload.pop("mpr_segmentation_overlay", None)
         elif request.metadata_mode == "fusion-registration-layer-preview":
             payload.pop("cornerInfo", None)
             payload.pop("orientation", None)

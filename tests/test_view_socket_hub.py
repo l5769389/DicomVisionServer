@@ -47,6 +47,16 @@ def test_merge_render_request_promotes_pending_preview_to_full_quality() -> None
     assert merged.target_sids == ("sid-1", "sid-2")
 
 
+def test_merge_render_request_treats_webp_as_full_quality() -> None:
+    merged = ViewSocketHub._merge_render_request(
+        RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",)),
+        RenderRequest(image_format="webp", fast_preview=False, target_sids=("sid-1",)),
+    )
+
+    assert merged.image_format == "webp"
+    assert merged.fast_preview is False
+
+
 def test_merge_render_request_keeps_broadcast_target_when_either_request_broadcasts() -> None:
     merged = ViewSocketHub._merge_render_request(
         RenderRequest(image_format="jpeg", fast_preview=True, target_sids=None),
@@ -148,8 +158,10 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
             "imageFormat": "png",
             "cornerInfo": {"topLeft": ["A"]},
             "orientation": {"top": "A"},
+            "scaleBar": {"visible": True},
             "measurements": [{"measurementId": "m"}],
             "annotations": [{"annotationId": "a"}],
+            "mprSegmentationOverlay": {"regions": []},
         }
     )
 
@@ -164,6 +176,10 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     mpr_payload = ViewSocketHub._build_image_update_payload(
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="mpr-pan-zoom-preview"),
+    )
+    mpr_crosshair_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="jpeg", fast_preview=True, metadata_mode="mpr-crosshair-preview"),
     )
 
     assert "measurements" not in stack_pixel_payload
@@ -186,6 +202,15 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     assert mpr_payload["renderIntent"] == "geometry-preview"
     assert "cornerInfo" not in mpr_payload
     assert "orientation" not in mpr_payload
+    assert mpr_crosshair_payload["imageFormat"] == "png"
+    assert mpr_crosshair_payload["metadataMode"] == "mpr-crosshair-preview"
+    assert mpr_crosshair_payload["renderIntent"] == "geometry-preview"
+    assert "cornerInfo" not in mpr_crosshair_payload
+    assert "orientation" not in mpr_crosshair_payload
+    assert "scaleBar" not in mpr_crosshair_payload
+    assert "measurements" not in mpr_crosshair_payload
+    assert "annotations" not in mpr_crosshair_payload
+    assert "mprSegmentationOverlay" not in mpr_crosshair_payload
 
 
 def test_render_request_revision_is_assigned_at_schedule_time() -> None:
