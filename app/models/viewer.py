@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 from app.core.workspace import DEFAULT_WORKSPACE_ID
-from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
+from app.models.measurement import DrawingScope, MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 
 
 Quaternion = tuple[float, float, float, float]
@@ -61,6 +61,7 @@ class AnnotationRecord:
     text: str = ""
     color: str = "#ffd166"
     size: str = "md"
+    scope: DrawingScope = "image"
 
 
 @dataclass(frozen=True)

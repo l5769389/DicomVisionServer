@@ -56,7 +56,7 @@ from app.core import (
     VIEW_OP_TYPE_SCROLL,
 )
 from app.core.logging import get_logger
-from app.models.measurement import MeasurementPoint, MeasurementRecord, MeasurementSliceContext
+from app.models.measurement import DrawingScope, MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import (
     AnnotationRecord,
     FusionRegistrationState,
@@ -1590,6 +1590,7 @@ class ViewerService:
             return False
 
         source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
+        slice_context = self._with_operation_slice_index(slice_context, payload.slice_index)
         metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
 
         label_anchor = image_points[1] if tool_type != "angle" else image_points[1]
@@ -1602,6 +1603,7 @@ class ViewerService:
             metrics=metrics,
             label_anchor=label_anchor,
             label_lines=label_lines,
+            scope=self._normalize_drawing_scope(payload.scope),
         )
         existing_index = next(
             (index for index, measurement in enumerate(view.measurements) if measurement.measurement_id == measurement_id),
@@ -1674,6 +1676,23 @@ class ViewerService:
         color = str(value or "").strip()
         return color or "#ffd166"
 
+    @staticmethod
+    def _normalize_drawing_scope(value: str | None) -> DrawingScope:
+        return "series" if str(value or "").strip().lower() == "series" else "image"
+
+    @staticmethod
+    def _with_operation_slice_index(
+        slice_context: MeasurementSliceContext,
+        slice_index: int | None,
+    ) -> MeasurementSliceContext:
+        if slice_index is None:
+            return slice_context
+        return MeasurementSliceContext(
+            kind=slice_context.kind,
+            slice_index=max(0, int(slice_index)),
+            sop_instance_uid=slice_context.sop_instance_uid,
+        )
+
     def _handle_annotation(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         tool_type = self._resolve_annotation_tool_type(payload)
         if tool_type is None:
@@ -1686,6 +1705,7 @@ class ViewerService:
             return False
 
         _, _, slice_context = self._resolve_measurement_source_context(view)
+        slice_context = self._with_operation_slice_index(slice_context, payload.slice_index)
         annotation_id = str(payload.annotation_id or payload.measurement_id or "").strip() or str(uuid4())
         next_annotation = AnnotationRecord(
             annotation_id=annotation_id,
@@ -1695,6 +1715,7 @@ class ViewerService:
             text=str(payload.text or ""),
             color=self._normalize_annotation_color(payload.color),
             size=self._normalize_annotation_size(payload.size),
+            scope=self._normalize_drawing_scope(payload.scope),
         )
         existing_index = next(
             (index for index, annotation in enumerate(view.annotations) if annotation.annotation_id == annotation_id),
@@ -1740,10 +1761,14 @@ class ViewerService:
         visible: list[MeasurementRecord] = []
         for measurement in view.measurements:
             if measurement.slice_context.kind == "stack":
-                if not self._is_mpr_view_type(view.view_type) and measurement.slice_context.slice_index == current_slice:
+                if not self._is_mpr_view_type(view.view_type) and (
+                    measurement.scope == "series" or measurement.slice_context.slice_index == current_slice
+                ):
                     visible.append(measurement)
                 continue
-            if self._is_mpr_view_type(view.view_type) and measurement.slice_context.slice_index == current_slice:
+            if self._is_mpr_view_type(view.view_type) and (
+                measurement.scope == "series" or measurement.slice_context.slice_index == current_slice
+            ):
                 visible.append(measurement)
         return tuple(visible)
 
@@ -1755,10 +1780,14 @@ class ViewerService:
         visible: list[AnnotationRecord] = []
         for annotation in view.annotations:
             if annotation.slice_context.kind == "stack":
-                if not self._is_mpr_view_type(view.view_type) and annotation.slice_context.slice_index == current_slice:
+                if not self._is_mpr_view_type(view.view_type) and (
+                    annotation.scope == "series" or annotation.slice_context.slice_index == current_slice
+                ):
                     visible.append(annotation)
                 continue
-            if self._is_mpr_view_type(view.view_type) and annotation.slice_context.slice_index == current_slice:
+            if self._is_mpr_view_type(view.view_type) and (
+                annotation.scope == "series" or annotation.slice_context.slice_index == current_slice
+            ):
                 visible.append(annotation)
         return tuple(visible)
 
@@ -1790,6 +1819,8 @@ class ViewerService:
                 toolType=measurement.tool_type,
                 points=[serialize_point(point) for point in measurement.points],
                 labelLines=list(measurement.label_lines),
+                scope=getattr(measurement, "scope", "image"),
+                sliceIndex=getattr(measurement.slice_context, "slice_index", None),
             )
             for measurement in measurements
         ]
@@ -1854,6 +1885,8 @@ class ViewerService:
                 text=annotation.text,
                 color=annotation.color,
                 size=annotation.size,
+                scope=getattr(annotation, "scope", "image"),
+                sliceIndex=getattr(annotation.slice_context, "slice_index", None),
             )
             for annotation in annotations
         ]

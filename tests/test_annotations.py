@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from app.models.measurement import MeasurementPoint, MeasurementSliceContext
+from app.models.measurement import MeasurementMetrics, MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import AnnotationRecord, ViewRecord
 from app.services.viewer_service import ViewerService
 
@@ -70,3 +70,58 @@ def test_visible_annotations_follow_current_slice() -> None:
     visible = service._build_visible_annotations(view)
 
     assert [annotation.annotation_id for annotation in visible] == ["visible"]
+
+
+def test_series_scope_annotation_stays_visible_across_slices() -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=5)
+    view.annotations = [
+        AnnotationRecord(
+            annotation_id="series",
+            tool_type="arrow",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=3, sop_instance_uid="sop-3"),
+            scope="series",
+        ),
+        AnnotationRecord(
+            annotation_id="image",
+            tool_type="arrow",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=4, sop_instance_uid="sop-4"),
+            scope="image",
+        ),
+    ]
+
+    visible = service._build_visible_annotations(view)
+
+    assert [annotation.annotation_id for annotation in visible] == ["series"]
+
+
+def test_series_scope_measurement_stays_visible_across_slices() -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=5)
+    metrics = MeasurementMetrics(unit="px", area_unit="px2")
+    view.measurements = [
+        MeasurementRecord(
+            measurement_id="series",
+            tool_type="line",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=3, sop_instance_uid="sop-3"),
+            metrics=metrics,
+            label_anchor=MeasurementPoint(2.0, 2.0),
+            scope="series",
+        ),
+        MeasurementRecord(
+            measurement_id="image",
+            tool_type="line",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=4, sop_instance_uid="sop-4"),
+            metrics=metrics,
+            label_anchor=MeasurementPoint(2.0, 2.0),
+            scope="image",
+        ),
+    ]
+
+    visible = service._build_visible_measurements(view)
+
+    assert [measurement.measurement_id for measurement in visible] == ["series"]

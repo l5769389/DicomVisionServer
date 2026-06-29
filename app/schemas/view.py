@@ -589,6 +589,8 @@ class MeasurementOverlayPayload(BaseModel):
     tool_type: str = Field(alias="toolType")
     points: list[MeasurementPointPayload]
     label_lines: list[str] = Field(alias="labelLines", default_factory=list)
+    scope: Literal["image", "series"] = "image"
+    slice_index: int | None = Field(default=None, alias="sliceIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -600,6 +602,8 @@ class AnnotationOverlayPayload(BaseModel):
     text: str = ""
     color: str = "#ffd166"
     size: str = "md"
+    scope: Literal["image", "series"] = "image"
+    slice_index: int | None = Field(default=None, alias="sliceIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -644,6 +648,8 @@ class ViewOperationRequest(BaseModel):
     text: str | None = None
     color: str | None = None
     size: str | None = None
+    scope: Literal["image", "series"] | None = None
+    slice_index: int | None = Field(default=None, alias="sliceIndex")
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
