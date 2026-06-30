@@ -120,7 +120,7 @@ def handle_view_operation(
     if is_mpr_view and active_viewport_changed and render_decision.mode != "none":
         render_decision = _promote_render_decision_to_broadcast(render_decision)
 
-    if render_decision.mode == "none":
+    if render_decision.mode == "none" and not render_decision.emit_mpr_state_update:
         return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
 
     _log_view_operation_state(service, view, payload)
@@ -136,6 +136,17 @@ def handle_view_operation(
 
 def _render_none() -> RenderDecision:
     return RenderDecision(mode="none")
+
+
+def _render_mpr_state_update(
+    *,
+    viewports: tuple[str, ...] | None = None,
+) -> RenderDecision:
+    return RenderDecision(
+        mode="none",
+        broadcast_viewports=viewports,
+        emit_mpr_state_update=True,
+    )
 
 
 def _render_single(
@@ -181,6 +192,16 @@ def _render_full_resolution_preview_single(*, defer: bool = False, metadata_mode
         "png",
         fast_preview=True,
         fast_preview_full_resolution=True,
+        defer=defer,
+        metadata_mode=metadata_mode,
+    )
+
+
+def _render_fast_preview_single(*, defer: bool = False, metadata_mode: str = "full") -> RenderDecision:
+    return _render_single(
+        "png",
+        fast_preview=True,
+        fast_preview_full_resolution=False,
         defer=defer,
         metadata_mode=metadata_mode,
     )
@@ -365,7 +386,7 @@ def _handle_crosshair_operation(
     if not should_broadcast_group:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_mpr_crosshair_preview_broadcast(
+        return _render_mpr_state_update(
             viewports=_reference_mpr_viewports(service, view),
         )
     if payload.action_type == "end":
@@ -394,7 +415,7 @@ def _handle_zoom_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-zoom-preview")
+            return _render_fast_preview_single(defer=True, metadata_mode="mpr-zoom-preview")
         return _render_single(defer=True)
     return _resolve_drag_single_render_decision(
         service,
@@ -485,7 +506,7 @@ def _handle_pan_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
+            return _render_fast_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
         return _render_single(defer=True)
     return _resolve_drag_single_render_decision(
         service,
@@ -582,6 +603,16 @@ def _handle_reset_operation(
 
     if reset_target == "annotations":
         if not service._clear_annotations(view):
+            return _render_none()
+        return _render_broadcast() if is_mpr_view else _render_single()
+
+    if reset_target in {"mprcrosshair", "mpr-crosshair", "crosshair"}:
+        if not service._reset_mpr_crosshair_state(view):
+            return _render_none()
+        return _render_broadcast()
+
+    if reset_target in {"rotate3d", "rotate-3d", "3drotation"}:
+        if not service._reset_rotate_3d_state(view):
             return _render_none()
         return _render_broadcast() if is_mpr_view else _render_single()
 
@@ -707,7 +738,13 @@ def _handle_mpr_mip_config_operation(
     if payload.action_type == DRAG_ACTION_START:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_full_resolution_preview_broadcast(metadata_mode="mpr-pan-zoom-preview")
+        return _render_broadcast(
+            "png",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+            metadata_mode="mpr-pan-zoom-preview",
+            emit_mpr_state_update=True,
+        )
     return _render_broadcast()
 
 
@@ -743,7 +780,7 @@ def _handle_mpr_oblique_operation(
     if not service._handle_mpr_oblique(view, payload):
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_mpr_crosshair_preview_broadcast(
+        return _render_mpr_state_update(
             viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
         )
     if payload.action_type == "end":
@@ -985,7 +1022,23 @@ def _build_operation_render_outcome(
     image_format: ImageFormat = "png",
 ) -> OperationRenderOutcome:
     if render_decision.mode == "none":
-        return OperationRenderOutcome(draft_measurement=render_decision.draft_measurement)
+        mpr_state_view_ids: tuple[str, ...] = ()
+        if render_decision.emit_mpr_state_update:
+            mpr_state_view_ids = tuple(
+                group_view.view_id
+                for group_view in service._get_mpr_group_views(view)
+                if group_view.width
+                and group_view.height
+                and (
+                    render_decision.broadcast_viewports is None
+                    or service._resolve_mpr_viewport(group_view) in render_decision.broadcast_viewports
+                )
+            )
+        return OperationRenderOutcome(
+            draft_measurement=render_decision.draft_measurement,
+            mpr_revision=mpr_revision,
+            mpr_state_view_ids=mpr_state_view_ids,
+        )
 
     if render_decision.mode == "broadcast":
         if service._is_fusion_view_type(view.view_type):

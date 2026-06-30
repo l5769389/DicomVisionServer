@@ -535,7 +535,7 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
 
     response, scheduled_options, events = asyncio.run(run())
     assert response == {"ok": True}
-    assert scheduled_options == [(("v-cor",), 7, True)]
+    assert scheduled_options == [(("v-cor",), 7, False)]
     assert events == [
         (
             "mpr_state_update",
@@ -545,7 +545,7 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
     ]
 
 
-def test_mpr_crosshair_state_emits_state_and_throttles_preview(monkeypatch) -> None:
+def test_mpr_crosshair_state_move_emits_state_without_preview(monkeypatch) -> None:
     async def run() -> tuple[dict[str, object], list[tuple[tuple[str, ...], str, bool, str, int | None]], list[tuple[str, object, str | None]]]:
         handlers._mpr_crosshair_state_queues.clear()
         handlers._mpr_crosshair_preview_states.clear()
@@ -606,12 +606,12 @@ def test_mpr_crosshair_state_emits_state_and_throttles_preview(monkeypatch) -> N
             "sid-1",
             {"viewId": "v-ax", "opType": "crosshair", "actionType": "move", "x": 0.5, "y": 0.5},
         )
-        await _wait_for(lambda: len(scheduled_batches) == 1)
+        await _wait_for(lambda: len(server.events) == 2)
         return response, scheduled_batches, server.events
 
     response, scheduled_batches, events = asyncio.run(run())
     assert response == {"ok": True}
-    assert scheduled_batches == [(("v-cor", "v-sag"), "png", False, "full", 12)]
+    assert scheduled_batches == []
     assert events == [
         ("mpr_state_update", {"viewId": "v-cor", "mprRevision": 12}, "sid-v-cor"),
         ("mpr_state_update", {"viewId": "v-sag", "mprRevision": 12}, "sid-v-sag"),

@@ -1086,7 +1086,7 @@ def test_mpr_oblique_second_view_rotation_preserves_first_view_crosshair_angle(m
     assert _visible_line_angles(service, axial_view, series, volume) == pytest.approx(axial_angles_after_first)
 
 
-def test_mpr_oblique_move_broadcasts_reference_full_resolution_preview(monkeypatch) -> None:
+def test_mpr_oblique_move_emits_reference_state_without_preview(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, axial_view = _build_axial_view(service, series, volume)
     coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
@@ -1134,15 +1134,13 @@ def test_mpr_oblique_move_broadcasts_reference_full_resolution_preview(monkeypat
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_view_ids == ()
     assert set(outcome.mpr_state_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
-    assert outcome.broadcast_image_format == "png"
-    assert outcome.broadcast_fast_preview is True
-    assert outcome.broadcast_fast_preview_full_resolution is False
-    assert outcome.broadcast_metadata_mode == "mpr-crosshair-preview"
+    assert outcome.broadcast_fast_preview is False
+    assert outcome.broadcast_metadata_mode == "full"
 
 
-def test_mpr_crosshair_move_uses_low_latency_preview_broadcast(monkeypatch) -> None:
+def test_mpr_crosshair_move_emits_reference_state_without_preview(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, axial_view = _build_axial_view(service, series, volume)
     coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
@@ -1184,12 +1182,10 @@ def test_mpr_crosshair_move_uses_low_latency_preview_broadcast(monkeypatch) -> N
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert set(outcome.broadcast_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
+    assert outcome.broadcast_view_ids == ()
     assert set(outcome.mpr_state_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
-    assert outcome.broadcast_image_format == "png"
-    assert outcome.broadcast_fast_preview is True
-    assert outcome.broadcast_fast_preview_full_resolution is False
-    assert outcome.broadcast_metadata_mode == "mpr-crosshair-preview"
+    assert outcome.broadcast_fast_preview is False
+    assert outcome.broadcast_metadata_mode == "full"
 
 
 def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) -> None:
@@ -1251,7 +1247,8 @@ def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) ->
         view_registry._view_by_id.update(previous_views)
 
     assert crosshair_outcome.mpr_revision == 1
-    assert crosshair_outcome.broadcast_metadata_mode == "mpr-crosshair-preview"
+    assert crosshair_outcome.broadcast_view_ids == ()
+    assert set(crosshair_outcome.mpr_state_view_ids) == {coronal_view.view_id, sagittal_view.view_id}
     assert window_outcome.mpr_revision == 1
     assert window_outcome.broadcast_metadata_mode == "mpr-pixel-preview"
     assert group.mpr_revision == 1
@@ -1379,7 +1376,7 @@ def test_stack_pan_move_uses_png_render(monkeypatch) -> None:
     assert pan_end.deferred_fast_preview is False
 
 
-def test_mpr_pan_move_schedules_deferred_full_resolution_preview(monkeypatch) -> None:
+def test_mpr_pan_move_schedules_deferred_low_cost_preview(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     _, axial_view = _build_axial_view(service, series, volume)
 
@@ -1408,7 +1405,7 @@ def test_mpr_pan_move_schedules_deferred_full_resolution_preview(monkeypatch) ->
     assert move_outcome.deferred_view_ids == (axial_view.view_id,)
     assert move_outcome.deferred_image_format == "png"
     assert move_outcome.deferred_fast_preview is True
-    assert move_outcome.deferred_fast_preview_full_resolution is True
+    assert move_outcome.deferred_fast_preview_full_resolution is False
     assert move_outcome.deferred_metadata_mode == "mpr-pan-zoom-preview"
     assert end_outcome.primary_result is None
     assert end_outcome.deferred_view_ids == (axial_view.view_id,)
@@ -1416,7 +1413,7 @@ def test_mpr_pan_move_schedules_deferred_full_resolution_preview(monkeypatch) ->
     assert end_outcome.deferred_fast_preview is False
 
 
-def test_mpr_zoom_move_schedules_deferred_full_resolution_preview(monkeypatch) -> None:
+def test_mpr_zoom_move_schedules_deferred_low_cost_preview(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     _, axial_view = _build_axial_view(service, series, volume)
     axial_view.zoom = 1.0
@@ -1445,7 +1442,7 @@ def test_mpr_zoom_move_schedules_deferred_full_resolution_preview(monkeypatch) -
     assert move_outcome.deferred_view_ids == (axial_view.view_id,)
     assert move_outcome.deferred_image_format == "png"
     assert move_outcome.deferred_fast_preview is True
-    assert move_outcome.deferred_fast_preview_full_resolution is True
+    assert move_outcome.deferred_fast_preview_full_resolution is False
     assert move_outcome.deferred_metadata_mode == "mpr-zoom-preview"
     assert end_outcome.primary_result is None
     assert end_outcome.deferred_view_ids == (axial_view.view_id,)
@@ -1511,6 +1508,7 @@ def test_mpr_mip_config_move_renders_full_resolution_preview_and_end_finalizes(m
     assert group.mpr_mip.viewports["mpr-ax"].thickness == 22
     assert group.mpr_mip.viewports["mpr-sag"].thickness == 0
     assert move_outcome.broadcast_view_ids == ("v-ax", "v-cor", "v-sag")
+    assert move_outcome.mpr_state_view_ids == ("v-ax", "v-cor", "v-sag")
     assert move_outcome.broadcast_image_format == "png"
     assert move_outcome.broadcast_fast_preview is True
     assert move_outcome.broadcast_fast_preview_full_resolution is True
@@ -1828,12 +1826,10 @@ def test_mpr_double_oblique_move_broadcasts_target_and_end_syncs_active_view(mon
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert outcome.broadcast_view_ids == (coronal_view.view_id,)
+    assert outcome.broadcast_view_ids == ()
     assert outcome.mpr_state_view_ids == (coronal_view.view_id,)
-    assert outcome.broadcast_image_format == "png"
-    assert outcome.broadcast_fast_preview is True
-    assert outcome.broadcast_fast_preview_full_resolution is False
-    assert outcome.broadcast_metadata_mode == "mpr-crosshair-preview"
+    assert outcome.broadcast_fast_preview is False
+    assert outcome.broadcast_metadata_mode == "full"
     assert set(end_outcome.broadcast_view_ids) == {axial_view.view_id, coronal_view.view_id}
     assert end_outcome.broadcast_image_format == "png"
     assert end_outcome.broadcast_fast_preview is False

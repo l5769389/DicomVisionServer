@@ -3046,6 +3046,54 @@ class ViewerService:
                 self._initialize_mpr_viewport(group_view)
             group_view.is_initialized = True
 
+    def _reset_mpr_crosshair_state(self, view: ViewRecord) -> bool:
+        group = view.view_group
+        if group is None:
+            return False
+        series = series_registry.get(view.series_id)
+        volume = self._get_series_volume(series)
+        volume_shape = volume.shape
+        default_frame = self._build_default_mpr_frame_state(volume_shape)
+        geometry = self._get_series_volume_geometry(series, volume_shape)
+        default_cursor = legacy_frame_to_cursor(default_frame, geometry, reference_center=default_frame.center)
+
+        group.active_viewport = MPR_VIEWPORT_AXIAL
+        group.crosshair_drag_active = False
+        group.crosshair_drag_origin_center = None
+        group.crosshair_drag_origin_image = None
+        group.rotation_drag = None
+        group.mpr_crosshair_angles.clear()
+        group.mpr_crosshair_mode = MPR_CROSSHAIR_MODE_ORTHOGONAL
+        group.mpr_independent_plane_normals.clear()
+        group.mpr_use_display_basis_for_cursor_offsets = False
+        self._sync_group_from_mpr_cursor(group, default_cursor, geometry, volume_shape)
+        self._reset_mpr_rotation_state(group)
+
+        for group_view in self._get_mpr_group_views(view):
+            self._reset_drag_state(group_view)
+            group_view.is_initialized = True
+        return True
+
+    def _reset_rotate_3d_state(self, view: ViewRecord) -> bool:
+        if self._is_mpr_view_type(view.view_type):
+            group = view.view_group
+            if group is None:
+                return False
+            self._set_mpr_model_rotation_matrix(group, np.eye(3, dtype=np.float64))
+            group.mpr_model_rotation_pivot_world = None
+            group.rotation_drag = None
+            for group_view in self._get_mpr_group_views(view):
+                self._reset_drag_state(group_view)
+                group_view.is_initialized = True
+            return True
+
+        if not self._is_3d_view_type(view.view_type):
+            return False
+        view.rotation_quaternion = _get_vtk_volume_renderer().get_default_rotation_quaternion()
+        self._reset_drag_state(view)
+        view.is_initialized = True
+        return True
+
     def _reset_mpr_group_geometry(
         self,
         group: ViewGroupRecord,

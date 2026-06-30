@@ -433,10 +433,6 @@ async def _dispatch_operation_result(
         broadcast_fast_preview = result.broadcast_fast_preview
         broadcast_fast_preview_full_resolution = result.broadcast_fast_preview_full_resolution
         broadcast_metadata_mode = result.broadcast_metadata_mode
-        if payload.action_type == DRAG_ACTION_MOVE and result.broadcast_metadata_mode == "mpr-crosshair-preview":
-            broadcast_fast_preview = False
-            broadcast_fast_preview_full_resolution = True
-            broadcast_metadata_mode = "full"
         if broadcast_fast_preview or result.broadcast_image_format == "jpeg":
             await view_socket_hub.schedule_render_batch(
                 result.broadcast_view_ids,
@@ -540,21 +536,7 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
             result.mpr_state_view_ids,
             mpr_revision=result.mpr_revision,
         )
-        if operation.payload.action_type == DRAG_ACTION_MOVE and result.broadcast_view_ids:
-            _schedule_mpr_crosshair_preview(
-                queue_key,
-                _MprCrosshairPreviewRequest(
-                    server=operation.server,
-                    sid=operation.sid,
-                    view_ids=result.broadcast_view_ids,
-                    image_format=result.broadcast_image_format,
-                    fast_preview=False,
-                    fast_preview_full_resolution=True,
-                    metadata_mode="full",
-                    mpr_revision=result.mpr_revision,
-                ),
-            )
-        elif operation.payload.action_type == DRAG_ACTION_END:
+        if operation.payload.action_type == DRAG_ACTION_END:
             _cancel_mpr_crosshair_preview(queue_key)
             if result.broadcast_view_ids:
                 _schedule_render_batch_for_views(
