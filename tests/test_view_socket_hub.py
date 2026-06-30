@@ -173,9 +173,27 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-geometry-preview"),
     )
+    stack_zoom_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(
+            image_format="png",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+            metadata_mode="stack-zoom-preview",
+        ),
+    )
     mpr_payload = ViewSocketHub._build_image_update_payload(
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="mpr-pan-zoom-preview"),
+    )
+    mpr_zoom_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(
+            image_format="png",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+            metadata_mode="mpr-zoom-preview",
+        ),
     )
     mpr_crosshair_payload = ViewSocketHub._build_image_update_payload(
         meta,
@@ -194,6 +212,11 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     assert stack_geometry_payload["measurements"] == [{"measurementId": "m"}]
     assert stack_geometry_payload["annotations"] == [{"annotationId": "a"}]
     assert stack_geometry_payload["renderIntent"] == "geometry-preview"
+    assert stack_zoom_payload["measurements"] == [{"measurementId": "m"}]
+    assert stack_zoom_payload["annotations"] == [{"annotationId": "a"}]
+    assert stack_zoom_payload["fastPreviewFullResolution"] is True
+    assert stack_zoom_payload["metadataMode"] == "stack-zoom-preview"
+    assert stack_zoom_payload["renderIntent"] == "geometry-preview"
     assert mpr_payload["measurements"] == [{"measurementId": "m"}]
     assert mpr_payload["annotations"] == [{"annotationId": "a"}]
     assert mpr_payload["fastPreview"] is True
@@ -202,6 +225,13 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     assert mpr_payload["renderIntent"] == "geometry-preview"
     assert "cornerInfo" not in mpr_payload
     assert "orientation" not in mpr_payload
+    assert mpr_zoom_payload["measurements"] == [{"measurementId": "m"}]
+    assert mpr_zoom_payload["annotations"] == [{"annotationId": "a"}]
+    assert mpr_zoom_payload["fastPreviewFullResolution"] is True
+    assert mpr_zoom_payload["metadataMode"] == "mpr-zoom-preview"
+    assert mpr_zoom_payload["renderIntent"] == "geometry-preview"
+    assert "cornerInfo" not in mpr_zoom_payload
+    assert "orientation" not in mpr_zoom_payload
     assert mpr_crosshair_payload["imageFormat"] == "png"
     assert mpr_crosshair_payload["metadataMode"] == "mpr-crosshair-preview"
     assert mpr_crosshair_payload["renderIntent"] == "geometry-preview"

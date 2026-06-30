@@ -1309,7 +1309,8 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert zoom_move.deferred_view_ids == (view.view_id,)
     assert zoom_move.deferred_image_format == "png"
     assert zoom_move.deferred_fast_preview is True
-    assert zoom_move.deferred_metadata_mode == "stack-geometry-preview"
+    assert zoom_move.deferred_fast_preview_full_resolution is True
+    assert zoom_move.deferred_metadata_mode == "stack-zoom-preview"
     assert zoom_end.primary_result is None
     assert zoom_end.deferred_view_ids == (view.view_id,)
     assert zoom_end.deferred_image_format == "png"
@@ -1445,6 +1446,7 @@ def test_mpr_zoom_move_schedules_deferred_full_resolution_preview(monkeypatch) -
     assert move_outcome.deferred_image_format == "png"
     assert move_outcome.deferred_fast_preview is True
     assert move_outcome.deferred_fast_preview_full_resolution is True
+    assert move_outcome.deferred_metadata_mode == "mpr-zoom-preview"
     assert end_outcome.primary_result is None
     assert end_outcome.deferred_view_ids == (axial_view.view_id,)
     assert end_outcome.deferred_image_format == "png"

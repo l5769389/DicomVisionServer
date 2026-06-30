@@ -430,13 +430,20 @@ async def _dispatch_operation_result(
     if result.mpr_state_view_ids:
         await _emit_mpr_state_updates(server, sid, result.mpr_state_view_ids, mpr_revision=result.mpr_revision)
     if result.broadcast_view_ids:
-        if result.broadcast_fast_preview or result.broadcast_image_format == "jpeg":
+        broadcast_fast_preview = result.broadcast_fast_preview
+        broadcast_fast_preview_full_resolution = result.broadcast_fast_preview_full_resolution
+        broadcast_metadata_mode = result.broadcast_metadata_mode
+        if payload.action_type == DRAG_ACTION_MOVE and result.broadcast_metadata_mode == "mpr-crosshair-preview":
+            broadcast_fast_preview = False
+            broadcast_fast_preview_full_resolution = True
+            broadcast_metadata_mode = "full"
+        if broadcast_fast_preview or result.broadcast_image_format == "jpeg":
             await view_socket_hub.schedule_render_batch(
                 result.broadcast_view_ids,
                 image_format=result.broadcast_image_format,
-                fast_preview=result.broadcast_fast_preview,
-                fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
-                metadata_mode=result.broadcast_metadata_mode,
+                fast_preview=broadcast_fast_preview,
+                fast_preview_full_resolution=broadcast_fast_preview_full_resolution,
+                metadata_mode=broadcast_metadata_mode,
                 mpr_revision=result.mpr_revision,
             )
         else:
@@ -445,9 +452,9 @@ async def _dispatch_operation_result(
                 sid,
                 result.broadcast_view_ids,
                 image_format=result.broadcast_image_format,
-                fast_preview=result.broadcast_fast_preview,
-                fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
-                metadata_mode=result.broadcast_metadata_mode,
+                fast_preview=broadcast_fast_preview,
+                fast_preview_full_resolution=broadcast_fast_preview_full_resolution,
+                metadata_mode=broadcast_metadata_mode,
                 mpr_revision=result.mpr_revision,
             )
     if result.deferred_view_ids:
@@ -541,9 +548,9 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
                     sid=operation.sid,
                     view_ids=result.broadcast_view_ids,
                     image_format=result.broadcast_image_format,
-                    fast_preview=result.broadcast_fast_preview,
-                    fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
-                    metadata_mode=result.broadcast_metadata_mode,
+                    fast_preview=False,
+                    fast_preview_full_resolution=True,
+                    metadata_mode="full",
                     mpr_revision=result.mpr_revision,
                 ),
             )

@@ -535,7 +535,7 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
 
     response, scheduled_options, events = asyncio.run(run())
     assert response == {"ok": True}
-    assert scheduled_options == [(("v-cor",), 7, False)]
+    assert scheduled_options == [(("v-cor",), 7, True)]
     assert events == [
         (
             "mpr_state_update",
@@ -611,7 +611,7 @@ def test_mpr_crosshair_state_emits_state_and_throttles_preview(monkeypatch) -> N
 
     response, scheduled_batches, events = asyncio.run(run())
     assert response == {"ok": True}
-    assert scheduled_batches == [(("v-cor", "v-sag"), "png", True, "mpr-crosshair-preview", 12)]
+    assert scheduled_batches == [(("v-cor", "v-sag"), "png", False, "full", 12)]
     assert events == [
         ("mpr_state_update", {"viewId": "v-cor", "mprRevision": 12}, "sid-v-cor"),
         ("mpr_state_update", {"viewId": "v-sag", "mprRevision": 12}, "sid-v-sag"),

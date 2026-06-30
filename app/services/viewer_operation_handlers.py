@@ -318,6 +318,7 @@ def _resolve_drag_single_render_decision(
     *,
     move_image_format: ImageFormat = "jpeg",
     fast_preview_on_move: bool | None = None,
+    fast_preview_full_resolution_on_move: bool = False,
     defer_on_move: bool = False,
     defer_on_end: bool = False,
     move_metadata_mode: str = "full",
@@ -328,6 +329,7 @@ def _resolve_drag_single_render_decision(
         return _render_single(
             move_image_format,
             fast_preview=service._is_3d_view_type(view.view_type) if fast_preview_on_move is None else fast_preview_on_move,
+            fast_preview_full_resolution=fast_preview_full_resolution_on_move,
             defer=defer_on_move,
             metadata_mode=move_metadata_mode,
         )
@@ -385,14 +387,14 @@ def _handle_zoom_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_broadcast()
+            return _render_full_resolution_preview_broadcast(metadata_mode="fusion-zoom-preview")
         return _render_broadcast()
     service._handle_drag_zoom(view, payload)
     if is_mpr_view:
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
+            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-zoom-preview")
         return _render_single(defer=True)
     return _resolve_drag_single_render_decision(
         service,
@@ -400,9 +402,10 @@ def _handle_zoom_operation(
         payload,
         move_image_format="png",
         fast_preview_on_move=True,
+        fast_preview_full_resolution_on_move=True,
         defer_on_move=True,
         defer_on_end=True,
-        move_metadata_mode="stack-geometry-preview",
+        move_metadata_mode="stack-zoom-preview",
     )
 
 

@@ -1324,7 +1324,7 @@ class ViewerService:
         workspace_id: str | None = None,
     ) -> ViewHoverResponse:
         view = view_registry.get(payload.view_id, workspace_id=workspace_id)
-        row, col = self._resolve_hover_row_col(view, payload.x, payload.y)
+        row, col = self._resolve_hover_row_col_for_workspace(view, payload.x, payload.y, workspace_id=workspace_id)
         return ViewHoverResponse(viewId=view.view_id, row=row, col=col)
 
     def build_mpr_state_update_payload(
@@ -1484,10 +1484,22 @@ class ViewerService:
         return self._water_phantom_qa_service.analyze(payload)
 
     def _resolve_hover_row_col(self, view: ViewRecord, normalized_x: float, normalized_y: float) -> tuple[int, int]:
+        return self._resolve_hover_row_col_for_workspace(view, normalized_x, normalized_y)
+
+    def _resolve_hover_row_col_for_workspace(
+        self,
+        view: ViewRecord,
+        normalized_x: float,
+        normalized_y: float,
+        workspace_id: str | None = None,
+    ) -> tuple[int, int]:
         if not view.width or not view.height or self._is_3d_view_type(view.view_type):
             return (0, 0)
 
-        image_width, image_height, image_transform, canvas_width, canvas_height = self._build_hover_mapping_context(view)
+        image_width, image_height, image_transform, canvas_width, canvas_height = self._build_hover_mapping_context(
+            view,
+            workspace_id=workspace_id,
+        )
         return map_normalized_canvas_to_image_row_col(
             normalized_x,
             normalized_y,
@@ -1498,14 +1510,18 @@ class ViewerService:
             image_transform=image_transform,
         )
 
-    def _build_hover_mapping_context(self, view: ViewRecord) -> tuple[int, int, Any, int, int]:
+    def _build_hover_mapping_context(
+        self,
+        view: ViewRecord,
+        workspace_id: str | None = None,
+    ) -> tuple[int, int, Any, int, int]:
         """Prepare the source-image dimensions and inverse transform used for hover lookup."""
 
-        image_width, image_height = self._get_hover_source_dimensions(view)
+        image_width, image_height = self._get_hover_source_dimensions(view, workspace_id=workspace_id)
         pixel_aspect_x = 1.0
         pixel_aspect_y = 1.0
         if self._is_mpr_view_type(view.view_type):
-            series = series_registry.get(view.series_id)
+            series = series_registry.get(view.series_id, workspace_id=workspace_id)
             target_viewport = self._resolve_mpr_viewport(view)
             volume = self._get_series_volume(series)
             pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
@@ -1536,9 +1552,9 @@ class ViewerService:
             render_plan.render_view.height or 0,
         )
 
-    def _get_hover_source_dimensions(self, view: ViewRecord) -> tuple[int, int]:
+    def _get_hover_source_dimensions(self, view: ViewRecord, workspace_id: str | None = None) -> tuple[int, int]:
         if self._is_mpr_view_type(view.view_type):
-            series = series_registry.get(view.series_id)
+            series = series_registry.get(view.series_id, workspace_id=workspace_id)
             volume = self._get_series_volume(series)
             if not view.is_initialized:
                 self._initialize_mpr_viewport(view)
@@ -1547,7 +1563,7 @@ class ViewerService:
             plane_pixels, _, _ = self._extract_mpr_plane(view, volume, target_viewport)
             return (int(plane_pixels.shape[1]), int(plane_pixels.shape[0]))
 
-        series = series_registry.get(view.series_id)
+        series = series_registry.get(view.series_id, workspace_id=workspace_id)
         instance = series.instances[view.current_index]
         if not instance.sop_instance_uid:
             return (0, 0)
@@ -1891,13 +1907,51 @@ class ViewerService:
                 if not self._is_mpr_view_type(view.view_type) and (
                     measurement.scope == "series" or measurement.slice_context.slice_index == current_slice
                 ):
-                    visible.append(measurement)
+                    visible.append(self._with_current_series_measurement_metrics(view, measurement))
                 continue
             if self._is_mpr_view_type(view.view_type) and (
                 measurement.scope == "series" or measurement.slice_context.slice_index == current_slice
             ):
-                visible.append(measurement)
+                visible.append(self._with_current_series_measurement_metrics(view, measurement))
         return tuple(visible)
+
+    def _with_current_series_measurement_metrics(
+        self,
+        view: ViewRecord,
+        measurement: MeasurementRecord,
+    ) -> MeasurementRecord:
+        if measurement.scope != "series":
+            return measurement
+
+        try:
+            source_pixels, spacing_xy, current_context = self._resolve_measurement_source_context(view)
+            metrics, label_lines = build_measurement_metrics(
+                measurement.tool_type,
+                measurement.points,
+                source_pixels,
+                spacing_xy,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to refresh series-scope measurement metrics for current slice",
+                exc_info=True,
+            )
+            return measurement
+
+        return replace(
+            measurement,
+            metrics=metrics,
+            label_lines=label_lines,
+            slice_context=MeasurementSliceContext(
+                kind=measurement.slice_context.kind,
+                slice_index=current_context.slice_index,
+                sop_instance_uid=(
+                    current_context.sop_instance_uid
+                    if measurement.slice_context.kind == "stack"
+                    else measurement.slice_context.sop_instance_uid
+                ),
+            ),
+        )
 
     def _build_visible_annotations(self, view: ViewRecord) -> tuple[AnnotationRecord, ...]:
         if not view.annotations:
@@ -4698,7 +4752,7 @@ class ViewerService:
             metadata_image_transform,
         )
         include_static_preview_metadata = not (
-            fast_preview and metadata_mode in {"mpr-pan-zoom-preview", "mpr-crosshair-preview"}
+            fast_preview and metadata_mode in {"mpr-pan-zoom-preview", "mpr-zoom-preview", "mpr-crosshair-preview"}
         )
         reference_instance, reference_cached = (
             (None, None)
@@ -4720,7 +4774,7 @@ class ViewerService:
                 cursor=payload_pose_context.cursor,
             )
         )
-        include_mpr_measurement_payloads = not fast_preview or metadata_mode == "mpr-pan-zoom-preview"
+        include_mpr_measurement_payloads = not fast_preview or metadata_mode in {"mpr-pan-zoom-preview", "mpr-zoom-preview"}
         visible_measurements = self._build_visible_measurements(view) if include_mpr_measurement_payloads else []
         visible_annotations = self._build_visible_annotations(view) if include_mpr_measurement_payloads else []
         context = RenderContext(

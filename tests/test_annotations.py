@@ -125,3 +125,37 @@ def test_series_scope_measurement_stays_visible_across_slices() -> None:
     visible = service._build_visible_measurements(view)
 
     assert [measurement.measurement_id for measurement in visible] == ["series"]
+
+
+def test_series_scope_measurement_refreshes_metrics_for_current_slice(monkeypatch) -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=5)
+    view.measurements = [
+        MeasurementRecord(
+            measurement_id="series",
+            tool_type="rect",
+            points=(MeasurementPoint(0.0, 0.0), MeasurementPoint(1.0, 1.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=3, sop_instance_uid="sop-3"),
+            metrics=MeasurementMetrics(unit="px", area_unit="px2", mean=7.0),
+            label_anchor=MeasurementPoint(1.0, 1.0),
+            label_lines=("Mean 7.0",),
+            scope="series",
+        )
+    ]
+
+    def resolve_source_context(_view: ViewRecord):
+        return (
+            np.full((4, 4), 42.0, dtype=np.float32),
+            None,
+            MeasurementSliceContext(kind="stack", slice_index=5, sop_instance_uid="sop-5"),
+        )
+
+    monkeypatch.setattr(service, "_resolve_measurement_source_context", resolve_source_context)
+
+    [visible] = service._build_visible_measurements(view)
+
+    assert visible.measurement_id == "series"
+    assert visible.slice_context.slice_index == 5
+    assert visible.slice_context.sop_instance_uid == "sop-5"
+    assert visible.metrics.mean == 42.0
+    assert "Mean 42.0" in visible.label_lines

@@ -428,7 +428,15 @@ class ViewSocketHub:
     def _resolve_render_intent(request: RenderRequest) -> str:
         if request.metadata_mode in {"stack-pixel-preview", "mpr-pixel-preview"}:
             return "pixel-only"
-        if request.metadata_mode in {"stack-geometry-preview", "mpr-pan-zoom-preview", "mpr-crosshair-preview", "stack-preview-lite"}:
+        if request.metadata_mode in {
+            "stack-geometry-preview",
+            "stack-zoom-preview",
+            "mpr-pan-zoom-preview",
+            "mpr-zoom-preview",
+            "mpr-crosshair-preview",
+            "stack-preview-lite",
+            "fusion-zoom-preview",
+        }:
             return "geometry-preview"
         if request.metadata_mode in {"mpr-segmentation-preview", "fusion-registration-layer-preview"}:
             return "overlay-preview"
@@ -454,7 +462,7 @@ class ViewSocketHub:
             payload.pop("annotations", None)
             payload.pop("mprSegmentationOverlay", None)
             payload.pop("mpr_segmentation_overlay", None)
-        elif request.metadata_mode == "mpr-pan-zoom-preview":
+        elif request.metadata_mode in {"mpr-pan-zoom-preview", "mpr-zoom-preview"}:
             payload.pop("cornerInfo", None)
             payload.pop("orientation", None)
         elif request.metadata_mode == "mpr-crosshair-preview":
@@ -472,6 +480,9 @@ class ViewSocketHub:
             payload.pop("measurements", None)
             payload.pop("annotations", None)
             payload.pop("fusionProjection", None)
+        elif request.metadata_mode == "fusion-zoom-preview":
+            payload.pop("cornerInfo", None)
+            payload.pop("orientation", None)
         return payload
 
     @staticmethod
