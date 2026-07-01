@@ -545,12 +545,18 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
     ]
 
 
-def test_mpr_crosshair_state_move_emits_state_without_preview(monkeypatch) -> None:
-    async def run() -> tuple[dict[str, object], list[tuple[tuple[str, ...], str, bool, str, int | None]], list[tuple[str, object, str | None]]]:
+def test_mpr_crosshair_state_move_emits_state_and_queues_preview(monkeypatch) -> None:
+    async def run() -> tuple[
+        dict[str, object],
+        list[tuple[tuple[str, ...], str, bool, str, int | None]],
+        list[tuple[tuple[str, ...], str, bool, str, int | None]],
+        list[tuple[str, object, str | None]],
+    ]:
         handlers._mpr_crosshair_state_queues.clear()
         handlers._mpr_crosshair_preview_states.clear()
         server = _SocketServerStub()
         scheduled_batches: list[tuple[tuple[str, ...], str, bool, str, int | None]] = []
+        queued_previews: list[tuple[tuple[str, ...], str, bool, str, int | None]] = []
 
         monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
         monkeypatch.setattr(
@@ -565,7 +571,7 @@ def test_mpr_crosshair_state_move_emits_state_without_preview(monkeypatch) -> No
             lambda payload, workspace_id=None: OperationRenderOutcome(
                 mpr_revision=12,
                 broadcast_view_ids=("v-cor", "v-sag"),
-                broadcast_image_format="png",
+                broadcast_image_format="webp",
                 broadcast_fast_preview=True,
                 broadcast_fast_preview_full_resolution=False,
                 broadcast_metadata_mode="mpr-crosshair-preview",
@@ -601,17 +607,32 @@ def test_mpr_crosshair_state_move_emits_state_without_preview(monkeypatch) -> No
 
         monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", fake_schedule_render_batch)
 
+        def fake_schedule_mpr_crosshair_preview(queue_key, request) -> None:
+            del queue_key
+            queued_previews.append(
+                (
+                    request.view_ids,
+                    request.image_format,
+                    request.fast_preview_full_resolution,
+                    request.metadata_mode,
+                    request.mpr_revision,
+                )
+            )
+
+        monkeypatch.setattr(handlers, "_schedule_mpr_crosshair_preview", fake_schedule_mpr_crosshair_preview)
+
         response = await handlers._handle_mpr_crosshair_state(
             server,  # type: ignore[arg-type]
             "sid-1",
             {"viewId": "v-ax", "opType": "crosshair", "actionType": "move", "x": 0.5, "y": 0.5},
         )
         await _wait_for(lambda: len(server.events) == 2)
-        return response, scheduled_batches, server.events
+        return response, scheduled_batches, queued_previews, server.events
 
-    response, scheduled_batches, events = asyncio.run(run())
+    response, scheduled_batches, queued_previews, events = asyncio.run(run())
     assert response == {"ok": True}
     assert scheduled_batches == []
+    assert queued_previews == [(("v-cor", "v-sag"), "webp", False, "mpr-crosshair-preview", 12)]
     assert events == [
         ("mpr_state_update", {"viewId": "v-cor", "mprRevision": 12}, "sid-v-cor"),
         ("mpr_state_update", {"viewId": "v-sag", "mprRevision": 12}, "sid-v-sag"),

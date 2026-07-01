@@ -228,7 +228,7 @@ def _render_mpr_crosshair_preview_broadcast(
     return _render_broadcast(
         "png",
         fast_preview=True,
-        fast_preview_full_resolution=False,
+        fast_preview_full_resolution=True,
         metadata_mode="mpr-crosshair-preview",
         viewports=viewports,
         emit_mpr_state_update=True,
@@ -386,7 +386,7 @@ def _handle_crosshair_operation(
     if not should_broadcast_group:
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_mpr_state_update(
+        return _render_mpr_crosshair_preview_broadcast(
             viewports=_reference_mpr_viewports(service, view),
         )
     if payload.action_type == "end":
@@ -780,7 +780,7 @@ def _handle_mpr_oblique_operation(
     if not service._handle_mpr_oblique(view, payload):
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
-        return _render_mpr_state_update(
+        return _render_mpr_crosshair_preview_broadcast(
             viewports=_target_mpr_oblique_preview_viewports(service, view, payload),
         )
     if payload.action_type == "end":

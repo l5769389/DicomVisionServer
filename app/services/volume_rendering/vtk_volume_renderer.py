@@ -63,6 +63,8 @@ class VolumeRenderSession:
     base_view_up: tuple[float, float, float]
     base_view_angle: float
     base_parallel_scale: float
+    transfer_function_token: tuple[object, ...] | None
+    sampling_token: tuple[object, ...] | None
 
 
 class VtkVolumeRenderer:
@@ -231,6 +233,8 @@ class VtkVolumeRenderer:
             base_view_up=tuple(float(value) for value in camera.GetViewUp()),
             base_view_angle=float(camera.GetViewAngle()),
             base_parallel_scale=float(camera.GetParallelScale()),
+            transfer_function_token=None,
+            sampling_token=None,
         )
 
     def _configure_session(self, session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
@@ -238,8 +242,26 @@ class VtkVolumeRenderer:
             session.render_window.SetSize(request.canvas_width, request.canvas_height)
             session.canvas_size = (request.canvas_width, request.canvas_height)
 
-        self._update_transfer_functions(session, request.window_width, request.window_center, request.volume_preset, request.volume_config)
-        self._update_sampling(session, request)
+        transfer_function_token = self._build_transfer_function_token(
+            request.window_width,
+            request.window_center,
+            request.volume_preset,
+            request.volume_config,
+        )
+        if session.transfer_function_token != transfer_function_token:
+            self._update_transfer_functions(
+                session,
+                request.window_width,
+                request.window_center,
+                request.volume_preset,
+                request.volume_config,
+            )
+            session.transfer_function_token = transfer_function_token
+
+        sampling_token = self._build_sampling_token(request)
+        if session.sampling_token != sampling_token:
+            self._update_sampling(session, request)
+            session.sampling_token = sampling_token
         self._update_camera(session, request)
 
     @staticmethod
@@ -264,6 +286,48 @@ class VtkVolumeRenderer:
         spacing_xyz: tuple[float, float, float],
     ) -> tuple[object, tuple[int, ...], tuple[float, float, float]]:
         return (id(volume), tuple(int(size) for size in volume.shape), tuple(float(value) for value in spacing_xyz))
+
+    @classmethod
+    def _build_transfer_function_token(
+        cls,
+        window_width: float,
+        window_center: float,
+        volume_preset: str,
+        volume_config: dict[str, Any] | None,
+    ) -> tuple[object, ...]:
+        return (
+            cls._token_float(window_width),
+            cls._token_float(window_center),
+            str(volume_preset or "bone").strip().lower(),
+            cls._freeze_token_value(volume_config or {}),
+        )
+
+    @staticmethod
+    def _build_sampling_token(request: VolumeRenderRequest) -> tuple[object, ...]:
+        return (
+            bool(request.fast_preview),
+            tuple(round(abs(float(value)), 6) for value in request.spacing_xyz),
+        )
+
+    @staticmethod
+    def _token_float(value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        return round(numeric, 6)
+
+    @classmethod
+    def _freeze_token_value(cls, value: Any) -> object:
+        if isinstance(value, dict):
+            return tuple(sorted((str(key), cls._freeze_token_value(item)) for key, item in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(cls._freeze_token_value(item) for item in value)
+        if isinstance(value, float):
+            return round(value, 6)
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        return str(value)
 
     @staticmethod
     def _build_image_data(volume: np.ndarray, spacing_xyz: tuple[float, float, float]) -> vtkImageData:

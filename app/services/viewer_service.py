@@ -278,6 +278,8 @@ CROSSHAIR_HIT_RADIUS = 12.0
 MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
+WEBP_PREVIEW_QUALITY = 80
+WEBP_PREVIEW_METHOD = 0
 PNG_COMPRESS_LEVEL = 1
 MPR_FAST_PREVIEW_SCALE = 0.33
 MPR_FAST_PREVIEW_MIN_SIDE = 96
@@ -10433,7 +10435,16 @@ class ViewerService:
             # stay PNG so overlays and measurements align with lossless pixels.
             image.convert("RGB").save(output, format="JPEG", quality=FAST_PREVIEW_JPEG_QUALITY)
         elif image_format == "webp":
-            image.save(output, format="WEBP", lossless=True)
+            if fast_preview:
+                image.save(
+                    output,
+                    format="WEBP",
+                    lossless=False,
+                    quality=WEBP_PREVIEW_QUALITY,
+                    method=WEBP_PREVIEW_METHOD,
+                )
+            else:
+                image.save(output, format="WEBP", lossless=True)
         else:
             # PNG is lossless at every compression level. Keep all viewer PNG
             # frames at a low compression level to reduce encode latency and

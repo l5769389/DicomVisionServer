@@ -49,7 +49,7 @@ MPR_CROSSHAIR_STATE_OPERATION_TYPES = {
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_MPR_OBLIQUE,
 }
-MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS = 0.08
+MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS = 0.05
 MPR_VIEW_TYPES = {"MPR", "AX", "COR", "SAG"}
 FUSION_VIEW_TYPES = {
     "FusionCTAxial",
@@ -536,6 +536,20 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
             result.mpr_state_view_ids,
             mpr_revision=result.mpr_revision,
         )
+        if operation.payload.action_type == DRAG_ACTION_MOVE and result.broadcast_view_ids:
+            _schedule_mpr_crosshair_preview(
+                queue_key,
+                _MprCrosshairPreviewRequest(
+                    server=operation.server,
+                    sid=operation.sid,
+                    view_ids=result.broadcast_view_ids,
+                    image_format=result.broadcast_image_format,
+                    fast_preview=result.broadcast_fast_preview,
+                    fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
+                    metadata_mode=result.broadcast_metadata_mode,
+                    mpr_revision=result.mpr_revision,
+                ),
+            )
         if operation.payload.action_type == DRAG_ACTION_END:
             _cancel_mpr_crosshair_preview(queue_key)
             if result.broadcast_view_ids:

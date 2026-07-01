@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -70,3 +71,24 @@ def test_volume_renderer_drop_session_finalizes_matching_view() -> None:
 
     assert finalized == ["view-a"]
     assert list(renderer._sessions.keys()) == ["view-b"]
+
+
+def test_volume_renderer_reuses_transfer_and_sampling_configuration(monkeypatch) -> None:
+    renderer = VtkVolumeRenderer()
+    request = _build_volume_request("view-a")
+    calls: list[str] = []
+    session = SimpleNamespace(
+        canvas_size=(request.canvas_width, request.canvas_height),
+        transfer_function_token=None,
+        sampling_token=None,
+    )
+
+    monkeypatch.setattr(renderer, "_update_transfer_functions", lambda *args: calls.append("transfer"))
+    monkeypatch.setattr(renderer, "_update_sampling", lambda *args: calls.append("sampling"))
+    monkeypatch.setattr(renderer, "_update_camera", lambda *args: calls.append("camera"))
+
+    renderer._configure_session(session, request)
+    renderer._configure_session(session, request)
+    renderer._configure_session(session, replace(request, fast_preview=True))
+
+    assert calls == ["transfer", "sampling", "camera", "camera", "sampling", "camera"]
