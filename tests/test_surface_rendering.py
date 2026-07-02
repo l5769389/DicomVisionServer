@@ -129,13 +129,11 @@ def test_3d_mode_and_surface_config_handlers_initialize_surface_state() -> None:
     assert view.is_initialized is True
 
 
-def test_surface_mode_3d_rotation_uses_surface_renderer(monkeypatch) -> None:
+def test_surface_mode_3d_rotation_updates_quaternion_without_vtk(monkeypatch) -> None:
     service = ViewerService()
-    series = _build_series()
-    volume = np.zeros((5, 6, 7), dtype=np.float32)
     view = ViewRecord(
         view_id="surface-view",
-        series_id=series.series_id,
+        series_id="surface-series",
         view_type="3D",
         width=200,
         height=100,
@@ -143,16 +141,9 @@ def test_surface_mode_3d_rotation_uses_surface_renderer(monkeypatch) -> None:
     view.render_3d_mode = "surface"
     view.surface_render_config = create_default_surface_render_config("bone")
 
-    monkeypatch.setattr("app.services.viewer_service.series_registry", SimpleNamespace(get=lambda series_id: series))
-    monkeypatch.setattr(service, "_get_series_volume", lambda active_series: volume)
-    monkeypatch.setattr(service, "_get_3d_spacing_xyz", lambda active_series: (0.7, 0.8, 1.2))
-
-    calls: dict[str, object] = {}
-
     def fake_apply_trackball_camera_delta(request, *, delta_x_pixels: float, delta_y_pixels: float):
-        calls["request"] = request
-        calls["delta"] = (delta_x_pixels, delta_y_pixels)
-        return (0.1, 0.2, 0.3, 0.9)
+        del request, delta_x_pixels, delta_y_pixels
+        raise AssertionError("rotate move should update quaternion without entering VTK")
 
     monkeypatch.setattr(
         "app.services.viewer_service.vtk_surface_renderer.apply_trackball_camera_delta",
@@ -180,13 +171,7 @@ def test_surface_mode_3d_rotation_uses_surface_renderer(monkeypatch) -> None:
         ),
     )
 
-    request = calls["request"]
-    assert request.view_id == view.view_id
-    assert request.volume is volume
-    assert request.spacing_xyz == (0.7, 0.8, 1.2)
-    assert request.fast_preview is True
-    assert calls["delta"] == pytest.approx((10.0, -5.0))
-    assert view.rotation_quaternion == (0.1, 0.2, 0.3, 0.9)
+    assert view.rotation_quaternion != pytest.approx((0.0, 0.0, 0.0, 1.0))
     assert view.is_initialized is True
 
 

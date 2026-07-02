@@ -580,6 +580,22 @@ class ViewSocketHub:
                 len(result.image_bytes),
                 len(extra_image_bytes.get("pet", b"")) if extra_image_bytes else 0,
             )
+        if request.fast_preview and payload.get("render3dMode"):
+            logger.debug(
+                (
+                    "3d preview socket timing view_id=%s mode=%s sids=%s "
+                    "format=%s metadata_mode=%s render_ms=%.1f emit_ms=%.1f total_ms=%.1f bytes=%s"
+                ),
+                view_id,
+                payload.get("render3dMode"),
+                len(sids),
+                request.image_format,
+                request.metadata_mode,
+                render_ms,
+                emit_ms,
+                (perf_counter() - render_started_at) * 1000.0,
+                len(result.image_bytes),
+            )
         if should_emit_progress:
             await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
         return True

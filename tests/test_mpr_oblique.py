@@ -1373,6 +1373,51 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert zoom_end.deferred_fast_preview is False
 
 
+def test_volume_zoom_move_uses_transport_format_without_full_resolution_preview(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    view = ViewRecord(view_id="volume-view", series_id=series.series_id, view_type="3D")
+    view.width = 1280
+    view.height = 960
+    view.zoom = 1.0
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=view.view_id,
+                opType="zoom",
+                actionType="start",
+                x=0,
+                y=0,
+                imageFormat="webp",
+            )
+        )
+        zoom_move = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=view.view_id,
+                opType="zoom",
+                actionType="move",
+                x=0,
+                y=-10,
+                imageFormat="webp",
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert zoom_move.deferred_view_ids == (view.view_id,)
+    assert zoom_move.deferred_image_format == "webp"
+    assert zoom_move.deferred_fast_preview is True
+    assert zoom_move.deferred_fast_preview_full_resolution is False
+    assert zoom_move.deferred_metadata_mode == "stack-zoom-preview"
+
+
 def test_window_drag_sensitivity_scales_with_current_width(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])

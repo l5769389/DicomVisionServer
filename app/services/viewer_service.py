@@ -200,6 +200,7 @@ from app.services.volume_render_config import (
     normalize_volume_render_config,
 )
 from app.services.surface_render_config import create_default_surface_render_config, normalize_surface_render_config
+from app.services.volume_rendering.camera_math import apply_trackball_delta_to_quaternion
 from app.services.volume_rendering.contracts import SurfaceRenderRequest, VolumeRenderRequest
 
 
@@ -283,6 +284,7 @@ WEBP_PREVIEW_METHOD = 0
 PNG_COMPRESS_LEVEL = 1
 MPR_FAST_PREVIEW_SCALE = 0.33
 MPR_FAST_PREVIEW_MIN_SIDE = 96
+VOLUME_FAST_PREVIEW_MAX_DIMENSION = 560
 MPR_PLANE_CACHE_MAX_ITEMS = 48
 FAST_BASE_PIXELS_CACHE_MAX_ITEMS = 64
 FUSION_REGISTRATION_PET_LAYER_CACHE_MAX_ITEMS = 32
@@ -389,6 +391,13 @@ class FusionRegistrationExportContext:
 class RenderPlan:
     render_view: ViewRecord
     render_ratio: float
+
+
+@dataclass(frozen=True)
+class VolumePreviewRenderPlan:
+    width: int
+    height: int
+    ratio: float
 
 
 ViewRenderProgressCallback = Callable[[dict[str, object]], None]
@@ -3168,24 +3177,57 @@ class ViewerService:
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
         fast_preview: bool,
+        scale_fast_preview_canvas: bool = True,
+        volume_token: str | None = None,
     ) -> VolumeRenderRequest:
         """Build the shared VTK request payload used by 3D render and drag paths."""
+
+        canvas_width = view.width or 0
+        canvas_height = view.height or 0
+        offset_x = float(view.offset_x)
+        offset_y = float(view.offset_y)
+        if fast_preview and scale_fast_preview_canvas:
+            preview_plan = self._resolve_volume_fast_preview_render_plan(
+                canvas_width,
+                canvas_height,
+            )
+            canvas_width = preview_plan.width
+            canvas_height = preview_plan.height
+            offset_x *= preview_plan.ratio
+            offset_y *= preview_plan.ratio
 
         return VolumeRenderRequest(
             view_id=view.view_id,
             volume=volume,
             spacing_xyz=spacing_xyz,
-            canvas_width=view.width or 0,
-            canvas_height=view.height or 0,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
             window_width=float(view.window_width or WINDOW_WIDTH_MIN),
             window_center=float(view.window_center or 0.0),
             zoom=float(view.zoom),
-            offset_x=float(view.offset_x),
-            offset_y=float(view.offset_y),
+            offset_x=offset_x,
+            offset_y=offset_y,
             rotation_quaternion=tuple(float(value) for value in view.rotation_quaternion),
             volume_preset=str(view.volume_preset or "bone"),
             volume_config=view.volume_render_config,
             fast_preview=fast_preview,
+            volume_token=volume_token,
+        )
+
+    @staticmethod
+    def _resolve_volume_fast_preview_render_plan(width: int, height: int) -> VolumePreviewRenderPlan:
+        """Cap expensive 3D volume preview frames while final frames stay full size."""
+
+        if width <= 0 or height <= 0:
+            return VolumePreviewRenderPlan(width=width, height=height, ratio=1.0)
+        max_dimension = max(width, height)
+        if max_dimension <= VOLUME_FAST_PREVIEW_MAX_DIMENSION:
+            return VolumePreviewRenderPlan(width=width, height=height, ratio=1.0)
+        scale = VOLUME_FAST_PREVIEW_MAX_DIMENSION / float(max_dimension)
+        return VolumePreviewRenderPlan(
+            width=max(1, int(round(width * scale))),
+            height=max(1, int(round(height * scale))),
+            ratio=scale,
         )
 
     def _build_surface_render_request(
@@ -3220,11 +3262,15 @@ class ViewerService:
         fast_preview: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
+        render_started_at = perf_counter()
         ensure_view_size(view)
 
+        volume_started_at = perf_counter()
         series = series_registry.get(view.series_id)
         self._emit_render_progress(progress_callback, "volume", progress_percent=6)
         volume = self._get_series_volume(series, progress_callback=progress_callback)
+        volume_token = self._build_series_volume_cache_key(series)
+        volume_ms = (perf_counter() - volume_started_at) * 1000.0
         if not view.is_initialized:
             self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_3d_viewport(view)
@@ -3233,6 +3279,7 @@ class ViewerService:
         spacing_xyz = self._get_3d_spacing_xyz(series)
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
         render_3d_mode = self._normalize_render_3d_mode(view.render_3d_mode)
+        image_started_at = perf_counter()
         if render_3d_mode == "surface":
             surface_request = self._build_surface_render_request(
                 view,
@@ -3244,17 +3291,23 @@ class ViewerService:
             if not fast_preview:
                 self._warm_surface_preview_session(surface_request)
             viewport_label = "3D SR"
+            render_width = surface_request.canvas_width
+            render_height = surface_request.canvas_height
         else:
-            image = _get_vtk_volume_renderer().render(
-                self._build_volume_render_request(
-                    view,
-                    volume=volume,
-                    spacing_xyz=spacing_xyz,
-                    fast_preview=fast_preview,
-                )
+            volume_request = self._build_volume_render_request(
+                view,
+                volume=volume,
+                spacing_xyz=spacing_xyz,
+                fast_preview=fast_preview,
+                volume_token=volume_token,
             )
+            image = _get_vtk_volume_renderer().render(volume_request)
             viewport_label = "3D VR"
+            render_width = volume_request.canvas_width
+            render_height = volume_request.canvas_height
+        image_ms = (perf_counter() - image_started_at) * 1000.0
 
+        metadata_started_at = perf_counter()
         corner_info = self._build_slice_corner_info_overlay(
             view,
             series,
@@ -3263,9 +3316,32 @@ class ViewerService:
             total_slices=max(1, volume.shape[0]),
             viewport_label=viewport_label,
         )
+        metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
+        encode_started_at = perf_counter()
         image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        encode_ms = (perf_counter() - encode_started_at) * 1000.0
+
+        logger.debug(
+            "3d render timing view_id=%s mode=%s fast_preview=%s image_format=%s source_shape=%s viewport=%sx%s render=%sx%s image=%sx%s volume_ms=%.1f image_ms=%.1f metadata_ms=%.1f encode_ms=%.1f total_ms=%.1f",
+            view.view_id,
+            render_3d_mode,
+            fast_preview,
+            image_format,
+            volume.shape,
+            view.width,
+            view.height,
+            render_width,
+            render_height,
+            image.width,
+            image.height,
+            volume_ms,
+            image_ms,
+            metadata_ms,
+            encode_ms,
+            (perf_counter() - render_started_at) * 1000.0,
+        )
 
         return RenderedImageResult(
             meta=ViewImageResponse(
@@ -7167,31 +7243,13 @@ class ViewerService:
         if abs(delta_x_pixels) < 0.01 and abs(delta_y_pixels) < 0.01:
             return
 
-        series = series_registry.get(view.series_id)
-        volume = self._get_series_volume(series)
-        spacing_xyz = self._get_3d_spacing_xyz(series)
-        if self._normalize_render_3d_mode(view.render_3d_mode) == "surface":
-            view.rotation_quaternion = _get_vtk_surface_renderer().apply_trackball_camera_delta(
-                self._build_surface_render_request(
-                    view,
-                    volume=volume,
-                    spacing_xyz=spacing_xyz,
-                    fast_preview=True,
-                ),
-                delta_x_pixels=delta_x_pixels,
-                delta_y_pixels=delta_y_pixels,
-            )
-        else:
-            view.rotation_quaternion = _get_vtk_volume_renderer().apply_trackball_camera_delta(
-                self._build_volume_render_request(
-                    view,
-                    volume=volume,
-                    spacing_xyz=spacing_xyz,
-                    fast_preview=True,
-                ),
-                delta_x_pixels=delta_x_pixels,
-                delta_y_pixels=delta_y_pixels,
-            )
+        view.rotation_quaternion = apply_trackball_delta_to_quaternion(
+            tuple(float(value) for value in view.rotation_quaternion),
+            delta_x_pixels=delta_x_pixels,
+            delta_y_pixels=delta_y_pixels,
+            canvas_width=float(view.width),
+            canvas_height=float(view.height),
+        )
         view.is_initialized = True
 
     def _handle_volume_config(self, view: ViewRecord, payload: ViewOperationRequest) -> None:

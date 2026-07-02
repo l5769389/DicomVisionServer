@@ -3,8 +3,9 @@
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from math import radians, tan
+from math import ceil, radians, tan
 from threading import RLock
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,7 @@ from vtkmodules.vtkRenderingCore import (
 )
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 
+from app.core.logging import get_logger
 from app.services.volume_rendering.contracts import VolumeRenderRequest
 from app.services.volume_rendering.camera_math import (
     normalize_quaternion,
@@ -33,15 +35,18 @@ from app.services.volume_rendering.camera_math import (
 
 
 vtkObject.GlobalWarningDisplayOff()
+logger = get_logger(__name__)
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
 TRACKBALL_MOTION_FACTOR = 36.0
 TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
 TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = 20.0
-FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.9
+FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.45
 FINAL_RENDER_IMAGE_SAMPLE_DISTANCE = 1.0
 FAST_PREVIEW_RAY_SAMPLE_FACTOR = 1.45
 FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.72
+FAST_PREVIEW_VOLUME_MAX_DIMENSION = 144
 VOLUME_SESSION_LIMIT = 8
+VOLUME_PREVIEW_CACHE_LIMIT = 4
 
 
 @dataclass
@@ -69,7 +74,11 @@ class VolumeRenderSession:
 
 class VtkVolumeRenderer:
     def __init__(self) -> None:
-        self._sessions: OrderedDict[str, VolumeRenderSession] = OrderedDict()
+        self._sessions: OrderedDict[tuple[str, str], VolumeRenderSession] = OrderedDict()
+        self._preview_volume_cache: OrderedDict[
+            tuple[object, tuple[int, ...], tuple[float, float, float]],
+            tuple[np.ndarray, tuple[float, float, float]],
+        ] = OrderedDict()
         self._lock = RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vtk-render")
 
@@ -96,27 +105,72 @@ class VtkVolumeRenderer:
         self._executor.submit(self._drop_session_in_executor, view_id).result()
 
     def _render_in_executor(self, request: VolumeRenderRequest) -> Image.Image:
+        total_started_at = perf_counter()
         if request.canvas_width <= 0 or request.canvas_height <= 0:
             raise ValueError("canvas size must be positive")
         if not request.view_id:
             raise ValueError("view_id is required")
 
+        volume_started_at = perf_counter()
         volume = np.asarray(request.volume, dtype=np.float32)
         if volume.ndim != 3 or volume.size == 0:
             raise ValueError("volume must be a non-empty 3D array")
+        volume_ms = (perf_counter() - volume_started_at) * 1000.0
 
         with self._lock:
+            session_started_at = perf_counter()
             session = self._get_or_create_session(request, volume)
+            session_ms = (perf_counter() - session_started_at) * 1000.0
+            configure_started_at = perf_counter()
             self._configure_session(session, request)
+            configure_ms = (perf_counter() - configure_started_at) * 1000.0
+            render_started_at = perf_counter()
             session.render_window.Render()
-            return self._capture_image(session)
+            render_ms = (perf_counter() - render_started_at) * 1000.0
+            capture_started_at = perf_counter()
+            image = self._capture_image(session)
+            capture_ms = (perf_counter() - capture_started_at) * 1000.0
+            if request.fast_preview:
+                source_shape = tuple(int(value) for value in volume.shape)
+                render_shape = tuple(int(value) for value in session.image_data.GetDimensions())
+                mapper_mode = self._get_mapper_last_used_render_mode(session.mapper)
+                logger.debug(
+                    "3d vtk preview timing view_id=%s token=%s session=%s source_shape=%s preview_image_dims=%s render_size=%sx%s mapper_mode=%s volume_ms=%.1f session_ms=%.1f configure_ms=%.1f vtk_render_ms=%.1f capture_ms=%.1f total_ms=%.1f",
+                    request.view_id,
+                    request.volume_token or "ndarray",
+                    self._build_session_key(request.view_id, request.fast_preview)[1],
+                    source_shape,
+                    render_shape,
+                    request.canvas_width,
+                    request.canvas_height,
+                    mapper_mode,
+                    volume_ms,
+                    session_ms,
+                    configure_ms,
+                    render_ms,
+                    capture_ms,
+                    (perf_counter() - total_started_at) * 1000.0,
+                )
+            return image
+
+    @staticmethod
+    def _get_mapper_last_used_render_mode(mapper: vtkSmartVolumeMapper) -> int | None:
+        getter = getattr(mapper, "GetLastUsedRenderMode", None)
+        if not callable(getter):
+            return None
+        try:
+            return int(getter())
+        except Exception:
+            return None
 
     def _drop_session_in_executor(self, view_id: str) -> None:
         with self._lock:
-            session = self._sessions.pop(view_id, None)
-            if session is None:
-                return
-            session.render_window.Finalize()
+            expired_keys = [key for key in self._sessions if key[0] == view_id]
+            for key in expired_keys:
+                session = self._sessions.pop(key, None)
+                if session is None:
+                    continue
+                session.render_window.Finalize()
 
     def _apply_trackball_camera_delta_in_executor(
         self,
@@ -140,16 +194,17 @@ class VtkVolumeRenderer:
             return self._camera_to_quaternion(session, camera)
 
     def _get_or_create_session(self, request: VolumeRenderRequest, volume: np.ndarray) -> VolumeRenderSession:
-        volume_token = self._build_volume_token(volume, request.spacing_xyz)
-        session = self._sessions.get(request.view_id)
+        volume_token = self._build_volume_token(volume, request.spacing_xyz, request.volume_token)
+        session_key = self._build_session_key(request.view_id, request.fast_preview)
+        session = self._sessions.get(session_key)
         if session is None or session.volume_token != volume_token:
             if session is not None:
                 session.render_window.Finalize()
-            session = self._create_session(volume, request.spacing_xyz, volume_token)
-            self._sessions[request.view_id] = session
+            session = self._create_session(volume, request.spacing_xyz, volume_token, request.fast_preview)
+            self._sessions[session_key] = session
             self._evict_sessions_if_needed()
             return session
-        self._sessions.move_to_end(request.view_id)
+        self._sessions.move_to_end(session_key)
         return session
 
     def _evict_sessions_if_needed(self) -> None:
@@ -162,8 +217,15 @@ class VtkVolumeRenderer:
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
         volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        fast_preview: bool,
     ) -> VolumeRenderSession:
-        image_data = self._build_image_data(volume, spacing_xyz)
+        render_volume, render_spacing_xyz = self._prepare_render_volume(
+            volume,
+            spacing_xyz,
+            volume_token,
+            fast_preview,
+        )
+        image_data = self._build_image_data(render_volume, render_spacing_xyz)
 
         mapper = vtkSmartVolumeMapper()
         mapper.SetInputData(image_data)
@@ -255,6 +317,7 @@ class VtkVolumeRenderer:
                 request.window_center,
                 request.volume_preset,
                 request.volume_config,
+                fast_preview=request.fast_preview,
             )
             session.transfer_function_token = transfer_function_token
 
@@ -284,8 +347,56 @@ class VtkVolumeRenderer:
     def _build_volume_token(
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
+        volume_token: str | None = None,
     ) -> tuple[object, tuple[int, ...], tuple[float, float, float]]:
-        return (id(volume), tuple(int(size) for size in volume.shape), tuple(float(value) for value in spacing_xyz))
+        identity: object = str(volume_token) if volume_token else id(volume)
+        return (identity, tuple(int(size) for size in volume.shape), tuple(float(value) for value in spacing_xyz))
+
+    @staticmethod
+    def _build_session_key(view_id: str, fast_preview: bool) -> tuple[str, str]:
+        return (view_id, "preview" if fast_preview else "final")
+
+    def _prepare_render_volume(
+        self,
+        volume: np.ndarray,
+        spacing_xyz: tuple[float, float, float],
+        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        fast_preview: bool,
+    ) -> tuple[np.ndarray, tuple[float, float, float]]:
+        if not fast_preview:
+            return volume, spacing_xyz
+
+        cached = self._preview_volume_cache.get(volume_token)
+        if cached is not None:
+            self._preview_volume_cache.move_to_end(volume_token)
+            return cached
+
+        sampled, sampled_spacing_xyz = self._downsample_preview_volume(volume, spacing_xyz)
+        self._preview_volume_cache[volume_token] = (sampled, sampled_spacing_xyz)
+        while len(self._preview_volume_cache) > VOLUME_PREVIEW_CACHE_LIMIT:
+            self._preview_volume_cache.popitem(last=False)
+        return sampled, sampled_spacing_xyz
+
+    @staticmethod
+    def _downsample_preview_volume(
+        volume: np.ndarray,
+        spacing_xyz: tuple[float, float, float],
+    ) -> tuple[np.ndarray, tuple[float, float, float]]:
+        depth, height, width = volume.shape
+        step = max(1, int(ceil(max(depth, height, width) / FAST_PREVIEW_VOLUME_MAX_DIMENSION)))
+        if step == 1:
+            return volume, spacing_xyz
+
+        sampled = volume[::step, ::step, ::step]
+        if min(sampled.shape) < 2:
+            return volume, spacing_xyz
+
+        spacing_x, spacing_y, spacing_z = spacing_xyz
+        return sampled, (
+            float(spacing_x) * float(step),
+            float(spacing_y) * float(step),
+            float(spacing_z) * float(step),
+        )
 
     @classmethod
     def _build_transfer_function_token(
@@ -355,9 +466,11 @@ class VtkVolumeRenderer:
                 FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE if request.fast_preview else FINAL_RENDER_IMAGE_SAMPLE_DISTANCE
             )
         if hasattr(session.mapper, "SetSampleDistance"):
-            min_spacing = max(1e-3, min(abs(float(value)) for value in request.spacing_xyz))
+            render_spacing_xyz = session.image_data.GetSpacing()
+            min_spacing = max(1e-3, min(abs(float(value)) for value in render_spacing_xyz))
             factor = FAST_PREVIEW_RAY_SAMPLE_FACTOR if request.fast_preview else FINAL_RENDER_RAY_SAMPLE_FACTOR
-            sample_distance = max(0.24, min(1.25, min_spacing * factor))
+            max_sample_distance = 3.5 if request.fast_preview else 1.25
+            sample_distance = max(0.24, min(max_sample_distance, min_spacing * factor))
             session.mapper.SetSampleDistance(sample_distance)
 
     def _update_transfer_functions(
@@ -367,6 +480,8 @@ class VtkVolumeRenderer:
         window_center: float,
         volume_preset: str,
         volume_config: dict[str, Any] | None,
+        *,
+        fast_preview: bool = False,
     ) -> None:
         config = volume_config or {}
         preset = str(config.get("preset") or volume_preset or "bone").strip().lower()
@@ -393,7 +508,13 @@ class VtkVolumeRenderer:
         else:
             session.volume_property.SetInterpolationTypeToLinear()
 
-        if shading_enabled and layers and blend_mode != "mip":
+        if fast_preview:
+            session.volume_property.ShadeOff()
+            ambient = 1.0
+            diffuse = 0.0
+            specular = 0.0
+            roughness = 1.0
+        elif shading_enabled and layers and blend_mode != "mip":
             session.volume_property.ShadeOn()
         else:
             session.volume_property.ShadeOff()
@@ -687,13 +808,14 @@ class VtkVolumeRenderer:
 
     def _update_camera(self, session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
         camera = session.renderer.GetActiveCamera()
-        rotation_matrix = self._quaternion_to_rotation_matrix(request.rotation_quaternion)
+        model_rotation_matrix = self._quaternion_to_rotation_matrix(request.rotation_quaternion)
+        camera_rotation_matrix = model_rotation_matrix.T
         base_position = np.array(session.base_position, dtype=np.float64)
         base_focal_point = np.array(session.base_focal_point, dtype=np.float64)
         base_view_up = np.array(session.base_view_up, dtype=np.float64)
         relative_position = base_position - base_focal_point
-        rotated_position = base_focal_point + rotation_matrix @ relative_position
-        rotated_view_up = rotation_matrix @ base_view_up
+        rotated_position = base_focal_point + camera_rotation_matrix @ relative_position
+        rotated_view_up = camera_rotation_matrix @ base_view_up
 
         clamped_zoom = min(max(0.65, float(request.zoom)), 2.35)
 

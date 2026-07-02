@@ -417,13 +417,14 @@ def _handle_zoom_operation(
         if payload.action_type == DRAG_ACTION_MOVE:
             return _render_fast_preview_single(defer=True, metadata_mode="mpr-zoom-preview")
         return _render_single(defer=True)
+    is_3d_view = service._is_3d_view_type(view.view_type)
     return _resolve_drag_single_render_decision(
         service,
         view,
         payload,
         move_image_format="png",
         fast_preview_on_move=True,
-        fast_preview_full_resolution_on_move=True,
+        fast_preview_full_resolution_on_move=not is_3d_view,
         defer_on_move=True,
         defer_on_end=True,
         move_metadata_mode="stack-zoom-preview",
