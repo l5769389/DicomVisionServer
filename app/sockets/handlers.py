@@ -30,6 +30,7 @@ from app.sockets.four_d_playback import four_d_playback_hub
 from app.sockets.runtime import view_socket_hub
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
+from app.services.volume_rendering.vtk_threading import should_run_3d_view_on_main_thread
 from app.services.workspace_activity import workspace_activity_service
 
 logger = get_logger(__name__)
@@ -244,7 +245,8 @@ def _should_queue_mpr_crosshair_state_operation(view_type: str, payload: ViewOpe
 
 
 async def _handle_view_operation_for_socket(payload: ViewOperationRequest, workspace_id: str, view_type: str):
-    del view_type
+    if should_run_3d_view_on_main_thread(view_type):
+        return viewer_service.handle_view_operation(payload, workspace_id)
     return await asyncio.to_thread(viewer_service.handle_view_operation, payload, workspace_id)
 
 

@@ -30,6 +30,7 @@ from app.services.volume_rendering.camera_math import (
     quaternion_to_rotation_matrix,
     rotation_matrix_to_quaternion,
 )
+from app.services.volume_rendering.vtk_threading import should_bypass_vtk_worker_thread
 
 
 vtkObject.GlobalWarningDisplayOff()
@@ -71,9 +72,14 @@ class VtkVolumeRenderer:
     def __init__(self) -> None:
         self._sessions: OrderedDict[str, VolumeRenderSession] = OrderedDict()
         self._lock = RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vtk-render")
+        self._executor = None if should_bypass_vtk_worker_thread() else ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vtk-render",
+        )
 
     def render(self, request: VolumeRenderRequest) -> Image.Image:
+        if self._executor is None:
+            return self._render_in_executor(request)
         return self._executor.submit(self._render_in_executor, request).result()
 
     def apply_trackball_camera_delta(
@@ -83,6 +89,12 @@ class VtkVolumeRenderer:
         delta_x_pixels: float,
         delta_y_pixels: float,
     ) -> tuple[float, float, float, float]:
+        if self._executor is None:
+            return self._apply_trackball_camera_delta_in_executor(
+                request,
+                delta_x_pixels,
+                delta_y_pixels,
+            )
         return self._executor.submit(
             self._apply_trackball_camera_delta_in_executor,
             request,
@@ -92,6 +104,9 @@ class VtkVolumeRenderer:
 
     def drop_session(self, view_id: str) -> None:
         if not view_id:
+            return
+        if self._executor is None:
+            self._drop_session_in_executor(view_id)
             return
         self._executor.submit(self._drop_session_in_executor, view_id).result()
 
@@ -808,7 +823,6 @@ class VtkVolumeRenderer:
 
 
 vtk_volume_renderer = VtkVolumeRenderer()
-
 
 
 

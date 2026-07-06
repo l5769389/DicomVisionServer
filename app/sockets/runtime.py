@@ -10,6 +10,7 @@ from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
 from app.core.logging import get_logger
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
+from app.services.volume_rendering.vtk_threading import should_run_3d_view_on_main_thread
 
 MPR_PREVIEW_BATCH_MIN_INTERVAL_SECONDS = 0.0
 logger = get_logger(__name__)
@@ -106,6 +107,14 @@ class ViewSocketHub:
         if view.view_group is not None and str(view.view_group.group_type).lower() in {"mpr", "fusion"}:
             return f"mpr-group:{view.view_group.group_id}"
         return f"view:{view_id}"
+
+    @staticmethod
+    def _should_render_on_main_thread(view_id: str) -> bool:
+        try:
+            view = view_registry.get(view_id)
+        except Exception:
+            return False
+        return should_run_3d_view_on_main_thread(view.view_type)
 
     @staticmethod
     def _is_mpr_group_queue(queue_key: str) -> bool:
@@ -547,15 +556,17 @@ class ViewSocketHub:
             future.add_done_callback(self._consume_progress_future)
 
         render_started_at = perf_counter()
-        result = await asyncio.to_thread(
-            viewer_service.render_view_by_id,
-            view_id,
-            image_format=request.image_format,
-            fast_preview=request.fast_preview,
-            fast_preview_full_resolution=request.fast_preview_full_resolution,
-            metadata_mode=request.metadata_mode,
-            progress_callback=progress_callback if should_emit_progress else None,
-        )
+        render_kwargs = {
+            "image_format": request.image_format,
+            "fast_preview": request.fast_preview,
+            "fast_preview_full_resolution": request.fast_preview_full_resolution,
+            "metadata_mode": request.metadata_mode,
+            "progress_callback": progress_callback if should_emit_progress else None,
+        }
+        if self._should_render_on_main_thread(view_id):
+            result = viewer_service.render_view_by_id(view_id, **render_kwargs)
+        else:
+            result = await asyncio.to_thread(viewer_service.render_view_by_id, view_id, **render_kwargs)
         render_ms = (perf_counter() - render_started_at) * 1000.0
         if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
             return False

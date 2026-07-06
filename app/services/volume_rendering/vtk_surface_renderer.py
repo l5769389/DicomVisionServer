@@ -37,6 +37,7 @@ from app.services.volume_rendering.camera_math import (
     quaternion_to_rotation_matrix,
     rotation_matrix_to_quaternion,
 )
+from app.services.volume_rendering.vtk_threading import should_bypass_vtk_worker_thread
 
 
 vtkObject.GlobalWarningDisplayOff()
@@ -75,12 +76,19 @@ class VtkSurfaceRenderer:
         self._sessions: OrderedDict[tuple[str, str], SurfaceRenderSession] = OrderedDict()
         self._warm_preview_keys: set[tuple[object, ...]] = set()
         self._lock = RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vtk-surface-render")
+        self._executor = None if should_bypass_vtk_worker_thread() else ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="vtk-surface-render",
+        )
 
     def render(self, request: SurfaceRenderRequest) -> Image.Image:
+        if self._executor is None:
+            return self._render_in_executor(request)
         return self._executor.submit(self._render_in_executor, request).result()
 
     def warm_preview_session(self, request: SurfaceRenderRequest) -> None:
+        if self._executor is None:
+            return
         if request.fast_preview or request.canvas_width <= 0 or request.canvas_height <= 0 or not request.view_id:
             return
 
@@ -100,6 +108,12 @@ class VtkSurfaceRenderer:
         delta_x_pixels: float,
         delta_y_pixels: float,
     ) -> tuple[float, float, float, float]:
+        if self._executor is None:
+            return self._apply_trackball_camera_delta_in_executor(
+                request,
+                delta_x_pixels,
+                delta_y_pixels,
+            )
         return self._executor.submit(
             self._apply_trackball_camera_delta_in_executor,
             request,
@@ -109,6 +123,9 @@ class VtkSurfaceRenderer:
 
     def drop_session(self, view_id: str) -> None:
         if not view_id:
+            return
+        if self._executor is None:
+            self._drop_session_in_executor(view_id)
             return
         self._executor.submit(self._drop_session_in_executor, view_id).result()
 
