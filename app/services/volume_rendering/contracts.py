@@ -22,6 +22,7 @@ class VolumeRenderRequest:
     volume_preset: str = "bone"
     volume_config: dict[str, Any] | None = None
     fast_preview: bool = False
+    volume_token: str | None = None
 
 
 @dataclass(frozen=True)

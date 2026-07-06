@@ -456,13 +456,14 @@ class VtkSurfaceRenderer:
 
     def _update_camera(self, session: SurfaceRenderSession, request: SurfaceRenderRequest) -> None:
         camera = session.renderer.GetActiveCamera()
-        rotation_matrix = self._quaternion_to_rotation_matrix(request.rotation_quaternion)
+        model_rotation_matrix = self._quaternion_to_rotation_matrix(request.rotation_quaternion)
+        camera_rotation_matrix = model_rotation_matrix.T
         base_position = np.array(session.base_position, dtype=np.float64)
         base_focal_point = np.array(session.base_focal_point, dtype=np.float64)
         base_view_up = np.array(session.base_view_up, dtype=np.float64)
         relative_position = base_position - base_focal_point
-        rotated_position = base_focal_point + rotation_matrix @ relative_position
-        rotated_view_up = rotation_matrix @ base_view_up
+        rotated_position = base_focal_point + camera_rotation_matrix @ relative_position
+        rotated_view_up = camera_rotation_matrix @ base_view_up
 
         clamped_zoom = min(max(0.65, float(request.zoom)), 2.35)
         camera.SetPosition(*rotated_position.tolist())
