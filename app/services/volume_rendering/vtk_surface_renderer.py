@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from math import ceil, radians, tan
+from math import radians, tan
 from threading import RLock
 from typing import Any
 
@@ -17,7 +17,6 @@ from vtkmodules.vtkFiltersCore import (
     vtkDecimatePro,
     vtkFlyingEdges3D,
     vtkPolyDataNormals,
-    vtkQuadricDecimation,
     vtkWindowedSincPolyDataFilter,
 )
 from vtkmodules.vtkRenderingCore import (
@@ -32,10 +31,21 @@ from app.core.logging import get_logger
 from app.services.surface_render_config import normalize_surface_render_config
 from app.services.volume_rendering.contracts import SurfaceRenderRequest
 from app.services.volume_rendering.camera_math import (
+    VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH,
+    VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT,
+    VTK_TRACKBALL_MOTION_FACTOR,
     normalize_quaternion,
     normalize_vector,
     quaternion_to_rotation_matrix,
     rotation_matrix_to_quaternion,
+)
+from app.services.volume_rendering.camera_fit import (
+    BASE_CAMERA_FORWARD,
+    BASE_CAMERA_UP,
+    bounds_center,
+    fit_stable_distance_for_bounds,
+    fit_stable_parallel_scale_for_bounds,
+    normalize_bounds,
 )
 from app.services.volume_rendering.vtk_threading import should_bypass_vtk_worker_thread
 
@@ -43,13 +53,11 @@ from app.services.volume_rendering.vtk_threading import should_bypass_vtk_worker
 vtkObject.GlobalWarningDisplayOff()
 logger = get_logger(__name__)
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
-TRACKBALL_MOTION_FACTOR = 36.0
-TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
-TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = 20.0
-FAST_PREVIEW_VOLUME_MAX_DIMENSION = 144
+TRACKBALL_MOTION_FACTOR = VTK_TRACKBALL_MOTION_FACTOR
+TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH
+TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT
 FAST_PREVIEW_RENDER_SCALE = 0.5
 FAST_PREVIEW_RENDER_MAX_DIMENSION = 720
-FAST_PREVIEW_DECIMATION_FLOOR = 0.78
 SURFACE_SESSION_LIMIT = 8
 
 
@@ -196,13 +204,13 @@ class VtkSurfaceRenderer:
     def _get_or_create_session(self, request: SurfaceRenderRequest, volume: np.ndarray) -> SurfaceRenderSession:
         volume_token = self._build_volume_token(volume, request.spacing_xyz)
         config = normalize_surface_render_config(request.surface_config)
-        config_token = self._build_config_token(config, request.fast_preview)
+        config_token = self._build_config_token(config)
         session_key = self._build_session_key(request.view_id, request.fast_preview)
         session = self._sessions.get(session_key)
         if session is None or session.volume_token != volume_token or session.config_token != config_token:
             if session is not None:
                 session.render_window.Finalize()
-            session = self._create_session(volume, request.spacing_xyz, volume_token, config, config_token, request.fast_preview)
+            session = self._create_session(volume, request.spacing_xyz, volume_token, config, config_token)
             self._sessions[session_key] = session
             self._evict_sessions_if_needed()
             return session
@@ -221,19 +229,18 @@ class VtkSurfaceRenderer:
         volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
         config: dict[str, object],
         config_token: tuple[object, ...],
-        fast_preview: bool,
     ) -> SurfaceRenderSession:
-        surface_volume, surface_spacing_xyz = self._prepare_surface_volume(volume, spacing_xyz, fast_preview)
+        surface_volume, surface_spacing_xyz = self._prepare_surface_volume(volume, spacing_xyz)
         image_data = self._build_image_data(surface_volume, surface_spacing_xyz)
-        mapper = self._build_surface_mapper(image_data, config, fast_preview)
+        mapper = self._build_surface_mapper(image_data, config)
         actor = vtkActor()
         actor.SetMapper(mapper)
-        self._apply_material(actor, config, fast_preview=fast_preview)
+        self._apply_material(actor, config)
 
         renderer = vtkRenderer()
         renderer.SetBackground(*BACKGROUND_RGB)
         renderer.AddActor(actor)
-        if not fast_preview and hasattr(renderer, "UseFXAAOn"):
+        if hasattr(renderer, "UseFXAAOn"):
             renderer.UseFXAAOn()
 
         render_window = vtkRenderWindow()
@@ -273,7 +280,6 @@ class VtkSurfaceRenderer:
     def _build_surface_mapper(
         image_data: vtkImageData,
         config: dict[str, object],
-        fast_preview: bool,
     ) -> vtkPolyDataMapper:
         contour = vtkFlyingEdges3D()
         contour.SetInputData(image_data)
@@ -281,7 +287,7 @@ class VtkSurfaceRenderer:
 
         source_port = contour.GetOutputPort()
         smoothing = max(0.0, min(1.0, float(config.get("smoothing", 0.0))))
-        if smoothing > 0.0 and not fast_preview:
+        if smoothing > 0.0:
             smoother = vtkWindowedSincPolyDataFilter()
             smoother.SetInputConnection(source_port)
             smoother.SetNumberOfIterations(max(1, int(6 + smoothing * 24)))
@@ -294,20 +300,12 @@ class VtkSurfaceRenderer:
             source_port = smoother.GetOutputPort()
 
         target_reduction = max(0.0, min(0.9, float(config.get("decimation", 0.0))))
-        if fast_preview:
-            target_reduction = max(target_reduction, FAST_PREVIEW_DECIMATION_FLOOR)
         if target_reduction > 0.0:
-            if fast_preview:
-                decimate = vtkQuadricDecimation()
-                decimate.SetInputConnection(source_port)
-                decimate.SetTargetReduction(target_reduction)
-                source_port = decimate.GetOutputPort()
-            else:
-                decimate = vtkDecimatePro()
-                decimate.SetInputConnection(source_port)
-                decimate.PreserveTopologyOn()
-                decimate.SetTargetReduction(target_reduction)
-                source_port = decimate.GetOutputPort()
+            decimate = vtkDecimatePro()
+            decimate.SetInputConnection(source_port)
+            decimate.PreserveTopologyOn()
+            decimate.SetTargetReduction(target_reduction)
+            source_port = decimate.GetOutputPort()
 
         normals = vtkPolyDataNormals()
         normals.SetInputConnection(source_port)
@@ -323,12 +321,10 @@ class VtkSurfaceRenderer:
         return mapper
 
     @staticmethod
-    def _apply_material(actor: vtkActor, config: dict[str, object], *, fast_preview: bool = False) -> None:
+    def _apply_material(actor: vtkActor, config: dict[str, object]) -> None:
         prop = actor.GetProperty()
         prop.SetColor(*VtkSurfaceRenderer._hex_to_rgb(str(config.get("color") or "#f0eadc"), (0.94, 0.92, 0.86)))
-        if fast_preview and hasattr(prop, "SetInterpolationToGouraud"):
-            prop.SetInterpolationToGouraud()
-        elif hasattr(prop, "SetInterpolationToPhong"):
+        if hasattr(prop, "SetInterpolationToPhong"):
             prop.SetInterpolationToPhong()
         prop.SetAmbient(max(0.0, min(1.0, float(config.get("ambient", 0.18)))))
         prop.SetDiffuse(max(0.0, min(1.0, float(config.get("diffuse", 0.78)))))
@@ -345,7 +341,8 @@ class VtkSurfaceRenderer:
 
     @staticmethod
     def _build_session_key(view_id: str, fast_preview: bool) -> tuple[str, str]:
-        return (view_id, "preview" if fast_preview else "final")
+        del fast_preview
+        return (view_id, "shared")
 
     @classmethod
     def _build_warm_preview_key(cls, request: SurfaceRenderRequest) -> tuple[object, ...]:
@@ -355,7 +352,7 @@ class VtkSurfaceRenderer:
         return (
             request.view_id,
             cls._build_volume_token(volume, request.spacing_xyz),
-            cls._build_config_token(config, True),
+            cls._build_config_token(config),
             cls._resolve_render_size(preview_request),
         )
 
@@ -367,7 +364,7 @@ class VtkSurfaceRenderer:
         return (id(volume), tuple(int(size) for size in volume.shape), tuple(float(value) for value in spacing_xyz))
 
     @staticmethod
-    def _build_config_token(config: dict[str, object], fast_preview: bool) -> tuple[object, ...]:
+    def _build_config_token(config: dict[str, object]) -> tuple[object, ...]:
         return (
             str(config.get("preset", "bone")),
             round(float(config.get("isoValue", 300.0)), 3),
@@ -378,36 +375,14 @@ class VtkSurfaceRenderer:
             round(float(config.get("diffuse", 0.78)), 3),
             round(float(config.get("specular", 0.28)), 3),
             round(float(config.get("roughness", 0.42)), 3),
-            bool(fast_preview),
         )
 
     @staticmethod
     def _prepare_surface_volume(
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
-        fast_preview: bool,
     ) -> tuple[np.ndarray, tuple[float, float, float]]:
-        if not fast_preview:
-            return volume, spacing_xyz
-
-        z_size, y_size, x_size = volume.shape
-        planar_step = max(1, int(ceil(max(y_size, x_size) / FAST_PREVIEW_VOLUME_MAX_DIMENSION)))
-        z_step = min(planar_step, max(1, z_size // 24))
-        y_step = planar_step
-        x_step = planar_step
-        if z_step == 1 and y_step == 1 and x_step == 1:
-            return volume, spacing_xyz
-
-        sampled = volume[::z_step, ::y_step, ::x_step]
-        if min(sampled.shape) < 2:
-            return volume, spacing_xyz
-
-        spacing_x, spacing_y, spacing_z = spacing_xyz
-        return sampled, (
-            float(spacing_x) * float(x_step),
-            float(spacing_y) * float(y_step),
-            float(spacing_z) * float(z_step),
-        )
+        return volume, spacing_xyz
 
     @staticmethod
     def _resolve_render_size(request: SurfaceRenderRequest) -> tuple[int, int]:
@@ -446,15 +421,40 @@ class VtkSurfaceRenderer:
     def _set_base_camera_orientation(camera) -> None:
         focal_point = np.array(camera.GetFocalPoint(), dtype=np.float64)
         distance = max(float(camera.GetDistance()), 1e-3)
-        forward = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
-        up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-        position = focal_point - forward * distance
+        position = focal_point - BASE_CAMERA_FORWARD * distance
         camera.SetPosition(*position.tolist())
         camera.SetFocalPoint(*focal_point.tolist())
-        camera.SetViewUp(*up.tolist())
+        camera.SetViewUp(*BASE_CAMERA_UP.tolist())
         camera.OrthogonalizeViewUp()
 
+    @staticmethod
+    def _resolve_session_bounds(session: SurfaceRenderSession) -> tuple[float, float, float, float, float, float] | None:
+        return normalize_bounds(session.actor.GetBounds()) or normalize_bounds(session.image_data.GetBounds())
+
+    def _refresh_base_camera_frame(self, session: SurfaceRenderSession, request: SurfaceRenderRequest) -> None:
+        bounds = self._resolve_session_bounds(session)
+        if bounds is None:
+            return
+
+        aspect_ratio = max(float(request.canvas_width), 1.0) / max(float(request.canvas_height), 1.0)
+        focal_point = bounds_center(bounds)
+        view_angle = max(float(session.base_view_angle), 1.0)
+        distance = fit_stable_distance_for_bounds(
+            bounds,
+            view_angle_degrees=view_angle,
+            aspect_ratio=aspect_ratio,
+        )
+        position = focal_point - BASE_CAMERA_FORWARD * distance
+        session.base_position = tuple(float(value) for value in position)
+        session.base_focal_point = tuple(float(value) for value in focal_point)
+        session.base_view_up = tuple(float(value) for value in BASE_CAMERA_UP)
+        session.base_parallel_scale = fit_stable_parallel_scale_for_bounds(
+            bounds,
+            aspect_ratio=aspect_ratio,
+        )
+
     def _update_camera(self, session: SurfaceRenderSession, request: SurfaceRenderRequest) -> None:
+        self._refresh_base_camera_frame(session, request)
         camera = session.renderer.GetActiveCamera()
         model_rotation_matrix = self._quaternion_to_rotation_matrix(request.rotation_quaternion)
         camera_rotation_matrix = model_rotation_matrix.T
@@ -488,10 +488,12 @@ class VtkSurfaceRenderer:
         current_up = self._normalize_vector(np.array(camera.GetViewUp(), dtype=np.float64))
         current_right = self._normalize_vector(np.cross(current_forward, current_up))
 
-        base_basis = np.column_stack((base_right, base_up, -base_forward))
-        current_basis = np.column_stack((current_right, current_up, -current_forward))
-        rotation_matrix = current_basis @ base_basis.T
-        return self._rotation_matrix_to_quaternion(rotation_matrix)
+        current_up = self._normalize_vector(np.cross(current_right, current_forward))
+
+        base_basis = np.column_stack((base_right, base_forward, base_up))
+        current_basis = np.column_stack((current_right, current_forward, current_up))
+        camera_rotation_matrix = current_basis @ base_basis.T
+        return self._rotation_matrix_to_quaternion(camera_rotation_matrix.T)
 
     @staticmethod
     def _normalize_quaternion(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:

@@ -4,14 +4,15 @@
 
 DicomVision Server is the FastAPI + Socket.IO backend for DicomVision. It provides DICOM discovery, PACS query and retrieval, 2D/MPR/4D/3D rendering, PET/CT fusion, segmentation, measurement, QA, export, and the backend bundle consumed by the desktop app.
 
-## v3.0.0 Backend Updates
+## v3.1.0 Backend Updates
 
-- **PET/CT Fusion**: CT/PET/Fusion/PET MIP rendering, PET-only display, PET intensity ranges, fusion previews, manual registration, registration persistence, and Socket.IO interaction support.
-- **MPR segmentation and VOI**: threshold segmentation, spherical VOI, overlay render intent, segmentation preview metadata, and sidecar-style data flow.
-- **MPR/4D/playback**: improved MPR, 4D MPR, slice playback, phase synchronization, and viewport size update stability.
-- **QA/MTF**: MTF/FWHM, water phantom QA, ROI metrics, and report data used by the v3.0.0 right-side result panels.
-- **PACS and export**: DICOMweb/DIMSE query and download, tag modification, de-identification, DICOM SR/GSPS, and PNG/DICOM export support.
-- **Desktop bundle**: Windows Server bundle builds for the Electron desktop installer.
+- **3D rendering consistency**: VR/Surface preview and final frames reuse the same view state to reduce brightness, scale, and pose jumps after rotation.
+- **3D rotation and camera**: supports direct model dragging, interactionId stale-frame suppression, mobile viewport fitting, and automatic initial framing from volume bounds.
+- **Adaptive 3D presets**: AAA, CT, CTA, MR, and CBCT presets use CT HU anchors plus foreground percentiles; non-HU data falls back to percentile-based presets.
+- **Surface parameters**: Surface rendering keeps independent isoValue, smoothing, decimation, color, and material settings with modality/intensity-aware defaults.
+- **Remove-bed and clipping**: adds render-time bed masking, freeform view-space clipping, clip/removeBed cache tokens, preprocessing progress, and timing logs.
+- **Web demo data**: local macOS development prefers `/Users/jun/Documents/test_dicom/py_test_path/py_test_path2`; deployments continue to use bundled sample data.
+- **Desktop bundle**: Windows/macOS Server bundles can be embedded in the Electron desktop installer.
 
 ## Repositories
 
@@ -21,12 +22,14 @@ DicomVision Server is the FastAPI + Socket.IO backend for DicomVision. It provid
 ## Capabilities
 
 - Load DICOM folders, single files, browser uploads, and sample data.
-- Serve thumbnails, corner info, DICOM tags, series, instances, and 4D phase metadata.
+- Serve thumbnails, corner info, DICOM tags, series, instances, 4D phase data, and view metadata.
 - PACS DICOMweb QIDO/WADO and DIMSE C-ECHO/C-FIND/C-GET.
-- 2D, Compare, Layout, MPR, oblique MPR, MIP, 3D volume rendering, 4D phase, and PET/CT Fusion rendering.
+- 2D, Compare, Layout, MPR, oblique MPR, MIP, 3D VR, 3D Surface, 4D phase, and PET/CT Fusion rendering.
+- 3D adaptive presets, Surface parameters, remove-bed masking, freeform clipping, camera reset, and mobile viewport fitting.
 - Measurement ROI metrics, MTF/FWHM, water phantom QA, realtime hover and draft interactions.
+- MPR threshold segmentation, VOI, segmentation overlay metadata, and import/export data flow.
 - DICOM tag edits, background jobs, de-identification, DICOM SR/GSPS, and image export.
-- Socket.IO image updates, view acknowledgements, error events, and playback state synchronization.
+- Socket.IO image updates, view acknowledgements, progress events, error events, and playback state synchronization.
 
 ## Product Screenshots
 

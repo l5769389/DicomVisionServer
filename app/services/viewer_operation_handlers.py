@@ -28,6 +28,8 @@ from app.core import (
     VIEW_OP_TYPE_VOLUME_CONFIG,
     VIEW_OP_TYPE_RENDER_3D_MODE,
     VIEW_OP_TYPE_SURFACE_CONFIG,
+    VIEW_OP_TYPE_VOLUME_RENDER_OPTIONS,
+    VIEW_OP_TYPE_VOLUME_CLIP,
     VIEW_OP_TYPE_MPR_MIP_CONFIG,
     VIEW_OP_TYPE_MPR_SEGMENTATION,
     VIEW_OP_TYPE_MPR_OBLIQUE,
@@ -682,6 +684,32 @@ def _handle_surface_config_operation(
     return _render_single()
 
 
+def _handle_volume_render_options_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if not service._handle_volume_render_options(view, payload):
+        return _render_none()
+    return _render_single()
+
+
+def _handle_volume_clip_operation(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+    is_mpr_view: bool,
+) -> RenderDecision:
+    del series, is_mpr_view
+    if not service._handle_volume_clip(view, payload):
+        return _render_none()
+    return _render_single()
+
+
 def _handle_measurement_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -913,6 +941,8 @@ OPERATION_HANDLERS: dict[str, OperationHandler] = {
     VIEW_OP_TYPE_VOLUME_CONFIG: _handle_volume_config_operation,
     VIEW_OP_TYPE_RENDER_3D_MODE: _handle_render_3d_mode_operation,
     VIEW_OP_TYPE_SURFACE_CONFIG: _handle_surface_config_operation,
+    VIEW_OP_TYPE_VOLUME_RENDER_OPTIONS: _handle_volume_render_options_operation,
+    VIEW_OP_TYPE_VOLUME_CLIP: _handle_volume_clip_operation,
     VIEW_OP_TYPE_MPR_MIP_CONFIG: _handle_mpr_mip_config_operation,
     VIEW_OP_TYPE_MPR_SEGMENTATION: _handle_mpr_segmentation_operation,
     VIEW_OP_TYPE_MPR_OBLIQUE: _handle_mpr_oblique_operation,

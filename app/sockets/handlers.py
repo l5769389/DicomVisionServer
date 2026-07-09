@@ -67,6 +67,7 @@ FUSION_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
 }
+ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS = 0.1
 
 
 @dataclass
@@ -145,6 +146,7 @@ def _schedule_render_for_view(
     metadata_mode: str = "full",
     target_sids: tuple[str, ...] | None = None,
     mpr_revision: int | None = None,
+    interaction_id: str | None = None,
 ) -> asyncio.Task[None]:
     async def run_render() -> None:
         try:
@@ -163,6 +165,7 @@ def _schedule_render_for_view(
                 metadata_mode=metadata_mode,
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
+                interaction_id=interaction_id,
             )
             logger.debug(
                 "socket background render completed sid=%s view_id=%s image_format=%s fast_preview=%s",
@@ -189,6 +192,7 @@ def _schedule_render_batch_for_views(
     metadata_mode: str = "full",
     target_sids: tuple[str, ...] | None = None,
     mpr_revision: int | None = None,
+    interaction_id: str | None = None,
 ) -> asyncio.Task[None]:
     async def run_render_batch() -> None:
         try:
@@ -207,6 +211,7 @@ def _schedule_render_batch_for_views(
                 metadata_mode=metadata_mode,
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
+                interaction_id=interaction_id,
             )
             logger.debug(
                 "socket background render batch completed sid=%s view_ids=%s image_format=%s fast_preview=%s",
@@ -421,6 +426,7 @@ async def _dispatch_operation_result(
             fast_preview_full_resolution=result.primary_fast_preview_full_resolution,
             metadata_mode=result.primary_metadata_mode,
             mpr_revision=result.mpr_revision,
+            interaction_id=payload.interaction_id,
         )
         primary_payload = view_socket_hub.build_image_update_payload(result.primary_result.meta, primary_request)
         await server.emit(
@@ -443,6 +449,7 @@ async def _dispatch_operation_result(
                 fast_preview_full_resolution=broadcast_fast_preview_full_resolution,
                 metadata_mode=broadcast_metadata_mode,
                 mpr_revision=result.mpr_revision,
+                interaction_id=payload.interaction_id,
             )
         else:
             _schedule_render_batch_for_views(
@@ -454,6 +461,7 @@ async def _dispatch_operation_result(
                 fast_preview_full_resolution=broadcast_fast_preview_full_resolution,
                 metadata_mode=broadcast_metadata_mode,
                 mpr_revision=result.mpr_revision,
+                interaction_id=payload.interaction_id,
             )
     if result.deferred_view_ids:
         if result.deferred_fast_preview or result.deferred_image_format == "jpeg":
@@ -465,6 +473,7 @@ async def _dispatch_operation_result(
                 metadata_mode=result.deferred_metadata_mode,
                 target_sids=(sid,),
                 mpr_revision=result.mpr_revision,
+                interaction_id=payload.interaction_id,
             )
         elif is_mpr_view:
             _schedule_render_batch_for_views(
@@ -477,9 +486,27 @@ async def _dispatch_operation_result(
                 metadata_mode=result.deferred_metadata_mode,
                 target_sids=(sid,),
                 mpr_revision=result.mpr_revision,
+                interaction_id=payload.interaction_id,
             )
         else:
             for view_id in result.deferred_view_ids:
+                if (
+                    view.view_type == "3D"
+                    and payload.op_type == VIEW_OP_TYPE_ROTATE_3D
+                    and payload.action_type == DRAG_ACTION_END
+                    and not result.deferred_fast_preview
+                ):
+                    view_socket_hub.schedule_delayed_final_render_for_view(
+                        view_id,
+                        delay_seconds=ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS,
+                        image_format=result.deferred_image_format,
+                        fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
+                        metadata_mode=result.deferred_metadata_mode,
+                        target_sids=(sid,),
+                        mpr_revision=result.mpr_revision,
+                        interaction_id=payload.interaction_id,
+                    )
+                    continue
                 _schedule_render_for_view(
                     server,
                     sid,
@@ -490,6 +517,7 @@ async def _dispatch_operation_result(
                     metadata_mode=result.deferred_metadata_mode,
                     target_sids=(sid,),
                     mpr_revision=result.mpr_revision,
+                    interaction_id=payload.interaction_id,
                 )
     log_method = logger.debug if payload.action_type == DRAG_ACTION_MOVE else logger.info
     log_method("socket view_operation sid=%s view_id=%s op_type=%s", sid, payload.view_id, payload.op_type)
@@ -608,6 +636,12 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
         workspace_id = view_socket_hub.get_sid_workspace(sid)
         view = view_registry.get(payload.view_id, workspace_id=workspace_id)
         view_socket_hub.bind_view(sid, payload.view_id)
+        if (
+            view.view_type == "3D"
+            and payload.op_type == VIEW_OP_TYPE_ROTATE_3D
+            and payload.action_type == DRAG_ACTION_START
+        ):
+            view_socket_hub.mark_view_interaction(payload.view_id, payload.interaction_id)
         if _should_queue_mpr_operation(view.view_type, payload):
             _enqueue_mpr_operation(
                 _resolve_mpr_operation_queue_key(view, workspace_id),

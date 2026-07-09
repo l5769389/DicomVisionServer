@@ -63,6 +63,7 @@ def test_bind_view_uses_requested_image_format(monkeypatch) -> None:
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del fast_preview, fast_preview_full_resolution, metadata_mode, mpr_revision
             render_calls.append((view_id, image_format, target_sids))
@@ -108,6 +109,7 @@ def test_set_view_size_uses_requested_image_format(monkeypatch) -> None:
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del fast_preview, fast_preview_full_resolution, metadata_mode, mpr_revision
             render_calls.append((view_id, image_format, target_sids))
@@ -162,6 +164,111 @@ def test_view_operation_payload_normalizes_image_format(monkeypatch) -> None:
     assert events == []
 
 
+def test_3d_rotate_start_marks_latest_interaction(monkeypatch) -> None:
+    async def run() -> list[tuple[str, str | None]]:
+        server = _SocketServerStub()
+        marked_interactions: list[tuple[str, str | None]] = []
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="3D"),
+        )
+        monkeypatch.setattr(
+            handlers.view_socket_hub,
+            "mark_view_interaction",
+            lambda view_id, interaction_id: marked_interactions.append((view_id, interaction_id)),
+        )
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: OperationRenderOutcome(),
+        )
+
+        response = await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {
+                "viewId": "v-3d",
+                "opType": "rotate3d",
+                "actionType": "start",
+                "interactionId": "drag-1",
+                "canvasX": 100,
+                "canvasY": 120,
+                "canvasWidth": 1000,
+                "canvasHeight": 800,
+            },
+        )
+        assert response == {"ok": True}
+        return marked_interactions
+
+    assert asyncio.run(run()) == [("v-3d", "drag-1")]
+
+
+def test_3d_rotate_end_schedules_debounced_final_render(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float, str, str | None]]:
+        server = _SocketServerStub()
+        scheduled_finals: list[tuple[str, float, str, str | None]] = []
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="3D"),
+        )
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: OperationRenderOutcome(
+                deferred_view_ids=("v-3d",),
+                deferred_image_format="png",
+                deferred_fast_preview=False,
+            ),
+        )
+
+        def fake_schedule_delayed_final_render_for_view(
+            view_id: str,
+            *,
+            delay_seconds: float,
+            image_format: str = "png",
+            fast_preview_full_resolution: bool = False,
+            metadata_mode: str = "full",
+            target_sids: tuple[str, ...] | None = None,
+            mpr_revision: int | None = None,
+            interaction_id: str | None = None,
+        ) -> None:
+            del fast_preview_full_resolution, metadata_mode, target_sids, mpr_revision
+            scheduled_finals.append((view_id, delay_seconds, image_format, interaction_id))
+
+        monkeypatch.setattr(
+            handlers.view_socket_hub,
+            "schedule_delayed_final_render_for_view",
+            fake_schedule_delayed_final_render_for_view,
+        )
+
+        response = await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {
+                "viewId": "v-3d",
+                "opType": "rotate3d",
+                "actionType": "end",
+                "interactionId": "drag-1",
+                "canvasX": 180,
+                "canvasY": 90,
+                "canvasWidth": 1000,
+                "canvasHeight": 800,
+            },
+        )
+        assert response == {"ok": True}
+        return scheduled_finals
+
+    assert asyncio.run(run()) == [("v-3d", handlers.ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS, "png", "drag-1")]
+
+
 def test_handle_operation_schedules_mpr_broadcast_batch_without_waiting(monkeypatch) -> None:
     async def run() -> list[tuple[tuple[str, ...], str, bool, tuple[str, ...] | None]]:
         server = _SocketServerStub()
@@ -193,6 +300,7 @@ def test_handle_operation_schedules_mpr_broadcast_batch_without_waiting(monkeypa
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del fast_preview_full_resolution, metadata_mode, mpr_revision
             render_calls.append((view_ids, image_format, fast_preview, target_sids))
@@ -518,6 +626,7 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del image_format, fast_preview, metadata_mode, target_sids
             scheduled_options.append((view_ids, mpr_revision, fast_preview_full_resolution))
@@ -600,6 +709,7 @@ def test_mpr_crosshair_state_move_emits_state_and_queues_preview(monkeypatch) ->
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del fast_preview_full_resolution, target_sids
             scheduled_batches.append((view_ids, image_format, fast_preview, metadata_mode, mpr_revision))
@@ -706,6 +816,7 @@ def test_mpr_crosshair_preview_generation_skips_replaced_request(monkeypatch) ->
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del image_format, fast_preview, fast_preview_full_resolution, metadata_mode, target_sids
             scheduled_batches.append((view_ids, mpr_revision))
@@ -779,6 +890,7 @@ def test_handle_operation_routes_mpr_deferred_preview_through_batch_scheduler(mo
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del image_format, fast_preview, fast_preview_full_resolution, metadata_mode
             scheduled_batches.append((view_ids, target_sids, mpr_revision))
@@ -812,6 +924,7 @@ def test_background_render_error_is_reported_to_socket(monkeypatch) -> None:
             metadata_mode: str = "full",
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
+            interaction_id: str | None = None,
         ) -> bool:
             del view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode, target_sids, mpr_revision
             raise RuntimeError("render failed")

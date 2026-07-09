@@ -3,7 +3,7 @@
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from math import ceil, radians, tan
+from math import radians, tan
 from threading import RLock
 from time import perf_counter
 from typing import Any
@@ -27,10 +27,21 @@ from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 from app.core.logging import get_logger
 from app.services.volume_rendering.contracts import VolumeRenderRequest
 from app.services.volume_rendering.camera_math import (
+    VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH,
+    VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT,
+    VTK_TRACKBALL_MOTION_FACTOR,
     normalize_quaternion,
     normalize_vector,
     quaternion_to_rotation_matrix,
     rotation_matrix_to_quaternion,
+)
+from app.services.volume_rendering.camera_fit import (
+    BASE_CAMERA_FORWARD,
+    BASE_CAMERA_UP,
+    bounds_center,
+    fit_stable_distance_for_bounds,
+    fit_stable_parallel_scale_for_bounds,
+    normalize_bounds,
 )
 from app.services.volume_rendering.vtk_threading import should_bypass_vtk_worker_thread
 
@@ -38,16 +49,18 @@ from app.services.volume_rendering.vtk_threading import should_bypass_vtk_worker
 vtkObject.GlobalWarningDisplayOff()
 logger = get_logger(__name__)
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
-TRACKBALL_MOTION_FACTOR = 36.0
-TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
-TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = 20.0
-FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.45
+TRACKBALL_MOTION_FACTOR = VTK_TRACKBALL_MOTION_FACTOR
+TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH
+TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT
+FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.15
 FINAL_RENDER_IMAGE_SAMPLE_DISTANCE = 1.0
-FAST_PREVIEW_RAY_SAMPLE_FACTOR = 1.45
-FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.72
-FAST_PREVIEW_VOLUME_MAX_DIMENSION = 144
+FAST_PREVIEW_RAY_SAMPLE_FACTOR = 0.9
+FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.55
+FAST_PREVIEW_MAX_SAMPLE_DISTANCE = 1.5
+FINAL_RENDER_MAX_SAMPLE_DISTANCE = 0.9
+FAST_PREVIEW_MULTI_SAMPLES = 0
+FINAL_RENDER_MULTI_SAMPLES = 4
 VOLUME_SESSION_LIMIT = 8
-VOLUME_PREVIEW_CACHE_LIMIT = 4
 
 
 @dataclass
@@ -71,15 +84,12 @@ class VolumeRenderSession:
     base_parallel_scale: float
     transfer_function_token: tuple[object, ...] | None
     sampling_token: tuple[object, ...] | None
+    render_quality_token: tuple[object, ...] | None
 
 
 class VtkVolumeRenderer:
     def __init__(self) -> None:
         self._sessions: OrderedDict[tuple[str, str], VolumeRenderSession] = OrderedDict()
-        self._preview_volume_cache: OrderedDict[
-            tuple[object, tuple[int, ...], tuple[float, float, float]],
-            tuple[np.ndarray, tuple[float, float, float]],
-        ] = OrderedDict()
         self._lock = RLock()
         self._executor = None if should_bypass_vtk_worker_thread() else ThreadPoolExecutor(
             max_workers=1,
@@ -215,7 +225,7 @@ class VtkVolumeRenderer:
         if session is None or session.volume_token != volume_token:
             if session is not None:
                 session.render_window.Finalize()
-            session = self._create_session(volume, request.spacing_xyz, volume_token, request.fast_preview)
+            session = self._create_session(volume, request.spacing_xyz, volume_token)
             self._sessions[session_key] = session
             self._evict_sessions_if_needed()
             return session
@@ -232,15 +242,8 @@ class VtkVolumeRenderer:
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
         volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
-        fast_preview: bool,
     ) -> VolumeRenderSession:
-        render_volume, render_spacing_xyz = self._prepare_render_volume(
-            volume,
-            spacing_xyz,
-            volume_token,
-            fast_preview,
-        )
-        image_data = self._build_image_data(render_volume, render_spacing_xyz)
+        image_data = self._build_image_data(volume, spacing_xyz)
 
         mapper = vtkSmartVolumeMapper()
         mapper.SetInputData(image_data)
@@ -312,6 +315,7 @@ class VtkVolumeRenderer:
             base_parallel_scale=float(camera.GetParallelScale()),
             transfer_function_token=None,
             sampling_token=None,
+            render_quality_token=None,
         )
 
     def _configure_session(self, session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
@@ -332,7 +336,6 @@ class VtkVolumeRenderer:
                 request.window_center,
                 request.volume_preset,
                 request.volume_config,
-                fast_preview=request.fast_preview,
             )
             session.transfer_function_token = transfer_function_token
 
@@ -340,6 +343,10 @@ class VtkVolumeRenderer:
         if session.sampling_token != sampling_token:
             self._update_sampling(session, request)
             session.sampling_token = sampling_token
+        render_quality_token = self._build_render_quality_token(request)
+        if session.render_quality_token != render_quality_token:
+            self._update_render_quality(session, request)
+            session.render_quality_token = render_quality_token
         self._update_camera(session, request)
 
     @staticmethod
@@ -350,12 +357,10 @@ class VtkVolumeRenderer:
     def _set_base_camera_orientation(camera) -> None:
         focal_point = np.array(camera.GetFocalPoint(), dtype=np.float64)
         distance = max(float(camera.GetDistance()), 1e-3)
-        forward = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
-        up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-        position = focal_point - forward * distance
+        position = focal_point - BASE_CAMERA_FORWARD * distance
         camera.SetPosition(*position.tolist())
         camera.SetFocalPoint(*focal_point.tolist())
-        camera.SetViewUp(*up.tolist())
+        camera.SetViewUp(*BASE_CAMERA_UP.tolist())
         camera.OrthogonalizeViewUp()
 
     @staticmethod
@@ -369,49 +374,17 @@ class VtkVolumeRenderer:
 
     @staticmethod
     def _build_session_key(view_id: str, fast_preview: bool) -> tuple[str, str]:
-        return (view_id, "preview" if fast_preview else "final")
-
-    def _prepare_render_volume(
-        self,
-        volume: np.ndarray,
-        spacing_xyz: tuple[float, float, float],
-        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
-        fast_preview: bool,
-    ) -> tuple[np.ndarray, tuple[float, float, float]]:
-        if not fast_preview:
-            return volume, spacing_xyz
-
-        cached = self._preview_volume_cache.get(volume_token)
-        if cached is not None:
-            self._preview_volume_cache.move_to_end(volume_token)
-            return cached
-
-        sampled, sampled_spacing_xyz = self._downsample_preview_volume(volume, spacing_xyz)
-        self._preview_volume_cache[volume_token] = (sampled, sampled_spacing_xyz)
-        while len(self._preview_volume_cache) > VOLUME_PREVIEW_CACHE_LIMIT:
-            self._preview_volume_cache.popitem(last=False)
-        return sampled, sampled_spacing_xyz
+        del fast_preview
+        return (view_id, "shared")
 
     @staticmethod
-    def _downsample_preview_volume(
+    def _prepare_render_volume(
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
+        fast_preview: bool,
     ) -> tuple[np.ndarray, tuple[float, float, float]]:
-        depth, height, width = volume.shape
-        step = max(1, int(ceil(max(depth, height, width) / FAST_PREVIEW_VOLUME_MAX_DIMENSION)))
-        if step == 1:
-            return volume, spacing_xyz
-
-        sampled = volume[::step, ::step, ::step]
-        if min(sampled.shape) < 2:
-            return volume, spacing_xyz
-
-        spacing_x, spacing_y, spacing_z = spacing_xyz
-        return sampled, (
-            float(spacing_x) * float(step),
-            float(spacing_y) * float(step),
-            float(spacing_z) * float(step),
-        )
+        del fast_preview
+        return volume, spacing_xyz
 
     @classmethod
     def _build_transfer_function_token(
@@ -434,6 +407,10 @@ class VtkVolumeRenderer:
             bool(request.fast_preview),
             tuple(round(abs(float(value)), 6) for value in request.spacing_xyz),
         )
+
+    @staticmethod
+    def _build_render_quality_token(request: VolumeRenderRequest) -> tuple[object, ...]:
+        return (bool(request.fast_preview),)
 
     @staticmethod
     def _token_float(value: Any) -> float:
@@ -484,9 +461,17 @@ class VtkVolumeRenderer:
             render_spacing_xyz = session.image_data.GetSpacing()
             min_spacing = max(1e-3, min(abs(float(value)) for value in render_spacing_xyz))
             factor = FAST_PREVIEW_RAY_SAMPLE_FACTOR if request.fast_preview else FINAL_RENDER_RAY_SAMPLE_FACTOR
-            max_sample_distance = 3.5 if request.fast_preview else 1.25
+            max_sample_distance = FAST_PREVIEW_MAX_SAMPLE_DISTANCE if request.fast_preview else FINAL_RENDER_MAX_SAMPLE_DISTANCE
             sample_distance = max(0.24, min(max_sample_distance, min_spacing * factor))
             session.mapper.SetSampleDistance(sample_distance)
+
+    @staticmethod
+    def _update_render_quality(session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
+        is_final_frame = not bool(request.fast_preview)
+        if hasattr(session.render_window, "SetMultiSamples"):
+            session.render_window.SetMultiSamples(FINAL_RENDER_MULTI_SAMPLES if is_final_frame else FAST_PREVIEW_MULTI_SAMPLES)
+        if hasattr(session.mapper, "SetUseJittering"):
+            session.mapper.SetUseJittering(1 if is_final_frame else 0)
 
     def _update_transfer_functions(
         self,
@@ -495,8 +480,6 @@ class VtkVolumeRenderer:
         window_center: float,
         volume_preset: str,
         volume_config: dict[str, Any] | None,
-        *,
-        fast_preview: bool = False,
     ) -> None:
         config = volume_config or {}
         preset = str(config.get("preset") or volume_preset or "bone").strip().lower()
@@ -523,13 +506,7 @@ class VtkVolumeRenderer:
         else:
             session.volume_property.SetInterpolationTypeToLinear()
 
-        if fast_preview:
-            session.volume_property.ShadeOff()
-            ambient = 1.0
-            diffuse = 0.0
-            specular = 0.0
-            roughness = 1.0
-        elif shading_enabled and layers and blend_mode != "mip":
+        if shading_enabled and layers and blend_mode != "mip":
             session.volume_property.ShadeOn()
         else:
             session.volume_property.ShadeOff()
@@ -596,18 +573,23 @@ class VtkVolumeRenderer:
                 (center + width * 0.22, 0.72, 0.26, 0.26),
                 (tail, 0.95, 0.52, 0.52),
             ])
-        elif preset == 'cardiac':
+        elif preset in {'cardiac', 'carotid', 'coronaryCta', 'bodyCta', 'neckCta', 'vesselOutline'}:
             color_points.extend([
                 (center + width * 0.08, 0.44, 0.24, 0.2),
                 (tail, 0.92, 0.86, 0.82),
             ])
-        elif preset == 'muscle':
+        elif preset in {'muscle', 'renalsStomach', 'mrDefault'}:
             color_points.extend([
                 (center + width * 0.05, 0.30, 0.20, 0.18),
                 (tail, 0.72, 0.58, 0.52),
             ])
+        elif preset in {'lung', 'lung2', 'lung3'}:
+            color_points.extend([
+                (center + width * 0.05, 0.18, 0.28, 0.36),
+                (tail, 0.72, 0.9, 1.0),
+            ])
 
-        if preset == 'mip':
+        if preset in {'mip', 'xray', 'mrMip', 'mrAngio'}:
             opacity_points = [
                 (low - width * 0.45, 0.0),
                 (low, 0.0),
@@ -619,10 +601,28 @@ class VtkVolumeRenderer:
 
         strength_scale = {
             'bone': 0.58,
+            'bones': 0.62,
+            'bonePlusPlate': 0.62,
+            'fracture': 0.64,
+            'lumbar': 0.6,
+            'hardware': 0.56,
+            'cbctRealist': 0.62,
+            'cbctBone': 0.62,
+            'cbctBone2': 0.66,
             'aaa': 0.75,
             'red': 0.92,
             'cardiac': 0.82,
             'muscle': 0.78,
+            'carotid': 0.8,
+            'coronaryCta': 0.82,
+            'bodyCta': 0.8,
+            'neckCta': 0.8,
+            'vesselOutline': 0.86,
+            'lung': 0.66,
+            'lung2': 0.7,
+            'lung3': 0.68,
+            'renalsStomach': 0.76,
+            'mrDefault': 0.72,
         }.get(preset, 0.8)
         overlay_factor = 0.34 if overlay_active else 1.0
         base_peak = 0.016 * strength_scale * overlay_factor
@@ -726,55 +726,6 @@ class VtkVolumeRenderer:
         ]
         return color_points, opacity_points
 
-        if key == 'bone':
-            knee = center + width * 0.12
-            plateau = center + width * 0.35
-            white_rgb = (1.0, 1.0, 1.0)
-            color_points = [
-                (low, *start_rgb),
-                (center, *mid_rgb),
-                (knee, *white_rgb),
-                (high, *white_rgb),
-                (plateau, *white_rgb),
-            ]
-            opacity_points = [
-                (low, 0.0),
-                (center, opacity * 0.35),
-                (knee, opacity * 0.72),
-                (high, opacity),
-                (plateau, opacity),
-            ]
-            return color_points, opacity_points
-
-        if key == 'lung':
-            color_points = [
-                (low, *start_rgb),
-                (center - width * 0.18, *mid_rgb),
-                (center, *end_rgb),
-                (high, *end_rgb),
-            ]
-            opacity_points = [
-                (low, 0.0),
-                (center - width * 0.12, opacity * 0.2),
-                (center, opacity * 0.8),
-                (high, opacity * 0.35),
-            ]
-            return color_points, opacity_points
-
-        color_points = [
-            (low, *start_rgb),
-            (center - width * 0.18, *mid_rgb),
-            (center + width * 0.08, *end_rgb),
-            (high, *end_rgb),
-        ]
-        opacity_points = [
-            (low, 0.0),
-            (center - width * 0.12, opacity * 0.25),
-            (center, opacity * 0.72),
-            (high, opacity * 0.9),
-        ]
-        return color_points, opacity_points
-
     @staticmethod
     def _build_gradient_opacity_points(
         preset: str,
@@ -787,7 +738,7 @@ class VtkVolumeRenderer:
                 (255.0, 0.0),
             ]
 
-        if preset == 'bone':
+        if preset in {'bone', 'bones', 'bonePlusPlate', 'fracture', 'lumbar', 'hardware', 'cbctRealist', 'cbctBone', 'cbctBone2', 'xray'}:
             return [
                 (0.0, 0.0),
                 (18.0, 0.0),
@@ -796,22 +747,39 @@ class VtkVolumeRenderer:
                 (210.0, 0.74 if not overlay_active else 0.86),
             ]
 
-        if preset == 'aaa':
+        if preset in {'aaa', 'carotid', 'coronaryCta', 'bodyCta', 'neckCta', 'vesselOutline'}:
+            if overlay_active:
+                return [
+                    (0.0, 0.24),
+                    (16.0, 0.36),
+                    (48.0, 0.62),
+                    (120.0, 0.86),
+                    (220.0, 0.96),
+                ]
             return [
-                (0.0, 0.0),
-                (16.0, 0.0 if not overlay_active else 0.01),
-                (48.0, 0.04 if not overlay_active else 0.10),
-                (120.0, 0.16 if not overlay_active else 0.34),
-                (220.0, 0.34 if not overlay_active else 0.76),
+                (0.0, 0.06),
+                (16.0, 0.12),
+                (48.0, 0.26),
+                (120.0, 0.52),
+                (220.0, 0.78),
             ]
 
-        if preset == 'cardiac':
+        if preset in {'cardiac', 'red', 'muscle', 'renalsStomach', 'mrDefault'}:
             return [
                 (0.0, 0.0),
                 (18.0, 0.01),
                 (60.0, 0.08),
                 (120.0, 0.24),
                 (220.0, 0.56),
+            ]
+
+        if preset in {'lung', 'lung2', 'lung3'}:
+            return [
+                (0.0, 0.0),
+                (12.0, 0.02),
+                (42.0, 0.1),
+                (96.0, 0.26),
+                (180.0, 0.48),
             ]
 
         return [
@@ -821,7 +789,34 @@ class VtkVolumeRenderer:
             (180.0, 0.3),
         ]
 
+    @staticmethod
+    def _resolve_session_bounds(session: VolumeRenderSession) -> tuple[float, float, float, float, float, float] | None:
+        return normalize_bounds(session.volume_actor.GetBounds()) or normalize_bounds(session.image_data.GetBounds())
+
+    def _refresh_base_camera_frame(self, session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
+        bounds = self._resolve_session_bounds(session)
+        if bounds is None:
+            return
+
+        aspect_ratio = max(float(request.canvas_width), 1.0) / max(float(request.canvas_height), 1.0)
+        focal_point = bounds_center(bounds)
+        view_angle = max(float(session.base_view_angle), 1.0)
+        distance = fit_stable_distance_for_bounds(
+            bounds,
+            view_angle_degrees=view_angle,
+            aspect_ratio=aspect_ratio,
+        )
+        position = focal_point - BASE_CAMERA_FORWARD * distance
+        session.base_position = tuple(float(value) for value in position)
+        session.base_focal_point = tuple(float(value) for value in focal_point)
+        session.base_view_up = tuple(float(value) for value in BASE_CAMERA_UP)
+        session.base_parallel_scale = fit_stable_parallel_scale_for_bounds(
+            bounds,
+            aspect_ratio=aspect_ratio,
+        )
+
     def _update_camera(self, session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
+        self._refresh_base_camera_frame(session, request)
         camera = session.renderer.GetActiveCamera()
         model_rotation_matrix = self._quaternion_to_rotation_matrix(request.rotation_quaternion)
         camera_rotation_matrix = model_rotation_matrix.T
@@ -857,10 +852,12 @@ class VtkVolumeRenderer:
         current_up = self._normalize_vector(np.array(camera.GetViewUp(), dtype=np.float64))
         current_right = self._normalize_vector(np.cross(current_forward, current_up))
 
-        base_basis = np.column_stack((base_right, base_up, -base_forward))
-        current_basis = np.column_stack((current_right, current_up, -current_forward))
-        rotation_matrix = current_basis @ base_basis.T
-        return self._rotation_matrix_to_quaternion(rotation_matrix)
+        current_up = self._normalize_vector(np.cross(current_right, current_forward))
+
+        base_basis = np.column_stack((base_right, base_forward, base_up))
+        current_basis = np.column_stack((current_right, current_forward, current_up))
+        camera_rotation_matrix = current_basis @ base_basis.T
+        return self._rotation_matrix_to_quaternion(camera_rotation_matrix.T)
 
     @staticmethod
     def _clamp_unit_interval(value: Any, fallback: float) -> float:
@@ -945,15 +942,3 @@ class VtkVolumeRenderer:
 
 
 vtk_volume_renderer = VtkVolumeRenderer()
-
-
-
-
-
-
-
-
-
-
-
-

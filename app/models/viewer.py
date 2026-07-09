@@ -111,8 +111,16 @@ class ViewTransformState:
     ver_flip: bool = False
     volume_preset: str = "bone"
     volume_render_config: dict[str, object] | None = None
+    volume_render_config_source: str = "preset"
+    volume_render_config_token: str | None = None
     render_3d_mode: str = "volume"
     surface_render_config: dict[str, object] | None = None
+    surface_render_config_source: str = "preset"
+    surface_render_config_token: str | None = None
+    volume_remove_bed: bool = False
+    volume_clip_mode: str | None = None
+    volume_clip_points: tuple[tuple[float, float], ...] = field(default_factory=tuple)
+    volume_clip_rotation_quaternion: Quaternion = (0.0, 0.0, 0.0, 1.0)
 
 
 @dataclass
@@ -129,6 +137,7 @@ class DragState:
     drag_origin_rotation_quaternion: Quaternion | None = None
     drag_origin_arcball_x: float | None = None
     drag_origin_arcball_y: float | None = None
+    drag_origin_arcball_z: float | None = None
     drag_origin_window_width: float | None = None
     drag_origin_window_center: float | None = None
     drag_origin_volume_render_config: dict[str, object] | None = None
@@ -414,6 +423,22 @@ class ViewRecord:
         self.transform.volume_render_config = value
 
     @property
+    def volume_render_config_source(self) -> str:
+        return self.transform.volume_render_config_source
+
+    @volume_render_config_source.setter
+    def volume_render_config_source(self, value: str) -> None:
+        self.transform.volume_render_config_source = value
+
+    @property
+    def volume_render_config_token(self) -> str | None:
+        return self.transform.volume_render_config_token
+
+    @volume_render_config_token.setter
+    def volume_render_config_token(self, value: str | None) -> None:
+        self.transform.volume_render_config_token = value
+
+    @property
     def render_3d_mode(self) -> str:
         return self.transform.render_3d_mode
 
@@ -428,6 +453,54 @@ class ViewRecord:
     @surface_render_config.setter
     def surface_render_config(self, value: dict[str, object] | None) -> None:
         self.transform.surface_render_config = value
+
+    @property
+    def surface_render_config_source(self) -> str:
+        return self.transform.surface_render_config_source
+
+    @surface_render_config_source.setter
+    def surface_render_config_source(self, value: str) -> None:
+        self.transform.surface_render_config_source = value
+
+    @property
+    def surface_render_config_token(self) -> str | None:
+        return self.transform.surface_render_config_token
+
+    @surface_render_config_token.setter
+    def surface_render_config_token(self, value: str | None) -> None:
+        self.transform.surface_render_config_token = value
+
+    @property
+    def volume_remove_bed(self) -> bool:
+        return self.transform.volume_remove_bed
+
+    @volume_remove_bed.setter
+    def volume_remove_bed(self, value: bool) -> None:
+        self.transform.volume_remove_bed = value
+
+    @property
+    def volume_clip_mode(self) -> str | None:
+        return self.transform.volume_clip_mode
+
+    @volume_clip_mode.setter
+    def volume_clip_mode(self, value: str | None) -> None:
+        self.transform.volume_clip_mode = value
+
+    @property
+    def volume_clip_points(self) -> tuple[tuple[float, float], ...]:
+        return self.transform.volume_clip_points
+
+    @volume_clip_points.setter
+    def volume_clip_points(self, value: tuple[tuple[float, float], ...]) -> None:
+        self.transform.volume_clip_points = value
+
+    @property
+    def volume_clip_rotation_quaternion(self) -> Quaternion:
+        return self.transform.volume_clip_rotation_quaternion
+
+    @volume_clip_rotation_quaternion.setter
+    def volume_clip_rotation_quaternion(self, value: Quaternion) -> None:
+        self.transform.volume_clip_rotation_quaternion = value
 
     @property
     def hor_flip(self) -> bool:
@@ -537,6 +610,14 @@ class ViewRecord:
         self.drag.drag_origin_arcball_y = value
 
     @property
+    def drag_origin_arcball_z(self) -> float | None:
+        return self.drag.drag_origin_arcball_z
+
+    @drag_origin_arcball_z.setter
+    def drag_origin_arcball_z(self, value: float | None) -> None:
+        self.drag.drag_origin_arcball_z = value
+
+    @property
     def drag_origin_window_width(self) -> float | None:
         if self.view_group is not None:
             return self.view_group.drag_origin_window_width
@@ -629,4 +710,3 @@ class ViewRecord:
         if self.view_group is not None:
             return self.view_group.mpr_segmentation
         return MprSegmentationState()
-

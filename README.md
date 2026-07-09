@@ -4,14 +4,15 @@
 
 DicomVision Server 是 DicomVision 的 FastAPI + Socket.IO 后端，负责 DICOM 发现、PACS 查询与下载、2D/MPR/4D/3D 渲染、PET/CT 融合、分割、测量、QA、导出和桌面端内置后端 bundle。
 
-## v3.0.0 后端更新
+## v3.1.0 后端更新
 
-- **PET/CT Fusion**：支持 CT/PET/Fusion/PET MIP 多视口渲染、PET-only 显示、PET 强度范围、融合预览、手动配准、配准保存和 Socket.IO 交互。
-- **MPR 分割与 VOI**：支持阈值分割、球形 VOI、overlay render intent、分割预览 metadata 和 sidecar 风格的数据流。
-- **MPR/4D/播放**：增强 MPR、4D MPR、切片播放、时相同步和视口尺寸更新稳定性。
-- **QA/MTF**：继续提供 MTF/FWHM、水模 QA、ROI 指标和报告数据，前端 v3.0.0 会以右侧报告区呈现。
-- **PACS 与导出**：保留 DICOMweb/DIMSE 查询下载、Tag 修改、脱敏导出、DICOM SR/GSPS 和 PNG/DICOM 导出能力。
-- **桌面 bundle**：可构建 Windows Server bundle，并被 Electron 桌面安装包内置启动。
+- **3D 渲染一致性**：VR/Surface 预览和最终帧复用同一视图状态，降低旋转结束后的亮度、尺度和姿态跳变。
+- **3D 旋转与相机**：支持模型直接拖拽旋转、interactionId 防旧帧覆盖、移动端视口适配和根据体数据范围自动初始构图。
+- **自适应 3D 模板**：AAA、CT、CTA、MR、CBCT 等模板使用 CT HU 锚点 + 前景百分位混合策略；非 HU 数据回退到百分位策略。
+- **Surface 参数**：Surface 使用独立 isoValue、平滑、decimation、颜色和材质参数，并支持按 modality/强度分布生成合理默认值。
+- **去床板与裁剪**：新增渲染时去床板 mask、自由形状贯穿裁剪、clip/removeBed 缓存 token、预处理进度和 timing log。
+- **Web demo 数据**：macOS 本地开发优先使用 `/Users/jun/Documents/test_dicom/py_test_path/py_test_path2`，部署环境继续使用项目默认样例。
+- **桌面 bundle**：继续支持 Windows/macOS Server bundle，并可被 Electron 桌面安装包内置启动。
 
 ## 仓库
 
@@ -21,12 +22,14 @@ DicomVision Server 是 DicomVision 的 FastAPI + Socket.IO 后端，负责 DICOM
 ## 主要能力
 
 - DICOM 文件夹、单文件、Web 上传和示例数据加载。
-- 缩略图、角标、DICOM Tag、序列、实例和 4D phase metadata 服务。
+- 缩略图、角标、DICOM Tag、序列、实例、4D phase 和视图 metadata 服务。
 - PACS DICOMweb QIDO/WADO 与 DIMSE C-ECHO/C-FIND/C-GET。
-- 2D、Compare、Layout、MPR、斜切 MPR、MIP、3D volume rendering、4D phase 和 PET/CT Fusion。
+- 2D、Compare、Layout、MPR、斜切 MPR、MIP、3D VR、3D Surface、4D phase 和 PET/CT Fusion。
+- 3D 自适应模板、Surface 参数、去床板、自由裁剪、相机重置和移动端视口适配。
 - 测量 ROI 指标、MTF/FWHM、水模 QA 和实时 hover/draft 交互。
+- MPR 阈值分割、VOI、分割 overlay metadata 和导入/导出数据流。
 - DICOM Tag 修改、批量任务、脱敏任务、DICOM SR/GSPS 和图像导出。
-- Socket.IO 实时图像推送、view ack、错误事件和播放状态同步。
+- Socket.IO 实时图像推送、view ack、进度事件、错误事件和播放状态同步。
 
 ## 产品截图
 

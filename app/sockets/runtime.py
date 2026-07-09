@@ -25,6 +25,7 @@ class RenderRequest:
     target_sids: tuple[str, ...] | None = None
     mpr_revision: int | None = None
     render_revision: int | None = None
+    interaction_id: str | None = None
 
 
 class ViewSocketHub:
@@ -40,7 +41,10 @@ class ViewSocketHub:
         self._last_mpr_preview_batch_started_at: dict[str, float] = {}
         self._mpr_final_preemption_tokens: dict[str, int] = {}
         self._mpr_final_preemption_revisions: dict[str, int] = {}
+        self._view_final_render_revisions: dict[str, int] = {}
         self._render_revisions: dict[str, int] = defaultdict(int)
+        self._view_active_interaction_ids: dict[str, str] = {}
+        self._delayed_final_render_tasks: dict[str, asyncio.Task[None]] = {}
 
     def attach_server(self, server: socketio.AsyncServer) -> None:
         self._server = server
@@ -87,9 +91,12 @@ class ViewSocketHub:
                 self._pending_render_requests.pop(queue_key, None)
         view_queue_key = f"view:{view_id}"
         self._render_locks.pop(view_queue_key, None)
+        self._view_final_render_revisions.pop(view_id, None)
+        self._view_active_interaction_ids.pop(view_id, None)
         preview_task = self._preview_worker_tasks.pop(view_queue_key, None)
         if preview_task is not None and not preview_task.done():
             preview_task.cancel()
+        self._cancel_delayed_final_render(view_id)
 
     def _get_render_lock(self, queue_key: str) -> asyncio.Lock:
         lock = self._render_locks.get(queue_key)
@@ -114,7 +121,8 @@ class ViewSocketHub:
             view = view_registry.get(view_id)
         except Exception:
             return False
-        return should_run_3d_view_on_main_thread(view.view_type)
+        view_type = getattr(view, "view_type", None)
+        return should_run_3d_view_on_main_thread(view_type) if view_type is not None else False
 
     @staticmethod
     def _is_mpr_group_queue(queue_key: str) -> bool:
@@ -165,11 +173,33 @@ class ViewSocketHub:
             if chosen.mpr_revision is not None
             else ViewSocketHub._choose_render_mpr_revision(current.mpr_revision, incoming.mpr_revision),
             render_revision=chosen.render_revision,
+            interaction_id=chosen.interaction_id,
         )
 
     def next_render_revision(self, view_id: str) -> int:
         self._render_revisions[view_id] += 1
         return self._render_revisions[view_id]
+
+    def _cancel_delayed_final_render(self, view_id: str) -> None:
+        task = self._delayed_final_render_tasks.pop(view_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def mark_view_interaction(self, view_id: str, interaction_id: str | None) -> None:
+        if not interaction_id:
+            return
+        normalized_interaction_id = str(interaction_id)
+        self._view_active_interaction_ids[view_id] = normalized_interaction_id
+        self._cancel_delayed_final_render(view_id)
+        queue_key = self._resolve_render_queue_key(view_id)
+        pending_requests = self._pending_render_requests.get(queue_key)
+        if not pending_requests:
+            return
+        pending_request = pending_requests.get(view_id)
+        if pending_request is not None and pending_request.interaction_id != normalized_interaction_id:
+            pending_requests.pop(view_id, None)
+        if not pending_requests:
+            self._pending_render_requests.pop(queue_key, None)
 
     def make_render_request(
         self,
@@ -182,6 +212,7 @@ class ViewSocketHub:
         target_sids: tuple[str, ...] | None = None,
         mpr_revision: int | None = None,
         render_revision: int | None = None,
+        interaction_id: str | None = None,
     ) -> RenderRequest:
         return RenderRequest(
             image_format=image_format,
@@ -191,6 +222,7 @@ class ViewSocketHub:
             target_sids=target_sids,
             mpr_revision=mpr_revision,
             render_revision=render_revision if render_revision is not None else self.next_render_revision(view_id),
+            interaction_id=interaction_id,
         )
 
     @staticmethod
@@ -202,7 +234,10 @@ class ViewSocketHub:
         return max(int(current), int(incoming))
 
     def _queue_pending_render(self, queue_key: str, view_id: str, incoming_request: RenderRequest) -> None:
-        if self._is_stale_mpr_preview_after_final(queue_key, incoming_request):
+        if (
+            self._is_stale_preview_after_final(queue_key, view_id, incoming_request)
+            or self._is_stale_interaction_request(view_id, incoming_request)
+        ):
             return
         pending_requests = self._pending_render_requests.setdefault(queue_key, {})
         current_request = pending_requests.get(view_id)
@@ -226,7 +261,7 @@ class ViewSocketHub:
         request_batch = {
             view_id: request
             for view_id, request in request_batch.items()
-            if not self._is_stale_mpr_preview_after_final(queue_key, request)
+            if not self._is_stale_preview_after_final(queue_key, view_id, request)
         }
         if not request_batch:
             return {}
@@ -288,12 +323,20 @@ class ViewSocketHub:
         self._discard_pending_preview_requests(queue_key)
         if self._has_final_render_request(self._pending_render_requests.get(queue_key)):
             return False
-        for view_id, request in request_batch.items():
+        for view_id, request in tuple(request_batch.items()):
+            if self._is_stale_preview_after_final(queue_key, view_id, request):
+                request_batch.pop(view_id, None)
+                continue
             self._queue_pending_render(queue_key, view_id, request)
         return bool(request_batch)
 
     def _cancel_mpr_preview_worker(self, queue_key: str) -> None:
         task = self._mpr_preview_worker_tasks.pop(queue_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _cancel_preview_worker(self, queue_key: str) -> None:
+        task = self._preview_worker_tasks.pop(queue_key, None)
         if task is not None and not task.done():
             task.cancel()
 
@@ -322,6 +365,14 @@ class ViewSocketHub:
             self._mpr_final_preemption_revisions.get(queue_key, -1),
         )
 
+    def _remember_view_final_revision(self, view_id: str, request: RenderRequest) -> None:
+        if request.render_revision is None:
+            return
+        self._view_final_render_revisions[view_id] = max(
+            int(request.render_revision),
+            self._view_final_render_revisions.get(view_id, -1),
+        )
+
     def _is_stale_mpr_preview_after_final(self, queue_key: str, request: RenderRequest) -> bool:
         if not self._is_mpr_group_queue(queue_key) or not self._is_preview_render_request(request):
             return False
@@ -332,17 +383,39 @@ class ViewSocketHub:
         final_revision_value = int(final_revision)
         return request_revision < final_revision_value
 
+    def _is_stale_view_preview_after_final(self, view_id: str, request: RenderRequest) -> bool:
+        if not self._is_preview_render_request(request) or request.render_revision is None:
+            return False
+        final_revision = self._view_final_render_revisions.get(view_id)
+        if final_revision is None:
+            return False
+        return int(request.render_revision) < int(final_revision)
+
+    def _is_stale_preview_after_final(self, queue_key: str, view_id: str, request: RenderRequest) -> bool:
+        return (
+            self._is_stale_mpr_preview_after_final(queue_key, request)
+            or self._is_stale_view_preview_after_final(view_id, request)
+        )
+
+    def _is_stale_interaction_request(self, view_id: str, request: RenderRequest) -> bool:
+        if request.interaction_id is None:
+            return False
+        active_interaction_id = self._view_active_interaction_ids.get(view_id)
+        return active_interaction_id is not None and request.interaction_id != active_interaction_id
+
     def _resolve_target_sids(self, view_id: str, target_sids: tuple[str, ...] | None) -> tuple[str, ...]:
         if target_sids is not None:
             return target_sids
         return tuple(self._view_sids.get(view_id, ()))
 
-    def _should_suppress_mpr_preview_emit(self, view_id: str, request: RenderRequest, preemption_token: int) -> bool:
+    def _should_suppress_preview_emit(self, view_id: str, request: RenderRequest, preemption_token: int) -> bool:
+        if self._is_stale_interaction_request(view_id, request):
+            return True
         if not self._is_preview_render_request(request):
             return False
 
         queue_key = self._resolve_render_queue_key(view_id)
-        if self._is_stale_mpr_preview_after_final(queue_key, request):
+        if self._is_stale_preview_after_final(queue_key, view_id, request):
             return True
         if not self._is_mpr_group_queue(queue_key):
             return False
@@ -361,7 +434,7 @@ class ViewSocketHub:
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
 
-    def _filter_stale_mpr_preview_batch(
+    def _filter_stale_preview_batch(
         self,
         queue_key: str,
         request_batch: dict[str, RenderRequest],
@@ -369,7 +442,8 @@ class ViewSocketHub:
         return {
             view_id: request
             for view_id, request in request_batch.items()
-            if not self._is_stale_mpr_preview_after_final(queue_key, request)
+            if not self._is_stale_preview_after_final(queue_key, view_id, request)
+            and not self._is_stale_interaction_request(view_id, request)
         }
 
     async def _run_mpr_preview_worker(self, queue_key: str) -> None:
@@ -377,7 +451,7 @@ class ViewSocketHub:
         try:
             while True:
                 request_batch = self._pop_pending_render_batch(queue_key)
-                request_batch = self._filter_stale_mpr_preview_batch(queue_key, request_batch)
+                request_batch = self._filter_stale_preview_batch(queue_key, request_batch)
                 if not request_batch:
                     return
 
@@ -389,7 +463,7 @@ class ViewSocketHub:
                 latest_batch = self._pop_pending_render_batch(queue_key)
                 if latest_batch:
                     request_batch = latest_batch
-                request_batch = self._filter_stale_mpr_preview_batch(queue_key, request_batch)
+                request_batch = self._filter_stale_preview_batch(queue_key, request_batch)
                 if not request_batch:
                     continue
 
@@ -423,6 +497,8 @@ class ViewSocketHub:
                             metadata_mode=request.metadata_mode,
                             target_sids=request.target_sids,
                             mpr_revision=request.mpr_revision,
+                            render_revision=request.render_revision,
+                            interaction_id=request.interaction_id,
                         )
                         for view_id, request in request_batch.items()
                     )
@@ -462,6 +538,8 @@ class ViewSocketHub:
         payload["renderIntent"] = cls._resolve_render_intent(request)
         if request.render_revision is not None:
             payload["renderRevision"] = int(request.render_revision)
+        if request.interaction_id is not None:
+            payload["interactionId"] = request.interaction_id
 
         if request.metadata_mode in {"stack-preview-lite", "stack-pixel-preview"}:
             payload.pop("measurements", None)
@@ -536,7 +614,7 @@ class ViewSocketHub:
 
         queue_key = self._resolve_render_queue_key(view_id)
         preemption_token = self._mpr_final_preemption_tokens.get(queue_key, 0)
-        if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
+        if self._should_suppress_preview_emit(view_id, request, preemption_token):
             return False
 
         should_emit_progress = not request.fast_preview
@@ -547,7 +625,7 @@ class ViewSocketHub:
         def progress_callback(payload: dict[str, object]) -> None:
             if self._server is None or not should_emit_progress:
                 return
-            if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
+            if self._should_suppress_preview_emit(view_id, request, preemption_token):
                 return
             future = asyncio.run_coroutine_threadsafe(
                 self._emit_progress_message(view_id, sids, payload),
@@ -568,7 +646,7 @@ class ViewSocketHub:
         else:
             result = await asyncio.to_thread(viewer_service.render_view_by_id, view_id, **render_kwargs)
         render_ms = (perf_counter() - render_started_at) * 1000.0
-        if self._should_suppress_mpr_preview_emit(view_id, request, preemption_token):
+        if self._should_suppress_preview_emit(view_id, request, preemption_token):
             return False
         payload = self._build_image_update_payload(result.meta, request)
         extra_image_bytes = getattr(result, "extra_image_bytes", None) or {}
@@ -664,6 +742,7 @@ class ViewSocketHub:
         metadata_mode: str = "full",
         target_sids: tuple[str, ...] | None = None,
         mpr_revision: int | None = None,
+        interaction_id: str | None = None,
     ) -> bool:
         if self._server is None:
             return False
@@ -683,6 +762,7 @@ class ViewSocketHub:
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
                 render_revision=self.next_render_revision(view_id),
+                interaction_id=interaction_id,
             )
 
         emitted = False
@@ -692,7 +772,7 @@ class ViewSocketHub:
             is_final_batch = all(self._is_final_render_request(request) for request in request_batch.values())
 
             if is_mpr_group and is_preview_batch:
-                request_batch = self._filter_stale_mpr_preview_batch(queue_key, request_batch)
+                request_batch = self._filter_stale_preview_batch(queue_key, request_batch)
                 if not request_batch:
                     continue
                 if self._replace_pending_preview_batch(queue_key, request_batch):
@@ -700,7 +780,8 @@ class ViewSocketHub:
                 continue
 
             if is_preview_batch:
-                if self._replace_pending_preview_batch(queue_key, request_batch):
+                request_batch = self._filter_stale_preview_batch(queue_key, request_batch)
+                if request_batch and self._replace_pending_preview_batch(queue_key, request_batch):
                     self._ensure_preview_worker(queue_key)
                 continue
 
@@ -719,6 +800,7 @@ class ViewSocketHub:
                         target_sids=request.target_sids,
                         mpr_revision=request.mpr_revision,
                         render_revision=request.render_revision,
+                        interaction_id=request.interaction_id,
                     )
                     for view_id, request in request_batch.items()
                 )
@@ -738,6 +820,7 @@ class ViewSocketHub:
         target_sids: tuple[str, ...] | None = None,
         mpr_revision: int | None = None,
         render_revision: int | None = None,
+        interaction_id: str | None = None,
     ) -> bool:
         if self._server is None:
             return False
@@ -752,12 +835,19 @@ class ViewSocketHub:
             target_sids=target_sids,
             mpr_revision=mpr_revision,
             render_revision=render_revision if render_revision is not None else self.next_render_revision(view_id),
+            interaction_id=interaction_id,
         )
         if self._is_mpr_group_queue(queue_key) and self._is_final_render_request(incoming_request):
             self._mark_mpr_final_preemption(queue_key)
             self._remember_mpr_final_revision(queue_key, incoming_request)
             self._discard_pending_preview_requests(queue_key)
-        elif self._is_stale_mpr_preview_after_final(queue_key, incoming_request):
+        elif self._is_final_render_request(incoming_request):
+            self._remember_view_final_revision(view_id, incoming_request)
+            self._discard_pending_preview_requests(queue_key)
+            self._cancel_preview_worker(queue_key)
+        elif self._is_stale_preview_after_final(queue_key, view_id, incoming_request):
+            return False
+        elif self._is_stale_interaction_request(view_id, incoming_request):
             return False
 
         if lock.locked():
@@ -770,6 +860,58 @@ class ViewSocketHub:
             if self._is_mpr_group_queue(queue_key):
                 await asyncio.sleep(0)
             return await self._drain_render_requests(queue_key, view_id, incoming_request)
+
+    def schedule_delayed_final_render_for_view(
+        self,
+        view_id: str,
+        *,
+        delay_seconds: float,
+        image_format: str = "png",
+        fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
+        target_sids: tuple[str, ...] | None = None,
+        mpr_revision: int | None = None,
+        interaction_id: str | None = None,
+    ) -> asyncio.Task[None]:
+        request = self.make_render_request(
+            view_id,
+            image_format=image_format,
+            fast_preview=False,
+            fast_preview_full_resolution=fast_preview_full_resolution,
+            metadata_mode=metadata_mode,
+            target_sids=target_sids,
+            mpr_revision=mpr_revision,
+            interaction_id=interaction_id,
+        )
+        self._cancel_delayed_final_render(view_id)
+
+        async def run_delayed_render() -> None:
+            try:
+                await asyncio.sleep(max(0.0, float(delay_seconds)))
+                if self._is_stale_interaction_request(view_id, request):
+                    return
+                await self.emit_render_for_view(
+                    view_id,
+                    image_format=request.image_format,
+                    fast_preview=False,
+                    fast_preview_full_resolution=request.fast_preview_full_resolution,
+                    metadata_mode=request.metadata_mode,
+                    target_sids=request.target_sids,
+                    mpr_revision=request.mpr_revision,
+                    render_revision=request.render_revision,
+                    interaction_id=request.interaction_id,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("delayed final render failed view_id=%s", view_id)
+            finally:
+                if self._delayed_final_render_tasks.get(view_id) is task:
+                    self._delayed_final_render_tasks.pop(view_id, None)
+
+        task = asyncio.create_task(run_delayed_render())
+        self._delayed_final_render_tasks[view_id] = task
+        return task
 
     async def emit_error_for_view(self, view_id: str, message: str) -> bool:
         if self._server is None:

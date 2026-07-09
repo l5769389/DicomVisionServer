@@ -14,6 +14,8 @@ VIEW_OP_TYPE_VOLUME_PRESET: Final = "volumePreset"
 VIEW_OP_TYPE_VOLUME_CONFIG: Final = "volumeConfig"
 VIEW_OP_TYPE_RENDER_3D_MODE: Final = "render3dMode"
 VIEW_OP_TYPE_SURFACE_CONFIG: Final = "surfaceConfig"
+VIEW_OP_TYPE_VOLUME_RENDER_OPTIONS: Final = "volumeRenderOptions"
+VIEW_OP_TYPE_VOLUME_CLIP: Final = "volumeClip"
 VIEW_OP_TYPE_MPR_MIP_CONFIG: Final = "mprMipConfig"
 VIEW_OP_TYPE_MPR_SEGMENTATION: Final = "mprSegmentation"
 VIEW_OP_TYPE_MPR_OBLIQUE: Final = "mprOblique"
@@ -65,4 +67,3 @@ FUSION_PANE_TYPES: Final = {
     FUSION_PANE_OVERLAY_AXIAL,
     FUSION_PANE_PET_CORONAL_MIP,
 }
-

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,7 @@ from app.core import VIEW_OP_TYPE_RENDER_3D_MODE, VIEW_OP_TYPE_ROTATE_3D, VIEW_O
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import SurfaceRenderConfig, ViewOperationRequest
 from app.services.surface_render_config import (
+    create_adaptive_surface_render_config,
     create_default_surface_render_config,
     normalize_surface_render_config,
 )
@@ -57,13 +59,48 @@ def test_surface_render_config_normalizes_out_of_range_values() -> None:
     assert config["roughness"] == 0.0
 
 
-def test_surface_fast_preview_uses_lower_cost_volume_and_render_size() -> None:
+def test_surface_render_config_supports_surface_presets() -> None:
+    soft_tissue = create_default_surface_render_config("surfacePreset:softTissue")
+    high_density = create_default_surface_render_config("high-density")
+
+    assert soft_tissue["preset"] == "softTissue"
+    assert soft_tissue["isoValue"] == 85.0
+    assert soft_tissue["color"] == "#b86642"
+    assert high_density["preset"] == "highDensity"
+    assert high_density["isoValue"] == 420.0
+    assert high_density["specular"] == 0.46
+
+
+def test_adaptive_surface_config_uses_ct_hu_and_percentile_fallback() -> None:
+    ct_volume = np.concatenate(
+        [
+            np.full(900, -1000, dtype=np.float32),
+            np.linspace(40, 220, 900, dtype=np.float32),
+            np.linspace(360, 900, 120, dtype=np.float32),
+        ]
+    ).reshape(12, 16, 10)
+    bone_config = create_adaptive_surface_render_config("bone", ct_volume, modality="CT")
+    soft_config = create_adaptive_surface_render_config("softTissue", ct_volume, modality="CT")
+    high_density_config = create_adaptive_surface_render_config("highDensity", ct_volume, modality="CT")
+
+    assert 180.0 <= bone_config["isoValue"] <= 420.0
+    assert -80.0 <= soft_config["isoValue"] <= 180.0
+    assert high_density_config["isoValue"] >= 320.0
+
+    mr_volume = np.linspace(0.0, 1.0, 1000, dtype=np.float32).reshape(10, 10, 10)
+    mr_config = create_adaptive_surface_render_config("bone", mr_volume, modality="MR")
+
+    assert 0.65 <= mr_config["isoValue"] <= 0.9
+
+
+def test_surface_fast_preview_preserves_mesh_source_and_uses_lower_render_size() -> None:
     volume = np.zeros((64, 512, 384), dtype=np.float32)
 
-    sampled, spacing = VtkSurfaceRenderer._prepare_surface_volume(volume, (0.5, 0.6, 1.2), fast_preview=True)
+    sampled, spacing = VtkSurfaceRenderer._prepare_surface_volume(volume, (0.5, 0.6, 1.2))
 
-    assert sampled.shape == (32, 128, 96)
-    assert spacing == pytest.approx((2.0, 2.4, 2.4))
+    assert sampled is volume
+    assert sampled.shape == volume.shape
+    assert spacing == pytest.approx((0.5, 0.6, 1.2))
 
     request = SurfaceRenderRequest(
         view_id="surface-view",
@@ -87,6 +124,30 @@ def test_surface_fast_preview_uses_lower_cost_volume_and_render_size() -> None:
             }
         )
     ) == (1000, 800)
+
+
+def test_surface_preview_and_final_share_session_key(monkeypatch) -> None:
+    renderer = VtkSurfaceRenderer()
+    created: list[object] = []
+
+    def fake_create_session(volume, spacing_xyz, volume_token, config, config_token):
+        del volume, spacing_xyz, config
+        created.append(config_token)
+        return SimpleNamespace(
+            volume_token=volume_token,
+            config_token=config_token,
+            render_window=SimpleNamespace(Finalize=lambda: None),
+        )
+
+    monkeypatch.setattr(renderer, "_create_session", fake_create_session)
+
+    request = _build_surface_request("surface-view")
+    renderer._get_or_create_session(request, request.volume)
+    renderer._get_or_create_session(replace(request, fast_preview=True), request.volume)
+    renderer._get_or_create_session(request, request.volume)
+
+    assert len(created) == 1
+    assert list(renderer._sessions.keys()) == [("surface-view", "shared")]
 
 
 def test_3d_mode_and_surface_config_handlers_initialize_surface_state() -> None:
@@ -126,7 +187,68 @@ def test_3d_mode_and_surface_config_handlers_initialize_surface_state() -> None:
     assert view.surface_render_config["smoothing"] == 0.7
     assert view.surface_render_config["decimation"] == 0.2
     assert view.surface_render_config["color"] == "#abcdef"
+    assert view.surface_render_config_source == "manual"
     assert view.is_initialized is True
+
+    service._handle_surface_config(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType=VIEW_OP_TYPE_SURFACE_CONFIG,
+            subOpType="surfacePreset:softTissue",
+            surfaceConfig=SurfaceRenderConfig(preset="softTissue"),
+        ),
+    )
+
+    assert view.surface_render_config["preset"] == "softTissue"
+    assert view.surface_render_config_source == "preset"
+    assert view.surface_render_config_token is None
+
+
+def test_surface_config_resolver_adapts_preset_and_preserves_manual_config() -> None:
+    service = ViewerService()
+    series = _build_series()
+    volume = np.concatenate(
+        [
+            np.full(500, -1000, dtype=np.float32),
+            np.linspace(60, 240, 500, dtype=np.float32),
+        ]
+    ).reshape(10, 10, 10)
+    view = _build_surface_view()
+    view.surface_render_config = create_default_surface_render_config("bone")
+    view.surface_render_config_source = "preset"
+    view.surface_render_config_token = None
+
+    adapted = service._resolve_surface_render_config_for_render(
+        view,
+        series=series,
+        volume=volume,
+        volume_token="surface-volume-token",
+    )
+
+    assert adapted["preset"] == "bone"
+    assert adapted["isoValue"] != create_default_surface_render_config("bone")["isoValue"]
+    assert view.surface_render_config_source == "preset"
+    assert view.surface_render_config_token is not None
+
+    view.surface_render_config = {
+        **create_default_surface_render_config("highDensity"),
+        "isoValue": 720.0,
+    }
+    view.surface_render_config_source = "manual"
+    view.surface_render_config_token = "stale-token"
+
+    manual = service._resolve_surface_render_config_for_render(
+        view,
+        series=series,
+        volume=volume,
+        volume_token="surface-volume-token",
+    )
+
+    assert manual["preset"] == "highDensity"
+    assert manual["isoValue"] == 720.0
+    assert view.surface_render_config_source == "manual"
+    assert view.surface_render_config_token is None
 
 
 def test_surface_mode_3d_rotation_updates_quaternion_without_vtk(monkeypatch) -> None:
@@ -310,7 +432,8 @@ def test_surface_session_lru_finalizes_oldest_session(monkeypatch) -> None:
     renderer = VtkSurfaceRenderer()
     finalized = []
 
-    def fake_create_session(volume, spacing_xyz, volume_token, config, config_token, fast_preview):
+    def fake_create_session(volume, spacing_xyz, volume_token, config, config_token):
+        del volume, spacing_xyz, config
         render_window = SimpleNamespace(Finalize=lambda: finalized.append(len(finalized)))
         return SimpleNamespace(
             volume_token=volume_token,
@@ -326,15 +449,14 @@ def test_surface_session_lru_finalizes_oldest_session(monkeypatch) -> None:
 
     assert len(renderer._sessions) == 8
     assert len(finalized) == 1
-    assert ("surface-view-0", "final") not in renderer._sessions
+    assert ("surface-view-0", "shared") not in renderer._sessions
 
 
-def test_surface_drop_session_cleans_final_preview_and_warm_keys() -> None:
+def test_surface_drop_session_cleans_matching_view_session_and_warm_keys() -> None:
     renderer = VtkSurfaceRenderer()
     finalized = []
-    renderer._sessions[("view-a", "final")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("a-final")))
-    renderer._sessions[("view-a", "preview")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("a-preview")))
-    renderer._sessions[("view-b", "final")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("b-final")))
+    renderer._sessions[("view-a", "shared")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("a-shared")))
+    renderer._sessions[("view-b", "shared")] = SimpleNamespace(render_window=SimpleNamespace(Finalize=lambda: finalized.append("b-shared")))
     renderer._warm_preview_keys = {
         ("view-a", "warm"),
         ("view-b", "warm"),
@@ -342,6 +464,6 @@ def test_surface_drop_session_cleans_final_preview_and_warm_keys() -> None:
 
     renderer._drop_session_in_executor("view-a")
 
-    assert sorted(finalized) == ["a-final", "a-preview"]
-    assert list(renderer._sessions.keys()) == [("view-b", "final")]
+    assert finalized == ["a-shared"]
+    assert list(renderer._sessions.keys()) == [("view-b", "shared")]
     assert renderer._warm_preview_keys == {("view-b", "warm")}

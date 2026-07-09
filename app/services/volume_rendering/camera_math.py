@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from math import cos, radians, sin
+from math import acos, cos, radians, sin, sqrt
 
 import numpy as np
 
 
-TRACKBALL_MOTION_FACTOR = 36.0
-TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
-TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = -20.0
+VTK_TRACKBALL_MOTION_FACTOR = 10.0
+VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = -20.0
+VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = -20.0
+DIRECT_MODEL_TRACKBALL_MOTION_FACTOR = 10.0
+DIRECT_MODEL_TRACKBALL_DEGREES_PER_VIEW_WIDTH = 20.0
+DIRECT_MODEL_TRACKBALL_DEGREES_PER_VIEW_HEIGHT = 20.0
+DIRECT_MODEL_TRACKBALL_RADIUS_VIEW_FRACTION = 0.5
+
+TRACKBALL_MOTION_FACTOR = VTK_TRACKBALL_MOTION_FACTOR
+TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH
+TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT
 
 
 def normalize_quaternion(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -93,6 +101,169 @@ def axis_angle_rotation_matrix(axis: np.ndarray, angle_degrees: float) -> np.nda
     )
 
 
+def apply_vtk_trackball_camera_delta_to_quaternion(
+    quaternion: tuple[float, float, float, float],
+    *,
+    delta_x_pixels: float,
+    delta_y_pixels: float,
+    canvas_width: float,
+    canvas_height: float,
+) -> tuple[float, float, float, float]:
+    """Apply vtkInteractorStyleTrackballCamera rotate semantics.
+
+    The stored quaternion represents model rotation, while rendering applies
+    its inverse to the camera. This helper therefore updates the camera basis
+    first, then stores the inverse as the next model quaternion.
+    """
+
+    width = max(float(canvas_width), 1.0)
+    height = max(float(canvas_height), 1.0)
+    delta_azimuth = (
+        float(delta_x_pixels)
+        * VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH
+        / width
+        * VTK_TRACKBALL_MOTION_FACTOR
+    )
+    delta_elevation = (
+        float(delta_y_pixels)
+        * VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT
+        / height
+        * VTK_TRACKBALL_MOTION_FACTOR
+    )
+    if abs(delta_azimuth) < 1e-12 and abs(delta_elevation) < 1e-12:
+        return normalize_quaternion(quaternion)
+
+    model_rotation = quaternion_to_rotation_matrix(quaternion)
+    camera_rotation = model_rotation.T
+    base_right = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    base_forward = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+    base_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+
+    current_forward = normalize_vector(camera_rotation @ base_forward)
+    current_up = normalize_vector(camera_rotation @ base_up)
+
+    azimuth_matrix = axis_angle_rotation_matrix(current_up, delta_azimuth)
+    current_forward = normalize_vector(azimuth_matrix @ current_forward)
+    current_up = normalize_vector(azimuth_matrix @ current_up)
+
+    elevation_axis = normalize_vector(np.cross(current_up, current_forward))
+    elevation_matrix = axis_angle_rotation_matrix(elevation_axis, delta_elevation)
+    current_forward = normalize_vector(elevation_matrix @ current_forward)
+    current_up = normalize_vector(elevation_matrix @ current_up)
+
+    current_right = normalize_vector(np.cross(current_forward, current_up))
+    current_up = normalize_vector(np.cross(current_right, current_forward))
+
+    base_basis = np.column_stack((base_right, base_forward, base_up))
+    current_basis = np.column_stack((current_right, current_forward, current_up))
+    next_camera_rotation = current_basis @ base_basis.T
+    next_model_rotation = next_camera_rotation.T
+    return rotation_matrix_to_quaternion(next_model_rotation)
+
+
+def apply_direct_model_trackball_delta_to_quaternion(
+    quaternion: tuple[float, float, float, float],
+    *,
+    delta_x_pixels: float,
+    delta_y_pixels: float,
+    canvas_width: float,
+    canvas_height: float,
+) -> tuple[float, float, float, float]:
+    """Rotate the stored model quaternion with fixed screen-axis controls.
+
+    This is intentionally not an arcball axis derived from the current model.
+    The initial camera looks at the volume from the negative-Y side, so the
+    visible "front" face is the model's -Y side. Positive drag signs therefore
+    intentionally differ from VTK camera orbit signs: the visible face follows
+    the pointer instead of the camera orbiting around the model.
+
+    A vertical drag should always mean the same screen-up pitch command, even
+    after the model has been turned upside down or rolled around.
+    """
+
+    width = max(float(canvas_width), 1.0)
+    height = max(float(canvas_height), 1.0)
+    yaw_degrees = (
+        float(delta_x_pixels)
+        * DIRECT_MODEL_TRACKBALL_DEGREES_PER_VIEW_WIDTH
+        / width
+        * DIRECT_MODEL_TRACKBALL_MOTION_FACTOR
+    )
+    pitch_degrees = (
+        float(delta_y_pixels)
+        * DIRECT_MODEL_TRACKBALL_DEGREES_PER_VIEW_HEIGHT
+        / height
+        * DIRECT_MODEL_TRACKBALL_MOTION_FACTOR
+    )
+    if abs(yaw_degrees) < 1e-12 and abs(pitch_degrees) < 1e-12:
+        return normalize_quaternion(quaternion)
+
+    model_rotation = quaternion_to_rotation_matrix(quaternion)
+    screen_right = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    screen_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+
+    yaw_matrix = axis_angle_rotation_matrix(screen_up, yaw_degrees)
+    pitch_matrix = axis_angle_rotation_matrix(screen_right, pitch_degrees)
+    next_model_rotation = pitch_matrix @ yaw_matrix @ model_rotation
+    return rotation_matrix_to_quaternion(next_model_rotation)
+
+
+def resolve_direct_model_trackball_control_point(
+    *,
+    canvas_x: float,
+    canvas_y: float,
+    canvas_width: float,
+    canvas_height: float,
+) -> tuple[float, float, float]:
+    """Project a canvas pointer to the front hemisphere of a virtual trackball.
+
+    Screen axes are represented in render/world coordinates: +X is screen
+    right, +Z is screen up, and -Y faces the user. The point returned here is
+    the model control point that should remain under the pointer while the
+    drag is active.
+    """
+
+    width = max(float(canvas_width), 1.0)
+    height = max(float(canvas_height), 1.0)
+    radius = max(min(width, height) * DIRECT_MODEL_TRACKBALL_RADIUS_VIEW_FRACTION, 1.0)
+    x = (float(canvas_x) - width * 0.5) / radius
+    z = (height * 0.5 - float(canvas_y)) / radius
+    distance_squared = x * x + z * z
+    if distance_squared <= 1.0:
+        y = -sqrt(max(0.0, 1.0 - distance_squared))
+        return tuple(float(value) for value in normalize_vector(np.asarray([x, y, z], dtype=np.float64)))
+
+    distance = sqrt(distance_squared)
+    return (float(x / distance), 0.0, float(z / distance))
+
+
+def apply_direct_model_trackball_control_points_to_quaternion(
+    quaternion: tuple[float, float, float, float],
+    *,
+    origin_control_point: tuple[float, float, float],
+    current_control_point: tuple[float, float, float],
+) -> tuple[float, float, float, float]:
+    """Rotate the model so the drag-start control point follows the pointer."""
+
+    origin_vector = normalize_vector(np.asarray(origin_control_point, dtype=np.float64))
+    current_vector = normalize_vector(np.asarray(current_control_point, dtype=np.float64))
+    dot = float(np.clip(np.dot(origin_vector, current_vector), -1.0, 1.0))
+    if dot >= 1.0 - 1e-12:
+        return normalize_quaternion(quaternion)
+
+    axis = np.cross(origin_vector, current_vector)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1e-12:
+        fallback_axis = np.cross(origin_vector, np.asarray([1.0, 0.0, 0.0], dtype=np.float64))
+        if float(np.linalg.norm(fallback_axis)) <= 1e-12:
+            fallback_axis = np.cross(origin_vector, np.asarray([0.0, 0.0, 1.0], dtype=np.float64))
+        axis = fallback_axis
+    angle_degrees = float(np.degrees(acos(dot)))
+    model_rotation = quaternion_to_rotation_matrix(quaternion)
+    control_rotation = axis_angle_rotation_matrix(axis, angle_degrees)
+    return rotation_matrix_to_quaternion(control_rotation @ model_rotation)
+
+
 def apply_trackball_delta_to_quaternion(
     quaternion: tuple[float, float, float, float],
     *,
@@ -101,39 +272,10 @@ def apply_trackball_delta_to_quaternion(
     canvas_width: float,
     canvas_height: float,
 ) -> tuple[float, float, float, float]:
-    """Apply screen-space "grab the model" drag semantics.
-
-    The quaternion represents model rotation. Rendering applies the inverse to
-    the camera, so dragging right/up makes visible anatomy move right/up instead
-    of orbiting the camera in the opposite direction.
-    """
-
-    width = max(float(canvas_width), 1.0)
-    height = max(float(canvas_height), 1.0)
-    delta_azimuth = (
-        float(delta_x_pixels)
-        * TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH
-        / width
-        * TRACKBALL_MOTION_FACTOR
+    return apply_direct_model_trackball_delta_to_quaternion(
+        quaternion,
+        delta_x_pixels=delta_x_pixels,
+        delta_y_pixels=delta_y_pixels,
+        canvas_width=canvas_width,
+        canvas_height=canvas_height,
     )
-    delta_elevation = (
-        float(delta_y_pixels)
-        * TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT
-        / height
-        * TRACKBALL_MOTION_FACTOR
-    )
-    if abs(delta_azimuth) < 1e-12 and abs(delta_elevation) < 1e-12:
-        return normalize_quaternion(quaternion)
-
-    current_matrix = quaternion_to_rotation_matrix(quaternion)
-    base_right = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
-    base_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-
-    current_up = normalize_vector(current_matrix @ base_up)
-    yaw_matrix = axis_angle_rotation_matrix(current_up, delta_azimuth)
-    yawed_matrix = yaw_matrix @ current_matrix
-
-    yawed_right = normalize_vector(yawed_matrix @ base_right)
-    pitch_matrix = axis_angle_rotation_matrix(yawed_right, delta_elevation)
-    next_matrix = pitch_matrix @ yawed_matrix
-    return rotation_matrix_to_quaternion(next_matrix)
