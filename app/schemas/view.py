@@ -1,6 +1,6 @@
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.dicom import CornerInfoPayload
 
@@ -18,15 +18,26 @@ ViewType = Literal[
     "FusionOverlayAxial",
     "FusionPETCoronalMip",
 ]
-ImageFormat = Literal["png", "jpeg"]
+ImageFormat = Literal["png", "jpeg", "webp"]
+VIEW_IMAGE_FORMATS = {"png", "jpeg", "webp"}
+
+
+def normalize_image_format(value: Any, default: ImageFormat = "webp") -> ImageFormat:
+    text = str(value or default).strip().lower()
+    if text == "jpg":
+        text = "jpeg"
+    if text in VIEW_IMAGE_FORMATS:
+        return cast(ImageFormat, text)
+    return default
 ExportFormat = Literal["png", "dicom", "dicom-sr", "dicom-gsps"]
 FusionRegistrationExportMode = Literal["newDicom", "br"]
 ViewSetSizeOperationType = Literal["setSize"]
-ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "annotation", "fusionRegistration", "fusionConfig", "petConfig"]
+ViewOperationType = Literal["scroll", "crosshair", "pan", "zoom", "window", "pseudocolor", "transform2d", "rotate3d", "reset", "volumePreset", "volumeConfig", "render3dMode", "surfaceConfig", "volumeRenderOptions", "volumeClip", "mprMipConfig", "mprSegmentation", "mprOblique", "mprCrosshairMode", "mprStateSync", "measurement", "annotation", "fusionRegistration", "fusionConfig", "petConfig"]
 ViewActionType = Literal["start", "move", "end", "delete"]
 VolumeBlendMode = Literal["composite", "mip"]
 VolumeInterpolationMode = Literal["nearest", "linear", "cubic"]
 Render3DMode = Literal["volume", "surface"]
+VolumeClipMode = Literal["inside", "outside"]
 MprMipAlgorithm = Literal["maximum", "minimum", "average", "sum"]
 MprCrosshairLine = Literal["horizontal", "vertical"]
 MprCrosshairMode = Literal["orthogonal", "double-oblique"]
@@ -88,6 +99,12 @@ class ViewSetSizeRequest(BaseModel):
     op_type: ViewSetSizeOperationType = Field(alias="opType", description="Operation name, always setSize for this endpoint.")
     size: ViewSize = Field(description="Current frontend viewport size in CSS pixels.")
     view_id: str = Field(alias="viewId", description="Server-side view ID returned by /view/create.")
+    image_format: ImageFormat = Field(default="webp", alias="imageFormat")
+
+    @field_validator("image_format", mode="before")
+    @classmethod
+    def _normalize_image_format(cls, value: Any) -> ImageFormat:
+        return normalize_image_format(value)
 
     model_config = {"populate_by_name": True}
 
@@ -300,14 +317,33 @@ class VolumeRenderConfig(BaseModel):
 
 class SurfaceRenderConfig(BaseModel):
     preset: str = "bone"
-    iso_value: float = Field(default=300.0, ge=-2000.0, le=4000.0, alias="isoValue")
+    iso_value: float = Field(default=240.0, ge=-2000.0, le=4000.0, alias="isoValue")
     smoothing: float = Field(default=0.28, ge=0.0, le=1.0)
-    decimation: float = Field(default=0.12, ge=0.0, le=0.9)
-    color: str = "#f0eadc"
-    ambient: float = Field(default=0.18, ge=0.0, le=1.0)
-    diffuse: float = Field(default=0.78, ge=0.0, le=1.0)
-    specular: float = Field(default=0.28, ge=0.0, le=1.0)
-    roughness: float = Field(default=0.42, ge=0.0, le=1.0)
+    decimation: float = Field(default=0.18, ge=0.0, le=0.9)
+    color: str = "#f3eadb"
+    ambient: float = Field(default=0.2, ge=0.0, le=1.0)
+    diffuse: float = Field(default=0.76, ge=0.0, le=1.0)
+    specular: float = Field(default=0.36, ge=0.0, le=1.0)
+    roughness: float = Field(default=0.34, ge=0.0, le=1.0)
+
+    model_config = {"populate_by_name": True}
+
+
+class VolumeClipPointPayload(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
+class VolumeClipState(BaseModel):
+    mode: VolumeClipMode
+    points: list[VolumeClipPointPayload] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class VolumeRenderOptions(BaseModel):
+    remove_bed: bool = Field(default=False, alias="removeBed")
+    clip: VolumeClipState | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -487,7 +523,7 @@ class FusionInfo(BaseModel):
 class FusionCompositeLayerInfo(BaseModel):
     key: str
     role: str
-    image_format: str = Field(default="png", alias="imageFormat")
+    image_format: str = Field(default="webp", alias="imageFormat")
 
     model_config = {"populate_by_name": True}
 
@@ -559,6 +595,7 @@ class ViewImageResponse(BaseModel):
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig")
     render_3d_mode: Render3DMode | None = Field(default=None, alias="render3dMode")
     surface_config: SurfaceRenderConfig | None = Field(default=None, alias="surfaceConfig")
+    volume_render_options: VolumeRenderOptions | None = Field(default=None, alias="volumeRenderOptions")
 
     model_config = {"populate_by_name": True}
 
@@ -575,6 +612,10 @@ class ViewHoverResponse(BaseModel):
     view_id: str = Field(alias="viewId")
     row: int
     col: int
+    pixel_value: float | None = Field(default=None, alias="pixelValue")
+    value_label: str | None = Field(default=None, alias="valueLabel")
+    value_unit: str | None = Field(default=None, alias="valueUnit")
+    display_text: str | None = Field(default=None, alias="displayText")
 
     model_config = {"populate_by_name": True}
 
@@ -584,11 +625,18 @@ class MeasurementPointPayload(BaseModel):
     y: float = Field(ge=0.0, le=1.0)
 
 
+class OverlayPointPayload(BaseModel):
+    x: float = Field(allow_inf_nan=False)
+    y: float = Field(allow_inf_nan=False)
+
+
 class MeasurementOverlayPayload(BaseModel):
     measurement_id: str = Field(alias="measurementId")
     tool_type: str = Field(alias="toolType")
-    points: list[MeasurementPointPayload]
+    points: list[OverlayPointPayload]
     label_lines: list[str] = Field(alias="labelLines", default_factory=list)
+    scope: Literal["image", "series"] = "image"
+    slice_index: int | None = Field(default=None, alias="sliceIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -596,10 +644,12 @@ class MeasurementOverlayPayload(BaseModel):
 class AnnotationOverlayPayload(BaseModel):
     annotation_id: str = Field(alias="annotationId")
     tool_type: str = Field(alias="toolType")
-    points: list[MeasurementPointPayload]
+    points: list[OverlayPointPayload]
     text: str = ""
     color: str = "#ffd166"
     size: str = "md"
+    scope: Literal["image", "series"] = "image"
+    slice_index: int | None = Field(default=None, alias="sliceIndex")
 
     model_config = {"populate_by_name": True}
 
@@ -607,6 +657,7 @@ class AnnotationOverlayPayload(BaseModel):
 class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="Server-side view ID that receives the interaction.")
     op_type: ViewOperationType = Field(alias="opType", description="Interaction type such as scroll, window, crosshair, or measurement.")
+    image_format: ImageFormat = Field(default="webp", alias="imageFormat")
     measurement_id: str | None = Field(default=None, alias="measurementId")
     annotation_id: str | None = Field(default=None, alias="annotationId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")
@@ -614,6 +665,11 @@ class ViewOperationRequest(BaseModel):
     action_type: ViewActionType | None = Field(default=None, alias="actionType")
     x: float | None = None
     y: float | None = None
+    canvas_x: float | None = Field(default=None, alias="canvasX")
+    canvas_y: float | None = Field(default=None, alias="canvasY")
+    canvas_width: float | None = Field(default=None, alias="canvasWidth")
+    canvas_height: float | None = Field(default=None, alias="canvasHeight")
+    interaction_id: str | None = Field(default=None, alias="interactionId")
     anchor_x: float | None = Field(default=None, alias="anchorX")
     anchor_y: float | None = Field(default=None, alias="anchorY")
     current_x: float | None = Field(default=None, alias="currentX")
@@ -644,6 +700,8 @@ class ViewOperationRequest(BaseModel):
     text: str | None = None
     color: str | None = None
     size: str | None = None
+    scope: Literal["image", "series"] | None = None
+    slice_index: int | None = Field(default=None, alias="sliceIndex")
     source_view_id: str | None = Field(default=None, alias="sourceViewId")
     rotation_degrees: int | None = Field(default=None, alias="rotationDegrees")
     hor_flip: bool | None = Field(default=None, alias="hor_flip")
@@ -651,6 +709,13 @@ class ViewOperationRequest(BaseModel):
     volume_config: VolumeRenderConfig | None = Field(default=None, alias="volumeConfig", description="3D transfer-function and lighting settings.")
     render_3d_mode: Render3DMode | None = Field(default=None, alias="render3dMode", description="3D renderer mode: volume or surface.")
     surface_config: SurfaceRenderConfig | None = Field(default=None, alias="surfaceConfig", description="3D surface extraction and material settings.")
+    volume_render_options: VolumeRenderOptions | None = Field(default=None, alias="volumeRenderOptions", description="3D render-time options such as bed removal and freeform clipping.")
+    remove_bed: bool | None = Field(default=None, alias="removeBed", description="Compatibility shortcut for volumeRenderOptions.removeBed.")
+
+    @field_validator("image_format", mode="before")
+    @classmethod
+    def _normalize_image_format(cls, value: Any) -> ImageFormat:
+        return normalize_image_format(value)
 
     model_config = {"populate_by_name": True}
 
@@ -776,4 +841,3 @@ class ViewQaWaterAnalyzeResponse(BaseModel):
     message: str | None = None
 
     model_config = {"populate_by_name": True}
-

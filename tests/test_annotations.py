@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from app.models.measurement import MeasurementPoint, MeasurementSliceContext
+from app.models.measurement import MeasurementMetrics, MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import AnnotationRecord, ViewRecord
 from app.services.viewer_service import ViewerService
 
@@ -49,6 +49,25 @@ def test_annotation_serialization_uses_backend_image_transform() -> None:
     assert payload.points[1].y == 0.635
 
 
+def test_annotation_serialization_preserves_points_outside_canvas() -> None:
+    annotation = AnnotationRecord(
+        annotation_id="annotation-outside",
+        tool_type="arrow",
+        points=(MeasurementPoint(-20.0, 40.0), MeasurementPoint(140.0, 60.0)),
+        slice_context=MeasurementSliceContext(kind="stack", slice_index=0, sop_instance_uid="sop-1"),
+    )
+    transform = _Transform(matrix=np.eye(3, dtype=np.float64))
+
+    [payload] = ViewerService._serialize_annotations(
+        (annotation,),
+        image_transform=transform,
+        canvas_width=100,
+        canvas_height=100,
+    )
+
+    assert [(point.x, point.y) for point in payload.points] == [(-0.2, 0.4), (1.4, 0.6)]
+
+
 def test_visible_annotations_follow_current_slice() -> None:
     service = ViewerService()
     view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=3)
@@ -70,3 +89,92 @@ def test_visible_annotations_follow_current_slice() -> None:
     visible = service._build_visible_annotations(view)
 
     assert [annotation.annotation_id for annotation in visible] == ["visible"]
+
+
+def test_series_scope_annotation_stays_visible_across_slices() -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=5)
+    view.annotations = [
+        AnnotationRecord(
+            annotation_id="series",
+            tool_type="arrow",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=3, sop_instance_uid="sop-3"),
+            scope="series",
+        ),
+        AnnotationRecord(
+            annotation_id="image",
+            tool_type="arrow",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=4, sop_instance_uid="sop-4"),
+            scope="image",
+        ),
+    ]
+
+    visible = service._build_visible_annotations(view)
+
+    assert [annotation.annotation_id for annotation in visible] == ["series"]
+
+
+def test_series_scope_measurement_stays_visible_across_slices() -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=5)
+    metrics = MeasurementMetrics(unit="px", area_unit="px2")
+    view.measurements = [
+        MeasurementRecord(
+            measurement_id="series",
+            tool_type="line",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=3, sop_instance_uid="sop-3"),
+            metrics=metrics,
+            label_anchor=MeasurementPoint(2.0, 2.0),
+            scope="series",
+        ),
+        MeasurementRecord(
+            measurement_id="image",
+            tool_type="line",
+            points=(MeasurementPoint(1.0, 1.0), MeasurementPoint(2.0, 2.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=4, sop_instance_uid="sop-4"),
+            metrics=metrics,
+            label_anchor=MeasurementPoint(2.0, 2.0),
+            scope="image",
+        ),
+    ]
+
+    visible = service._build_visible_measurements(view)
+
+    assert [measurement.measurement_id for measurement in visible] == ["series"]
+
+
+def test_series_scope_measurement_refreshes_metrics_for_current_slice(monkeypatch) -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=5)
+    view.measurements = [
+        MeasurementRecord(
+            measurement_id="series",
+            tool_type="rect",
+            points=(MeasurementPoint(0.0, 0.0), MeasurementPoint(1.0, 1.0)),
+            slice_context=MeasurementSliceContext(kind="stack", slice_index=3, sop_instance_uid="sop-3"),
+            metrics=MeasurementMetrics(unit="px", area_unit="px2", mean=7.0),
+            label_anchor=MeasurementPoint(1.0, 1.0),
+            label_lines=("Mean 7.0",),
+            scope="series",
+        )
+    ]
+
+    def resolve_source_context(_view: ViewRecord):
+        return (
+            np.full((4, 4), 42.0, dtype=np.float32),
+            None,
+            MeasurementSliceContext(kind="stack", slice_index=5, sop_instance_uid="sop-5"),
+        )
+
+    monkeypatch.setattr(service, "_resolve_measurement_source_context", resolve_source_context)
+
+    [visible] = service._build_visible_measurements(view)
+
+    assert visible.measurement_id == "series"
+    assert visible.slice_context.slice_index == 5
+    assert visible.slice_context.sop_instance_uid == "sop-5"
+    assert visible.metrics.mean == 42.0
+    assert "Mean 42.0" in visible.label_lines

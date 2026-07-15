@@ -14,7 +14,7 @@ def get_workspace_stats(
 
 
 @router.post("/release", summary="Release current anonymous workspace resources")
-def release_workspace(
+async def release_workspace(
     workspace_id: str = Depends(get_request_workspace_id),
 ) -> dict[str, object]:
     return workspace_activity_service.release(workspace_id)

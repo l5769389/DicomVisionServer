@@ -39,6 +39,37 @@ def _build_rgb_dataset(pixels: np.ndarray) -> Dataset:
     return dataset
 
 
+def _build_grayscale_dataset(pixels: np.ndarray, *, slope: float = 1.0, intercept: float = 0.0) -> Dataset:
+    dataset = Dataset()
+    dataset.file_meta = FileMetaDataset()
+    dataset.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    dataset.Rows = pixels.shape[0]
+    dataset.Columns = pixels.shape[1]
+    dataset.SamplesPerPixel = 1
+    dataset.PhotometricInterpretation = "MONOCHROME2"
+    dataset.BitsAllocated = 16
+    dataset.BitsStored = 16
+    dataset.HighBit = 15
+    dataset.PixelRepresentation = 1
+    dataset.RescaleSlope = slope
+    dataset.RescaleIntercept = intercept
+    dataset.PixelData = pixels.astype(np.int16).tobytes()
+    return dataset
+
+
+def test_extract_source_pixels_applies_ct_rescale_for_quantitative_hover_values() -> None:
+    pixels = np.asarray([[0, 100], [250, 500]], dtype=np.int16)
+
+    source_pixels = DicomCache()._extract_source_pixels(
+        _build_grayscale_dataset(pixels, slope=2.0, intercept=-1024.0)
+    )
+
+    np.testing.assert_array_equal(
+        source_pixels,
+        np.asarray([[-1024.0, -824.0], [-524.0, -24.0]], dtype=np.float32),
+    )
+
+
 def test_extract_source_pixels_preserves_rgb_secondary_capture_pixels() -> None:
     pixels = np.array(
         [

@@ -7,6 +7,7 @@ from typing import Literal
 MeasurementToolType = Literal["line", "rect", "ellipse", "angle", "curve", "freeform"]
 MeasurementUnit = Literal["mm", "px"]
 MeasurementAreaUnit = Literal["mm2", "px2"]
+DrawingScope = Literal["image", "series"]
 
 
 @dataclass(frozen=True)
@@ -46,3 +47,4 @@ class MeasurementRecord:
     metrics: MeasurementMetrics
     label_anchor: MeasurementPoint
     label_lines: tuple[str, ...] = field(default_factory=tuple)
+    scope: DrawingScope = "image"

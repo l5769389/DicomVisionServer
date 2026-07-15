@@ -340,6 +340,7 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     )
     service._reset_mpr_group_geometry(group, volume.shape, series=series)
     reslice_calls = 0
+    encode_calls: list[tuple[str, bool]] = []
 
     def fake_reslice_plane(*args, **kwargs):
         nonlocal reslice_calls
@@ -373,15 +374,21 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     )
     monkeypatch.setattr(viewer_service_module.layered_renderer, "render", lambda context: Image.new("L", (300, 300)))
     monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context, **kwargs: Image.new("L", (300, 300)))
-    monkeypatch.setattr(service, "_encode_image", lambda image, image_format, **kwargs: b"image")
+    def fake_encode(image, image_format, **kwargs):
+        del image
+        encode_calls.append((image_format, bool(kwargs.get("fast_preview"))))
+        return b"image"
 
-    service._render_mpr_view(view, image_format="png", fast_preview=False)
+    monkeypatch.setattr(service, "_encode_image", fake_encode)
+
+    service._render_mpr_view(view, image_format="webp", fast_preview=False)
     view.offset_x = 18.0
     view.offset_y = -7.0
     view.zoom = 1.2
-    service._render_mpr_view(view, image_format="jpeg", fast_preview=True, fast_preview_full_resolution=True)
+    service._render_mpr_view(view, image_format="webp", fast_preview=True, fast_preview_full_resolution=True)
 
     assert reslice_calls == 1
+    assert encode_calls == [("webp", False), ("webp", False)]
 
 
 def test_fast_preview_reuses_windowed_base_pixels_for_pan_zoom(monkeypatch) -> None:

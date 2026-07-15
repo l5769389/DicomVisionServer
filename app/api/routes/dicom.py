@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
@@ -32,6 +34,28 @@ from app.services.viewer_service import viewer_service
 
 router = APIRouter(prefix="/dicom", tags=["dicom"])
 settings = get_settings()
+BUNDLED_SAMPLE_DICOM_PATH = Path(__file__).resolve().parents[3] / "sample-data" / "test"
+MAC_LOCAL_SAMPLE_DICOM_PATH = Path("/Users/jun/Documents/test_dicom/py_test_path/py_test_path2")
+
+
+def _resolve_existing_path(path: Path) -> str | None:
+    expanded_path = path.expanduser()
+    if expanded_path.exists():
+        return str(expanded_path.resolve())
+    return None
+
+
+def _local_sample_dicom_candidates() -> tuple[Path, ...]:
+    if sys.platform == "darwin":
+        return (MAC_LOCAL_SAMPLE_DICOM_PATH,)
+    return ()
+
+
+def _is_bundled_sample_path(path: str) -> bool:
+    try:
+        return Path(path).expanduser().resolve() == BUNDLED_SAMPLE_DICOM_PATH.resolve()
+    except OSError:
+        return False
 
 
 def _dicom_artifact_headers(
@@ -87,6 +111,32 @@ def _dicom_tag_artifact_headers(
     )
 
 
+def _resolve_sample_dicom_path() -> str:
+    configured_sample_path = (settings.web_sample_dicom_path or "").strip()
+    prefer_local_sample = configured_sample_path == "" or _is_bundled_sample_path(configured_sample_path)
+    if prefer_local_sample:
+        for candidate_path in _local_sample_dicom_candidates():
+            resolved_candidate_path = _resolve_existing_path(candidate_path)
+            if resolved_candidate_path:
+                return resolved_candidate_path
+
+    if configured_sample_path:
+        configured_path = _resolve_existing_path(Path(configured_sample_path))
+        if configured_path:
+            return configured_path
+
+    bundled_path = _resolve_existing_path(BUNDLED_SAMPLE_DICOM_PATH)
+    if bundled_path:
+        return bundled_path
+
+    if configured_sample_path:
+        raise HTTPException(
+            status_code=400,
+            detail=f"WEB_SAMPLE_DICOM_PATH does not point to an existing file or folder: {configured_sample_path}",
+        )
+    raise HTTPException(status_code=400, detail="WEB_SAMPLE_DICOM_PATH is not configured")
+
+
 @router.post(
     "/loadFolder",
     response_model=LoadFolderResponse,
@@ -136,10 +186,7 @@ def load_sample_folder(
     workspace_id: str = Depends(get_request_workspace_id),
 ) -> LoadSampleResponse:
     """Load the demo dataset used by the web preview mode."""
-    sample_path = settings.web_sample_dicom_path
-    if not sample_path:
-        raise HTTPException(status_code=400, detail="WEB_SAMPLE_DICOM_PATH is not configured")
-
+    sample_path = _resolve_sample_dicom_path()
     response = series_registry.load_folder(LoadFolderRequest(folderPath=sample_path), workspace_id=workspace_id)
     return LoadSampleResponse(
         seriesId=response.series_id,

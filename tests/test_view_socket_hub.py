@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 from types import SimpleNamespace
 from time import perf_counter
 
@@ -47,6 +48,16 @@ def test_merge_render_request_promotes_pending_preview_to_full_quality() -> None
     assert merged.target_sids == ("sid-1", "sid-2")
 
 
+def test_merge_render_request_treats_webp_as_full_quality() -> None:
+    merged = ViewSocketHub._merge_render_request(
+        RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",)),
+        RenderRequest(image_format="webp", fast_preview=False, target_sids=("sid-1",)),
+    )
+
+    assert merged.image_format == "webp"
+    assert merged.fast_preview is False
+
+
 def test_merge_render_request_keeps_broadcast_target_when_either_request_broadcasts() -> None:
     merged = ViewSocketHub._merge_render_request(
         RenderRequest(image_format="jpeg", fast_preview=True, target_sids=None),
@@ -87,13 +98,13 @@ def test_emit_progress_message_targets_bound_sids() -> None:
         await hub._emit_progress_message(
             "view-1",
             ("sid-1", "sid-2"),
-            {"phase": "volume", "progressPercent": 42},
+            {"phase": "preprocess", "progressPercent": 42, "message": "正在应用 3D 裁剪..."},
         )
         return server.events
 
     assert asyncio.run(run()) == [
-        ("view_progress", {"viewId": "view-1", "phase": "volume", "progressPercent": 42}, "sid-1"),
-        ("view_progress", {"viewId": "view-1", "phase": "volume", "progressPercent": 42}, "sid-2"),
+        ("view_progress", {"viewId": "view-1", "phase": "preprocess", "progressPercent": 42, "message": "正在应用 3D 裁剪..."}, "sid-1"),
+        ("view_progress", {"viewId": "view-1", "phase": "preprocess", "progressPercent": 42, "message": "正在应用 3D 裁剪..."}, "sid-2"),
     ]
 
 
@@ -148,8 +159,10 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
             "imageFormat": "png",
             "cornerInfo": {"topLeft": ["A"]},
             "orientation": {"top": "A"},
+            "scaleBar": {"visible": True},
             "measurements": [{"measurementId": "m"}],
             "annotations": [{"annotationId": "a"}],
+            "mprSegmentationOverlay": {"regions": []},
         }
     )
 
@@ -161,9 +174,35 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="stack-geometry-preview"),
     )
+    stack_zoom_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(
+            image_format="png",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+            metadata_mode="stack-zoom-preview",
+        ),
+    )
     mpr_payload = ViewSocketHub._build_image_update_payload(
         meta,
         RenderRequest(image_format="png", fast_preview=True, metadata_mode="mpr-pan-zoom-preview"),
+    )
+    mpr_zoom_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(
+            image_format="png",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+            metadata_mode="mpr-zoom-preview",
+        ),
+    )
+    mpr_crosshair_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="jpeg", fast_preview=True, metadata_mode="mpr-crosshair-preview"),
+    )
+    interaction_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(image_format="jpeg", fast_preview=True, interaction_id="drag-1"),
     )
 
     assert "measurements" not in stack_pixel_payload
@@ -178,6 +217,11 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     assert stack_geometry_payload["measurements"] == [{"measurementId": "m"}]
     assert stack_geometry_payload["annotations"] == [{"annotationId": "a"}]
     assert stack_geometry_payload["renderIntent"] == "geometry-preview"
+    assert stack_zoom_payload["measurements"] == [{"measurementId": "m"}]
+    assert stack_zoom_payload["annotations"] == [{"annotationId": "a"}]
+    assert stack_zoom_payload["fastPreviewFullResolution"] is True
+    assert stack_zoom_payload["metadataMode"] == "stack-zoom-preview"
+    assert stack_zoom_payload["renderIntent"] == "geometry-preview"
     assert mpr_payload["measurements"] == [{"measurementId": "m"}]
     assert mpr_payload["annotations"] == [{"annotationId": "a"}]
     assert mpr_payload["fastPreview"] is True
@@ -186,6 +230,23 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     assert mpr_payload["renderIntent"] == "geometry-preview"
     assert "cornerInfo" not in mpr_payload
     assert "orientation" not in mpr_payload
+    assert mpr_zoom_payload["measurements"] == [{"measurementId": "m"}]
+    assert mpr_zoom_payload["annotations"] == [{"annotationId": "a"}]
+    assert mpr_zoom_payload["fastPreviewFullResolution"] is True
+    assert mpr_zoom_payload["metadataMode"] == "mpr-zoom-preview"
+    assert mpr_zoom_payload["renderIntent"] == "geometry-preview"
+    assert "cornerInfo" not in mpr_zoom_payload
+    assert "orientation" not in mpr_zoom_payload
+    assert mpr_crosshair_payload["imageFormat"] == "png"
+    assert mpr_crosshair_payload["metadataMode"] == "mpr-crosshair-preview"
+    assert mpr_crosshair_payload["renderIntent"] == "geometry-preview"
+    assert "cornerInfo" not in mpr_crosshair_payload
+    assert "orientation" not in mpr_crosshair_payload
+    assert "scaleBar" not in mpr_crosshair_payload
+    assert "measurements" not in mpr_crosshair_payload
+    assert "annotations" not in mpr_crosshair_payload
+    assert "mprSegmentationOverlay" not in mpr_crosshair_payload
+    assert interaction_payload["interactionId"] == "drag-1"
 
 
 def test_render_request_revision_is_assigned_at_schedule_time() -> None:
@@ -198,6 +259,213 @@ def test_render_request_revision_is_assigned_at_schedule_time() -> None:
     assert first.render_revision == 1
     assert second.render_revision == 2
     assert other.render_revision == 1
+
+
+def test_view_preview_after_final_is_suppressed_by_render_revision() -> None:
+    hub = ViewSocketHub()
+    hub._remember_view_final_revision(
+        "view-1",
+        RenderRequest(image_format="png", fast_preview=False, render_revision=5),
+    )
+
+    assert hub._is_stale_preview_after_final(
+        "view:view-1",
+        "view-1",
+        RenderRequest(image_format="jpeg", fast_preview=True, render_revision=4),
+    ) is True
+    assert hub._is_stale_preview_after_final(
+        "view:view-1",
+        "view-1",
+        RenderRequest(image_format="jpeg", fast_preview=True, render_revision=6),
+    ) is False
+
+
+def test_final_view_render_discards_pending_preview(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, bool, int | None]], dict[str, dict[str, RenderRequest]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: f"view:{view_id}")
+        hub._pending_render_requests["view:view-1"] = {
+            "view-1": RenderRequest(image_format="jpeg", fast_preview=True, render_revision=1)
+        }
+        calls: list[tuple[str, bool, int | None]] = []
+
+        async def fake_emit_render_message(view_id: str, request: RenderRequest) -> bool:
+            calls.append((view_id, request.fast_preview, request.render_revision))
+            return True
+
+        monkeypatch.setattr(hub, "_emit_render_message", fake_emit_render_message)
+
+        emitted = await hub.emit_render_for_view(
+            "view-1",
+            image_format="png",
+            fast_preview=False,
+            render_revision=2,
+        )
+        return emitted, calls, hub._pending_render_requests
+
+    emitted, calls, pending = asyncio.run(run())
+
+    assert emitted is True
+    assert calls == [("view-1", False, 2)]
+    assert pending == {}
+
+
+def test_new_view_interaction_discards_pending_old_interaction(monkeypatch) -> None:
+    hub = ViewSocketHub()
+    monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: f"view:{view_id}")
+    hub._pending_render_requests["view:view-1"] = {
+        "view-1": RenderRequest(image_format="png", fast_preview=False, interaction_id="old-drag")
+    }
+
+    hub.mark_view_interaction("view-1", "new-drag")
+
+    assert hub._pending_render_requests == {}
+    assert hub._view_active_interaction_ids["view-1"] == "new-drag"
+
+
+def test_old_interaction_render_is_suppressed_after_new_start(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, object, str | None]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-1")
+        hub.mark_view_interaction("view-1", "new-drag")
+
+        class _Meta:
+            def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+                del by_alias
+                return {"viewId": "view-1", "imageFormat": "jpeg"}
+
+        monkeypatch.setattr(
+            socket_runtime.viewer_service,
+            "render_view_by_id",
+            lambda *args, **kwargs: SimpleNamespace(meta=_Meta(), image_bytes=b"old"),
+        )
+
+        emitted = await hub._emit_render_message(
+            "view-1",
+            RenderRequest(image_format="jpeg", fast_preview=True, target_sids=("sid-1",), interaction_id="old-drag"),
+        )
+        return emitted, server.events
+
+    emitted, events = asyncio.run(run())
+    assert emitted is False
+    assert events == []
+
+
+def test_delayed_final_render_runs_when_no_new_interaction(monkeypatch) -> None:
+    async def run() -> list[tuple[str, str, str | None]]:
+        hub = ViewSocketHub()
+        calls: list[tuple[str, str, str | None]] = []
+
+        async def fake_emit_render_for_view(view_id: str, **kwargs) -> bool:
+            calls.append((view_id, kwargs["image_format"], kwargs.get("interaction_id")))
+            return True
+
+        monkeypatch.setattr(hub, "emit_render_for_view", fake_emit_render_for_view)
+        task = hub.schedule_delayed_final_render_for_view(
+            "view-1",
+            delay_seconds=0.01,
+            image_format="png",
+            interaction_id="drag-1",
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+        return calls
+
+    assert asyncio.run(run()) == [("view-1", "png", "drag-1")]
+
+
+def test_delayed_final_render_is_cancelled_by_next_interaction(monkeypatch) -> None:
+    async def run() -> list[tuple[str, str, str | None]]:
+        hub = ViewSocketHub()
+        calls: list[tuple[str, str, str | None]] = []
+
+        async def fake_emit_render_for_view(view_id: str, **kwargs) -> bool:
+            calls.append((view_id, kwargs["image_format"], kwargs.get("interaction_id")))
+            return True
+
+        monkeypatch.setattr(hub, "emit_render_for_view", fake_emit_render_for_view)
+        task = hub.schedule_delayed_final_render_for_view(
+            "view-1",
+            delay_seconds=0.05,
+            image_format="png",
+            interaction_id="old-drag",
+        )
+        hub.mark_view_interaction("view-1", "new-drag")
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.sleep(0.06)
+        return calls
+
+    assert asyncio.run(run()) == []
+
+
+def test_close_view_cancels_pending_and_delayed_render(monkeypatch) -> None:
+    async def run() -> tuple[dict[str, dict[str, RenderRequest]], list[tuple[str, str, str | None]], bool]:
+        hub = ViewSocketHub()
+        calls: list[tuple[str, str, str | None]] = []
+
+        async def fake_emit_render_for_view(view_id: str, **kwargs) -> bool:
+            calls.append((view_id, kwargs["image_format"], kwargs.get("interaction_id")))
+            return True
+
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: f"view:{view_id}")
+        monkeypatch.setattr(hub, "emit_render_for_view", fake_emit_render_for_view)
+        hub._pending_render_requests["view:view-1"] = {
+            "view-1": RenderRequest(image_format="jpeg", fast_preview=True)
+        }
+        task = hub.schedule_delayed_final_render_for_view(
+            "view-1",
+            delay_seconds=0.05,
+            image_format="png",
+            interaction_id="drag-1",
+        )
+
+        hub.close_view("view-1")
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.sleep(0.06)
+        return hub._pending_render_requests, calls, hub.is_view_closed("view-1")
+
+    pending, calls, is_closed = asyncio.run(run())
+    assert pending == {}
+    assert calls == []
+    assert is_closed is True
+
+
+def test_close_view_suppresses_in_flight_emit_after_render(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, dict[str, object], str | None]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-1")
+
+        class _Meta:
+            def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+                del by_alias
+                return {"viewId": "view-1", "imageFormat": "png"}
+
+        def fake_render_view_by_id(*args, **kwargs):
+            del args, kwargs
+            hub.close_view("view-1")
+            return SimpleNamespace(meta=_Meta(), image_bytes=b"late")
+
+        monkeypatch.setattr(hub, "_should_render_on_main_thread", lambda view_id: True)
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+
+        emitted = await hub._emit_render_message(
+            "view-1",
+            RenderRequest(image_format="png", fast_preview=False, target_sids=("sid-1",)),
+        )
+        return emitted, server.events
+
+    emitted, events = asyncio.run(run())
+    assert emitted is False
+    assert events == [
+        ("view_progress", {"viewId": "view-1", "phase": "queued", "progressPercent": 2}, "sid-1")
+    ]
 
 
 def test_non_mpr_preview_worker_keeps_latest_pending_request(monkeypatch) -> None:
