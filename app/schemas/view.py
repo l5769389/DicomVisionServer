@@ -22,7 +22,7 @@ ImageFormat = Literal["png", "jpeg", "webp"]
 VIEW_IMAGE_FORMATS = {"png", "jpeg", "webp"}
 
 
-def normalize_image_format(value: Any, default: ImageFormat = "png") -> ImageFormat:
+def normalize_image_format(value: Any, default: ImageFormat = "webp") -> ImageFormat:
     text = str(value or default).strip().lower()
     if text == "jpg":
         text = "jpeg"
@@ -99,7 +99,7 @@ class ViewSetSizeRequest(BaseModel):
     op_type: ViewSetSizeOperationType = Field(alias="opType", description="Operation name, always setSize for this endpoint.")
     size: ViewSize = Field(description="Current frontend viewport size in CSS pixels.")
     view_id: str = Field(alias="viewId", description="Server-side view ID returned by /view/create.")
-    image_format: ImageFormat = Field(default="png", alias="imageFormat")
+    image_format: ImageFormat = Field(default="webp", alias="imageFormat")
 
     @field_validator("image_format", mode="before")
     @classmethod
@@ -523,7 +523,7 @@ class FusionInfo(BaseModel):
 class FusionCompositeLayerInfo(BaseModel):
     key: str
     role: str
-    image_format: str = Field(default="png", alias="imageFormat")
+    image_format: str = Field(default="webp", alias="imageFormat")
 
     model_config = {"populate_by_name": True}
 
@@ -612,6 +612,10 @@ class ViewHoverResponse(BaseModel):
     view_id: str = Field(alias="viewId")
     row: int
     col: int
+    pixel_value: float | None = Field(default=None, alias="pixelValue")
+    value_label: str | None = Field(default=None, alias="valueLabel")
+    value_unit: str | None = Field(default=None, alias="valueUnit")
+    display_text: str | None = Field(default=None, alias="displayText")
 
     model_config = {"populate_by_name": True}
 
@@ -621,10 +625,15 @@ class MeasurementPointPayload(BaseModel):
     y: float = Field(ge=0.0, le=1.0)
 
 
+class OverlayPointPayload(BaseModel):
+    x: float = Field(allow_inf_nan=False)
+    y: float = Field(allow_inf_nan=False)
+
+
 class MeasurementOverlayPayload(BaseModel):
     measurement_id: str = Field(alias="measurementId")
     tool_type: str = Field(alias="toolType")
-    points: list[MeasurementPointPayload]
+    points: list[OverlayPointPayload]
     label_lines: list[str] = Field(alias="labelLines", default_factory=list)
     scope: Literal["image", "series"] = "image"
     slice_index: int | None = Field(default=None, alias="sliceIndex")
@@ -635,7 +644,7 @@ class MeasurementOverlayPayload(BaseModel):
 class AnnotationOverlayPayload(BaseModel):
     annotation_id: str = Field(alias="annotationId")
     tool_type: str = Field(alias="toolType")
-    points: list[MeasurementPointPayload]
+    points: list[OverlayPointPayload]
     text: str = ""
     color: str = "#ffd166"
     size: str = "md"
@@ -648,7 +657,7 @@ class AnnotationOverlayPayload(BaseModel):
 class ViewOperationRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="Server-side view ID that receives the interaction.")
     op_type: ViewOperationType = Field(alias="opType", description="Interaction type such as scroll, window, crosshair, or measurement.")
-    image_format: ImageFormat = Field(default="png", alias="imageFormat")
+    image_format: ImageFormat = Field(default="webp", alias="imageFormat")
     measurement_id: str | None = Field(default=None, alias="measurementId")
     annotation_id: str | None = Field(default=None, alias="annotationId")
     viewport_key: str | None = Field(default=None, alias="viewportKey")

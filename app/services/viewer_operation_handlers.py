@@ -53,19 +53,19 @@ RenderMode = Literal["none", "single", "broadcast"]
 @dataclass(frozen=True)
 class OperationRenderOutcome:
     primary_result: RenderedImageResult | None = None
-    primary_image_format: ImageFormat = "png"
+    primary_image_format: ImageFormat = "webp"
     primary_fast_preview: bool = False
     primary_fast_preview_full_resolution: bool = False
     primary_metadata_mode: str = "full"
     draft_measurement: dict[str, object] | None = None
     mpr_revision: int | None = None
     broadcast_view_ids: tuple[str, ...] = ()
-    broadcast_image_format: ImageFormat = "png"
+    broadcast_image_format: ImageFormat = "webp"
     broadcast_fast_preview: bool = False
     broadcast_fast_preview_full_resolution: bool = False
     broadcast_metadata_mode: str = "full"
     deferred_view_ids: tuple[str, ...] = ()
-    deferred_image_format: ImageFormat = "png"
+    deferred_image_format: ImageFormat = "webp"
     deferred_fast_preview: bool = False
     deferred_fast_preview_full_resolution: bool = False
     deferred_metadata_mode: str = "full"
@@ -75,7 +75,7 @@ class OperationRenderOutcome:
 @dataclass(frozen=True)
 class RenderDecision:
     mode: RenderMode
-    image_format: ImageFormat = "png"
+    image_format: ImageFormat = "webp"
     fast_preview: bool = False
     fast_preview_full_resolution: bool = False
     defer_single: bool = False
@@ -152,7 +152,7 @@ def _render_mpr_state_update(
 
 
 def _render_single(
-    image_format: ImageFormat = "png",
+    image_format: ImageFormat = "webp",
     *,
     fast_preview: bool = False,
     fast_preview_full_resolution: bool = False,
@@ -170,7 +170,7 @@ def _render_single(
 
 
 def _render_broadcast(
-    image_format: ImageFormat = "png",
+    image_format: ImageFormat = "webp",
     *,
     fast_preview: bool = False,
     fast_preview_full_resolution: bool = False,
@@ -191,7 +191,7 @@ def _render_broadcast(
 
 def _render_full_resolution_preview_single(*, defer: bool = False, metadata_mode: str = "full") -> RenderDecision:
     return _render_single(
-        "png",
+        "webp",
         fast_preview=True,
         fast_preview_full_resolution=True,
         defer=defer,
@@ -201,7 +201,7 @@ def _render_full_resolution_preview_single(*, defer: bool = False, metadata_mode
 
 def _render_fast_preview_single(*, defer: bool = False, metadata_mode: str = "full") -> RenderDecision:
     return _render_single(
-        "png",
+        "webp",
         fast_preview=True,
         fast_preview_full_resolution=False,
         defer=defer,
@@ -215,7 +215,7 @@ def _render_full_resolution_preview_broadcast(
     metadata_mode: str = "full",
 ) -> RenderDecision:
     return _render_broadcast(
-        "png",
+        "webp",
         fast_preview=True,
         fast_preview_full_resolution=True,
         metadata_mode=metadata_mode,
@@ -417,14 +417,14 @@ def _handle_zoom_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_fast_preview_single(defer=True, metadata_mode="mpr-zoom-preview")
+            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-zoom-preview")
         return _render_single(defer=True)
     is_3d_view = service._is_3d_view_type(view.view_type)
     return _resolve_drag_single_render_decision(
         service,
         view,
         payload,
-        move_image_format="png",
+        move_image_format="webp",
         fast_preview_on_move=True,
         fast_preview_full_resolution_on_move=not is_3d_view,
         defer_on_move=True,
@@ -455,7 +455,7 @@ def _handle_window_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         return _render_single(
-            "png",
+            "webp",
             fast_preview=payload.action_type == DRAG_ACTION_MOVE,
             defer=payload.action_type == DRAG_ACTION_MOVE,
             metadata_mode="stack-pixel-preview" if payload.action_type == DRAG_ACTION_MOVE else "full",
@@ -480,7 +480,7 @@ def _handle_window_operation(
         service,
         view,
         payload,
-        move_image_format="png",
+        move_image_format="webp",
         fast_preview_on_move=True,
         defer_on_move=True,
         defer_on_end=True,
@@ -509,13 +509,13 @@ def _handle_pan_operation(
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_fast_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
+            return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-pan-zoom-preview")
         return _render_single(defer=True)
     return _resolve_drag_single_render_decision(
         service,
         view,
         payload,
-        move_image_format="png",
+        move_image_format="webp",
         fast_preview_on_move=True,
         defer_on_move=True,
         defer_on_end=True,
@@ -551,6 +551,10 @@ def _handle_rotate_3d_operation(
     is_mpr_view: bool,
 ) -> RenderDecision:
     del series
+    if str(payload.sub_op_type or "").strip().lower().startswith("orientation:"):
+        if not service._handle_anatomical_orientation(view, payload):
+            return _render_none()
+        return _render_single()
     if is_mpr_view:
         if not service._handle_mpr_model_rotate_3d(view, payload):
             return _render_none()
@@ -1050,7 +1054,7 @@ def _build_operation_render_outcome(
     render_decision: RenderDecision,
     *,
     mpr_revision: int | None = None,
-    image_format: ImageFormat = "png",
+    image_format: ImageFormat = "webp",
 ) -> OperationRenderOutcome:
     if render_decision.mode == "none":
         mpr_state_view_ids: tuple[str, ...] = ()

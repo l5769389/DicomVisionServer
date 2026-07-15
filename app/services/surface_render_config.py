@@ -66,14 +66,21 @@ def create_adaptive_surface_render_config(
         return config
 
     modality_value = str(modality or "").strip().upper()
-    use_hu_anchors = stats.is_ct_hu or modality_value in {"CT", "CTA", "CBCT"}
-    if use_hu_anchors and stats.is_ct_hu:
+    hu_range_is_plausible = stats.source_min <= -500.0 or stats.source_max >= 300.0
+    use_hu_anchors = stats.is_ct_hu and hu_range_is_plausible and modality_value not in {"MR", "CBCT"}
+    if use_hu_anchors:
         if preset == "softTissue":
-            iso_value = _clamp((stats.p50 + stats.p75) / 2.0, -80.0, 180.0)
+            low_anchor = (stats.p10 + stats.p25) / 2.0
+            if stats.p10 <= -120.0:
+                iso_value = _clamp(low_anchor, -350.0, -80.0)
+            else:
+                iso_value = _clamp((stats.p10 + stats.p50) / 2.0, -80.0, 160.0)
         elif preset == "highDensity":
-            iso_value = _clamp(max(320.0, min(900.0, max(stats.p95, stats.p99 * 0.72))), 260.0, 1200.0)
+            dense_anchor = max(stats.p95, stats.p99, stats.p995 * 0.78)
+            minimum_dense_hu = 700.0 if stats.very_dense_foreground_fraction >= 0.001 else 450.0
+            iso_value = _clamp(max(minimum_dense_hu, dense_anchor), 350.0, 1800.0)
         else:
-            iso_value = _clamp(max(180.0, min(420.0, max(stats.p90, stats.p75 + 70.0))), 120.0, 560.0)
+            iso_value = _clamp(max(220.0, min(520.0, max(stats.p90, stats.p75 + 90.0))), 160.0, 650.0)
     else:
         span = max(stats.p99 - stats.p10, 1.0)
         if preset == "softTissue":

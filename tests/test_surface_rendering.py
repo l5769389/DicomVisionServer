@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from PIL import Image
+from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPolyData
 
 from app.core import VIEW_OP_TYPE_RENDER_3D_MODE, VIEW_OP_TYPE_ROTATE_3D, VIEW_OP_TYPE_SURFACE_CONFIG
 from app.models.viewer import SeriesRecord, ViewRecord
@@ -83,14 +84,133 @@ def test_adaptive_surface_config_uses_ct_hu_and_percentile_fallback() -> None:
     soft_config = create_adaptive_surface_render_config("softTissue", ct_volume, modality="CT")
     high_density_config = create_adaptive_surface_render_config("highDensity", ct_volume, modality="CT")
 
-    assert 180.0 <= bone_config["isoValue"] <= 420.0
+    assert 180.0 <= bone_config["isoValue"] <= 520.0
     assert -80.0 <= soft_config["isoValue"] <= 180.0
-    assert high_density_config["isoValue"] >= 320.0
+    assert high_density_config["isoValue"] >= 450.0
 
     mr_volume = np.linspace(0.0, 1.0, 1000, dtype=np.float32).reshape(10, 10, 10)
     mr_config = create_adaptive_surface_render_config("bone", mr_volume, modality="MR")
+    cbct_config = create_adaptive_surface_render_config("bone", mr_volume, modality="CBCT")
 
     assert 0.65 <= mr_config["isoValue"] <= 0.9
+    assert 0.65 <= cbct_config["isoValue"] <= 0.9
+
+
+def test_adaptive_surface_presets_separate_skin_bone_and_dense_metal() -> None:
+    ct_volume = np.concatenate(
+        [
+            np.full(1200, -1000, dtype=np.float32),
+            np.linspace(-320, -80, 400, dtype=np.float32),
+            np.linspace(20, 180, 700, dtype=np.float32),
+            np.linspace(250, 850, 180, dtype=np.float32),
+            np.linspace(1200, 2600, 40, dtype=np.float32),
+        ]
+    ).reshape(18, 14, 10)
+
+    skin = create_adaptive_surface_render_config("softTissue", ct_volume, modality="CT")
+    bone = create_adaptive_surface_render_config("bone", ct_volume, modality="CT")
+    dense = create_adaptive_surface_render_config("highDensity", ct_volume, modality="CT")
+
+    assert -350.0 <= skin["isoValue"] <= -80.0
+    assert 160.0 <= bone["isoValue"] <= 650.0
+    assert dense["isoValue"] >= 700.0
+    assert skin["isoValue"] < bone["isoValue"] < dense["isoValue"]
+
+
+def test_surface_mesh_cache_reuses_geometry_and_limits_entries(monkeypatch) -> None:
+    renderer = VtkSurfaceRenderer()
+    image_data = vtkImageData()
+    volume_token = ("volume-token", (8, 8, 8), (1.0, 1.0, 1.0))
+    builds: list[float] = []
+
+    def fake_build_surface_mesh(_image_data, config):
+        builds.append(float(config["isoValue"]))
+        return vtkPolyData()
+
+    monkeypatch.setattr(renderer, "_build_surface_mesh", fake_build_surface_mesh)
+    config = create_default_surface_render_config("bone")
+
+    first = renderer._get_or_create_mesh(image_data, volume_token, config)
+    second = renderer._get_or_create_mesh(image_data, volume_token, config)
+
+    assert first is second
+    assert builds == [float(config["isoValue"])]
+
+    for index in range(9):
+        renderer._get_or_create_mesh(
+            image_data,
+            volume_token,
+            {**config, "isoValue": 300.0 + index},
+        )
+
+    assert len(renderer._mesh_cache) == 8
+
+
+def test_surface_material_update_keeps_existing_geometry(monkeypatch) -> None:
+    renderer = VtkSurfaceRenderer()
+    renderer._executor = None
+    volume = np.zeros((6, 6, 6), dtype=np.float32)
+    volume[2:5, 2:5, 2:5] = 600.0
+    initial_config = create_default_surface_render_config("bone")
+    progress_messages: list[dict[str, object]] = []
+    request = _build_surface_request()
+    request = replace(
+        request,
+        volume=volume,
+        surface_config=initial_config,
+        volume_token="material-volume",
+        progress_callback=progress_messages.append,
+    )
+    session = renderer._get_or_create_session(request, volume)
+    initial_geometry_token = session.geometry_token
+    assert [message["message"] for message in progress_messages] == [
+        "正在提取 Surface 等值面...",
+        "Surface 表面优化完成",
+    ]
+
+    def fail_mesh_rebuild(*_args, **_kwargs):
+        raise AssertionError("material-only updates must not rebuild the surface mesh")
+
+    monkeypatch.setattr(renderer, "_get_or_create_mesh", fail_mesh_rebuild)
+    updated_config = {
+        **initial_config,
+        "color": "#336699",
+        "ambient": 0.41,
+    }
+    updated = renderer._get_or_create_session(replace(request, surface_config=updated_config), volume)
+
+    assert updated is session
+    assert updated.geometry_token == initial_geometry_token
+    assert updated.config_token != VtkSurfaceRenderer._build_config_token(initial_config)
+    assert updated.actor.GetProperty().GetColor() == pytest.approx((0x33 / 255.0, 0x66 / 255.0, 0x99 / 255.0))
+
+
+def test_surface_session_reuses_cached_mesh_when_switching_back_to_a_preset(monkeypatch) -> None:
+    renderer = VtkSurfaceRenderer()
+    renderer._executor = None
+    volume = np.zeros((4, 4, 4), dtype=np.float32)
+    builds: list[float] = []
+
+    def fake_build_surface_mesh(_image_data, config):
+        builds.append(float(config["isoValue"]))
+        return vtkPolyData()
+
+    monkeypatch.setattr(renderer, "_build_surface_mesh", fake_build_surface_mesh)
+    bone = create_default_surface_render_config("bone")
+    soft_tissue = create_default_surface_render_config("softTissue")
+    request = replace(
+        _build_surface_request(),
+        volume=volume,
+        volume_token="preset-switch-volume",
+        surface_config=bone,
+    )
+
+    first_session = renderer._get_or_create_session(request, volume)
+    soft_session = renderer._get_or_create_session(replace(request, surface_config=soft_tissue), volume)
+    restored_session = renderer._get_or_create_session(request, volume)
+
+    assert first_session is soft_session is restored_session
+    assert builds == [float(bone["isoValue"]), float(soft_tissue["isoValue"])]
 
 
 def test_surface_fast_preview_preserves_mesh_source_and_uses_lower_render_size() -> None:
@@ -328,17 +448,19 @@ def test_full_surface_render_warms_preview_session(monkeypatch) -> None:
     view = _build_surface_view()
     _patch_surface_render_dependencies(monkeypatch, service, series, volume)
     warm_requests = []
+    progress_messages: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         "app.services.viewer_service.vtk_surface_renderer.warm_preview_session",
         lambda request: warm_requests.append(request),
     )
 
-    service._render_3d_view(view, fast_preview=False)
+    service._render_3d_view(view, fast_preview=False, progress_callback=progress_messages.append)
 
     assert len(warm_requests) == 1
     assert warm_requests[0].view_id == view.view_id
     assert warm_requests[0].fast_preview is False
+    assert any(message.get("message") == "正在准备 Surface 数据..." for message in progress_messages)
 
 
 def test_surface_fast_preview_render_does_not_warm_preview_session(monkeypatch) -> None:

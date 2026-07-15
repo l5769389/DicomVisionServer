@@ -68,6 +68,11 @@ FUSION_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_ZOOM,
 }
 ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS = 0.1
+PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS = 0.06
+MPR_END_REQUIRES_PENDING_MOVE_TYPES = {
+    VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_ZOOM,
+}
 
 
 @dataclass
@@ -127,7 +132,7 @@ async def _emit_errors(
         await server.emit(event_name, error, to=sid)
 
 
-async def _emit_render(server: socketio.AsyncServer, sid: str, view_id: str, *, image_format: str = "png") -> None:
+async def _emit_render(server: socketio.AsyncServer, sid: str, view_id: str, *, image_format: str = "webp") -> None:
     workspace_id = view_socket_hub.get_sid_workspace(sid)
     view_registry.get(view_id, workspace_id=workspace_id)
     view_socket_hub.bind_view(sid, view_id)
@@ -270,7 +275,7 @@ def _pop_next_mpr_operation(state: _MprOperationQueueState) -> _QueuedMprOperati
     if (
         state.pending_end is not None
         and state.pending_move is not None
-        and state.pending_move.payload.op_type == VIEW_OP_TYPE_FUSION_REGISTRATION
+        and state.pending_move.payload.op_type in MPR_END_REQUIRES_PENDING_MOVE_TYPES
     ):
         operation = state.pending_move
         state.pending_move = None
@@ -294,7 +299,13 @@ def _enqueue_mpr_operation(queue_key: str, operation: _QueuedMprOperation) -> No
         state.pending_move = None
         state.pending_end = None
     elif action_type == DRAG_ACTION_END:
-        state.pending_move = None
+        has_authoritative_end_state = (
+            operation.payload.interaction_id is not None
+            and operation.payload.canvas_width is not None
+            and operation.payload.canvas_height is not None
+        )
+        if has_authoritative_end_state or operation.payload.op_type not in MPR_END_REQUIRES_PENDING_MOVE_TYPES:
+            state.pending_move = None
         state.pending_end = operation
     elif action_type == DRAG_ACTION_MOVE:
         if state.pending_end is None:
@@ -475,6 +486,21 @@ async def _dispatch_operation_result(
                 mpr_revision=result.mpr_revision,
                 interaction_id=payload.interaction_id,
             )
+        elif (
+            payload.op_type in {VIEW_OP_TYPE_PAN, VIEW_OP_TYPE_ZOOM}
+            and payload.action_type == DRAG_ACTION_END
+        ):
+            for view_id in result.deferred_view_ids:
+                view_socket_hub.schedule_delayed_final_render_for_view(
+                    view_id,
+                    delay_seconds=PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS,
+                    image_format=result.deferred_image_format,
+                    fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
+                    metadata_mode=result.deferred_metadata_mode,
+                    target_sids=(sid,),
+                    mpr_revision=result.mpr_revision,
+                    interaction_id=payload.interaction_id,
+                )
         elif is_mpr_view:
             _schedule_render_batch_for_views(
                 server,
@@ -637,8 +663,7 @@ async def _handle_operation(server: socketio.AsyncServer, sid: str, data: dict) 
         view = view_registry.get(payload.view_id, workspace_id=workspace_id)
         view_socket_hub.bind_view(sid, payload.view_id)
         if (
-            view.view_type == "3D"
-            and payload.op_type == VIEW_OP_TYPE_ROTATE_3D
+            payload.op_type in {VIEW_OP_TYPE_PAN, VIEW_OP_TYPE_ZOOM, VIEW_OP_TYPE_ROTATE_3D}
             and payload.action_type == DRAG_ACTION_START
         ):
             view_socket_hub.mark_view_interaction(payload.view_id, payload.interaction_id)

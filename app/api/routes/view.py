@@ -78,13 +78,14 @@ def create_view(
     summary="Close a render view",
     description="Releases a view, detaches Socket bindings, and drops view-owned resources such as VTK sessions.",
 )
-def close_view(
+async def close_view(
     payload: ViewCloseRequest,
     workspace_id: str = Depends(get_request_workspace_id),
 ) -> OperationAcceptedResponse:
     """Close a view and remove any realtime bindings for it."""
+    view_registry.get(payload.view_id, workspace_id=workspace_id)
+    view_socket_hub.close_view(payload.view_id)
     result = viewer_service.close_view_by_id(payload.view_id, workspace_id=workspace_id)
-    view_socket_hub.unbind_view(payload.view_id)
     return result
 
 

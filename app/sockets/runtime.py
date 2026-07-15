@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class RenderRequest:
-    image_format: str = "png"
+    image_format: str = "webp"
     fast_preview: bool = False
     fast_preview_full_resolution: bool = False
     metadata_mode: str = "full"
@@ -45,6 +45,7 @@ class ViewSocketHub:
         self._render_revisions: dict[str, int] = defaultdict(int)
         self._view_active_interaction_ids: dict[str, str] = {}
         self._delayed_final_render_tasks: dict[str, asyncio.Task[None]] = {}
+        self._closed_view_ids: set[str] = set()
 
     def attach_server(self, server: socketio.AsyncServer) -> None:
         self._server = server
@@ -58,6 +59,8 @@ class ViewSocketHub:
         return self._sid_workspaces.get(sid, DEFAULT_WORKSPACE_ID)
 
     def bind_view(self, sid: str, view_id: str) -> None:
+        if view_id in self._closed_view_ids:
+            return
         self._view_sids[view_id].add(sid)
         self._sid_views[sid].add(view_id)
 
@@ -97,6 +100,15 @@ class ViewSocketHub:
         if preview_task is not None and not preview_task.done():
             preview_task.cancel()
         self._cancel_delayed_final_render(view_id)
+
+    def close_view(self, view_id: str) -> None:
+        if not view_id:
+            return
+        self._closed_view_ids.add(view_id)
+        self.unbind_view(view_id)
+
+    def is_view_closed(self, view_id: str) -> bool:
+        return view_id in self._closed_view_ids
 
     def _get_render_lock(self, queue_key: str) -> asyncio.Lock:
         lock = self._render_locks.get(queue_key)
@@ -205,7 +217,7 @@ class ViewSocketHub:
         self,
         view_id: str,
         *,
-        image_format: str = "png",
+        image_format: str = "webp",
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
@@ -234,6 +246,8 @@ class ViewSocketHub:
         return max(int(current), int(incoming))
 
     def _queue_pending_render(self, queue_key: str, view_id: str, incoming_request: RenderRequest) -> None:
+        if self.is_view_closed(view_id):
+            return
         if (
             self._is_stale_preview_after_final(queue_key, view_id, incoming_request)
             or self._is_stale_interaction_request(view_id, incoming_request)
@@ -404,6 +418,8 @@ class ViewSocketHub:
         return active_interaction_id is not None and request.interaction_id != active_interaction_id
 
     def _resolve_target_sids(self, view_id: str, target_sids: tuple[str, ...] | None) -> tuple[str, ...]:
+        if self.is_view_closed(view_id):
+            return ()
         if target_sids is not None:
             return target_sids
         return tuple(self._view_sids.get(view_id, ()))
@@ -577,7 +593,7 @@ class ViewSocketHub:
         return ViewSocketHub.build_image_update_payload(result_meta, request)
 
     async def _emit_progress_message(self, view_id: str, sids: tuple[str, ...], payload: dict[str, object]) -> None:
-        if self._server is None or not sids:
+        if self._server is None or not sids or self.is_view_closed(view_id):
             return
 
         message = {"viewId": view_id, **payload}
@@ -592,7 +608,7 @@ class ViewSocketHub:
             pass
 
     async def _emit_render_error_message(self, view_id: str, request: RenderRequest, exc: Exception) -> None:
-        if self._server is None:
+        if self._server is None or self.is_view_closed(view_id):
             return
 
         sids = self._resolve_target_sids(view_id, request.target_sids)
@@ -605,7 +621,7 @@ class ViewSocketHub:
             await self._server.emit("render_error", error, to=sid)
 
     async def _emit_render_message(self, view_id: str, request: RenderRequest) -> bool:
-        if self._server is None:
+        if self._server is None or self.is_view_closed(view_id):
             return False
 
         sids = self._resolve_target_sids(view_id, request.target_sids)
@@ -646,7 +662,7 @@ class ViewSocketHub:
         else:
             result = await asyncio.to_thread(viewer_service.render_view_by_id, view_id, **render_kwargs)
         render_ms = (perf_counter() - render_started_at) * 1000.0
-        if self._should_suppress_preview_emit(view_id, request, preemption_token):
+        if self.is_view_closed(view_id) or self._should_suppress_preview_emit(view_id, request, preemption_token):
             return False
         payload = self._build_image_update_payload(result.meta, request)
         extra_image_bytes = getattr(result, "extra_image_bytes", None) or {}
@@ -736,7 +752,7 @@ class ViewSocketHub:
         self,
         view_ids: tuple[str, ...],
         *,
-        image_format: str = "png",
+        image_format: str = "webp",
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
@@ -748,6 +764,7 @@ class ViewSocketHub:
             return False
 
         unique_view_ids = tuple(dict.fromkeys(view_ids))
+        unique_view_ids = tuple(view_id for view_id in unique_view_ids if not self.is_view_closed(view_id))
         if not unique_view_ids:
             return False
 
@@ -813,7 +830,7 @@ class ViewSocketHub:
         self,
         view_id: str,
         *,
-        image_format: str = "png",
+        image_format: str = "webp",
         fast_preview: bool = False,
         fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
@@ -822,7 +839,7 @@ class ViewSocketHub:
         render_revision: int | None = None,
         interaction_id: str | None = None,
     ) -> bool:
-        if self._server is None:
+        if self._server is None or self.is_view_closed(view_id):
             return False
 
         queue_key = self._resolve_render_queue_key(view_id)
@@ -866,7 +883,7 @@ class ViewSocketHub:
         view_id: str,
         *,
         delay_seconds: float,
-        image_format: str = "png",
+        image_format: str = "webp",
         fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
         target_sids: tuple[str, ...] | None = None,
@@ -888,7 +905,7 @@ class ViewSocketHub:
         async def run_delayed_render() -> None:
             try:
                 await asyncio.sleep(max(0.0, float(delay_seconds)))
-                if self._is_stale_interaction_request(view_id, request):
+                if self.is_view_closed(view_id) or self._is_stale_interaction_request(view_id, request):
                     return
                 await self.emit_render_for_view(
                     view_id,

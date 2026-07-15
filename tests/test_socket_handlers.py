@@ -160,7 +160,7 @@ def test_view_operation_payload_normalizes_image_format(monkeypatch) -> None:
         return seen_formats, [event for event, _payload, _to in server.events]
 
     seen_formats, events = asyncio.run(run())
-    assert seen_formats == ["webp", "png"]
+    assert seen_formats == ["webp", "webp"]
     assert events == []
 
 
@@ -267,6 +267,79 @@ def test_3d_rotate_end_schedules_debounced_final_render(monkeypatch) -> None:
         return scheduled_finals
 
     assert asyncio.run(run()) == [("v-3d", handlers.ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS, "png", "drag-1")]
+
+
+def test_pan_zoom_start_marks_interaction_and_end_debounces_final(monkeypatch) -> None:
+    async def run() -> tuple[list[tuple[str, str | None]], list[tuple[str, float, str | None]]]:
+        server = _SocketServerStub()
+        marked: list[tuple[str, str | None]] = []
+        scheduled: list[tuple[str, float, str | None]] = []
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="Stack"),
+        )
+        monkeypatch.setattr(
+            handlers.view_socket_hub,
+            "mark_view_interaction",
+            lambda view_id, interaction_id: marked.append((view_id, interaction_id)),
+        )
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: OperationRenderOutcome(
+                deferred_view_ids=(payload.view_id,),
+                deferred_image_format="png",
+                deferred_fast_preview=payload.action_type != "end",
+            ),
+        )
+
+        def fake_schedule(view_id: str, *, delay_seconds: float, interaction_id: str | None = None, **kwargs) -> None:
+            del kwargs
+            scheduled.append((view_id, delay_seconds, interaction_id))
+
+        monkeypatch.setattr(handlers.view_socket_hub, "schedule_delayed_final_render_for_view", fake_schedule)
+        monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", lambda *args, **kwargs: asyncio.sleep(0))
+
+        for op_type, interaction_id in (("pan", "pan-1"), ("zoom", "zoom-1")):
+            assert await handlers._handle_operation(
+                server,  # type: ignore[arg-type]
+                "sid-1",
+                {
+                    "viewId": "v-stack",
+                    "opType": op_type,
+                    "actionType": "start",
+                    "interactionId": interaction_id,
+                    "canvasWidth": 500,
+                    "canvasHeight": 400,
+                },
+            ) == {"ok": True}
+            assert await handlers._handle_operation(
+                server,  # type: ignore[arg-type]
+                "sid-1",
+                {
+                    "viewId": "v-stack",
+                    "opType": op_type,
+                    "actionType": "end",
+                    "interactionId": interaction_id,
+                    "x": 20,
+                    "y": -10,
+                    "canvasWidth": 500,
+                    "canvasHeight": 400,
+                },
+            ) == {"ok": True}
+
+        return marked, scheduled
+
+    marked, scheduled = asyncio.run(run())
+    assert marked == [("v-stack", "pan-1"), ("v-stack", "zoom-1")]
+    assert scheduled == [
+        ("v-stack", handlers.PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS, "pan-1"),
+        ("v-stack", handlers.PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS, "zoom-1"),
+    ]
 
 
 def test_handle_operation_schedules_mpr_broadcast_batch_without_waiting(monkeypatch) -> None:
@@ -465,6 +538,106 @@ def test_mpr_operation_queue_end_drops_pending_move(monkeypatch) -> None:
         return calls
 
     assert asyncio.run(run()) == [("start", 0.1), ("end", 0.9)]
+
+
+def test_legacy_mpr_pan_queue_applies_pending_move_before_end(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float | None]]:
+        handlers._mpr_operation_queues.clear()
+        server = _SocketServerStub()
+        calls: list[tuple[str, float | None]] = []
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def fake_process(operation):
+            calls.append((str(operation.payload.action_type), operation.payload.x))
+            if operation.payload.action_type == "start":
+                start_entered.set()
+                await release_start.wait()
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(handlers, "_process_queued_mpr_operation", fake_process)
+
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "pan", "actionType": "start", "x": 0.0, "y": 0.0},
+        ) == {"ok": True}
+        await _wait_for(start_entered.is_set)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "pan", "actionType": "move", "x": 42.0, "y": -18.0},
+        ) == {"ok": True}
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "pan", "actionType": "end", "x": 42.0, "y": -18.0},
+        ) == {"ok": True}
+        release_start.set()
+        await _wait_for(lambda: calls == [("start", 0.0), ("move", 42.0), ("end", 42.0)])
+        return calls
+
+    assert asyncio.run(run()) == [("start", 0.0), ("move", 42.0), ("end", 42.0)]
+
+
+def test_mpr_pan_queue_uses_authoritative_end_without_replaying_pending_move(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float | None]]:
+        handlers._mpr_operation_queues.clear()
+        server = _SocketServerStub()
+        calls: list[tuple[str, float | None]] = []
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def fake_process(operation):
+            calls.append((str(operation.payload.action_type), operation.payload.x))
+            if operation.payload.action_type == "start":
+                start_entered.set()
+                await release_start.wait()
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(handlers, "_process_queued_mpr_operation", fake_process)
+
+        common = {
+            "viewId": "v-ax",
+            "opType": "pan",
+            "interactionId": "pan-1",
+            "canvasWidth": 800,
+            "canvasHeight": 600,
+        }
+        monkeypatch.setattr(handlers.view_socket_hub, "mark_view_interaction", lambda view_id, interaction_id: None)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {**common, "actionType": "start", "x": 0.0, "y": 0.0},
+        ) == {"ok": True}
+        await _wait_for(start_entered.is_set)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {**common, "actionType": "move", "x": 24.0, "y": -12.0},
+        ) == {"ok": True}
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {**common, "actionType": "end", "x": 42.0, "y": -18.0},
+        ) == {"ok": True}
+        release_start.set()
+        await _wait_for(lambda: calls == [("start", 0.0), ("end", 42.0)])
+        return calls
+
+    assert asyncio.run(run()) == [("start", 0.0), ("end", 42.0)]
 
 
 def test_fusion_registration_queue_drops_pending_move_before_end(monkeypatch) -> None:

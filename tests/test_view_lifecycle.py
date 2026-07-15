@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import fastapi_app
 from app.models.viewer import SeriesRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
+from app.sockets.runtime import RenderRequest
 from app.sockets.runtime import view_socket_hub
 from app.services.series_registry import series_registry
 from app.services.view_group_registry import view_group_registry
@@ -23,6 +24,7 @@ def isolated_registries() -> Iterator[None]:
     previous_mpr_group_ids = dict(view_group_registry._mpr_group_id_by_series_id)
     previous_view_sids = {key: set(value) for key, value in view_socket_hub._view_sids.items()}
     previous_sid_views = {key: set(value) for key, value in view_socket_hub._sid_views.items()}
+    previous_closed_view_ids = set(view_socket_hub._closed_view_ids)
 
     series_registry._series_by_id.clear()
     series_registry._series_id_by_key.clear()
@@ -33,6 +35,7 @@ def isolated_registries() -> Iterator[None]:
     view_socket_hub._sid_views.clear()
     view_socket_hub._pending_render_requests.clear()
     view_socket_hub._render_locks.clear()
+    view_socket_hub._closed_view_ids.clear()
 
     try:
         yield
@@ -53,6 +56,8 @@ def isolated_registries() -> Iterator[None]:
         view_socket_hub._sid_views.update(previous_sid_views)
         view_socket_hub._pending_render_requests.clear()
         view_socket_hub._render_locks.clear()
+        view_socket_hub._closed_view_ids.clear()
+        view_socket_hub._closed_view_ids.update(previous_closed_view_ids)
 
 
 def _register_series(series_id: str = "series-1") -> str:
@@ -105,6 +110,26 @@ def test_close_view_releases_view_and_socket_bindings() -> None:
         view_registry.get(view_id)
     assert view_id not in view_socket_hub._view_sids
     assert "sid-1" not in view_socket_hub._sid_views
+    assert view_socket_hub.is_view_closed(view_id) is True
+
+
+def test_close_3d_view_marks_closed_and_discards_pending_renders() -> None:
+    client = TestClient(fastapi_app)
+    series_id = _register_series()
+    view_id = _create_view(client, series_id, "3D")
+    view_socket_hub.bind_view("sid-1", view_id)
+    view_socket_hub._pending_render_requests[f"view:{view_id}"] = {
+        view_id: RenderRequest(image_format="jpeg", fast_preview=True)
+    }
+
+    response = client.post("/api/v1/view/close", json={"viewId": view_id})
+
+    assert response.status_code == 200
+    assert view_socket_hub.is_view_closed(view_id) is True
+    assert view_id not in view_socket_hub._view_sids
+    assert view_socket_hub._pending_render_requests == {}
+    with pytest.raises(HTTPException):
+        view_registry.get(view_id)
 
 
 def test_close_last_mpr_view_releases_view_group() -> None:

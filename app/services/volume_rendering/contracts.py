@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -38,3 +38,5 @@ class SurfaceRenderRequest:
     rotation_quaternion: tuple[float, float, float, float]
     surface_config: dict[str, Any] | None = None
     fast_preview: bool = False
+    volume_token: str | None = None
+    progress_callback: Callable[[dict[str, object]], None] | None = None

@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.1.1 - 2026-07-15
+
+### Highlights
+
+- Stabilized server-authoritative hover coordinates and pixel-value formatting for 2D and MPR views.
+- Improved server-side pan/zoom state application, MPR interaction handling, 3D rendering workflows, surface presets, clipping, and remove-bed processing.
+- Added regression coverage for hover values, drag math, view lifecycle, socket state, rendering, and overlay geometry.
+
 ## v3.1.0 - 2026-07-09
 
 ### 新增

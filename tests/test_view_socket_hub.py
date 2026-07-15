@@ -402,6 +402,72 @@ def test_delayed_final_render_is_cancelled_by_next_interaction(monkeypatch) -> N
     assert asyncio.run(run()) == []
 
 
+def test_close_view_cancels_pending_and_delayed_render(monkeypatch) -> None:
+    async def run() -> tuple[dict[str, dict[str, RenderRequest]], list[tuple[str, str, str | None]], bool]:
+        hub = ViewSocketHub()
+        calls: list[tuple[str, str, str | None]] = []
+
+        async def fake_emit_render_for_view(view_id: str, **kwargs) -> bool:
+            calls.append((view_id, kwargs["image_format"], kwargs.get("interaction_id")))
+            return True
+
+        monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: f"view:{view_id}")
+        monkeypatch.setattr(hub, "emit_render_for_view", fake_emit_render_for_view)
+        hub._pending_render_requests["view:view-1"] = {
+            "view-1": RenderRequest(image_format="jpeg", fast_preview=True)
+        }
+        task = hub.schedule_delayed_final_render_for_view(
+            "view-1",
+            delay_seconds=0.05,
+            image_format="png",
+            interaction_id="drag-1",
+        )
+
+        hub.close_view("view-1")
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.sleep(0.06)
+        return hub._pending_render_requests, calls, hub.is_view_closed("view-1")
+
+    pending, calls, is_closed = asyncio.run(run())
+    assert pending == {}
+    assert calls == []
+    assert is_closed is True
+
+
+def test_close_view_suppresses_in_flight_emit_after_render(monkeypatch) -> None:
+    async def run() -> tuple[bool, list[tuple[str, dict[str, object], str | None]]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-1")
+
+        class _Meta:
+            def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+                del by_alias
+                return {"viewId": "view-1", "imageFormat": "png"}
+
+        def fake_render_view_by_id(*args, **kwargs):
+            del args, kwargs
+            hub.close_view("view-1")
+            return SimpleNamespace(meta=_Meta(), image_bytes=b"late")
+
+        monkeypatch.setattr(hub, "_should_render_on_main_thread", lambda view_id: True)
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+
+        emitted = await hub._emit_render_message(
+            "view-1",
+            RenderRequest(image_format="png", fast_preview=False, target_sids=("sid-1",)),
+        )
+        return emitted, server.events
+
+    emitted, events = asyncio.run(run())
+    assert emitted is False
+    assert events == [
+        ("view_progress", {"viewId": "view-1", "phase": "queued", "progressPercent": 2}, "sid-1")
+    ]
+
+
 def test_non_mpr_preview_worker_keeps_latest_pending_request(monkeypatch) -> None:
     async def run() -> list[tuple[str, str, bool, str]]:
         hub = ViewSocketHub()

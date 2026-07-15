@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import acos, cos, radians, sin, sqrt
+from math import acos, cos, degrees, radians, sin, sqrt
 
 import numpy as np
 
@@ -12,6 +12,27 @@ DIRECT_MODEL_TRACKBALL_MOTION_FACTOR = 10.0
 DIRECT_MODEL_TRACKBALL_DEGREES_PER_VIEW_WIDTH = 20.0
 DIRECT_MODEL_TRACKBALL_DEGREES_PER_VIEW_HEIGHT = 20.0
 DIRECT_MODEL_TRACKBALL_RADIUS_VIEW_FRACTION = 0.5
+ANATOMICAL_ORIENTATION_SNAP_DEGREES = 22.5
+ANATOMICAL_ORIENTATION_FACES = ("A", "P", "L", "R", "S", "I")
+
+_ANATOMICAL_FACE_NORMALS = {
+    "A": np.asarray([0.0, -1.0, 0.0], dtype=np.float64),
+    "P": np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
+    "L": np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
+    "R": np.asarray([-1.0, 0.0, 0.0], dtype=np.float64),
+    "S": np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+    "I": np.asarray([0.0, 0.0, -1.0], dtype=np.float64),
+}
+_ANATOMICAL_FACE_UP = {
+    "A": np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+    "P": np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+    "L": np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+    "R": np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+    "S": np.asarray([0.0, -1.0, 0.0], dtype=np.float64),
+    "I": np.asarray([0.0, -1.0, 0.0], dtype=np.float64),
+}
+_CAMERA_FACING_NORMAL = np.asarray([0.0, -1.0, 0.0], dtype=np.float64)
+_CAMERA_SCREEN_UP = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
 
 TRACKBALL_MOTION_FACTOR = VTK_TRACKBALL_MOTION_FACTOR
 TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH
@@ -82,6 +103,40 @@ def quaternion_to_rotation_matrix(quaternion: tuple[float, float, float, float])
         ],
         dtype=np.float64,
     )
+
+
+def anatomical_orientation_quaternion(face: str) -> tuple[float, float, float, float] | None:
+    normalized_face = str(face or "").strip().upper()
+    normal = _ANATOMICAL_FACE_NORMALS.get(normalized_face)
+    up = _ANATOMICAL_FACE_UP.get(normalized_face)
+    if normal is None or up is None:
+        return None
+
+    source_right = normalize_vector(np.cross(normal, up))
+    target_right = normalize_vector(np.cross(_CAMERA_FACING_NORMAL, _CAMERA_SCREEN_UP))
+    source_basis = np.column_stack((source_right, normal, up))
+    target_basis = np.column_stack((target_right, _CAMERA_FACING_NORMAL, _CAMERA_SCREEN_UP))
+    return rotation_matrix_to_quaternion(target_basis @ source_basis.T)
+
+
+def resolve_anatomical_orientation_face(
+    quaternion: tuple[float, float, float, float],
+    *,
+    max_angle_degrees: float = ANATOMICAL_ORIENTATION_SNAP_DEGREES,
+) -> str | None:
+    rotation = quaternion_to_rotation_matrix(quaternion)
+    best_face: str | None = None
+    best_dot = -1.0
+    for face in ANATOMICAL_ORIENTATION_FACES:
+        transformed_normal = rotation @ _ANATOMICAL_FACE_NORMALS[face]
+        facing_dot = float(np.dot(normalize_vector(transformed_normal), _CAMERA_FACING_NORMAL))
+        if facing_dot > best_dot:
+            best_face = face
+            best_dot = facing_dot
+
+    clamped_dot = max(-1.0, min(1.0, best_dot))
+    angle_degrees = degrees(acos(clamped_dot))
+    return best_face if angle_degrees <= max(0.0, float(max_angle_degrees)) else None
 
 
 def axis_angle_rotation_matrix(axis: np.ndarray, angle_degrees: float) -> np.ndarray:

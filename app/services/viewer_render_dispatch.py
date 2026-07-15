@@ -19,7 +19,7 @@ PET_VIEW_TYPES = {"PET"}
 def render_by_view_type(
     service: "ViewerService",
     view: ViewRecord,
-    image_format: ImageFormat = "png",
+    image_format: ImageFormat = "webp",
     *,
     fast_preview: bool = False,
     fast_preview_full_resolution: bool = False,

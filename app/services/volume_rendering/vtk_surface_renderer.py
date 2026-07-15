@@ -12,7 +12,7 @@ from PIL import Image
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.util.vtkConstants import VTK_FLOAT
 from vtkmodules.vtkCommonCore import vtkObject
-from vtkmodules.vtkCommonDataModel import vtkImageData
+from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPolyData
 from vtkmodules.vtkFiltersCore import (
     vtkDecimatePro,
     vtkFlyingEdges3D,
@@ -59,6 +59,7 @@ TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = VTK_TRACKBALL_ELEVATION_DEGREES_PE
 FAST_PREVIEW_RENDER_SCALE = 0.5
 FAST_PREVIEW_RENDER_MAX_DIMENSION = 720
 SURFACE_SESSION_LIMIT = 8
+SURFACE_MESH_CACHE_LIMIT = 8
 
 
 @dataclass
@@ -71,6 +72,7 @@ class SurfaceRenderSession:
     window_to_image: vtkWindowToImageFilter
     volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]]
     config_token: tuple[object, ...]
+    geometry_token: tuple[object, ...]
     canvas_size: tuple[int, int]
     base_position: tuple[float, float, float]
     base_focal_point: tuple[float, float, float]
@@ -82,6 +84,7 @@ class SurfaceRenderSession:
 class VtkSurfaceRenderer:
     def __init__(self) -> None:
         self._sessions: OrderedDict[tuple[str, str], SurfaceRenderSession] = OrderedDict()
+        self._mesh_cache: OrderedDict[tuple[object, ...], vtkPolyData] = OrderedDict()
         self._warm_preview_keys: set[tuple[object, ...]] = set()
         self._lock = RLock()
         self._executor = None if should_bypass_vtk_worker_thread() else ThreadPoolExecutor(
@@ -203,17 +206,42 @@ class VtkSurfaceRenderer:
 
     def _get_or_create_session(self, request: SurfaceRenderRequest, volume: np.ndarray) -> SurfaceRenderSession:
         volume_token = self._build_volume_token(volume, request.spacing_xyz)
+        if request.volume_token:
+            volume_token = (request.volume_token, volume_token[1], volume_token[2])
         config = normalize_surface_render_config(request.surface_config)
         config_token = self._build_config_token(config)
+        geometry_token = self._build_geometry_token(config)
         session_key = self._build_session_key(request.view_id, request.fast_preview)
         session = self._sessions.get(session_key)
-        if session is None or session.volume_token != volume_token or session.config_token != config_token:
+        if session is None or session.volume_token != volume_token:
             if session is not None:
                 session.render_window.Finalize()
+            self._report_progress(request, 84, "正在提取 Surface 等值面...")
             session = self._create_session(volume, request.spacing_xyz, volume_token, config, config_token)
             self._sessions[session_key] = session
             self._evict_sessions_if_needed()
+            self._report_progress(request, 92, "Surface 表面优化完成")
             return session
+
+        if session.config_token != config_token:
+            if session.geometry_token != geometry_token:
+                mesh_key = self._build_mesh_cache_key(volume_token, geometry_token)
+                cache_hit = mesh_key in self._mesh_cache
+                self._report_progress(
+                    request,
+                    88 if cache_hit else 84,
+                    "正在复用 Surface 网格..." if cache_hit else "正在提取 Surface 等值面...",
+                )
+                mesh = self._get_or_create_mesh(session.image_data, volume_token, config)
+                session.mapper.SetInputData(mesh)
+                session.mapper.Update()
+                session.geometry_token = geometry_token
+                self._report_progress(request, 92, "Surface 表面优化完成")
+            else:
+                self._report_progress(request, 90, "正在更新 Surface 材质...")
+            self._apply_material(session.actor, config)
+            session.config_token = config_token
+
         self._sessions.move_to_end(session_key)
         return session
 
@@ -232,7 +260,9 @@ class VtkSurfaceRenderer:
     ) -> SurfaceRenderSession:
         surface_volume, surface_spacing_xyz = self._prepare_surface_volume(volume, spacing_xyz)
         image_data = self._build_image_data(surface_volume, surface_spacing_xyz)
-        mapper = self._build_surface_mapper(image_data, config)
+        geometry_token = self._build_geometry_token(config)
+        mesh = self._get_or_create_mesh(image_data, volume_token, config)
+        mapper = self._build_surface_mapper(mesh)
         actor = vtkActor()
         actor.SetMapper(mapper)
         self._apply_material(actor, config)
@@ -268,6 +298,7 @@ class VtkSurfaceRenderer:
             window_to_image=window_to_image,
             volume_token=volume_token,
             config_token=config_token,
+            geometry_token=geometry_token,
             canvas_size=(0, 0),
             base_position=tuple(float(value) for value in camera.GetPosition()),
             base_focal_point=tuple(float(value) for value in camera.GetFocalPoint()),
@@ -277,13 +308,19 @@ class VtkSurfaceRenderer:
         )
 
     @staticmethod
-    def _build_surface_mapper(
+    def _build_surface_mesh(
         image_data: vtkImageData,
         config: dict[str, object],
-    ) -> vtkPolyDataMapper:
+    ) -> vtkPolyData:
         contour = vtkFlyingEdges3D()
         contour.SetInputData(image_data)
         contour.SetValue(0, float(config.get("isoValue", 300.0)))
+        if hasattr(contour, "ComputeScalarsOff"):
+            contour.ComputeScalarsOff()
+        if hasattr(contour, "ComputeGradientsOff"):
+            contour.ComputeGradientsOff()
+        if hasattr(contour, "ComputeNormalsOff"):
+            contour.ComputeNormalsOff()
 
         source_port = contour.GetOutputPort()
         smoothing = max(0.0, min(1.0, float(config.get("smoothing", 0.0))))
@@ -314,11 +351,38 @@ class VtkSurfaceRenderer:
         normals.SplittingOff()
         normals.SetFeatureAngle(60.0)
 
+        normals.Update()
+        mesh = vtkPolyData()
+        mesh.DeepCopy(normals.GetOutput())
+        return mesh
+
+    @staticmethod
+    def _build_surface_mapper(mesh: vtkPolyData) -> vtkPolyDataMapper:
         mapper = vtkPolyDataMapper()
-        mapper.SetInputConnection(normals.GetOutputPort())
+        mapper.SetInputData(mesh)
         mapper.ScalarVisibilityOff()
         mapper.Update()
         return mapper
+
+    def _get_or_create_mesh(
+        self,
+        image_data: vtkImageData,
+        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        config: dict[str, object],
+    ) -> vtkPolyData:
+        geometry_token = self._build_geometry_token(config)
+        cache_key = self._build_mesh_cache_key(volume_token, geometry_token)
+        cached = self._mesh_cache.get(cache_key)
+        if cached is not None:
+            self._mesh_cache.move_to_end(cache_key)
+            return cached
+
+        mesh = self._build_surface_mesh(image_data, config)
+        self._mesh_cache[cache_key] = mesh
+        self._mesh_cache.move_to_end(cache_key)
+        while len(self._mesh_cache) > SURFACE_MESH_CACHE_LIMIT:
+            self._mesh_cache.popitem(last=False)
+        return mesh
 
     @staticmethod
     def _apply_material(actor: vtkActor, config: dict[str, object]) -> None:
@@ -349,9 +413,12 @@ class VtkSurfaceRenderer:
         volume = np.asarray(request.volume)
         config = normalize_surface_render_config(request.surface_config)
         preview_request = replace(request, fast_preview=True)
+        volume_token = cls._build_volume_token(volume, request.spacing_xyz)
+        if request.volume_token:
+            volume_token = (request.volume_token, volume_token[1], volume_token[2])
         return (
             request.view_id,
-            cls._build_volume_token(volume, request.spacing_xyz),
+            volume_token,
             cls._build_config_token(config),
             cls._resolve_render_size(preview_request),
         )
@@ -376,6 +443,35 @@ class VtkSurfaceRenderer:
             round(float(config.get("specular", 0.28)), 3),
             round(float(config.get("roughness", 0.42)), 3),
         )
+
+    @staticmethod
+    def _build_geometry_token(config: dict[str, object]) -> tuple[object, ...]:
+        return (
+            round(float(config.get("isoValue", 300.0)), 3),
+            round(float(config.get("smoothing", 0.0)), 3),
+            round(float(config.get("decimation", 0.0)), 3),
+        )
+
+    @staticmethod
+    def _build_mesh_cache_key(
+        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        geometry_token: tuple[object, ...],
+    ) -> tuple[object, ...]:
+        return (*volume_token, *geometry_token)
+
+    @staticmethod
+    def _report_progress(request: SurfaceRenderRequest, progress_percent: int, message: str) -> None:
+        callback = request.progress_callback
+        if callback is None or request.fast_preview:
+            return
+        try:
+            callback({
+                "phase": "preprocess",
+                "progressPercent": progress_percent,
+                "message": message,
+            })
+        except Exception:
+            logger.debug("surface progress callback failed view_id=%s", request.view_id, exc_info=True)
 
     @staticmethod
     def _prepare_surface_volume(

@@ -49,6 +49,25 @@ def test_annotation_serialization_uses_backend_image_transform() -> None:
     assert payload.points[1].y == 0.635
 
 
+def test_annotation_serialization_preserves_points_outside_canvas() -> None:
+    annotation = AnnotationRecord(
+        annotation_id="annotation-outside",
+        tool_type="arrow",
+        points=(MeasurementPoint(-20.0, 40.0), MeasurementPoint(140.0, 60.0)),
+        slice_context=MeasurementSliceContext(kind="stack", slice_index=0, sop_instance_uid="sop-1"),
+    )
+    transform = _Transform(matrix=np.eye(3, dtype=np.float64))
+
+    [payload] = ViewerService._serialize_annotations(
+        (annotation,),
+        image_transform=transform,
+        canvas_width=100,
+        canvas_height=100,
+    )
+
+    assert [(point.x, point.y) for point in payload.points] == [(-0.2, 0.4), (1.4, 0.6)]
+
+
 def test_visible_annotations_follow_current_slice() -> None:
     service = ViewerService()
     view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", current_index=3)

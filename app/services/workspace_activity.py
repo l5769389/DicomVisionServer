@@ -23,11 +23,13 @@ class WorkspaceActivityService:
         from app.services.view_group_registry import view_group_registry
         from app.services.view_registry import view_registry
         from app.services.viewer_service import viewer_service
+        from app.sockets.runtime import view_socket_hub
 
         workspace_views = view_registry.list_all(workspace_id=normalized_workspace_id)
         released_view_count = 0
         for view in workspace_views:
             try:
+                view_socket_hub.close_view(view.view_id)
                 viewer_service.close_view_by_id(view.view_id, workspace_id=normalized_workspace_id)
                 released_view_count += 1
             except Exception:

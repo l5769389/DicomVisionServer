@@ -10,14 +10,17 @@ from app.models.viewer import ViewRecord
 from app.core import VIEW_OP_TYPE_ROTATE_3D
 from app.schemas.view import ViewOperationRequest
 from app.services.volume_rendering.camera_math import (
+    ANATOMICAL_ORIENTATION_FACES,
     DIRECT_MODEL_TRACKBALL_MOTION_FACTOR,
     VTK_TRACKBALL_MOTION_FACTOR,
+    anatomical_orientation_quaternion,
     apply_direct_model_trackball_control_points_to_quaternion,
     apply_direct_model_trackball_delta_to_quaternion,
     apply_vtk_trackball_camera_delta_to_quaternion,
     normalize_quaternion,
     quaternion_to_rotation_matrix,
     resolve_direct_model_trackball_control_point,
+    resolve_anatomical_orientation_face,
     rotation_matrix_to_quaternion,
 )
 from app.services.volume_rendering.camera_fit import (
@@ -36,6 +39,75 @@ def test_camera_quaternion_math_round_trips_rotation_matrix() -> None:
     matrix = quaternion_to_rotation_matrix(quaternion)
 
     assert rotation_matrix_to_quaternion(matrix) == pytest.approx(quaternion)
+
+
+def test_anatomical_orientation_quaternions_face_the_camera_and_round_trip() -> None:
+    face_normals = {
+        "A": np.asarray([0.0, -1.0, 0.0]),
+        "P": np.asarray([0.0, 1.0, 0.0]),
+        "L": np.asarray([1.0, 0.0, 0.0]),
+        "R": np.asarray([-1.0, 0.0, 0.0]),
+        "S": np.asarray([0.0, 0.0, 1.0]),
+        "I": np.asarray([0.0, 0.0, -1.0]),
+    }
+    face_up = {
+        "A": np.asarray([0.0, 0.0, 1.0]),
+        "P": np.asarray([0.0, 0.0, 1.0]),
+        "L": np.asarray([0.0, 0.0, 1.0]),
+        "R": np.asarray([0.0, 0.0, 1.0]),
+        "S": np.asarray([0.0, -1.0, 0.0]),
+        "I": np.asarray([0.0, -1.0, 0.0]),
+    }
+
+    for face in ANATOMICAL_ORIENTATION_FACES:
+        quaternion = anatomical_orientation_quaternion(face)
+        assert quaternion is not None
+        rotation = quaternion_to_rotation_matrix(quaternion)
+        assert rotation @ face_normals[face] == pytest.approx((0.0, -1.0, 0.0))
+        assert rotation @ face_up[face] == pytest.approx((0.0, 0.0, 1.0))
+        assert resolve_anatomical_orientation_face(quaternion) == face
+
+
+def test_anatomical_orientation_operation_preserves_non_rotation_3d_state() -> None:
+    service = ViewerService()
+    view = ViewRecord(view_id="orientation-view", series_id="series", view_type="3D")
+    view.zoom = 1.6
+    view.offset_x = 17.0
+    view.offset_y = -9.0
+    view.render_3d_mode = "surface"
+    view.volume_remove_bed = True
+    view.volume_clip_mode = "inside"
+    view.drag_origin_arcball_x = 0.2
+    view.drag_origin_rotation_quaternion = (0.0, 0.0, 0.0, 1.0)
+
+    changed = service._handle_anatomical_orientation(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType=VIEW_OP_TYPE_ROTATE_3D,
+            subOpType="orientation:L",
+        ),
+    )
+
+    assert changed is True
+    assert resolve_anatomical_orientation_face(view.rotation_quaternion) == "L"
+    assert view.zoom == pytest.approx(1.6)
+    assert view.offset_x == pytest.approx(17.0)
+    assert view.offset_y == pytest.approx(-9.0)
+    assert view.render_3d_mode == "surface"
+    assert view.volume_remove_bed is True
+    assert view.volume_clip_mode == "inside"
+    assert view.drag_origin_arcball_x is None
+    assert view.drag_origin_rotation_quaternion is None
+
+    assert service._handle_anatomical_orientation(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType=VIEW_OP_TYPE_ROTATE_3D,
+            subOpType="orientation:invalid",
+        ),
+    ) is False
 
 
 def test_vtk_trackball_motion_factor_matches_vtk_default() -> None:
