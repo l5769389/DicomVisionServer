@@ -25,6 +25,7 @@ def render_by_view_type(
     fast_preview_full_resolution: bool = False,
     metadata_mode: str = "full",
     progress_callback: ViewRenderProgressCallback | None = None,
+    raw_3d_output: bool = False,
 ) -> "RenderedImageResult":
     """Route a view record to the renderer that owns its view type."""
 
@@ -43,6 +44,7 @@ def render_by_view_type(
             image_format=image_format,
             fast_preview=fast_preview,
             progress_callback=progress_callback,
+            raw_output=raw_3d_output,
         )
     if view.view_type in FUSION_VIEW_TYPES:
         return service._render_fusion_view(

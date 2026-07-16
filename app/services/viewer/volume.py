@@ -548,6 +548,7 @@ class ViewerVolumeMixin:
         *,
         fast_preview: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
+        raw_output: bool = False,
     ) -> RenderedImageResult:
         render_started_at = perf_counter()
         ensure_view_size(view)
@@ -635,10 +636,13 @@ class ViewerVolumeMixin:
         )
         metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
 
-        self._emit_render_progress(progress_callback, "encode", progress_percent=96)
-        encode_started_at = perf_counter()
-        image_bytes = self._encode_3d_image(image, image_format, fast_preview=fast_preview)
-        encode_ms = (perf_counter() - encode_started_at) * 1000.0
+        encode_ms = 0.0
+        image_bytes = b""
+        if not raw_output:
+            self._emit_render_progress(progress_callback, "encode", progress_percent=96)
+            encode_started_at = perf_counter()
+            image_bytes = self._encode_3d_image(image, image_format, fast_preview=fast_preview)
+            encode_ms = (perf_counter() - encode_started_at) * 1000.0
 
         performance_timings = vtk_timings.as_dict()
         performance_timings["webp_encode_ms"] = encode_ms
@@ -689,6 +693,7 @@ class ViewerVolumeMixin:
             ),
             image_bytes=image_bytes,
             performance_timings=performance_timings,
+            raw_image=image,
         )
 
     def _resolve_surface_render_config_for_render(

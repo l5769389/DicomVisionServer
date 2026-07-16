@@ -55,7 +55,15 @@ class _RenderServiceSpy:
         self.calls.append(("mpr", view.view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode))
         return "mpr-result"
 
-    def _render_3d_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, progress_callback=None) -> str:
+    def _render_3d_view(
+        self,
+        view: ViewRecord,
+        *,
+        image_format: str,
+        fast_preview: bool,
+        progress_callback=None,
+        raw_output: bool = False,
+    ) -> str:
         self.calls.append(("3d", view.view_id, image_format, fast_preview, None, "full"))
         return "3d-result"
 

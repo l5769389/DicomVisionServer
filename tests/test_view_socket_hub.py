@@ -2,6 +2,7 @@ import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
 from time import perf_counter
+from PIL import Image
 
 from app.sockets import runtime as socket_runtime
 from app.sockets.runtime import RenderRequest, ViewSocketHub
@@ -150,6 +151,111 @@ def test_fast_preview_render_skips_progress_messages(monkeypatch) -> None:
             "sid-1",
         ),
     ]
+
+
+def test_3d_webrtc_render_skips_webp_encoding_and_emits_metadata(monkeypatch) -> None:
+    class _Meta:
+        def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+            del by_alias
+            return {"viewId": "view-3d", "imageFormat": "webp", "render3dMode": "volume"}
+
+    def fake_render_view_by_id(*args, **kwargs):
+        assert kwargs["raw_3d_output"] is True
+        return SimpleNamespace(
+            meta=_Meta(),
+            image_bytes=b"",
+            raw_image=Image.new("RGB", (8, 8), "red"),
+            performance_timings={},
+        )
+
+    async def run() -> list[tuple[str, dict[str, object], str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-3d")
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "get_active_sids",
+            lambda _view_id, sids: sids,
+        )
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "publish",
+            lambda _sid, _view_id, _image: 0.2,
+        )
+
+        emitted = await hub._emit_render_message(
+            "view-3d",
+            RenderRequest(image_format="webp", target_sids=("sid-1",)),
+        )
+        assert emitted is True
+        return server.events
+
+    events = asyncio.run(run())
+    assert not any(event == "image_update" for event, _payload, _sid in events)
+    metadata_events = [entry for entry in events if entry[0] == "image_update_metadata"]
+    assert metadata_events == [
+        (
+            "image_update_metadata",
+            {
+                "viewId": "view-3d",
+                "imageFormat": "webp",
+                "render3dMode": "volume",
+                "fastPreview": False,
+                "fastPreviewFullResolution": False,
+                "metadataMode": "full",
+                "renderIntent": "full",
+                "imageTransport": "webrtc",
+            },
+            "sid-1",
+        )
+    ]
+
+
+def test_3d_mixed_transports_render_once_and_emit_each_transport(monkeypatch) -> None:
+    class _Meta:
+        def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+            del by_alias
+            return {"viewId": "view-3d", "imageFormat": "webp", "render3dMode": "volume"}
+
+    def fake_render_view_by_id(*args, **kwargs):
+        assert kwargs["raw_3d_output"] is False
+        return SimpleNamespace(
+            meta=_Meta(),
+            image_bytes=b"webp-frame",
+            raw_image=Image.new("RGB", (8, 8), "red"),
+            performance_timings={},
+        )
+
+    async def run() -> list[tuple[str, object, str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "get_active_sids",
+            lambda _view_id, _sids: ("sid-webrtc",),
+        )
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "publish",
+            lambda _sid, _view_id, _image: 0.1,
+        )
+
+        emitted = await hub._emit_render_message(
+            "view-3d",
+            RenderRequest(image_format="webp", target_sids=("sid-webp", "sid-webrtc")),
+        )
+        assert emitted is True
+        return server.events
+
+    events = asyncio.run(run())
+
+    assert any(event == "image_update" and sid == "sid-webp" for event, _payload, sid in events)
+    assert not any(event == "image_update" and sid == "sid-webrtc" for event, _payload, sid in events)
+    assert any(event == "image_update_metadata" and sid == "sid-webrtc" for event, _payload, sid in events)
 
 
 def test_preview_metadata_modes_drop_heavy_fields() -> None:

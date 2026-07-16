@@ -125,6 +125,7 @@ class ViewerService(
         fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
+        raw_3d_output: bool = False,
         workspace_id: str | None = None,
     ) -> RenderedImageResult:
         view = view_registry.get(view_id, workspace_id=workspace_id)
@@ -137,6 +138,7 @@ class ViewerService(
             fast_preview_full_resolution=fast_preview_full_resolution,
             metadata_mode=metadata_mode,
             progress_callback=progress_callback,
+            raw_3d_output=raw_3d_output,
         )
 
     def _snapshot_mpr_view_for_render(self, view: ViewRecord) -> ViewRecord:

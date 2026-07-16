@@ -360,6 +360,7 @@ class RenderedImageResult:
     image_bytes: bytes
     extra_image_bytes: dict[str, bytes] = field(default_factory=dict)
     performance_timings: dict[str, float | str] = field(default_factory=dict)
+    raw_image: Image.Image | None = None
 
 
 @dataclass(frozen=True)

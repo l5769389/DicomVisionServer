@@ -11,6 +11,7 @@ from app.core.logging import get_logger
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 from app.services.volume_rendering.vtk_threading import should_run_3d_view_on_main_thread
+from app.services.webrtc_3d_transport import webrtc_3d_transport_manager
 
 MPR_PREVIEW_BATCH_MIN_INTERVAL_SECONDS = 0.0
 logger = get_logger(__name__)
@@ -79,6 +80,7 @@ class ViewSocketHub:
                 self._view_sids.pop(view_id, None)
 
     def unbind_view(self, view_id: str) -> None:
+        webrtc_3d_transport_manager.schedule_close_view(view_id)
         sids = self._view_sids.pop(view_id, set())
         for sid in sids:
             views = self._sid_views.get(sid)
@@ -650,12 +652,15 @@ class ViewSocketHub:
             future.add_done_callback(self._consume_progress_future)
 
         render_started_at = perf_counter()
+        webrtc_sids = webrtc_3d_transport_manager.get_active_sids(view_id, sids)
+        webp_sids = tuple(sid for sid in sids if sid not in webrtc_sids)
         render_kwargs = {
             "image_format": request.image_format,
             "fast_preview": request.fast_preview,
             "fast_preview_full_resolution": request.fast_preview_full_resolution,
             "metadata_mode": request.metadata_mode,
             "progress_callback": progress_callback if should_emit_progress else None,
+            "raw_3d_output": bool(webrtc_sids) and not webp_sids,
         }
         if self._should_render_on_main_thread(view_id):
             result = viewer_service.render_view_by_id(view_id, **render_kwargs)
@@ -668,8 +673,18 @@ class ViewSocketHub:
         extra_image_bytes = getattr(result, "extra_image_bytes", None) or {}
         message = (payload, result.image_bytes, extra_image_bytes) if extra_image_bytes else (payload, result.image_bytes)
         emit_started_at = perf_counter()
-        for sid in sids:
+        for sid in webp_sids:
             await self._server.emit("image_update", message, to=sid)
+        webrtc_publish_ms = 0.0
+        raw_image = getattr(result, "raw_image", None)
+        if raw_image is not None:
+            webrtc_payload = {**payload, "imageTransport": "webrtc"}
+            for sid in webrtc_sids:
+                publish_ms = webrtc_3d_transport_manager.publish(sid, view_id, raw_image)
+                if publish_ms is None:
+                    continue
+                webrtc_publish_ms += publish_ms
+                await self._server.emit("image_update_metadata", webrtc_payload, to=sid)
         emit_ms = (perf_counter() - emit_started_at) * 1000.0
         performance_timings = dict(getattr(result, "performance_timings", None) or {})
         if payload.get("render3dMode"):
@@ -679,7 +694,7 @@ class ViewSocketHub:
                 (
                     "3d pipeline timing view_id=%s mode=%s fast_preview=%s sids=%s bytes=%s "
                     "vtk_render_ms=%.1f gpu_readback_ms=%.1f webp_encode_ms=%.1f "
-                    "socket_send_ms=%.1f gpu_ipc_ms=%.1f total_ms=%.1f"
+                    "socket_send_ms=%.1f webrtc_publish_ms=%.1f gpu_ipc_ms=%.1f total_ms=%.1f"
                 ),
                 view_id,
                 payload.get("render3dMode"),
@@ -690,6 +705,7 @@ class ViewSocketHub:
                 float(performance_timings.get("gpu_readback_ms", 0.0)),
                 float(performance_timings.get("webp_encode_ms", 0.0)),
                 emit_ms,
+                webrtc_publish_ms,
                 float(performance_timings.get("ipc_ms", 0.0)),
                 (perf_counter() - render_started_at) * 1000.0,
             )

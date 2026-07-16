@@ -31,6 +31,10 @@ from app.sockets.runtime import view_socket_hub
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 from app.services.volume_rendering.vtk_threading import should_run_3d_view_on_main_thread
+from app.services.webrtc_3d_transport import (
+    get_webrtc_3d_client_config,
+    webrtc_3d_transport_manager,
+)
 from app.services.workspace_activity import workspace_activity_service
 
 logger = get_logger(__name__)
@@ -794,9 +798,40 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
     @server.event
     async def disconnect(sid: str) -> None:
         await four_d_playback_hub.unbind_sid(sid)
+        await webrtc_3d_transport_manager.close_sid(sid)
         view_socket_hub.unbind_sid(sid)
         logger.info("socket disconnected sid=%s", sid)
         return None
+
+    @server.on("webrtc_3d_config")
+    async def webrtc_3d_config(sid: str, _data: dict | None = None) -> dict[str, object]:
+        return get_webrtc_3d_client_config()
+
+    @server.on("webrtc_3d_offer")
+    async def webrtc_3d_offer(sid: str, data: dict) -> dict[str, object]:
+        view_id = str(data.get("viewId") or "")
+        workspace_id = view_socket_hub.get_sid_workspace(sid)
+        try:
+            view = view_registry.get(view_id, workspace_id=workspace_id)
+            if view.view_type != "3D":
+                return {"ok": False, "message": "WebRTC transport is only available for 3D views"}
+            view_socket_hub.bind_view(sid, view_id)
+            return await webrtc_3d_transport_manager.create_answer(
+                sid,
+                view_id,
+                str(data.get("sdp") or ""),
+                str(data.get("type") or ""),
+            )
+        except Exception as exc:
+            logger.exception("3d WebRTC offer failed sid=%s view_id=%s", sid, view_id)
+            return {"ok": False, "message": _build_error_payload(exc)["message"]}
+
+    @server.on("webrtc_3d_close")
+    async def webrtc_3d_close(sid: str, data: dict) -> dict[str, object]:
+        view_id = str(data.get("viewId") or "")
+        if view_id:
+            await webrtc_3d_transport_manager.close(sid, view_id)
+        return {"ok": True, "viewId": view_id}
 
     @server.on("bind_view")
     async def bind_view(sid: str, data: dict) -> dict[str, object] | None:
