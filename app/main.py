@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import socketio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,12 +17,52 @@ setup_logging()
 logger = get_logger(__name__)
 settings = get_settings()
 
+
+@asynccontextmanager
+async def application_lifespan(_app: FastAPI):
+    from app.services.volume_rendering.diagnostics import collect_vtk_render_diagnostics
+    from app.services.volume_rendering.gpu_render_process import (
+        shutdown_gpu_render_process,
+        start_gpu_render_process_if_enabled,
+    )
+
+    try:
+        diagnostics = start_gpu_render_process_if_enabled()
+        process_mode = diagnostics is not None
+        if diagnostics is None:
+            diagnostics = collect_vtk_render_diagnostics()
+        logger.info(
+            (
+                "VTK render diagnostics process_mode=%s vtk=%s python=%s platform=%s "
+                "opengl_vendor=%s opengl_renderer=%s opengl_version=%s mapper_mode=%s software_renderer=%s error=%s"
+            ),
+            process_mode,
+            diagnostics.get("vtk"),
+            diagnostics.get("python"),
+            diagnostics.get("platform"),
+            diagnostics.get("opengl_vendor"),
+            diagnostics.get("opengl_renderer"),
+            diagnostics.get("opengl_version"),
+            diagnostics.get("mapper_mode"),
+            diagnostics.get("software_renderer"),
+            diagnostics.get("error"),
+        )
+        logger.debug("VTK OpenGL capabilities:\n%s", diagnostics.get("capabilities", ""))
+    except Exception:
+        logger.exception("failed to initialize VTK render diagnostics")
+    try:
+        yield
+    finally:
+        shutdown_gpu_render_process()
+
+
 fastapi_app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version="3.1.2",
     docs_url="/docs" if settings.api_docs_enabled else None,
     redoc_url="/redoc" if settings.api_docs_enabled else None,
     openapi_url="/openapi.json" if settings.api_docs_enabled else None,
+    lifespan=application_lifespan,
 )
 
 fastapi_app.add_middleware(

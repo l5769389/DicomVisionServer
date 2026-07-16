@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 from PIL import Image
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
-from vtkmodules.util.vtkConstants import VTK_FLOAT
 from vtkmodules.vtkCommonCore import vtkObject
 from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
 from vtkmodules.vtkRenderingCore import (
@@ -25,7 +24,9 @@ from vtkmodules.vtkRenderingCore import (
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 
 from app.core.logging import get_logger
-from app.services.volume_rendering.contracts import VolumeRenderRequest
+from app.core.config import get_settings
+from app.services.volume_rendering.contracts import VolumeRenderRequest, VtkRenderTimings
+from app.services.volume_rendering.volume_dtype import prepare_vtk_volume
 from app.services.volume_rendering.camera_math import (
     VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH,
     VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT,
@@ -75,7 +76,7 @@ class VolumeRenderSession:
     color_func: vtkColorTransferFunction
     opacity_func: vtkPiecewiseFunction
     gradient_func: vtkPiecewiseFunction
-    volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]]
+    volume_token: tuple[object, ...]
     canvas_size: tuple[int, int]
     base_position: tuple[float, float, float]
     base_focal_point: tuple[float, float, float]
@@ -88,8 +89,10 @@ class VolumeRenderSession:
 
 
 class VtkVolumeRenderer:
-    def __init__(self) -> None:
+    def __init__(self, *, use_process: bool = False) -> None:
         self._sessions: OrderedDict[tuple[str, str], VolumeRenderSession] = OrderedDict()
+        self._last_timings: dict[str, VtkRenderTimings] = {}
+        self._use_process = bool(use_process)
         self._lock = RLock()
         self._executor = None if should_bypass_vtk_worker_thread() else ThreadPoolExecutor(
             max_workers=1,
@@ -97,9 +100,18 @@ class VtkVolumeRenderer:
         )
 
     def render(self, request: VolumeRenderRequest) -> Image.Image:
+        if self._use_process:
+            from app.services.volume_rendering.gpu_render_process import get_gpu_render_process_client
+
+            image, timings = get_gpu_render_process_client().render_volume(request)
+            self._last_timings[request.view_id] = timings
+            return image
         if self._executor is None:
             return self._render_in_executor(request)
         return self._executor.submit(self._render_in_executor, request).result()
+
+    def get_last_timings(self, view_id: str) -> VtkRenderTimings:
+        return self._last_timings.get(view_id, VtkRenderTimings())
 
     def apply_trackball_camera_delta(
         self,
@@ -108,6 +120,14 @@ class VtkVolumeRenderer:
         delta_x_pixels: float,
         delta_y_pixels: float,
     ) -> tuple[float, float, float, float]:
+        if self._use_process:
+            from app.services.volume_rendering.gpu_render_process import get_gpu_render_process_client
+
+            return get_gpu_render_process_client().apply_volume_trackball(
+                request,
+                delta_x_pixels,
+                delta_y_pixels,
+            )
         if self._executor is None:
             return self._apply_trackball_camera_delta_in_executor(
                 request,
@@ -124,6 +144,12 @@ class VtkVolumeRenderer:
     def drop_session(self, view_id: str) -> None:
         if not view_id:
             return
+        self._last_timings.pop(view_id, None)
+        if self._use_process:
+            from app.services.volume_rendering.gpu_render_process import get_gpu_render_process_client
+
+            get_gpu_render_process_client().drop_session(view_id)
+            return
         if self._executor is None:
             self._drop_session_in_executor(view_id)
             return
@@ -137,7 +163,7 @@ class VtkVolumeRenderer:
             raise ValueError("view_id is required")
 
         volume_started_at = perf_counter()
-        volume = np.asarray(request.volume, dtype=np.float32)
+        volume = np.asarray(request.volume)
         if volume.ndim != 3 or volume.size == 0:
             raise ValueError("volume must be a non-empty 3D array")
         volume_ms = (perf_counter() - volume_started_at) * 1000.0
@@ -155,6 +181,14 @@ class VtkVolumeRenderer:
             capture_started_at = perf_counter()
             image = self._capture_image(session)
             capture_ms = (perf_counter() - capture_started_at) * 1000.0
+            self._last_timings[request.view_id] = VtkRenderTimings(
+                vtk_render_ms=render_ms,
+                gpu_readback_ms=capture_ms,
+                session_ms=session_ms,
+                configure_ms=configure_ms,
+                source_dtype=str(volume.dtype),
+                vtk_dtype=str(session.image_data.GetScalarTypeAsString()),
+            )
             if request.fast_preview:
                 source_shape = tuple(int(value) for value in volume.shape)
                 render_shape = tuple(int(value) for value in session.image_data.GetDimensions())
@@ -205,7 +239,7 @@ class VtkVolumeRenderer:
     ) -> tuple[float, float, float, float]:
         if request.canvas_width <= 0 or request.canvas_height <= 0:
             raise ValueError("canvas size must be positive")
-        volume = np.asarray(request.volume, dtype=np.float32)
+        volume = np.asarray(request.volume)
         with self._lock:
             session = self._get_or_create_session(request, volume)
             self._configure_session(session, request)
@@ -225,7 +259,7 @@ class VtkVolumeRenderer:
         if session is None or session.volume_token != volume_token:
             if session is not None:
                 session.render_window.Finalize()
-            session = self._create_session(volume, request.spacing_xyz, volume_token)
+            session = self._create_session(prepare_vtk_volume(volume), request.spacing_xyz, volume_token)
             self._sessions[session_key] = session
             self._evict_sessions_if_needed()
             return session
@@ -241,7 +275,7 @@ class VtkVolumeRenderer:
         self,
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
-        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        volume_token: tuple[object, ...],
     ) -> VolumeRenderSession:
         image_data = self._build_image_data(volume, spacing_xyz)
 
@@ -368,9 +402,14 @@ class VtkVolumeRenderer:
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
         volume_token: str | None = None,
-    ) -> tuple[object, tuple[int, ...], tuple[float, float, float]]:
+    ) -> tuple[object, tuple[int, ...], tuple[float, float, float], str]:
         identity: object = str(volume_token) if volume_token else id(volume)
-        return (identity, tuple(int(size) for size in volume.shape), tuple(float(value) for value in spacing_xyz))
+        return (
+            identity,
+            tuple(int(size) for size in volume.shape),
+            tuple(float(value) for value in spacing_xyz),
+            str(volume.dtype),
+        )
 
     @staticmethod
     def _build_session_key(view_id: str, fast_preview: bool) -> tuple[str, str]:
@@ -443,7 +482,6 @@ class VtkVolumeRenderer:
         vtk_array = numpy_to_vtk(
             num_array=np.ascontiguousarray(volume).ravel(order="C"),
             deep=True,
-            array_type=VTK_FLOAT,
         )
         vtk_array.SetName("Scalars")
         image_data.GetPointData().SetScalars(vtk_array)
@@ -941,4 +979,4 @@ class VtkVolumeRenderer:
         return Image.fromarray(array)
 
 
-vtk_volume_renderer = VtkVolumeRenderer()
+vtk_volume_renderer = VtkVolumeRenderer(use_process=get_settings().vtk_render_process_enabled)

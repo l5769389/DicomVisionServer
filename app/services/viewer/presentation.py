@@ -1664,3 +1664,30 @@ class ViewerPresentationMixin:
                 optimize=False,
             )
         return output.getvalue()
+
+    @staticmethod
+    def _encode_3d_image(image: Image.Image, image_format: ImageFormat, *, fast_preview: bool = False) -> bytes:
+        if image_format != "webp":
+            return ViewerPresentationMixin._encode_image(image, image_format, fast_preview=fast_preview)
+
+        output = io.BytesIO()
+        if fast_preview:
+            image.save(
+                output,
+                format="WEBP",
+                lossless=False,
+                quality=WEBP_PREVIEW_QUALITY,
+                method=WEBP_PREVIEW_METHOD,
+            )
+        else:
+            # A rendered 3D RGB frame has already passed through transfer functions,
+            # lighting and ray sampling. High-quality lossy WebP avoids the large
+            # lossless encode tail without changing quantitative 2D/MPR transport.
+            image.save(
+                output,
+                format="WEBP",
+                lossless=False,
+                quality=WEBP_3D_FINAL_QUALITY,
+                method=WEBP_3D_FINAL_METHOD,
+            )
+        return output.getvalue()

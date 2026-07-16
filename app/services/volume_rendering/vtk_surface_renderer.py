@@ -5,12 +5,12 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from math import radians, tan
 from threading import RLock
+from time import perf_counter
 from typing import Any
 
 import numpy as np
 from PIL import Image
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
-from vtkmodules.util.vtkConstants import VTK_FLOAT
 from vtkmodules.vtkCommonCore import vtkObject
 from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPolyData
 from vtkmodules.vtkFiltersCore import (
@@ -27,9 +27,11 @@ from vtkmodules.vtkRenderingCore import (
     vtkWindowToImageFilter,
 )
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.services.surface_render_config import normalize_surface_render_config
-from app.services.volume_rendering.contracts import SurfaceRenderRequest
+from app.services.volume_rendering.contracts import SurfaceRenderRequest, VtkRenderTimings
+from app.services.volume_rendering.volume_dtype import prepare_vtk_volume
 from app.services.volume_rendering.camera_math import (
     VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH,
     VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT,
@@ -70,7 +72,7 @@ class SurfaceRenderSession:
     renderer: vtkRenderer
     render_window: vtkRenderWindow
     window_to_image: vtkWindowToImageFilter
-    volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]]
+    volume_token: tuple[object, ...]
     config_token: tuple[object, ...]
     geometry_token: tuple[object, ...]
     canvas_size: tuple[int, int]
@@ -82,10 +84,12 @@ class SurfaceRenderSession:
 
 
 class VtkSurfaceRenderer:
-    def __init__(self) -> None:
+    def __init__(self, *, use_process: bool = False) -> None:
         self._sessions: OrderedDict[tuple[str, str], SurfaceRenderSession] = OrderedDict()
         self._mesh_cache: OrderedDict[tuple[object, ...], vtkPolyData] = OrderedDict()
         self._warm_preview_keys: set[tuple[object, ...]] = set()
+        self._last_timings: dict[str, VtkRenderTimings] = {}
+        self._use_process = bool(use_process)
         self._lock = RLock()
         self._executor = None if should_bypass_vtk_worker_thread() else ThreadPoolExecutor(
             max_workers=1,
@@ -93,11 +97,22 @@ class VtkSurfaceRenderer:
         )
 
     def render(self, request: SurfaceRenderRequest) -> Image.Image:
+        if self._use_process:
+            from app.services.volume_rendering.gpu_render_process import get_gpu_render_process_client
+
+            image, timings = get_gpu_render_process_client().render_surface(request)
+            self._last_timings[request.view_id] = timings
+            return image
         if self._executor is None:
             return self._render_in_executor(request)
         return self._executor.submit(self._render_in_executor, request).result()
 
+    def get_last_timings(self, view_id: str) -> VtkRenderTimings:
+        return self._last_timings.get(view_id, VtkRenderTimings())
+
     def warm_preview_session(self, request: SurfaceRenderRequest) -> None:
+        if self._use_process:
+            return
         if self._executor is None:
             return
         if request.fast_preview or request.canvas_width <= 0 or request.canvas_height <= 0 or not request.view_id:
@@ -119,6 +134,14 @@ class VtkSurfaceRenderer:
         delta_x_pixels: float,
         delta_y_pixels: float,
     ) -> tuple[float, float, float, float]:
+        if self._use_process:
+            from app.services.volume_rendering.gpu_render_process import get_gpu_render_process_client
+
+            return get_gpu_render_process_client().apply_surface_trackball(
+                request,
+                delta_x_pixels,
+                delta_y_pixels,
+            )
         if self._executor is None:
             return self._apply_trackball_camera_delta_in_executor(
                 request,
@@ -135,6 +158,12 @@ class VtkSurfaceRenderer:
     def drop_session(self, view_id: str) -> None:
         if not view_id:
             return
+        self._last_timings.pop(view_id, None)
+        if self._use_process:
+            from app.services.volume_rendering.gpu_render_process import get_gpu_render_process_client
+
+            get_gpu_render_process_client().drop_session(view_id)
+            return
         if self._executor is None:
             self._drop_session_in_executor(view_id)
             return
@@ -146,18 +175,35 @@ class VtkSurfaceRenderer:
         if not request.view_id:
             raise ValueError("view_id is required")
 
-        volume = np.asarray(request.volume, dtype=np.float32)
+        volume = np.asarray(request.volume)
         if volume.ndim != 3 or volume.size == 0:
             raise ValueError("volume must be a non-empty 3D array")
 
         with self._lock:
+            session_started_at = perf_counter()
             session = self._get_or_create_session(request, volume)
+            session_ms = (perf_counter() - session_started_at) * 1000.0
+            configure_started_at = perf_counter()
             self._configure_session(session, request)
+            configure_ms = (perf_counter() - configure_started_at) * 1000.0
+            render_started_at = perf_counter()
             session.render_window.Render()
-            return self._capture_image(session)
+            render_ms = (perf_counter() - render_started_at) * 1000.0
+            capture_started_at = perf_counter()
+            image = self._capture_image(session)
+            capture_ms = (perf_counter() - capture_started_at) * 1000.0
+            self._last_timings[request.view_id] = VtkRenderTimings(
+                vtk_render_ms=render_ms,
+                gpu_readback_ms=capture_ms,
+                session_ms=session_ms,
+                configure_ms=configure_ms,
+                source_dtype=str(volume.dtype),
+                vtk_dtype=str(session.image_data.GetScalarTypeAsString()),
+            )
+            return image
 
     def _warm_preview_session_in_executor(self, request: SurfaceRenderRequest) -> None:
-        volume = np.asarray(request.volume, dtype=np.float32)
+        volume = np.asarray(request.volume)
         if volume.ndim != 3 or volume.size == 0:
             return
 
@@ -181,7 +227,7 @@ class VtkSurfaceRenderer:
     ) -> tuple[float, float, float, float]:
         if request.canvas_width <= 0 or request.canvas_height <= 0:
             raise ValueError("canvas size must be positive")
-        volume = np.asarray(request.volume, dtype=np.float32)
+        volume = np.asarray(request.volume)
         with self._lock:
             session = self._get_or_create_session(request, volume)
             self._configure_session(session, request)
@@ -207,7 +253,7 @@ class VtkSurfaceRenderer:
     def _get_or_create_session(self, request: SurfaceRenderRequest, volume: np.ndarray) -> SurfaceRenderSession:
         volume_token = self._build_volume_token(volume, request.spacing_xyz)
         if request.volume_token:
-            volume_token = (request.volume_token, volume_token[1], volume_token[2])
+            volume_token = (request.volume_token, volume_token[1], volume_token[2], volume_token[3])
         config = normalize_surface_render_config(request.surface_config)
         config_token = self._build_config_token(config)
         geometry_token = self._build_geometry_token(config)
@@ -217,7 +263,13 @@ class VtkSurfaceRenderer:
             if session is not None:
                 session.render_window.Finalize()
             self._report_progress(request, 84, "正在提取 Surface 等值面...")
-            session = self._create_session(volume, request.spacing_xyz, volume_token, config, config_token)
+            session = self._create_session(
+                prepare_vtk_volume(volume),
+                request.spacing_xyz,
+                volume_token,
+                config,
+                config_token,
+            )
             self._sessions[session_key] = session
             self._evict_sessions_if_needed()
             self._report_progress(request, 92, "Surface 表面优化完成")
@@ -254,7 +306,7 @@ class VtkSurfaceRenderer:
         self,
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
-        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        volume_token: tuple[object, ...],
         config: dict[str, object],
         config_token: tuple[object, ...],
     ) -> SurfaceRenderSession:
@@ -367,7 +419,7 @@ class VtkSurfaceRenderer:
     def _get_or_create_mesh(
         self,
         image_data: vtkImageData,
-        volume_token: tuple[object, tuple[int, ...], tuple[float, float, float]],
+        volume_token: tuple[object, ...],
         config: dict[str, object],
     ) -> vtkPolyData:
         geometry_token = self._build_geometry_token(config)
@@ -415,7 +467,7 @@ class VtkSurfaceRenderer:
         preview_request = replace(request, fast_preview=True)
         volume_token = cls._build_volume_token(volume, request.spacing_xyz)
         if request.volume_token:
-            volume_token = (request.volume_token, volume_token[1], volume_token[2])
+            volume_token = (request.volume_token, volume_token[1], volume_token[2], volume_token[3])
         return (
             request.view_id,
             volume_token,
@@ -427,8 +479,13 @@ class VtkSurfaceRenderer:
     def _build_volume_token(
         volume: np.ndarray,
         spacing_xyz: tuple[float, float, float],
-    ) -> tuple[object, tuple[int, ...], tuple[float, float, float]]:
-        return (id(volume), tuple(int(size) for size in volume.shape), tuple(float(value) for value in spacing_xyz))
+    ) -> tuple[object, tuple[int, ...], tuple[float, float, float], str]:
+        return (
+            id(volume),
+            tuple(int(size) for size in volume.shape),
+            tuple(float(value) for value in spacing_xyz),
+            str(volume.dtype),
+        )
 
     @staticmethod
     def _build_config_token(config: dict[str, object]) -> tuple[object, ...]:
@@ -507,7 +564,6 @@ class VtkSurfaceRenderer:
         vtk_array = numpy_to_vtk(
             num_array=np.ascontiguousarray(volume).ravel(order="C"),
             deep=True,
-            array_type=VTK_FLOAT,
         )
         vtk_array.SetName("Scalars")
         image_data.GetPointData().SetScalars(vtk_array)
@@ -665,4 +721,4 @@ class VtkSurfaceRenderer:
         return Image.fromarray(array)
 
 
-vtk_surface_renderer = VtkSurfaceRenderer()
+vtk_surface_renderer = VtkSurfaceRenderer(use_process=get_settings().vtk_render_process_enabled)

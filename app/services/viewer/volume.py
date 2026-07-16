@@ -596,6 +596,7 @@ class ViewerVolumeMixin:
                 progress_callback=progress_callback,
             )
             image = compat._get_vtk_surface_renderer().render(surface_request)
+            vtk_timings = compat._get_vtk_surface_renderer().get_last_timings(view.view_id)
             if not fast_preview:
                 self._warm_surface_preview_session(surface_request)
             viewport_label = "3D SR"
@@ -617,6 +618,7 @@ class ViewerVolumeMixin:
                 volume_token=render_volume_token,
             )
             image = compat._get_vtk_volume_renderer().render(volume_request)
+            vtk_timings = compat._get_vtk_volume_renderer().get_last_timings(view.view_id)
             viewport_label = "3D VR"
             render_width = volume_request.canvas_width
             render_height = volume_request.canvas_height
@@ -635,16 +637,23 @@ class ViewerVolumeMixin:
 
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
         encode_started_at = perf_counter()
-        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        image_bytes = self._encode_3d_image(image, image_format, fast_preview=fast_preview)
         encode_ms = (perf_counter() - encode_started_at) * 1000.0
 
-        logger.debug(
-            "3d render timing view_id=%s mode=%s fast_preview=%s image_format=%s source_shape=%s viewport=%sx%s render=%sx%s image=%sx%s volume_ms=%.1f image_ms=%.1f metadata_ms=%.1f encode_ms=%.1f total_ms=%.1f",
+        performance_timings = vtk_timings.as_dict()
+        performance_timings["webp_encode_ms"] = encode_ms
+        performance_timings["viewer_render_ms"] = (perf_counter() - render_started_at) * 1000.0
+
+        log_method = logger.debug if fast_preview else logger.info
+        log_method(
+            "3d render timing view_id=%s mode=%s fast_preview=%s image_format=%s source_shape=%s source_dtype=%s vtk_dtype=%s viewport=%sx%s render=%sx%s image=%sx%s volume_ms=%.1f session_ms=%.1f configure_ms=%.1f vtk_render_ms=%.1f gpu_readback_ms=%.1f gpu_ipc_ms=%.1f metadata_ms=%.1f webp_encode_ms=%.1f total_ms=%.1f",
             view.view_id,
             render_3d_mode,
             fast_preview,
             image_format,
             volume.shape,
+            performance_timings.get("source_dtype", ""),
+            performance_timings.get("vtk_dtype", ""),
             view.width,
             view.height,
             render_width,
@@ -652,7 +661,11 @@ class ViewerVolumeMixin:
             image.width,
             image.height,
             volume_ms,
-            image_ms,
+            float(performance_timings.get("session_ms", 0.0)),
+            float(performance_timings.get("configure_ms", 0.0)),
+            float(performance_timings.get("vtk_render_ms", 0.0)),
+            float(performance_timings.get("gpu_readback_ms", 0.0)),
+            float(performance_timings.get("ipc_ms", 0.0)),
             metadata_ms,
             encode_ms,
             (perf_counter() - render_started_at) * 1000.0,
@@ -675,6 +688,7 @@ class ViewerVolumeMixin:
                 volumeRenderOptions=self._build_volume_render_options_response(view),
             ),
             image_bytes=image_bytes,
+            performance_timings=performance_timings,
         )
 
     def _resolve_surface_render_config_for_render(

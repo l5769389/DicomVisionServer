@@ -75,6 +75,8 @@ uv run python run.py
 - `CORS_ORIGINS`：允许访问后端的前端来源，JSON 数组字符串，例如 `["http://localhost:5173"]`。
 - `WEB_SAMPLE_DICOM_PATH`：Web demo 可加载的服务端示例 DICOM 路径。
 - `WEB_UPLOAD_DICOM_ROOT`：浏览器上传 DICOM 的临时存储根目录。
+- `VTK_RENDER_PROCESS_ENABLED`：是否启用独立 VTK GPU 渲染进程；macOS 默认开启。
+- `VTK_SHARED_MEMORY_MAX_BYTES`：主进程与 GPU 进程之间的体数据共享内存上限，默认 1 GiB。
 - `DICOMVISION_PACS_CACHE_ROOT`：PACS 下载缓存目录。
 - `DICOMVISION_PACS_CACHE_TTL_SECONDS`：PACS 缓存保留时间。
 
@@ -125,6 +127,24 @@ dist/
 ```
 
 Client 的 `npm run release:win` 会构建 Server bundle，并把它打入 Windows 桌面安装包。
+
+## VTK 渲染诊断与 Benchmark
+
+macOS 默认在独立 GPU 进程中执行 3D VTK 渲染。服务启动日志会记录 OpenGL vendor、renderer、VTK mapper 模式，以及是否检测到软件渲染器。
+
+使用合成体数据运行可重复基准：
+
+```bash
+uv run python scripts/benchmark_vtk_render.py --process --iterations 8
+```
+
+使用指定 DICOM 目录：
+
+```bash
+uv run python scripts/benchmark_vtk_render.py --process --dicom-path /path/to/dicom
+```
+
+报告分别统计 VTK render、GPU readback、WebP encode 和本地 Socket send。生产环境真实 Socket.IO 发送耗时记录在 `3d pipeline timing` 日志中。
 
 ## 测试
 

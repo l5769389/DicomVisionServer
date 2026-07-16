@@ -7,6 +7,28 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class VtkRenderTimings:
+    vtk_render_ms: float = 0.0
+    gpu_readback_ms: float = 0.0
+    session_ms: float = 0.0
+    configure_ms: float = 0.0
+    ipc_ms: float = 0.0
+    source_dtype: str = ""
+    vtk_dtype: str = ""
+
+    def as_dict(self) -> dict[str, float | str]:
+        return {
+            "vtk_render_ms": self.vtk_render_ms,
+            "gpu_readback_ms": self.gpu_readback_ms,
+            "session_ms": self.session_ms,
+            "configure_ms": self.configure_ms,
+            "ipc_ms": self.ipc_ms,
+            "source_dtype": self.source_dtype,
+            "vtk_dtype": self.vtk_dtype,
+        }
+
+
+@dataclass(frozen=True)
 class VolumeRenderRequest:
     view_id: str
     volume: np.ndarray

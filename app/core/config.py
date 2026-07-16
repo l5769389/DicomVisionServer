@@ -1,4 +1,5 @@
 from functools import lru_cache
+import sys
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,6 +12,14 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, alias="APP_PORT")
     cors_origins: list[str] = Field(default=["*"], alias="CORS_ORIGINS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    vtk_render_process_enabled: bool = Field(
+        default_factory=lambda: sys.platform == "darwin",
+        alias="VTK_RENDER_PROCESS_ENABLED",
+    )
+    vtk_shared_memory_max_bytes: int = Field(
+        default=1024 * 1024 * 1024,
+        alias="VTK_SHARED_MEMORY_MAX_BYTES",
+    )
     expose_api_docs: bool | None = Field(default=None, alias="EXPOSE_API_DOCS")
     web_sample_dicom_path: str | None = Field(default=None, alias="WEB_SAMPLE_DICOM_PATH")
     web_upload_dicom_root: str | None = Field(default=None, alias="WEB_UPLOAD_DICOM_ROOT")

@@ -6,6 +6,8 @@ from typing import Callable
 
 import numpy as np
 
+from app.services.volume_rendering.volume_dtype import prepare_vtk_volume
+
 
 class SeriesVolumeCache:
     def __init__(self, *, max_bytes: int, on_evict: Callable[[str, np.ndarray], None] | None = None) -> None:
@@ -50,7 +52,9 @@ class SeriesVolumeCache:
             return cached_volume
 
     def store(self, series_id: str, volume: np.ndarray) -> np.ndarray:
-        normalized = np.ascontiguousarray(volume, dtype=np.float32)
+        # Integral CT/CBCT values remain 16-bit in the shared series cache.
+        # MPR reslicing explicitly promotes interpolated output to float32.
+        normalized = prepare_vtk_volume(volume)
         with self._lock:
             existing = self._cache.get(series_id)
             if existing is not None:

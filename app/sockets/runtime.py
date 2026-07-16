@@ -671,6 +671,28 @@ class ViewSocketHub:
         for sid in sids:
             await self._server.emit("image_update", message, to=sid)
         emit_ms = (perf_counter() - emit_started_at) * 1000.0
+        performance_timings = dict(getattr(result, "performance_timings", None) or {})
+        if payload.get("render3dMode"):
+            performance_timings["socket_send_ms"] = emit_ms
+            log_method = logger.debug if request.fast_preview else logger.info
+            log_method(
+                (
+                    "3d pipeline timing view_id=%s mode=%s fast_preview=%s sids=%s bytes=%s "
+                    "vtk_render_ms=%.1f gpu_readback_ms=%.1f webp_encode_ms=%.1f "
+                    "socket_send_ms=%.1f gpu_ipc_ms=%.1f total_ms=%.1f"
+                ),
+                view_id,
+                payload.get("render3dMode"),
+                request.fast_preview,
+                len(sids),
+                len(result.image_bytes),
+                float(performance_timings.get("vtk_render_ms", 0.0)),
+                float(performance_timings.get("gpu_readback_ms", 0.0)),
+                float(performance_timings.get("webp_encode_ms", 0.0)),
+                emit_ms,
+                float(performance_timings.get("ipc_ms", 0.0)),
+                (perf_counter() - render_started_at) * 1000.0,
+            )
         if request.metadata_mode == "fusion-registration-layer-preview":
             logger.info(
                 (

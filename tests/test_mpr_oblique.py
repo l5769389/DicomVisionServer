@@ -208,6 +208,27 @@ def test_webp_preview_uses_lossy_quality_and_final_uses_lossless(monkeypatch) ->
     ]
 
 
+def test_3d_webp_uses_fast_preview_and_high_quality_lossy_final(monkeypatch) -> None:
+    save_calls: list[dict[str, object]] = []
+
+    def fake_save(self, output, **kwargs):
+        del self
+        save_calls.append(kwargs)
+        output.write(b"webp")
+
+    monkeypatch.setattr(Image.Image, "save", fake_save)
+
+    preview_encoded = ViewerService._encode_3d_image(Image.new("RGB", (1, 1)), "webp", fast_preview=True)
+    final_encoded = ViewerService._encode_3d_image(Image.new("RGB", (1, 1)), "webp", fast_preview=False)
+
+    assert preview_encoded == b"webp"
+    assert final_encoded == b"webp"
+    assert save_calls == [
+        {"format": "WEBP", "lossless": False, "quality": 80, "method": 0},
+        {"format": "WEBP", "lossless": False, "quality": 94, "method": 2},
+    ]
+
+
 def test_view_transform_payload_reports_clamped_zoom() -> None:
     view = ViewRecord(view_id="v", series_id="s", view_type="Stack")
 

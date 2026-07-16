@@ -297,6 +297,8 @@ VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
 WEBP_PREVIEW_QUALITY = 80
 WEBP_PREVIEW_METHOD = 0
+WEBP_3D_FINAL_QUALITY = 94
+WEBP_3D_FINAL_METHOD = 2
 PNG_COMPRESS_LEVEL = 1
 MPR_FAST_PREVIEW_SCALE = 0.33
 MPR_FAST_PREVIEW_MIN_SIDE = 96
@@ -357,6 +359,7 @@ class RenderedImageResult:
     meta: ViewImageResponse
     image_bytes: bytes
     extra_image_bytes: dict[str, bytes] = field(default_factory=dict)
+    performance_timings: dict[str, float | str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
