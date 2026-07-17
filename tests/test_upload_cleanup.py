@@ -33,3 +33,19 @@ def test_api_docs_are_hidden_by_default_in_production() -> None:
 
 def test_api_docs_can_be_enabled_explicitly() -> None:
     assert Settings(APP_ENV="production", EXPOSE_API_DOCS=True).api_docs_enabled is True
+
+
+def test_3d_transport_settings_are_normalized_and_bounded() -> None:
+    settings = Settings(
+        DICOMVISION_3D_TRANSPORT="WebRTC",
+        DICOMVISION_WEBRTC_VIDEO_CODEC="H264",
+        DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS=99_000_000,
+        DICOMVISION_WEBRTC_VIDEO_FPS=120,
+        DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES=9,
+    )
+
+    assert settings.normalized_three_d_transport == "webrtc"
+    assert settings.normalized_webrtc_video_codec == "h264"
+    assert settings.normalized_webrtc_video_bitrate_bps == 20_000_000
+    assert settings.normalized_webrtc_video_fps == 60
+    assert settings.normalized_webrtc_initial_burst_frames == 3

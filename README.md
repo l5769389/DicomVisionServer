@@ -72,6 +72,8 @@ uv run python run.py
 
 - `APP_ENV`：运行环境，部署时通常为 `production`。
 - `APP_HOST` / `APP_PORT`：监听地址和端口。
+- `DICOMVISION_3D_TRANSPORT`：服务启动时固定 3D 帧传输方式，可选 `webp` 或 `webrtc`。
+- `DICOMVISION_WEBRTC_VIDEO_CODEC` / `DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS`：WebRTC 编码器和目标码率。
 - `CORS_ORIGINS`：允许访问后端的前端来源，JSON 数组字符串，例如 `["http://localhost:5173"]`。
 - `WEB_SAMPLE_DICOM_PATH`：Web demo 可加载的服务端示例 DICOM 路径。
 - `WEB_UPLOAD_DICOM_ROOT`：浏览器上传 DICOM 的临时存储根目录。

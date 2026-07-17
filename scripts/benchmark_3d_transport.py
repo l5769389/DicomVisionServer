@@ -38,6 +38,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames", type=int, default=12)
     parser.add_argument("--width", type=int, default=720)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument(
+        "--interval-ms",
+        type=float,
+        default=0.0,
+        help="Optional delay between renders; zero exercises continuous interaction",
+    )
+    parser.add_argument(
+        "--settle-ms",
+        type=float,
+        default=250.0,
+        help="Observe the media track after the final render to detect trailing frames",
+    )
     return parser.parse_args()
 
 
@@ -173,7 +185,8 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 
         started_at = perf_counter()
         request_latencies_ms: list[float] = []
-        for _ in range(max(1, args.frames)):
+        render_count = max(1, args.frames)
+        for _ in range(render_count):
             first_frame_index = len(samples.frame_times)
             request_started_at = perf_counter()
             await socket.call("bind_view", {"viewId": view_id, "render": True, "imageFormat": "webp"}, timeout=120)
@@ -181,11 +194,13 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             request_latencies_ms.append(
                 (samples.frame_times[first_frame_index] - request_started_at) * 1000.0
             )
-            if args.transport == "webrtc":
-                # Let the short reliability burst drain before the next render;
-                # benchmark latency is based on the first presented frame.
-                await asyncio.sleep(0.15)
+            if args.interval_ms > 0:
+                await asyncio.sleep(args.interval_ms / 1000.0)
         elapsed_ms = (perf_counter() - started_at) * 1000.0
+        delivered_at_completion = len(samples.frame_times)
+        if args.settle_ms > 0:
+            await asyncio.sleep(args.settle_ms / 1000.0)
+        trailing_frames = len(samples.frame_times) - delivered_at_completion
 
         intervals_ms = [
             (current - previous) * 1000.0
@@ -193,8 +208,9 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         ]
         nonzero_payloads = [size for size in samples.payload_sizes if size]
         print(
-            f"transport={args.transport} renders={max(1, args.frames)} "
-            f"media_frames={len(samples.frame_times)} total_ms={elapsed_ms:.1f}"
+            f"transport={args.transport} renders={render_count} "
+            f"media_frames={delivered_at_completion} trailing_media_frames={trailing_frames} "
+            f"total_ms={elapsed_ms:.1f}"
         )
         print(
             "render_to_frame_ms "

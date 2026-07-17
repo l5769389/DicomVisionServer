@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import fractions
 import json
 import os
 from time import perf_counter
+import time
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
 from app.core.logging import get_logger
+from app.core.config import get_settings
 
 logger = get_logger(__name__)
 
@@ -32,6 +35,14 @@ _VideoStreamTrackBase = VideoStreamTrack if VideoStreamTrack is not None else ob
 
 
 WEBRTC_3D_ICE_SERVERS_ENV = "DICOMVISION_WEBRTC_ICE_SERVERS"
+
+
+def _transport_settings():
+    return get_settings()
+
+
+def is_webrtc_3d_enabled() -> bool:
+    return _transport_settings().normalized_three_d_transport == "webrtc"
 
 
 def _load_ice_server_payloads() -> list[dict[str, object]]:
@@ -63,10 +74,16 @@ def _load_ice_server_payloads() -> list[dict[str, object]]:
 
 
 def get_webrtc_3d_client_config() -> dict[str, object]:
+    settings = _transport_settings()
+    codec = settings.normalized_webrtc_video_codec
     return {
         "ok": True,
+        "transport": settings.normalized_three_d_transport,
         "iceServers": _load_ice_server_payloads(),
-        "videoCodecs": ["VP8", "H264"],
+        "videoCodecs": [codec.upper()],
+        "videoCodec": codec,
+        "videoBitrateBps": settings.normalized_webrtc_video_bitrate_bps,
+        "videoFps": settings.normalized_webrtc_video_fps,
     }
 
 
@@ -84,26 +101,64 @@ def _build_rtc_configuration():
     return RTCConfiguration(iceServers=ice_servers)
 
 
+def _configure_codec_defaults(codec: str, bitrate_bps: int, fps: int) -> None:
+    """Configure aiortc's encoder before it is lazily created by the sender."""
+    if codec == "h264":
+        from aiortc.codecs import h264
+
+        h264.DEFAULT_BITRATE = bitrate_bps
+        h264.MAX_BITRATE = max(h264.MAX_BITRATE, bitrate_bps)
+        h264.MAX_FRAME_RATE = fps
+        return
+
+    from aiortc.codecs import vpx
+
+    vpx.DEFAULT_BITRATE = bitrate_bps
+    vpx.MAX_BITRATE = max(vpx.MAX_BITRATE, bitrate_bps)
+    vpx.MAX_FRAME_RATE = fps
+
+
 class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-type]
     """A backpressure-free video source that keeps only the newest rendered frame."""
 
     kind = "video"
 
-    def __init__(self) -> None:
+    def __init__(self, *, fps: int | None = None, initial_burst_frames: int | None = None) -> None:
         super().__init__()
+        settings = _transport_settings()
+        self._fps = fps or settings.normalized_webrtc_video_fps
+        self._initial_burst_frames = initial_burst_frames or settings.normalized_webrtc_initial_burst_frames
         self._latest_frame: np.ndarray | None = None
         self._frame_ready = asyncio.Event()
         self._remaining_burst_frames = 0
         self._logged_first_frame = False
+        self._has_published_frame = False
+        self._timestamp = 0
+        self._next_frame_at: float | None = None
 
     def publish(self, image: Image.Image) -> None:
         self._latest_frame = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
-        # A single isolated RTP frame is not reliably presented by every video
-        # decoder. Emit a short burst for each render, then become idle again.
-        # New renders replace the burst immediately, so stale frames never
-        # accumulate while the user is interacting.
-        self._remaining_burst_frames = 3
+        # Some decoders need more than one packetized frame to present the
+        # first image. Only the first render gets a short startup burst. Every
+        # later render is a single latest-state frame, preventing the browser
+        # jitter buffer from continuing to play old camera poses after release.
+        self._remaining_burst_frames = self._initial_burst_frames if not self._has_published_frame else 1
+        self._has_published_frame = True
         self._frame_ready.set()
+
+    async def _next_low_latency_timestamp(self) -> tuple[int, fractions.Fraction]:
+        time_base = fractions.Fraction(1, 90_000)
+        frame_interval = 1.0 / self._fps
+        now = time.monotonic()
+        if self._next_frame_at is None or now - self._next_frame_at > frame_interval * 2:
+            self._next_frame_at = now
+        else:
+            wait = self._next_frame_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+        self._next_frame_at = max(self._next_frame_at + frame_interval, time.monotonic())
+        self._timestamp += round(90_000 / self._fps)
+        return self._timestamp, time_base
 
     async def recv(self):
         while self._latest_frame is None or self._remaining_burst_frames <= 0:
@@ -116,7 +171,7 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
         if not self._logged_first_frame:
             logger.info("3d webrtc encoder consumed first frame shape=%s", pixels.shape)
             self._logged_first_frame = True
-        pts, time_base = await self.next_timestamp()
+        pts, time_base = await self._next_low_latency_timestamp()
         frame = VideoFrame.from_ndarray(pixels, format="rgb24")
         frame.pts = pts
         frame.time_base = time_base
@@ -141,6 +196,8 @@ class WebRtc3DTransportManager:
         return sid, view_id
 
     async def create_answer(self, sid: str, view_id: str, sdp: str, description_type: str) -> dict[str, object]:
+        if not is_webrtc_3d_enabled():
+            return {"ok": False, "message": "The server is configured for WebP 3D transport"}
         if not view_id or not sdp or description_type != "offer":
             return {"ok": False, "message": "A valid WebRTC offer and viewId are required"}
         if RTCPeerConnection is None or RTCSessionDescription is None:
@@ -148,17 +205,25 @@ class WebRtc3DTransportManager:
 
         await self.close(sid, view_id)
         peer = RTCPeerConnection(configuration=_build_rtc_configuration())
-        track = LatestFrameVideoTrack()
+        settings = _transport_settings()
+        track = LatestFrameVideoTrack(
+            fps=settings.normalized_webrtc_video_fps,
+            initial_burst_frames=settings.normalized_webrtc_initial_burst_frames,
+        )
         transceiver = peer.addTransceiver(track, direction="sendonly")
         try:
+            _configure_codec_defaults(
+                settings.normalized_webrtc_video_codec,
+                settings.normalized_webrtc_video_bitrate_bps,
+                settings.normalized_webrtc_video_fps,
+            )
             capabilities = RTCRtpSender.getCapabilities("video")
-            # VP8 is aiortc's most portable software path and works consistently
-            # across Chromium, Safari/WebKit and headless benchmark clients.
-            # H.264 remains negotiated as a fallback for compatible deployments.
-            preferred = [codec for codec in capabilities.codecs if codec.mimeType.lower() == "video/vp8"]
-            fallback = [codec for codec in capabilities.codecs if codec.mimeType.lower() == "video/h264"]
-            if preferred or fallback:
-                transceiver.setCodecPreferences([*preferred, *fallback])
+            # Use exactly the codec selected at server startup. Keeping one
+            # codec avoids negotiation-dependent quality changes across clients.
+            preferred_mime = f"video/{settings.normalized_webrtc_video_codec}"
+            preferred = [codec for codec in capabilities.codecs if codec.mimeType.lower() == preferred_mime]
+            if preferred:
+                transceiver.setCodecPreferences(preferred)
         except Exception:
             logger.debug("failed to set WebRTC 3D codec preferences", exc_info=True)
 
@@ -204,6 +269,8 @@ class WebRtc3DTransportManager:
             raise
 
     def get_active_sids(self, view_id: str, candidate_sids: tuple[str, ...]) -> tuple[str, ...]:
+        if not is_webrtc_3d_enabled():
+            return ()
         active: list[str] = []
         for sid in candidate_sids:
             session = self._sessions.get(self._key(sid, view_id))

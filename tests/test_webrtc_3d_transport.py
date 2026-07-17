@@ -3,16 +3,31 @@ import json
 from types import SimpleNamespace
 
 from PIL import Image
+import pytest
 
+from app.core.config import get_settings
 from app.services.webrtc_3d_transport import (
     LatestFrameVideoTrack,
     WebRtc3DSession,
     WebRtc3DTransportManager,
+    _configure_codec_defaults,
     get_webrtc_3d_client_config,
 )
 
 
-def test_client_config_uses_configured_ice_servers(monkeypatch) -> None:
+@pytest.fixture
+def webrtc_enabled(monkeypatch):
+    monkeypatch.setenv("DICOMVISION_3D_TRANSPORT", "webrtc")
+    monkeypatch.setenv("DICOMVISION_WEBRTC_VIDEO_CODEC", "vp8")
+    monkeypatch.setenv("DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS", "4000000")
+    monkeypatch.setenv("DICOMVISION_WEBRTC_VIDEO_FPS", "60")
+    monkeypatch.setenv("DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES", "2")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def test_client_config_uses_startup_transport_and_ice_servers(monkeypatch, webrtc_enabled) -> None:
     monkeypatch.setenv(
         "DICOMVISION_WEBRTC_ICE_SERVERS",
         json.dumps(
@@ -30,6 +45,10 @@ def test_client_config_uses_configured_ice_servers(monkeypatch) -> None:
     config = get_webrtc_3d_client_config()
 
     assert config["ok"] is True
+    assert config["transport"] == "webrtc"
+    assert config["videoCodec"] == "vp8"
+    assert config["videoBitrateBps"] == 4_000_000
+    assert config["videoFps"] == 60
     assert config["iceServers"] == [
         {"urls": "stun:stun.example.test:3478"},
         {
@@ -40,9 +59,30 @@ def test_client_config_uses_configured_ice_servers(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("codec", "module_name"),
+    (("vp8", "vpx"), ("h264", "h264")),
+)
+def test_codec_defaults_apply_configured_bitrate_and_fps(
+    monkeypatch,
+    codec: str,
+    module_name: str,
+) -> None:
+    codec_module = pytest.importorskip(f"aiortc.codecs.{module_name}")
+    monkeypatch.setattr(codec_module, "DEFAULT_BITRATE", 500_000)
+    monkeypatch.setattr(codec_module, "MAX_BITRATE", 1_500_000)
+    monkeypatch.setattr(codec_module, "MAX_FRAME_RATE", 30)
+
+    _configure_codec_defaults(codec, bitrate_bps=4_000_000, fps=60)
+
+    assert codec_module.DEFAULT_BITRATE == 4_000_000
+    assert codec_module.MAX_BITRATE == 4_000_000
+    assert codec_module.MAX_FRAME_RATE == 60
+
+
 def test_latest_frame_track_drops_superseded_frames() -> None:
     async def run():
-        track = LatestFrameVideoTrack()
+        track = LatestFrameVideoTrack(fps=60, initial_burst_frames=2)
         track.publish(Image.new("RGB", (4, 4), "red"))
         track.publish(Image.new("RGB", (4, 4), "green"))
         frame = await track.recv()
@@ -54,30 +94,33 @@ def test_latest_frame_track_drops_superseded_frames() -> None:
     assert tuple(pixels[0, 0]) == (0, 128, 0)
 
 
-def test_latest_frame_track_emits_short_burst_then_waits() -> None:
-    async def run() -> tuple[int, bool]:
-        track = LatestFrameVideoTrack()
+def test_latest_frame_track_bursts_only_for_first_render() -> None:
+    async def run() -> tuple[int, int, bool]:
+        track = LatestFrameVideoTrack(fps=60, initial_burst_frames=2)
         track.publish(Image.new("RGB", (4, 4), "red"))
         await track.recv()
         await track.recv()
+        first_remaining = track._remaining_burst_frames
+        track.publish(Image.new("RGB", (4, 4), "green"))
         await track.recv()
-        remaining = track._remaining_burst_frames
+        next_remaining = track._remaining_burst_frames
         waiting = asyncio.create_task(track.recv())
         await asyncio.sleep(0)
         is_waiting = not waiting.done()
         waiting.cancel()
         track.stop()
-        return remaining, is_waiting
+        return first_remaining, next_remaining, is_waiting
 
-    remaining, is_waiting = asyncio.run(run())
+    first_remaining, next_remaining, is_waiting = asyncio.run(run())
 
-    assert remaining == 0
+    assert first_remaining == 0
+    assert next_remaining == 0
     assert is_waiting is True
 
 
-def test_transport_is_active_only_after_peer_is_connected() -> None:
+def test_transport_is_active_only_after_peer_is_connected(webrtc_enabled) -> None:
     manager = WebRtc3DTransportManager()
-    track = LatestFrameVideoTrack()
+    track = LatestFrameVideoTrack(fps=60, initial_burst_frames=2)
     peer = SimpleNamespace(connectionState="connecting")
     manager._sessions[("sid-1", "view-1")] = WebRtc3DSession(
         sid="sid-1",
@@ -92,3 +135,20 @@ def test_transport_is_active_only_after_peer_is_connected() -> None:
 
     assert manager.get_active_sids("view-1", ("sid-1",)) == ("sid-1",)
     track.stop()
+
+
+def test_webp_startup_mode_never_activates_webrtc_session(monkeypatch) -> None:
+    monkeypatch.setenv("DICOMVISION_3D_TRANSPORT", "webp")
+    get_settings.cache_clear()
+    manager = WebRtc3DTransportManager()
+    track = LatestFrameVideoTrack(fps=60, initial_burst_frames=2)
+    manager._sessions[("sid-1", "view-1")] = WebRtc3DSession(
+        sid="sid-1",
+        view_id="view-1",
+        peer=SimpleNamespace(connectionState="connected"),
+        track=track,
+    )
+
+    assert manager.get_active_sids("view-1", ("sid-1",)) == ()
+    track.stop()
+    get_settings.cache_clear()

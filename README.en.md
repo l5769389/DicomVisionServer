@@ -72,6 +72,8 @@ Common environment variables:
 
 - `APP_ENV`: runtime environment, usually `production` for deployments.
 - `APP_HOST` / `APP_PORT`: bind host and port.
+- `DICOMVISION_3D_TRANSPORT`: fixed 3D frame transport selected at server startup (`webp` or `webrtc`).
+- `DICOMVISION_WEBRTC_VIDEO_CODEC` / `DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS`: WebRTC codec and target bitrate.
 - `CORS_ORIGINS`: allowed frontend origins as a JSON array string, for example `["http://localhost:5173"]`.
 - `WEB_SAMPLE_DICOM_PATH`: server-side sample DICOM path for web demo mode.
 - `WEB_UPLOAD_DICOM_ROOT`: temporary storage root for browser-uploaded DICOM files.

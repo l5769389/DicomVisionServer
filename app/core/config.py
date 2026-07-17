@@ -20,6 +20,17 @@ class Settings(BaseSettings):
         default=1024 * 1024 * 1024,
         alias="VTK_SHARED_MEMORY_MAX_BYTES",
     )
+    three_d_transport: str = Field(default="webp", alias="DICOMVISION_3D_TRANSPORT")
+    webrtc_video_codec: str = Field(default="vp8", alias="DICOMVISION_WEBRTC_VIDEO_CODEC")
+    webrtc_video_bitrate_bps: int = Field(
+        default=4_000_000,
+        alias="DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS",
+    )
+    webrtc_video_fps: int = Field(default=60, alias="DICOMVISION_WEBRTC_VIDEO_FPS")
+    webrtc_initial_burst_frames: int = Field(
+        default=2,
+        alias="DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES",
+    )
     expose_api_docs: bool | None = Field(default=None, alias="EXPOSE_API_DOCS")
     web_sample_dicom_path: str | None = Field(default=None, alias="WEB_SAMPLE_DICOM_PATH")
     web_upload_dicom_root: str | None = Field(default=None, alias="WEB_UPLOAD_DICOM_ROOT")
@@ -42,6 +53,26 @@ class Settings(BaseSettings):
         if self.expose_api_docs is not None:
             return self.expose_api_docs
         return self.app_env.lower() not in {"prod", "production"}
+
+    @property
+    def normalized_three_d_transport(self) -> str:
+        return "webrtc" if self.three_d_transport.strip().lower() == "webrtc" else "webp"
+
+    @property
+    def normalized_webrtc_video_codec(self) -> str:
+        return "h264" if self.webrtc_video_codec.strip().lower() == "h264" else "vp8"
+
+    @property
+    def normalized_webrtc_video_bitrate_bps(self) -> int:
+        return max(500_000, min(int(self.webrtc_video_bitrate_bps), 20_000_000))
+
+    @property
+    def normalized_webrtc_video_fps(self) -> int:
+        return max(15, min(int(self.webrtc_video_fps), 60))
+
+    @property
+    def normalized_webrtc_initial_burst_frames(self) -> int:
+        return max(1, min(int(self.webrtc_initial_burst_frames), 3))
 
     model_config = SettingsConfigDict(
         env_file=".env",
