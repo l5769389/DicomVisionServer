@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 import fractions
 import json
@@ -123,7 +124,13 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
 
     kind = "video"
 
-    def __init__(self, *, fps: int | None = None, initial_burst_frames: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fps: int | None = None,
+        initial_burst_frames: int | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         super().__init__()
         settings = _transport_settings()
         self._fps = fps or settings.normalized_webrtc_video_fps
@@ -133,8 +140,10 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
         self._remaining_burst_frames = 0
         self._logged_first_frame = False
         self._has_published_frame = False
-        self._timestamp = 0
-        self._next_frame_at: float | None = None
+        self._timestamp_origin: float | None = None
+        self._last_frame_at: float | None = None
+        self._last_timestamp = -1
+        self._clock = clock or time.monotonic
 
     def publish(self, image: Image.Image) -> None:
         self._latest_frame = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
@@ -149,21 +158,32 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
     async def _next_low_latency_timestamp(self) -> tuple[int, fractions.Fraction]:
         time_base = fractions.Fraction(1, 90_000)
         frame_interval = 1.0 / self._fps
-        now = time.monotonic()
-        if self._next_frame_at is None or now - self._next_frame_at > frame_interval * 2:
-            self._next_frame_at = now
-        else:
-            wait = self._next_frame_at - now
+        now = self._clock()
+        if self._last_frame_at is not None:
+            wait = self._last_frame_at + frame_interval - now
             if wait > 0:
                 await asyncio.sleep(wait)
-        self._next_frame_at = max(self._next_frame_at + frame_interval, time.monotonic())
-        self._timestamp += round(90_000 / self._fps)
-        return self._timestamp, time_base
+                now = self._clock()
+
+        self._last_frame_at = now
+        if self._timestamp_origin is None:
+            self._timestamp_origin = now
+        # The renderer usually produces fewer frames than the configured
+        # encoder ceiling. Derive PTS from actual presentation time so the
+        # browser does not receive a 25-30 fps stream labelled as 60 fps and
+        # compensate by growing its jitter buffer.
+        elapsed_ticks = round((now - self._timestamp_origin) * 90_000)
+        self._last_timestamp = max(self._last_timestamp + 1, elapsed_ticks)
+        return self._last_timestamp, time_base
 
     async def recv(self):
         while self._latest_frame is None or self._remaining_burst_frames <= 0:
             self._frame_ready.clear()
             await self._frame_ready.wait()
+        pts, time_base = await self._next_low_latency_timestamp()
+        # A newer render may arrive while the track is pacing the encoder.
+        # Select pixels after that wait so the old camera pose is superseded
+        # before it ever enters the encoder or browser jitter buffer.
         pixels = self._latest_frame
         self._remaining_burst_frames -= 1
         if self._remaining_burst_frames <= 0:
@@ -171,7 +191,6 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
         if not self._logged_first_frame:
             logger.info("3d webrtc encoder consumed first frame shape=%s", pixels.shape)
             self._logged_first_frame = True
-        pts, time_base = await self._next_low_latency_timestamp()
         frame = VideoFrame.from_ndarray(pixels, format="rgb24")
         frame.pts = pts
         frame.time_base = time_base

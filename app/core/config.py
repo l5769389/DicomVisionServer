@@ -26,7 +26,7 @@ class Settings(BaseSettings):
         default=4_000_000,
         alias="DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS",
     )
-    webrtc_video_fps: int = Field(default=60, alias="DICOMVISION_WEBRTC_VIDEO_FPS")
+    webrtc_video_fps: int = Field(default=30, alias="DICOMVISION_WEBRTC_VIDEO_FPS")
     webrtc_initial_burst_frames: int = Field(
         default=2,
         alias="DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES",

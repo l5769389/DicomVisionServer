@@ -49,3 +49,7 @@ def test_3d_transport_settings_are_normalized_and_bounded() -> None:
     assert settings.normalized_webrtc_video_bitrate_bps == 20_000_000
     assert settings.normalized_webrtc_video_fps == 60
     assert settings.normalized_webrtc_initial_burst_frames == 3
+
+
+def test_webrtc_default_frame_rate_matches_interactive_render_cadence() -> None:
+    assert Settings().normalized_webrtc_video_fps == 30

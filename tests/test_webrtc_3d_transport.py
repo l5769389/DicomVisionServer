@@ -118,6 +118,48 @@ def test_latest_frame_track_bursts_only_for_first_render() -> None:
     assert is_waiting is True
 
 
+def test_latest_frame_track_timestamps_follow_actual_frame_arrival() -> None:
+    timestamps = iter((10.0, 10.04))
+
+    async def run() -> tuple[int, int]:
+        track = LatestFrameVideoTrack(
+            fps=60,
+            initial_burst_frames=1,
+            clock=lambda: next(timestamps),
+        )
+        track.publish(Image.new("RGB", (4, 4), "red"))
+        first = await track.recv()
+        track.publish(Image.new("RGB", (4, 4), "green"))
+        second = await track.recv()
+        track.stop()
+        return first.pts, second.pts
+
+    first_pts, second_pts = asyncio.run(run())
+
+    # Forty milliseconds on a 90 kHz RTP clock is 3600 ticks. The old fixed
+    # 60 fps clock incorrectly reported only 1500 ticks for the same interval.
+    assert second_pts - first_pts == 3600
+
+
+def test_latest_frame_track_replaces_pixels_while_encoder_is_pacing() -> None:
+    async def run():
+        track = LatestFrameVideoTrack(fps=30, initial_burst_frames=1)
+        track.publish(Image.new("RGB", (4, 4), "black"))
+        await track.recv()
+
+        track.publish(Image.new("RGB", (4, 4), "red"))
+        pending_frame = asyncio.create_task(track.recv())
+        await asyncio.sleep(0.005)
+        track.publish(Image.new("RGB", (4, 4), "green"))
+        frame = await pending_frame
+        track.stop()
+        return frame.to_ndarray(format="rgb24")
+
+    pixels = asyncio.run(run())
+
+    assert tuple(pixels[0, 0]) == (0, 128, 0)
+
+
 def test_transport_is_active_only_after_peer_is_connected(webrtc_enabled) -> None:
     manager = WebRtc3DTransportManager()
     track = LatestFrameVideoTrack(fps=60, initial_burst_frames=2)

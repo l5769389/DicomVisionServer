@@ -11,7 +11,7 @@ Copy `.env.example` to `.env` and select one transport:
 DICOMVISION_3D_TRANSPORT=webrtc
 DICOMVISION_WEBRTC_VIDEO_CODEC=vp8
 DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS=4000000
-DICOMVISION_WEBRTC_VIDEO_FPS=60
+DICOMVISION_WEBRTC_VIDEO_FPS=30
 DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES=2
 ```
 
@@ -23,6 +23,10 @@ The first rendered image is repeated briefly to initialize the decoder. Later
 renders emit one latest-state frame only, reducing post-interaction playout lag.
 The default VP8 bitrate is raised from aiortc's 500 kbps to 4 Mbps because medical
 volume rendering contains substantially more fine texture than a webcam stream.
+The default encoder ceiling is 30 fps, matching the measured VTK cadence so the
+rate controller spends more of that bitrate on each rendered frame. RTP timestamps
+still follow actual render arrival time rather than pretending frames are evenly
+spaced.
 
 For local/LAN testing, host ICE candidates are normally sufficient. Public cloud
 deployments should configure STUN and TURN using a JSON array:
