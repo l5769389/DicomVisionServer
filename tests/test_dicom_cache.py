@@ -3,7 +3,7 @@ import math
 import numpy as np
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.multival import MultiValue
-from pydicom.uid import ExplicitVRLittleEndian
+from pydicom.uid import ExplicitVRLittleEndian, RLELossless
 
 from app.services.dicom_cache import DicomCache
 
@@ -57,6 +57,30 @@ def _build_grayscale_dataset(pixels: np.ndarray, *, slope: float = 1.0, intercep
     return dataset
 
 
+def _build_multiframe_grayscale_dataset(
+    pixels: np.ndarray,
+    *,
+    slope: float = 1.0,
+    intercept: float = 0.0,
+) -> Dataset:
+    dataset = Dataset()
+    dataset.file_meta = FileMetaDataset()
+    dataset.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    dataset.Rows = pixels.shape[-2]
+    dataset.Columns = pixels.shape[-1]
+    dataset.NumberOfFrames = pixels.shape[0]
+    dataset.SamplesPerPixel = 1
+    dataset.PhotometricInterpretation = "MONOCHROME2"
+    dataset.BitsAllocated = 16
+    dataset.BitsStored = 16
+    dataset.HighBit = 15
+    dataset.PixelRepresentation = 1
+    dataset.RescaleSlope = slope
+    dataset.RescaleIntercept = intercept
+    dataset.PixelData = pixels.astype(np.int16).tobytes()
+    return dataset
+
+
 def test_extract_source_pixels_applies_ct_rescale_for_quantitative_hover_values() -> None:
     pixels = np.asarray([[0, 100], [250, 500]], dtype=np.int16)
 
@@ -68,6 +92,44 @@ def test_extract_source_pixels_applies_ct_rescale_for_quantitative_hover_values(
         source_pixels,
         np.asarray([[-1024.0, -824.0], [-524.0, -24.0]], dtype=np.float32),
     )
+
+
+def test_extract_source_pixels_decodes_rle_lossless_before_applying_ct_rescale() -> None:
+    pixels = np.asarray([[-100, 0, 100], [250, 500, 750]], dtype=np.int16)
+    dataset = _build_grayscale_dataset(pixels, slope=1.5, intercept=-1000.0)
+    dataset.compress(RLELossless)
+
+    source_pixels = DicomCache()._extract_source_pixels(dataset)
+
+    assert dataset.file_meta.TransferSyntaxUID == RLELossless
+    np.testing.assert_array_equal(source_pixels, pixels.astype(np.float32) * 1.5 - 1000.0)
+
+
+def test_extract_source_pixels_uses_first_multiframe_grayscale_frame_explicitly() -> None:
+    first_frame = np.asarray([[0, 100], [200, 300]], dtype=np.int16)
+    second_frame = np.asarray([[1000, 1100], [1200, 1300]], dtype=np.int16)
+    dataset = _build_multiframe_grayscale_dataset(
+        np.stack([first_frame, second_frame]),
+        slope=2.0,
+        intercept=-1024.0,
+    )
+
+    source_pixels = DicomCache()._extract_source_pixels(dataset)
+
+    assert source_pixels.shape == first_frame.shape
+    np.testing.assert_array_equal(source_pixels, first_frame.astype(np.float32) * 2.0 - 1024.0)
+
+
+def test_extract_source_pixels_normalizes_monochrome1_visual_polarity_after_rescale() -> None:
+    pixels = np.asarray([[0, 100], [200, 300]], dtype=np.int16)
+    dataset = _build_grayscale_dataset(pixels, slope=2.0, intercept=-1000.0)
+    dataset.PhotometricInterpretation = "MONOCHROME1"
+
+    source_pixels = DicomCache()._extract_source_pixels(dataset)
+
+    rescaled = pixels.astype(np.float32) * 2.0 - 1000.0
+    np.testing.assert_array_equal(source_pixels, -rescaled)
+    assert source_pixels[0, 0] > source_pixels[-1, -1]
 
 
 def test_extract_source_pixels_preserves_rgb_secondary_capture_pixels() -> None:

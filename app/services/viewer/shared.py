@@ -161,10 +161,12 @@ from app.services.mpr import (
     ijk_to_world_point,
     legacy_frame_to_cursor,
     orthonormalize_matrix,
+    plane_image_point_to_world,
     reslice_plane,
     spacing_along_world_direction,
     translate_cursor,
     world_to_ijk_point,
+    world_point_to_plane_image,
 )
 from app.services import mpr_geometry
 from app.services.dicom_gsps_export_service import build_gsps_dicom_bytes

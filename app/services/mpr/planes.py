@@ -46,6 +46,44 @@ class PlanePose:
     is_oblique: bool
 
 
+def plane_image_point_to_world(
+    plane: PlanePose,
+    point_xy: tuple[float, float] | np.ndarray,
+) -> np.ndarray:
+    """Map a full-resolution MPR image point into the displayed world frame."""
+
+    point = np.asarray(point_xy, dtype=np.float64)
+    height, width = plane.output_shape
+    col_offset_mm = (float(point[0]) - (float(width) - 1.0) / 2.0) * float(plane.pixel_spacing_col_mm)
+    row_offset_mm = (float(point[1]) - (float(height) - 1.0) / 2.0) * float(plane.pixel_spacing_row_mm)
+    return (
+        np.asarray(plane.center_world, dtype=np.float64)
+        + np.asarray(plane.col_world, dtype=np.float64) * col_offset_mm
+        + np.asarray(plane.row_world, dtype=np.float64) * row_offset_mm
+    )
+
+
+def world_point_to_plane_image(
+    plane: PlanePose,
+    point_world: tuple[float, float, float] | np.ndarray,
+) -> tuple[float, float]:
+    """Orthogonally project a world point onto a full-resolution MPR image."""
+
+    delta = np.asarray(point_world, dtype=np.float64) - np.asarray(plane.center_world, dtype=np.float64)
+    height, width = plane.output_shape
+    x = (
+        float(np.dot(delta, np.asarray(plane.col_world, dtype=np.float64)))
+        / max(abs(float(plane.pixel_spacing_col_mm)), 1e-6)
+        + (float(width) - 1.0) / 2.0
+    )
+    y = (
+        float(np.dot(delta, np.asarray(plane.row_world, dtype=np.float64)))
+        / max(abs(float(plane.pixel_spacing_row_mm)), 1e-6)
+        + (float(height) - 1.0) / 2.0
+    )
+    return (x, y)
+
+
 def _normalize_world_vector(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
     next_vector = np.asarray(vector, dtype=np.float64)
     norm = float(np.linalg.norm(next_vector))

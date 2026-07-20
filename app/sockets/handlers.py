@@ -101,6 +101,7 @@ class _MprCrosshairPreviewRequest:
     fast_preview_full_resolution: bool
     metadata_mode: str
     mpr_revision: int | None
+    interaction_id: str | None = None
     generation: int = 0
 
 
@@ -343,6 +344,7 @@ async def _emit_mpr_state_updates(
     view_ids: tuple[str, ...],
     *,
     mpr_revision: int | None = None,
+    interaction_id: str | None = None,
 ) -> None:
     if not view_ids:
         return
@@ -357,6 +359,8 @@ async def _emit_mpr_state_updates(
         state_payload = state_payload_map.get(state_view_id)
         if not state_payload:
             continue
+        if interaction_id is not None:
+            state_payload["interactionId"] = interaction_id
         for target_sid in view_socket_hub.get_view_sids(state_view_id):
             await server.emit("mpr_state_update", state_payload, to=target_sid)
 
@@ -403,6 +407,7 @@ async def _run_mpr_crosshair_preview_queue(queue_key: str, state: _MprCrosshairP
                     fast_preview_full_resolution=request.fast_preview_full_resolution,
                     metadata_mode=request.metadata_mode,
                     mpr_revision=request.mpr_revision,
+                    interaction_id=request.interaction_id,
                 )
                 state.last_dispatch_at = asyncio.get_running_loop().time()
             except Exception as exc:
@@ -447,7 +452,13 @@ async def _dispatch_operation_result(
         )
     is_mpr_view = view.view_type in MPR_VIEW_TYPES
     if result.mpr_state_view_ids:
-        await _emit_mpr_state_updates(server, sid, result.mpr_state_view_ids, mpr_revision=result.mpr_revision)
+        await _emit_mpr_state_updates(
+            server,
+            sid,
+            result.mpr_state_view_ids,
+            mpr_revision=result.mpr_revision,
+            interaction_id=payload.interaction_id,
+        )
     if result.broadcast_view_ids:
         broadcast_fast_preview = result.broadcast_fast_preview
         broadcast_fast_preview_full_resolution = result.broadcast_fast_preview_full_resolution
@@ -591,6 +602,7 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
             operation.sid,
             result.mpr_state_view_ids,
             mpr_revision=result.mpr_revision,
+            interaction_id=operation.payload.interaction_id,
         )
         if operation.payload.action_type == DRAG_ACTION_MOVE and result.broadcast_view_ids:
             _schedule_mpr_crosshair_preview(
@@ -604,6 +616,7 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
                     fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
                     metadata_mode=result.broadcast_metadata_mode,
                     mpr_revision=result.mpr_revision,
+                    interaction_id=operation.payload.interaction_id,
                 ),
             )
         if operation.payload.action_type == DRAG_ACTION_END:
@@ -618,6 +631,7 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
                     fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
                     metadata_mode=result.broadcast_metadata_mode,
                     mpr_revision=result.mpr_revision,
+                    interaction_id=operation.payload.interaction_id,
                 )
         logger.debug(
             "socket mpr_crosshair_state sid=%s view_id=%s action=%s",

@@ -22,6 +22,8 @@ from .planes import (
     OutputShapePolicy,
     PlanePose,
     derive_plane_pose,
+    plane_image_point_to_world,
+    world_point_to_plane_image,
 )
 from .reslice import (
     MipConfig,
@@ -45,9 +47,11 @@ __all__ = [
     "ijk_to_world_point",
     "legacy_frame_to_cursor",
     "orthonormalize_matrix",
+    "plane_image_point_to_world",
     "reslice_plane",
     "rotate_cursor",
     "spacing_along_world_direction",
     "translate_cursor",
     "world_to_ijk_point",
+    "world_point_to_plane_image",
 ]

@@ -46,5 +46,6 @@ class MeasurementRecord:
     slice_context: MeasurementSliceContext
     metrics: MeasurementMetrics
     label_anchor: MeasurementPoint
+    world_points: tuple[tuple[float, float, float], ...] = field(default_factory=tuple)
     label_lines: tuple[str, ...] = field(default_factory=tuple)
     scope: DrawingScope = "image"

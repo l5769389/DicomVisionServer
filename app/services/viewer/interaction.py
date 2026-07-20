@@ -426,6 +426,93 @@ class ViewerInteractionMixin:
             MeasurementSliceContext(kind="stack", slice_index=view.current_index, sop_instance_uid=instance.sop_instance_uid),
         )
 
+    def _resolve_mpr_measurement_plane_pose(self, view: ViewRecord) -> PlanePose:
+        series = compat.series_registry.get(view.series_id)
+        volume = self._get_series_volume(series)
+        target_viewport = self._resolve_mpr_viewport(view)
+        return self._build_mpr_pose_context(view, volume.shape, series=series).poses[target_viewport]
+
+    def _resolve_mpr_measurement_model_transform(
+        self,
+        view: ViewRecord,
+        *,
+        fallback_pivot_world: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        group = view.view_group
+        if group is None:
+            return np.eye(3, dtype=np.float64), np.asarray(fallback_pivot_world, dtype=np.float64)
+        return (
+            self._get_mpr_model_rotation_matrix(group),
+            self._get_mpr_model_rotation_pivot_world(group, fallback_pivot_world),
+        )
+
+    def _capture_mpr_measurement_world_points(
+        self,
+        view: ViewRecord,
+        image_points: tuple[MeasurementPoint, ...],
+    ) -> tuple[tuple[float, float, float], ...]:
+        if not self._is_mpr_view_type(view.view_type):
+            return ()
+
+        plane_pose = self._resolve_mpr_measurement_plane_pose(view)
+        rotation, pivot = self._resolve_mpr_measurement_model_transform(
+            view,
+            fallback_pivot_world=plane_pose.cursor_center_world,
+        )
+        inverse_rotation = rotation.T
+        world_points: list[tuple[float, float, float]] = []
+        for point in image_points:
+            displayed_world = plane_image_point_to_world(plane_pose, (point.x, point.y))
+            source_world = pivot + inverse_rotation @ (displayed_world - pivot)
+            world_points.append(tuple(float(value) for value in source_world))
+        return tuple(world_points)
+
+    def _project_mpr_measurement_to_current_plane(
+        self,
+        view: ViewRecord,
+        measurement: MeasurementRecord,
+    ) -> MeasurementRecord:
+        if not measurement.world_points:
+            return measurement
+
+        plane_pose = self._resolve_mpr_measurement_plane_pose(view)
+        rotation, pivot = self._resolve_mpr_measurement_model_transform(
+            view,
+            fallback_pivot_world=plane_pose.cursor_center_world,
+        )
+        projected_points: list[MeasurementPoint] = []
+        for source_world_value in measurement.world_points:
+            source_world = np.asarray(source_world_value, dtype=np.float64)
+            displayed_world = pivot + rotation @ (source_world - pivot)
+            x, y = world_point_to_plane_image(plane_pose, displayed_world)
+            projected_points.append(MeasurementPoint(x=x, y=y))
+
+        next_points = tuple(projected_points)
+        source_pixels, spacing_xy, current_context = self._resolve_measurement_source_context(view)
+        metrics, label_lines = build_measurement_metrics(
+            measurement.tool_type,
+            next_points,
+            source_pixels,
+            spacing_xy,
+        )
+        next_context = (
+            MeasurementSliceContext(
+                kind=measurement.slice_context.kind,
+                slice_index=current_context.slice_index,
+                sop_instance_uid=measurement.slice_context.sop_instance_uid,
+            )
+            if measurement.scope == "series"
+            else measurement.slice_context
+        )
+        return replace(
+            measurement,
+            points=next_points,
+            slice_context=next_context,
+            metrics=metrics,
+            label_anchor=next_points[1],
+            label_lines=label_lines,
+        )
+
     @staticmethod
     def _resolve_measurement_tool_type(payload: ViewOperationRequest) -> str | None:
         tool_type = str(payload.sub_op_type or "").strip().lower()
@@ -543,6 +630,7 @@ class ViewerInteractionMixin:
         source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
         slice_context = self._with_operation_slice_index(slice_context, payload.slice_index)
         metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
+        world_points = self._capture_mpr_measurement_world_points(view, image_points)
 
         label_anchor = image_points[1] if tool_type != "angle" else image_points[1]
         measurement_id = str(payload.measurement_id or "").strip() or str(uuid4())
@@ -553,6 +641,7 @@ class ViewerInteractionMixin:
             slice_context=slice_context,
             metrics=metrics,
             label_anchor=label_anchor,
+            world_points=world_points,
             label_lines=label_lines,
             scope=self._normalize_drawing_scope(payload.scope),
         )
@@ -720,7 +809,12 @@ class ViewerInteractionMixin:
             if self._is_mpr_view_type(view.view_type) and (
                 measurement.scope == "series" or measurement.slice_context.slice_index == current_slice
             ):
-                visible.append(self._with_current_series_measurement_metrics(view, measurement))
+                try:
+                    projected = self._project_mpr_measurement_to_current_plane(view, measurement)
+                except Exception:
+                    logger.debug("Failed to reproject MPR measurement", exc_info=True)
+                    projected = measurement
+                visible.append(self._with_current_series_measurement_metrics(view, projected))
         return tuple(visible)
 
     def _with_current_series_measurement_metrics(

@@ -6,6 +6,7 @@ import pytest
 from PIL import Image
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
+from app.models.measurement import MeasurementMetrics, MeasurementPoint, MeasurementRecord, MeasurementSliceContext
 from app.models.viewer import InstanceRecord, MprFrameState, SeriesRecord, ViewGroupRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, RenderContext
@@ -21,6 +22,7 @@ from app.services.mpr import (
     ijk_to_world_point,
     legacy_frame_to_cursor,
     reslice_plane,
+    world_point_to_plane_image,
     world_to_ijk_point,
 )
 from app.services.mpr_geometry import VolumePatientTransform
@@ -649,6 +651,127 @@ def test_mpr_model_rotation_changes_reslice_without_rotating_cursor() -> None:
 
     assert not np.allclose(rotated_plane, base_plane, atol=1e-6)
     assert np.allclose(resolved_cursor.orientation_world, cursor.orientation_world, atol=1e-6)
+
+
+def test_mpr_measurement_world_points_reproject_with_rotated_model(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.zeros((5, 6, 7), dtype=np.float32)
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    plane = service._build_mpr_pose_context(view, volume.shape, series=series).poses[MPR_VIEWPORT_AXIAL]
+    center_x, center_y = world_point_to_plane_image(plane, plane.cursor_center_world)
+    image_points = (
+        MeasurementPoint(x=center_x, y=center_y),
+        MeasurementPoint(x=center_x + 1.0, y=center_y),
+    )
+    world_points = service._capture_mpr_measurement_world_points(view, image_points)
+
+    measurement = MeasurementRecord(
+        measurement_id="mpr-line",
+        tool_type="line",
+        points=image_points,
+        slice_context=MeasurementSliceContext(kind="mpr", slice_index=0),
+        metrics=MeasurementMetrics(unit="mm", area_unit="mm2", length=1.0),
+        label_anchor=image_points[1],
+        world_points=world_points,
+    )
+    service._set_mpr_model_rotation_matrix(
+        group,
+        axis_angle_rotation_matrix(np.asarray(plane.normal_world), np.pi / 2.0),
+        pivot_world=plane.cursor_center_world,
+    )
+
+    projected = service._project_mpr_measurement_to_current_plane(view, measurement)
+
+    assert projected.points[0].x == pytest.approx(center_x)
+    assert projected.points[0].y == pytest.approx(center_y)
+    assert projected.points[1].x == pytest.approx(center_x)
+    assert projected.points[1].y == pytest.approx(center_y - 1.0)
+    assert projected.metrics.length == pytest.approx(1.0)
+
+
+def test_mpr_measurement_world_points_reproject_onto_new_oblique_plane(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.zeros((5, 6, 7), dtype=np.float32)
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    plane = service._build_mpr_pose_context(view, volume.shape, series=series).poses[MPR_VIEWPORT_AXIAL]
+    center_x, center_y = world_point_to_plane_image(plane, plane.cursor_center_world)
+    image_points = (
+        MeasurementPoint(x=center_x, y=center_y),
+        MeasurementPoint(x=center_x + 1.0, y=center_y),
+    )
+    measurement = MeasurementRecord(
+        measurement_id="mpr-oblique-line",
+        tool_type="line",
+        points=image_points,
+        slice_context=MeasurementSliceContext(kind="mpr", slice_index=0),
+        metrics=MeasurementMetrics(unit="mm", area_unit="mm2", length=1.0),
+        label_anchor=image_points[1],
+        world_points=service._capture_mpr_measurement_world_points(view, image_points),
+    )
+    oblique_normal = np.asarray([1.0, 0.0, 1.0], dtype=np.float64)
+    oblique_normal /= np.linalg.norm(oblique_normal)
+    group.mpr_crosshair_mode = "double-oblique"
+    group.mpr_independent_plane_normals[MPR_VIEWPORT_AXIAL] = tuple(oblique_normal)
+
+    projected = service._project_mpr_measurement_to_current_plane(view, measurement)
+
+    assert projected.metrics.length == pytest.approx(np.sqrt(0.5), abs=1e-6)
+    assert projected.points != measurement.points
+
+
+def test_mpr_measurement_returns_to_original_position_after_360_incremental_rotations(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    volume = np.zeros((7, 9, 11), dtype=np.float32)
+    monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+    monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)
+
+    group = ViewGroupRecord(group_id="g", group_type="MPR", series_id="s")
+    view = ViewRecord(view_id="v", series_id="s", view_type="MPR", view_group=group)
+    service._reset_mpr_group_geometry(group, volume.shape, series=series)
+    plane = service._build_mpr_pose_context(view, volume.shape, series=series).poses[MPR_VIEWPORT_AXIAL]
+    center_x, center_y = world_point_to_plane_image(plane, plane.cursor_center_world)
+    image_points = (
+        MeasurementPoint(x=center_x - 2.0, y=center_y - 1.0),
+        MeasurementPoint(x=center_x + 3.0, y=center_y + 2.0),
+    )
+    measurement = MeasurementRecord(
+        measurement_id="incremental-rotation-line",
+        tool_type="line",
+        points=image_points,
+        slice_context=MeasurementSliceContext(kind="mpr", slice_index=0),
+        metrics=MeasurementMetrics(unit="mm", area_unit="mm2", length=np.hypot(5.0, 3.0)),
+        label_anchor=image_points[1],
+        world_points=service._capture_mpr_measurement_world_points(view, image_points),
+    )
+
+    for _ in range(360):
+        service._apply_mpr_model_rotation_delta(
+            group,
+            plane,
+            screen_angle_delta_rad=np.deg2rad(1.0),
+        )
+
+    projected = service._project_mpr_measurement_to_current_plane(view, measurement)
+
+    np.testing.assert_allclose(service._get_mpr_model_rotation_matrix(group), np.eye(3), atol=1e-10)
+    assert projected.points[0].x == pytest.approx(image_points[0].x, abs=1e-9)
+    assert projected.points[0].y == pytest.approx(image_points[0].y, abs=1e-9)
+    assert projected.points[1].x == pytest.approx(image_points[1].x, abs=1e-9)
+    assert projected.points[1].y == pytest.approx(image_points[1].y, abs=1e-9)
+    assert projected.metrics.length == pytest.approx(np.hypot(5.0, 3.0), abs=1e-9)
 
 
 def test_mpr_model_rotation_uses_fixed_pivot_when_crosshair_center_moves() -> None:

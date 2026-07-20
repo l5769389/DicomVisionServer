@@ -970,10 +970,10 @@ def test_mpr_crosshair_state_queue_keeps_latest_move(monkeypatch) -> None:
 
 
 def test_mpr_crosshair_preview_generation_skips_replaced_request(monkeypatch) -> None:
-    async def run() -> list[tuple[tuple[str, ...], int | None]]:
+    async def run() -> list[tuple[tuple[str, ...], int | None, str | None]]:
         handlers._mpr_crosshair_preview_states.clear()
         server = _SocketServerStub()
-        scheduled_batches: list[tuple[tuple[str, ...], int | None]] = []
+        scheduled_batches: list[tuple[tuple[str, ...], int | None, str | None]] = []
         queue_key = "mpr-op:workspace-a:g"
         loop = asyncio.get_running_loop()
         handlers._mpr_crosshair_preview_states[queue_key] = handlers._MprCrosshairPreviewState(
@@ -992,7 +992,7 @@ def test_mpr_crosshair_preview_generation_skips_replaced_request(monkeypatch) ->
             interaction_id: str | None = None,
         ) -> bool:
             del image_format, fast_preview, fast_preview_full_resolution, metadata_mode, target_sids
-            scheduled_batches.append((view_ids, mpr_revision))
+            scheduled_batches.append((view_ids, mpr_revision, interaction_id))
             return False
 
         monkeypatch.setattr(handlers, "MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS", 0.02)
@@ -1009,6 +1009,7 @@ def test_mpr_crosshair_preview_generation_skips_replaced_request(monkeypatch) ->
                 fast_preview_full_resolution=False,
                 metadata_mode="mpr-crosshair-preview",
                 mpr_revision=1,
+                interaction_id="interaction-old",
             ),
         )
         await asyncio.sleep(0)
@@ -1023,12 +1024,13 @@ def test_mpr_crosshair_preview_generation_skips_replaced_request(monkeypatch) ->
                 fast_preview_full_resolution=False,
                 metadata_mode="mpr-crosshair-preview",
                 mpr_revision=2,
+                interaction_id="interaction-new",
             ),
         )
         await _wait_for(lambda: len(scheduled_batches) == 1)
         return scheduled_batches
 
-    assert asyncio.run(run()) == [(("v-new",), 2)]
+    assert asyncio.run(run()) == [(("v-new",), 2, "interaction-new")]
 
 
 def test_handle_operation_routes_mpr_deferred_preview_through_batch_scheduler(monkeypatch) -> None:

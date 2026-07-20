@@ -15,6 +15,46 @@ class _SocketServerStub:
         self.events.append((event, payload, to))
 
 
+def test_duplicate_view_bind_is_idempotent() -> None:
+    hub = ViewSocketHub()
+
+    hub.bind_view("sid-1", "view-1")
+    hub.bind_view("sid-1", "view-1")
+
+    assert hub.get_view_sids("view-1") == ("sid-1",)
+    assert hub._sid_views["sid-1"] == {"view-1"}
+
+
+def test_disconnect_then_reconnect_moves_view_subscription_to_new_sid() -> None:
+    hub = ViewSocketHub()
+    hub.bind_sid_workspace("sid-before-reconnect", "workspace-a")
+    hub.bind_view("sid-before-reconnect", "view-1")
+
+    hub.unbind_sid("sid-before-reconnect")
+
+    assert hub.get_view_sids("view-1") == ()
+    assert hub.get_sid_workspace("sid-before-reconnect") != "workspace-a"
+
+    hub.bind_sid_workspace("sid-after-reconnect", "workspace-a")
+    hub.bind_view("sid-after-reconnect", "view-1")
+    hub.bind_view("sid-after-reconnect", "view-1")
+
+    assert hub.get_view_sids("view-1") == ("sid-after-reconnect",)
+    assert hub.get_sid_workspace("sid-after-reconnect") == "workspace-a"
+
+
+def test_closed_view_cannot_be_rebound_by_late_reconnect() -> None:
+    hub = ViewSocketHub()
+    hub.bind_view("sid-before-close", "view-1")
+
+    hub.close_view("view-1")
+    hub.bind_view("sid-after-reconnect", "view-1")
+
+    assert hub.is_view_closed("view-1") is True
+    assert hub.get_view_sids("view-1") == ()
+    assert "sid-after-reconnect" not in hub._sid_views
+
+
 def test_merge_render_request_keeps_full_quality_when_preview_arrives_later() -> None:
     merged = ViewSocketHub._merge_render_request(
         RenderRequest(image_format="png", fast_preview=False, target_sids=("sid-1",)),

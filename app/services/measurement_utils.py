@@ -44,7 +44,7 @@ def build_measurement_metrics(
     if tool_type == "ellipse":
         return _build_ellipse_metrics(points[:2], source_pixels, spacing_xy)
     if tool_type == "angle":
-        return _build_angle_metrics(points[:3])
+        return _build_angle_metrics(points[:3], spacing_xy)
     if tool_type == "curve":
         return _build_curve_metrics(points, spacing_xy)
     if tool_type == "freeform":
@@ -219,10 +219,17 @@ def _build_ellipse_metrics(
     )
 
 
-def _build_angle_metrics(points: tuple[MeasurementPoint, ...]) -> tuple[MeasurementMetrics, tuple[str, ...]]:
+def _build_angle_metrics(
+    points: tuple[MeasurementPoint, ...],
+    spacing_xy: tuple[float, float] | None,
+) -> tuple[MeasurementMetrics, tuple[str, ...]]:
     start, vertex, end = points
     vector_a = np.asarray([start.x - vertex.x, start.y - vertex.y], dtype=np.float64)
     vector_b = np.asarray([end.x - vertex.x, end.y - vertex.y], dtype=np.float64)
+    if spacing_xy is not None:
+        physical_scale = np.asarray([spacing_xy[0], spacing_xy[1]], dtype=np.float64)
+        vector_a *= physical_scale
+        vector_b *= physical_scale
     length_a = float(np.linalg.norm(vector_a))
     length_b = float(np.linalg.norm(vector_b))
     if length_a <= 1e-6 or length_b <= 1e-6:
