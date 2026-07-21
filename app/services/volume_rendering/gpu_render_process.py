@@ -242,6 +242,10 @@ def _open_shared_volume(descriptor: dict[str, object]) -> tuple[SharedMemory, np
     return shared, volume
 
 
+def _is_surface_command(command: str) -> bool:
+    return command in {"render_surface", "surface_trackball"}
+
+
 def _gpu_render_worker_main(connection: Connection) -> None:
     try:
         from app.core.logging import setup_logging
@@ -276,7 +280,7 @@ def _gpu_render_worker_main(connection: Connection) -> None:
             shared, volume = _open_shared_volume(dict(message["volume"]))
             try:
                 request_payload = dict(message["request"])
-                if command.startswith("surface"):
+                if _is_surface_command(command):
                     request_payload["progress_callback"] = lambda payload: connection.send({
                         "kind": "progress",
                         "payload": payload,

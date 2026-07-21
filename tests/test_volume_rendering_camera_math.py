@@ -497,6 +497,7 @@ def test_volume_renderer_reuses_transfer_and_sampling_configuration(monkeypatch)
     calls: list[str] = []
     session = SimpleNamespace(
         canvas_size=(request.canvas_width, request.canvas_height),
+        render_window=SimpleNamespace(SetSize=lambda *_args: None),
         transfer_function_token=None,
         sampling_token=None,
         render_quality_token=None,

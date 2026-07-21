@@ -15,6 +15,7 @@ class ViewerStateMixin:
         fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
+        raw_3d_output: bool = False,
     ) -> RenderedImageResult:
         return render_by_view_type(
             self,
@@ -24,6 +25,7 @@ class ViewerStateMixin:
             fast_preview_full_resolution=fast_preview_full_resolution,
             metadata_mode=metadata_mode,
             progress_callback=progress_callback,
+            raw_3d_output=raw_3d_output,
         )
 
     def _emit_render_progress(

@@ -4,15 +4,13 @@
 
 DicomVision Server is the FastAPI + Socket.IO backend for DicomVision. It provides DICOM discovery, PACS query and retrieval, 2D/MPR/4D/3D rendering, PET/CT fusion, segmentation, measurement, QA, export, and the backend bundle consumed by the desktop app.
 
-## v3.1.0 Backend Updates
+## Architecture
 
-- **3D rendering consistency**: VR/Surface preview and final frames reuse the same view state to reduce brightness, scale, and pose jumps after rotation.
-- **3D rotation and camera**: supports direct model dragging, interactionId stale-frame suppression, mobile viewport fitting, and automatic initial framing from volume bounds.
-- **Adaptive 3D presets**: AAA, CT, CTA, MR, and CBCT presets use CT HU anchors plus foreground percentiles; non-HU data falls back to percentile-based presets.
-- **Surface parameters**: Surface rendering keeps independent isoValue, smoothing, decimation, color, and material settings with modality/intensity-aware defaults.
-- **Remove-bed and clipping**: adds render-time bed masking, freeform view-space clipping, clip/removeBed cache tokens, preprocessing progress, and timing logs.
-- **Web demo data**: local macOS development prefers `/Users/jun/Documents/test_dicom/py_test_path/py_test_path2`; deployments continue to use bundled sample data.
-- **Desktop bundle**: Windows/macOS Server bundles can be embedded in the Electron desktop installer.
+The server is the authoritative execution layer for DICOM discovery, rendering, view state, export, and compute-intensive analysis. It exposes a stable REST + Socket.IO interface to the desktop, web, and mobile clients and can run either as a standalone service or inside a desktop bundle.
+
+- **Rendering**: VTK-backed 2D/MPR/4D/3D rendering, a dedicated GPU-process option, WebRTC interactive 3D transport, and lossless settled WebP frames.
+- **Import safety**: DICOM files, directories, ZIP, 7z, and RAR archives are accepted. Archive members are constrained by safe paths, entry counts, unpacked size, and compression ratio before they are scanned.
+- **Deployment**: FastAPI + Socket.IO service for local, LAN, cloud, Docker, and embedded desktop-backend deployments.
 
 ## Repositories
 
@@ -21,7 +19,7 @@ DicomVision Server is the FastAPI + Socket.IO backend for DicomVision. It provid
 
 ## Capabilities
 
-- Load DICOM folders, single files, browser uploads, and sample data.
+- Load DICOM folders, single files, browser uploads, ZIP/7z/RAR archives, and sample data.
 - Serve thumbnails, corner info, DICOM tags, series, instances, 4D phase data, and view metadata.
 - PACS DICOMweb QIDO/WADO and DIMSE C-ECHO/C-FIND/C-GET.
 - 2D, Compare, Layout, MPR, oblique MPR, MIP, 3D VR, 3D Surface, 4D phase, and PET/CT Fusion rendering.
@@ -72,11 +70,16 @@ Common environment variables:
 
 - `APP_ENV`: runtime environment, usually `production` for deployments.
 - `APP_HOST` / `APP_PORT`: bind host and port.
+- `DICOMVISION_3D_TRANSPORT`: fixed 3D frame transport selected at server startup (`webp` or `webrtc`).
+- `DICOMVISION_WEBRTC_VIDEO_CODEC` / `DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS`: WebRTC codec and target bitrate.
 - `CORS_ORIGINS`: allowed frontend origins as a JSON array string, for example `["http://localhost:5173"]`.
 - `WEB_SAMPLE_DICOM_PATH`: server-side sample DICOM path for web demo mode.
 - `WEB_UPLOAD_DICOM_ROOT`: temporary storage root for browser-uploaded DICOM files.
+- `WEB_UPLOAD_MAX_ARCHIVE_ENTRIES` / `WEB_UPLOAD_MAX_ARCHIVE_UNCOMPRESSED_BYTES` / `WEB_UPLOAD_MAX_ARCHIVE_COMPRESSION_RATIO`: archive-import safety limits.
 - `DICOMVISION_PACS_CACHE_ROOT`: PACS download cache directory.
 - `DICOMVISION_PACS_CACHE_TTL_SECONDS`: PACS cache retention time.
+
+In WebRTC mode, continuous 3D previews use the low-latency video track and each settled operation is replaced by a lossless WebP final still.
 
 ## Common API
 

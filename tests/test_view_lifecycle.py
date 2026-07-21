@@ -83,6 +83,81 @@ def _register_stack_view(series_id: str, view_id: str = "view-1") -> ViewRecord:
     return view
 
 
+def _register_3d_view(series_id: str, view_id: str = "view-3d") -> ViewRecord:
+    view = ViewRecord(view_id=view_id, series_id=series_id, view_type="3D", width=720, height=720)
+    view_registry._view_by_id[view.view_id] = view
+    return view
+
+
+@pytest.mark.parametrize(
+    ("op_type", "start_x", "start_y", "move_x", "move_y"),
+    (
+        ("pan", 0.0, 0.0, 48.0, -24.0),
+        ("zoom", 0.0, 0.0, 0.0, -80.0),
+    ),
+)
+def test_3d_pan_and_zoom_moves_use_preview_then_end_uses_final(
+    op_type: str,
+    start_x: float,
+    start_y: float,
+    move_x: float,
+    move_y: float,
+) -> None:
+    series_id = _register_series()
+    view = _register_3d_view(series_id)
+    interaction_id = f"{op_type}-interaction"
+
+    viewer_service.handle_view_operation(
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType=op_type,
+            actionType="start",
+            x=start_x,
+            y=start_y,
+            canvasX=360,
+            canvasY=360,
+            canvasWidth=720,
+            canvasHeight=720,
+            interactionId=interaction_id,
+        )
+    )
+    move_outcome = viewer_service.handle_view_operation(
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType=op_type,
+            actionType="move",
+            x=move_x,
+            y=move_y,
+            canvasX=360 + move_x,
+            canvasY=360 + move_y,
+            canvasWidth=720,
+            canvasHeight=720,
+            interactionId=interaction_id,
+        )
+    )
+    end_outcome = viewer_service.handle_view_operation(
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType=op_type,
+            actionType="end",
+            x=move_x,
+            y=move_y,
+            canvasX=360 + move_x,
+            canvasY=360 + move_y,
+            canvasWidth=720,
+            canvasHeight=720,
+            interactionId=interaction_id,
+        )
+    )
+
+    assert move_outcome.deferred_view_ids == (view.view_id,)
+    assert move_outcome.deferred_image_format == "webp"
+    assert move_outcome.deferred_fast_preview is True
+    assert end_outcome.deferred_view_ids == (view.view_id,)
+    assert end_outcome.deferred_image_format == "webp"
+    assert end_outcome.deferred_fast_preview is False
+
+
 def _create_view(client: TestClient, series_id: str, view_type: str, view_group_key: str | None = None) -> str:
     payload = {"seriesId": series_id, "viewType": view_type}
     if view_group_key:

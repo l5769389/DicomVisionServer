@@ -48,6 +48,17 @@ async def application_lifespan(_app: FastAPI):
             diagnostics.get("error"),
         )
         logger.debug("VTK OpenGL capabilities:\n%s", diagnostics.get("capabilities", ""))
+        logger.info(
+            (
+                "3D transport configuration transport=%s codec=%s bitrate_bps=%s fps=%s "
+                "initial_burst_frames=%s"
+            ),
+            settings.normalized_three_d_transport,
+            settings.normalized_webrtc_video_codec,
+            settings.normalized_webrtc_video_bitrate_bps,
+            settings.normalized_webrtc_video_fps,
+            settings.normalized_webrtc_initial_burst_frames,
+        )
     except Exception:
         logger.exception("failed to initialize VTK render diagnostics")
     try:
@@ -58,7 +69,7 @@ async def application_lifespan(_app: FastAPI):
 
 fastapi_app = FastAPI(
     title=settings.app_name,
-    version="3.1.2",
+    version="3.1.3",
     docs_url="/docs" if settings.api_docs_enabled else None,
     redoc_url="/redoc" if settings.api_docs_enabled else None,
     openapi_url="/openapi.json" if settings.api_docs_enabled else None,

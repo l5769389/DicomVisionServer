@@ -3,7 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from app.services.volume_rendering.contracts import VolumeRenderRequest
-from app.services.volume_rendering.gpu_render_process import _SharedVolumeStore, GpuRenderProcessClient
+from app.services.volume_rendering.gpu_render_process import (
+    _SharedVolumeStore,
+    GpuRenderProcessClient,
+    _is_surface_command,
+)
 
 
 def _request(volume: np.ndarray) -> VolumeRenderRequest:
@@ -64,3 +68,10 @@ def test_process_request_serialization_excludes_volume() -> None:
     assert "volume" not in payload
     assert payload["view_id"] == "view-1"
     assert payload["volume_token"] == "series-token"
+
+
+def test_gpu_worker_routes_render_surface_to_surface_request() -> None:
+    assert _is_surface_command("render_surface") is True
+    assert _is_surface_command("surface_trackball") is True
+    assert _is_surface_command("render_volume") is False
+    assert _is_surface_command("volume_trackball") is False

@@ -2,6 +2,8 @@ import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
 from time import perf_counter
+from PIL import Image
+import pytest
 
 from app.sockets import runtime as socket_runtime
 from app.sockets.runtime import RenderRequest, ViewSocketHub
@@ -190,6 +192,186 @@ def test_fast_preview_render_skips_progress_messages(monkeypatch) -> None:
             "sid-1",
         ),
     ]
+
+
+def test_3d_webrtc_preview_skips_webp_encoding_and_emits_metadata(monkeypatch) -> None:
+    class _Meta:
+        def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+            del by_alias
+            return {"viewId": "view-3d", "imageFormat": "webp", "render3dMode": "volume"}
+
+    def fake_render_view_by_id(*args, **kwargs):
+        assert kwargs["raw_3d_output"] is True
+        return SimpleNamespace(
+            meta=_Meta(),
+            image_bytes=b"",
+            raw_image=Image.new("RGB", (8, 8), "red"),
+            performance_timings={},
+        )
+
+    async def run() -> list[tuple[str, dict[str, object], str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-3d")
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "get_active_sids",
+            lambda _view_id, sids: sids,
+        )
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "publish",
+            lambda _sid, _view_id, _image: 0.2,
+        )
+
+        emitted = await hub._emit_render_message(
+            "view-3d",
+            RenderRequest(image_format="webp", fast_preview=True, target_sids=("sid-1",)),
+        )
+        assert emitted is True
+        return server.events
+
+    events = asyncio.run(run())
+    assert not any(event == "image_update" for event, _payload, _sid in events)
+    metadata_events = [entry for entry in events if entry[0] == "image_update_metadata"]
+    assert metadata_events == [
+        (
+            "image_update_metadata",
+            {
+                "viewId": "view-3d",
+                "imageFormat": "webp",
+                "render3dMode": "volume",
+                "fastPreview": True,
+                "fastPreviewFullResolution": False,
+                "metadataMode": "full",
+                "renderIntent": "geometry-preview",
+                "imageTransport": "webrtc",
+            },
+            "sid-1",
+        )
+    ]
+
+
+def test_3d_webrtc_final_uses_lossless_webp_still_instead_of_video(monkeypatch) -> None:
+    class _Meta:
+        def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+            del by_alias
+            return {"viewId": "view-3d", "imageFormat": "webp", "render3dMode": "volume"}
+
+    def fake_render_view_by_id(*args, **kwargs):
+        assert kwargs["raw_3d_output"] is False
+        return SimpleNamespace(
+            meta=_Meta(),
+            image_bytes=b"lossless-webp-final",
+            raw_image=Image.new("RGB", (8, 8), "red"),
+            performance_timings={},
+        )
+
+    published: list[tuple[str, str]] = []
+    keyframe_requests: list[tuple[str, str, int]] = []
+
+    async def run() -> list[tuple[str, object, str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        hub.bind_view("sid-1", "view-3d")
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "get_active_sids",
+            lambda _view_id, sids: sids,
+        )
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "publish",
+            lambda sid, view_id, _image: published.append((sid, view_id)),
+        )
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "request_keyframe",
+            lambda sid, view_id, *, burst_frames=2: keyframe_requests.append(
+                (sid, view_id, burst_frames)
+            ),
+        )
+
+        emitted = await hub._emit_render_message(
+            "view-3d",
+            RenderRequest(image_format="webp", fast_preview=False, target_sids=("sid-1",)),
+        )
+        assert emitted is True
+        return server.events
+
+    events = asyncio.run(run())
+    assert published == []
+    assert keyframe_requests == [("sid-1", "view-3d", 2)]
+    assert not any(event == "image_update_metadata" for event, _payload, _sid in events)
+    image_events = [entry for entry in events if entry[0] == "image_update"]
+    assert image_events == [
+        (
+            "image_update",
+            (
+                {
+                    "viewId": "view-3d",
+                    "imageFormat": "webp",
+                    "render3dMode": "volume",
+                    "fastPreview": False,
+                    "fastPreviewFullResolution": False,
+                    "metadataMode": "full",
+                    "renderIntent": "full",
+                    "imageTransport": "webp-final",
+                },
+                b"lossless-webp-final",
+            ),
+            "sid-1",
+        )
+    ]
+
+
+def test_3d_mixed_transports_render_once_and_emit_each_transport(monkeypatch) -> None:
+    class _Meta:
+        def model_dump(self, *, by_alias: bool = False) -> dict[str, object]:
+            del by_alias
+            return {"viewId": "view-3d", "imageFormat": "webp", "render3dMode": "volume"}
+
+    def fake_render_view_by_id(*args, **kwargs):
+        assert kwargs["raw_3d_output"] is False
+        return SimpleNamespace(
+            meta=_Meta(),
+            image_bytes=b"webp-frame",
+            raw_image=Image.new("RGB", (8, 8), "red"),
+            performance_timings={},
+        )
+
+    async def run() -> list[tuple[str, object, str | None]]:
+        hub = ViewSocketHub()
+        server = _SocketServerStub()
+        hub.attach_server(server)  # type: ignore[arg-type]
+        monkeypatch.setattr(socket_runtime.viewer_service, "render_view_by_id", fake_render_view_by_id)
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "get_active_sids",
+            lambda _view_id, _sids: ("sid-webrtc",),
+        )
+        monkeypatch.setattr(
+            socket_runtime.webrtc_3d_transport_manager,
+            "publish",
+            lambda _sid, _view_id, _image: 0.1,
+        )
+
+        emitted = await hub._emit_render_message(
+            "view-3d",
+            RenderRequest(image_format="webp", fast_preview=True, target_sids=("sid-webp", "sid-webrtc")),
+        )
+        assert emitted is True
+        return server.events
+
+    events = asyncio.run(run())
+
+    assert any(event == "image_update" and sid == "sid-webp" for event, _payload, sid in events)
+    assert not any(event == "image_update" and sid == "sid-webrtc" for event, _payload, sid in events)
+    assert any(event == "image_update_metadata" and sid == "sid-webrtc" for event, _payload, sid in events)
 
 
 def test_preview_metadata_modes_drop_heavy_fields() -> None:
@@ -415,6 +597,35 @@ def test_delayed_final_render_runs_when_no_new_interaction(monkeypatch) -> None:
         return calls
 
     assert asyncio.run(run()) == [("view-1", "png", "drag-1")]
+
+
+def test_adaptive_final_delay_completes_target_spacing_after_recent_preview(monkeypatch) -> None:
+    hub = ViewSocketHub()
+    monkeypatch.setattr(socket_runtime, "perf_counter", lambda: 10.02)
+    hub._last_preview_emitted_at["view-1"] = 10.0
+
+    assert hub.adaptive_final_render_delay(
+        "view-1",
+        target_preview_spacing_seconds=0.05,
+        minimum_delay_seconds=0.01,
+    ) == pytest.approx(0.03)
+
+
+def test_adaptive_final_delay_uses_minimum_when_preview_is_old_or_missing(monkeypatch) -> None:
+    hub = ViewSocketHub()
+    monkeypatch.setattr(socket_runtime, "perf_counter", lambda: 10.2)
+    hub._last_preview_emitted_at["view-1"] = 10.0
+
+    assert hub.adaptive_final_render_delay(
+        "view-1",
+        target_preview_spacing_seconds=0.05,
+        minimum_delay_seconds=0.01,
+    ) == pytest.approx(0.01)
+    assert hub.adaptive_final_render_delay(
+        "view-missing",
+        target_preview_spacing_seconds=0.05,
+        minimum_delay_seconds=0.01,
+    ) == pytest.approx(0.01)
 
 
 def test_delayed_final_render_is_cancelled_by_next_interaction(monkeypatch) -> None:

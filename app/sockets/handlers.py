@@ -31,6 +31,10 @@ from app.sockets.runtime import view_socket_hub
 from app.services.view_registry import view_registry
 from app.services.viewer_service import viewer_service
 from app.services.volume_rendering.vtk_threading import should_run_3d_view_on_main_thread
+from app.services.webrtc_3d_transport import (
+    get_webrtc_3d_client_config,
+    webrtc_3d_transport_manager,
+)
 from app.services.workspace_activity import workspace_activity_service
 
 logger = get_logger(__name__)
@@ -67,8 +71,10 @@ FUSION_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
 }
-ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS = 0.1
-PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS = 0.06
+ROTATE3D_FINAL_RENDER_TARGET_SPACING_SECONDS = 0.05
+ROTATE3D_FINAL_RENDER_MIN_DELAY_SECONDS = 0.01
+PAN_ZOOM_FINAL_RENDER_TARGET_SPACING_SECONDS = 0.035
+PAN_ZOOM_FINAL_RENDER_MIN_DELAY_SECONDS = 0.005
 MPR_END_REQUIRES_PENDING_MOVE_TYPES = {
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_ZOOM,
@@ -504,7 +510,11 @@ async def _dispatch_operation_result(
             for view_id in result.deferred_view_ids:
                 view_socket_hub.schedule_delayed_final_render_for_view(
                     view_id,
-                    delay_seconds=PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS,
+                    delay_seconds=view_socket_hub.adaptive_final_render_delay(
+                        view_id,
+                        target_preview_spacing_seconds=PAN_ZOOM_FINAL_RENDER_TARGET_SPACING_SECONDS,
+                        minimum_delay_seconds=PAN_ZOOM_FINAL_RENDER_MIN_DELAY_SECONDS,
+                    ),
                     image_format=result.deferred_image_format,
                     fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
                     metadata_mode=result.deferred_metadata_mode,
@@ -535,7 +545,11 @@ async def _dispatch_operation_result(
                 ):
                     view_socket_hub.schedule_delayed_final_render_for_view(
                         view_id,
-                        delay_seconds=ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS,
+                        delay_seconds=view_socket_hub.adaptive_final_render_delay(
+                            view_id,
+                            target_preview_spacing_seconds=ROTATE3D_FINAL_RENDER_TARGET_SPACING_SECONDS,
+                            minimum_delay_seconds=ROTATE3D_FINAL_RENDER_MIN_DELAY_SECONDS,
+                        ),
                         image_format=result.deferred_image_format,
                         fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
                         metadata_mode=result.deferred_metadata_mode,
@@ -808,9 +822,40 @@ def register_socket_handlers(server: socketio.AsyncServer) -> None:
     @server.event
     async def disconnect(sid: str) -> None:
         await four_d_playback_hub.unbind_sid(sid)
+        await webrtc_3d_transport_manager.close_sid(sid)
         view_socket_hub.unbind_sid(sid)
         logger.info("socket disconnected sid=%s", sid)
         return None
+
+    @server.on("webrtc_3d_config")
+    async def webrtc_3d_config(sid: str, _data: dict | None = None) -> dict[str, object]:
+        return get_webrtc_3d_client_config()
+
+    @server.on("webrtc_3d_offer")
+    async def webrtc_3d_offer(sid: str, data: dict) -> dict[str, object]:
+        view_id = str(data.get("viewId") or "")
+        workspace_id = view_socket_hub.get_sid_workspace(sid)
+        try:
+            view = view_registry.get(view_id, workspace_id=workspace_id)
+            if view.view_type != "3D":
+                return {"ok": False, "message": "WebRTC transport is only available for 3D views"}
+            view_socket_hub.bind_view(sid, view_id)
+            return await webrtc_3d_transport_manager.create_answer(
+                sid,
+                view_id,
+                str(data.get("sdp") or ""),
+                str(data.get("type") or ""),
+            )
+        except Exception as exc:
+            logger.exception("3d WebRTC offer failed sid=%s view_id=%s", sid, view_id)
+            return {"ok": False, "message": _build_error_payload(exc)["message"]}
+
+    @server.on("webrtc_3d_close")
+    async def webrtc_3d_close(sid: str, data: dict) -> dict[str, object]:
+        view_id = str(data.get("viewId") or "")
+        if view_id:
+            await webrtc_3d_transport_manager.close(sid, view_id)
+        return {"ok": True, "viewId": view_id}
 
     @server.on("bind_view")
     async def bind_view(sid: str, data: dict) -> dict[str, object] | None:

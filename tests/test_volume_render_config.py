@@ -123,11 +123,23 @@ def test_volume_renderer_uses_higher_quality_sampling_for_final_frame() -> None:
     assert preview_mapper.image_sample_distances[-1] == 1.15
     assert final_mapper.image_sample_distances[-1] == 1.0
     assert preview_mapper.sample_distances[-1] == 0.9
-    assert final_mapper.sample_distances[-1] == 0.55
+    assert final_mapper.sample_distances[-1] == 0.45
     assert preview_window.multi_samples[-1] == 0
-    assert final_window.multi_samples[-1] == 4
+    assert final_window.multi_samples[-1] == 8
     assert preview_mapper.jittering[-1] == 0
     assert final_mapper.jittering[-1] == 1
+
+
+def test_volume_final_render_supersamples_without_changing_preview_size() -> None:
+    assert VtkVolumeRenderer._resolve_render_size(
+        SimpleNamespace(canvas_width=800, canvas_height=600, fast_preview=True)
+    ) == (800, 600)
+    assert VtkVolumeRenderer._resolve_render_size(
+        SimpleNamespace(canvas_width=800, canvas_height=600, fast_preview=False)
+    ) == (1000, 750)
+    assert VtkVolumeRenderer._resolve_render_size(
+        SimpleNamespace(canvas_width=1500, canvas_height=900, fast_preview=False)
+    ) == (1600, 960)
 
 
 def test_volume_renderer_quality_feature_detection_tolerates_missing_vtk_methods() -> None:

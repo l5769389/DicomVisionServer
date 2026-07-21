@@ -152,6 +152,8 @@ def load_folder(
     workspace_id: str = Depends(get_request_workspace_id),
 ) -> LoadFolderResponse:
     """Register DICOM files without decoding all pixel data up front."""
+    if Path(payload.folder_path).expanduser().suffix.lower() in {".zip", ".7z", ".rar"}:
+        return dicom_upload_service.load_archive_path(payload.folder_path, workspace_id=workspace_id)
     return series_registry.load_folder(payload, workspace_id=workspace_id)
 
 
@@ -160,7 +162,7 @@ def load_folder(
     response_model=LoadFolderResponse,
     summary="Upload and scan DICOM files",
     description=(
-        "Receives browser-selected DICOM files, stores them in a server-side temporary upload session, "
+        "Receives browser-selected DICOM files or ZIP/7z/RAR archives, stores them in a server-side temporary upload session, "
         "groups them into series, registers those series in memory, and returns the same summary shape as loadFolder."
     ),
 )
