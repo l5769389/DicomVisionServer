@@ -4,15 +4,13 @@
 
 DicomVision Server 是 DicomVision 的 FastAPI + Socket.IO 后端，负责 DICOM 发现、PACS 查询与下载、2D/MPR/4D/3D 渲染、PET/CT 融合、分割、测量、QA、导出和桌面端内置后端 bundle。
 
-## v3.1.0 后端更新
+## 架构
 
-- **3D 渲染一致性**：VR/Surface 预览和最终帧复用同一视图状态，降低旋转结束后的亮度、尺度和姿态跳变。
-- **3D 旋转与相机**：支持模型直接拖拽旋转、interactionId 防旧帧覆盖、移动端视口适配和根据体数据范围自动初始构图。
-- **自适应 3D 模板**：AAA、CT、CTA、MR、CBCT 等模板使用 CT HU 锚点 + 前景百分位混合策略；非 HU 数据回退到百分位策略。
-- **Surface 参数**：Surface 使用独立 isoValue、平滑、decimation、颜色和材质参数，并支持按 modality/强度分布生成合理默认值。
-- **去床板与裁剪**：新增渲染时去床板 mask、自由形状贯穿裁剪、clip/removeBed 缓存 token、预处理进度和 timing log。
-- **Web demo 数据**：macOS 本地开发优先使用 `/Users/jun/Documents/test_dicom/py_test_path/py_test_path2`，部署环境继续使用项目默认样例。
-- **桌面 bundle**：继续支持 Windows/macOS Server bundle，并可被 Electron 桌面安装包内置启动。
+Server 是 DICOM 发现、渲染、视图状态、导出和计算密集型分析的权威执行层。它通过稳定的 REST + Socket.IO 接口服务桌面端、Web 端和移动端，既可独立部署，也可随桌面安装包内置运行。
+
+- **渲染链路**：基于 VTK 的 2D/MPR/4D/3D 渲染，可选独立 GPU 进程，支持 WebRTC 交互预览和无损 WebP 最终帧。
+- **安全导入**：接受 DICOM 文件、目录、ZIP、7z 与 RAR；在扫描前限制压缩包成员路径、条目数、解压体积和压缩比。
+- **部署方式**：适用于本地、局域网、云服务、Docker 与桌面端内置后端。
 
 ## 仓库
 
@@ -21,7 +19,7 @@ DicomVision Server 是 DicomVision 的 FastAPI + Socket.IO 后端，负责 DICOM
 
 ## 主要能力
 
-- DICOM 文件夹、单文件、Web 上传和示例数据加载。
+- DICOM 文件夹、单文件、Web 上传、ZIP/7z/RAR 压缩包和示例数据加载。
 - 缩略图、角标、DICOM Tag、序列、实例、4D phase 和视图 metadata 服务。
 - PACS DICOMweb QIDO/WADO 与 DIMSE C-ECHO/C-FIND/C-GET。
 - 2D、Compare、Layout、MPR、斜切 MPR、MIP、3D VR、3D Surface、4D phase 和 PET/CT Fusion。
@@ -77,6 +75,7 @@ uv run python run.py
 - `CORS_ORIGINS`：允许访问后端的前端来源，JSON 数组字符串，例如 `["http://localhost:5173"]`。
 - `WEB_SAMPLE_DICOM_PATH`：Web demo 可加载的服务端示例 DICOM 路径。
 - `WEB_UPLOAD_DICOM_ROOT`：浏览器上传 DICOM 的临时存储根目录。
+- `WEB_UPLOAD_MAX_ARCHIVE_ENTRIES` / `WEB_UPLOAD_MAX_ARCHIVE_UNCOMPRESSED_BYTES` / `WEB_UPLOAD_MAX_ARCHIVE_COMPRESSION_RATIO`：压缩包导入安全限制。
 - `VTK_RENDER_PROCESS_ENABLED`：是否启用独立 VTK GPU 渲染进程；macOS 默认开启。
 - `VTK_SHARED_MEMORY_MAX_BYTES`：主进程与 GPU 进程之间的体数据共享内存上限，默认 1 GiB。
 - `DICOMVISION_PACS_CACHE_ROOT`：PACS 下载缓存目录。
@@ -146,7 +145,7 @@ uv run python scripts/benchmark_vtk_render.py --process --iterations 8
 uv run python scripts/benchmark_vtk_render.py --process --dicom-path /path/to/dicom
 ```
 
-报告分别统计 VTK render、GPU readback、WebP encode 和本地 Socket send。生产环境真实 Socket.IO 发送耗时记录在 `3d pipeline timing` 日志中。
+报告分别统计 VTK render、GPU readback、WebP encode 和本地 Socket send。WebRTC 模式下，交互预览走视频轨道，操作稳定后使用无损 WebP 覆盖最终画面；传输基准会分别输出交互帧延迟和最终无损帧延迟。生产环境真实 Socket.IO 发送耗时记录在 `3d pipeline timing` 日志中。
 
 ## 测试
 

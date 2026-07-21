@@ -71,8 +71,10 @@ FUSION_LOW_LATENCY_OPERATION_TYPES = {
     VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
 }
-ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS = 0.1
-PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS = 0.06
+ROTATE3D_FINAL_RENDER_TARGET_SPACING_SECONDS = 0.05
+ROTATE3D_FINAL_RENDER_MIN_DELAY_SECONDS = 0.01
+PAN_ZOOM_FINAL_RENDER_TARGET_SPACING_SECONDS = 0.035
+PAN_ZOOM_FINAL_RENDER_MIN_DELAY_SECONDS = 0.005
 MPR_END_REQUIRES_PENDING_MOVE_TYPES = {
     VIEW_OP_TYPE_PAN,
     VIEW_OP_TYPE_ZOOM,
@@ -497,7 +499,11 @@ async def _dispatch_operation_result(
             for view_id in result.deferred_view_ids:
                 view_socket_hub.schedule_delayed_final_render_for_view(
                     view_id,
-                    delay_seconds=PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS,
+                    delay_seconds=view_socket_hub.adaptive_final_render_delay(
+                        view_id,
+                        target_preview_spacing_seconds=PAN_ZOOM_FINAL_RENDER_TARGET_SPACING_SECONDS,
+                        minimum_delay_seconds=PAN_ZOOM_FINAL_RENDER_MIN_DELAY_SECONDS,
+                    ),
                     image_format=result.deferred_image_format,
                     fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
                     metadata_mode=result.deferred_metadata_mode,
@@ -528,7 +534,11 @@ async def _dispatch_operation_result(
                 ):
                     view_socket_hub.schedule_delayed_final_render_for_view(
                         view_id,
-                        delay_seconds=ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS,
+                        delay_seconds=view_socket_hub.adaptive_final_render_delay(
+                            view_id,
+                            target_preview_spacing_seconds=ROTATE3D_FINAL_RENDER_TARGET_SPACING_SECONDS,
+                            minimum_delay_seconds=ROTATE3D_FINAL_RENDER_MIN_DELAY_SECONDS,
+                        ),
                         image_format=result.deferred_image_format,
                         fast_preview_full_resolution=result.deferred_fast_preview_full_resolution,
                         metadata_mode=result.deferred_metadata_mode,

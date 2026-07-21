@@ -60,6 +60,8 @@ TRACKBALL_AZIMUTH_DEGREES_PER_VIEW_WIDTH = VTK_TRACKBALL_AZIMUTH_DEGREES_PER_VIE
 TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = VTK_TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT
 FAST_PREVIEW_RENDER_SCALE = 0.5
 FAST_PREVIEW_RENDER_MAX_DIMENSION = 720
+FINAL_RENDER_SCALE = 1.25
+FINAL_RENDER_MAX_DIMENSION = 1600
 SURFACE_SESSION_LIMIT = 8
 SURFACE_MESH_CACHE_LIMIT = 8
 
@@ -542,7 +544,15 @@ class VtkSurfaceRenderer:
         width = max(1, int(request.canvas_width))
         height = max(1, int(request.canvas_height))
         if not request.fast_preview:
-            return (width, height)
+            scale = min(
+                FINAL_RENDER_SCALE,
+                FINAL_RENDER_MAX_DIMENSION / float(max(width, height)),
+            )
+            scale = max(1.0, scale)
+            return (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
 
         scale = FAST_PREVIEW_RENDER_SCALE
         largest = max(width, height)

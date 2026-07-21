@@ -119,13 +119,18 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         size_response.raise_for_status()
 
         samples = BenchmarkSamples()
+        final_samples = BenchmarkSamples()
         socket = socketio.AsyncClient(reconnection=False)
         peer: RTCPeerConnection | None = None
 
         @socket.on("image_update")
         async def on_image_update(payload, image_binary, *_extra) -> None:
-            if args.transport == "webp" and payload.get("viewId") == view_id:
+            if payload.get("viewId") != view_id:
+                return
+            if args.transport == "webp":
                 samples.add(len(image_binary))
+            elif payload.get("imageTransport") == "webp-final":
+                final_samples.add(len(image_binary))
 
         @socket.on("image_update_metadata")
         async def on_image_update_metadata(payload) -> None:
@@ -177,19 +182,73 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 
         warmup_target = 1
         await socket.call("bind_view", {"viewId": view_id, "render": True, "imageFormat": "webp"}, timeout=120)
-        await wait_for_count(samples, warmup_target)
         if args.transport == "webrtc":
+            await wait_for_count(final_samples, warmup_target)
+            interaction_id = f"benchmark-{uuid4().hex}"
+            center_x = args.width / 2.0
+            center_y = args.height / 2.0
+            operation_base = {
+                "viewId": view_id,
+                "opType": "rotate3d",
+                "interactionId": interaction_id,
+                "canvasWidth": args.width,
+                "canvasHeight": args.height,
+            }
+            await socket.call(
+                "view_operation",
+                {
+                    **operation_base,
+                    "actionType": "start",
+                    "canvasX": center_x,
+                    "canvasY": center_y,
+                    "x": 0.5,
+                    "y": 0.5,
+                },
+                timeout=20,
+            )
+            await socket.call(
+                "view_operation",
+                {
+                    **operation_base,
+                    "actionType": "move",
+                    "canvasX": center_x + 2.0,
+                    "canvasY": center_y,
+                    "x": (center_x + 2.0) / args.width,
+                    "y": 0.5,
+                },
+                timeout=20,
+            )
+            await wait_for_count(samples, warmup_target)
             await asyncio.sleep(0.15)
+        else:
+            await wait_for_count(samples, warmup_target)
         samples.frame_times.clear()
         samples.payload_sizes.clear()
+        final_samples.frame_times.clear()
+        final_samples.payload_sizes.clear()
 
         started_at = perf_counter()
         request_latencies_ms: list[float] = []
         render_count = max(1, args.frames)
-        for _ in range(render_count):
+        for frame_index in range(render_count):
             first_frame_index = len(samples.frame_times)
             request_started_at = perf_counter()
-            await socket.call("bind_view", {"viewId": view_id, "render": True, "imageFormat": "webp"}, timeout=120)
+            if args.transport == "webrtc":
+                canvas_x = center_x + min(args.width * 0.2, (frame_index + 2) * 3.0)
+                await socket.call(
+                    "view_operation",
+                    {
+                        **operation_base,
+                        "actionType": "move",
+                        "canvasX": canvas_x,
+                        "canvasY": center_y,
+                        "x": canvas_x / args.width,
+                        "y": 0.5,
+                    },
+                    timeout=20,
+                )
+            else:
+                await socket.call("bind_view", {"viewId": view_id, "render": True, "imageFormat": "webp"}, timeout=120)
             await wait_for_count(samples, first_frame_index + 1, timeout=120)
             request_latencies_ms.append(
                 (samples.frame_times[first_frame_index] - request_started_at) * 1000.0
@@ -198,6 +257,24 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                 await asyncio.sleep(args.interval_ms / 1000.0)
         elapsed_ms = (perf_counter() - started_at) * 1000.0
         delivered_at_completion = len(samples.frame_times)
+        final_latency_ms = 0.0
+        if args.transport == "webrtc":
+            final_started_at = perf_counter()
+            final_canvas_x = center_x + min(args.width * 0.2, (render_count + 1) * 3.0)
+            await socket.call(
+                "view_operation",
+                {
+                    **operation_base,
+                    "actionType": "end",
+                    "canvasX": final_canvas_x,
+                    "canvasY": center_y,
+                    "x": final_canvas_x / args.width,
+                    "y": 0.5,
+                },
+                timeout=20,
+            )
+            await wait_for_count(final_samples, 1, timeout=120)
+            final_latency_ms = (final_samples.frame_times[0] - final_started_at) * 1000.0
         if args.settle_ms > 0:
             await asyncio.sleep(args.settle_ms / 1000.0)
         trailing_frames = len(samples.frame_times) - delivered_at_completion
@@ -229,6 +306,12 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             f"mean={mean(nonzero_payloads) if nonzero_payloads else 0.0:.0f} "
             f"total={sum(nonzero_payloads)}"
         )
+        if args.transport == "webrtc":
+            print(
+                "final_lossless_webp "
+                f"latency_ms={final_latency_ms:.1f} "
+                f"bytes={final_samples.payload_sizes[0] if final_samples.payload_sizes else 0}"
+            )
 
         if peer is not None:
             await socket.call("webrtc_3d_close", {"viewId": view_id})

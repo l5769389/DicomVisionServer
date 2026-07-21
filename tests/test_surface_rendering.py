@@ -168,6 +168,11 @@ def test_surface_material_update_keeps_existing_geometry(monkeypatch) -> None:
         "Surface 表面优化完成",
     ]
 
+    progress_messages.clear()
+    reused = renderer._get_or_create_session(request, volume)
+    assert reused is session
+    assert progress_messages == []
+
     def fail_mesh_rebuild(*_args, **_kwargs):
         raise AssertionError("material-only updates must not rebuild the surface mesh")
 
@@ -243,7 +248,7 @@ def test_surface_fast_preview_preserves_mesh_source_and_uses_lower_render_size()
                 "fast_preview": False,
             }
         )
-    ) == (1000, 800)
+    ) == (1250, 1000)
 
 
 def test_surface_preview_and_final_share_session_key(monkeypatch) -> None:
@@ -441,7 +446,7 @@ def _patch_surface_render_dependencies(monkeypatch, service: ViewerService, seri
     )
 
 
-def test_full_surface_render_warms_preview_session(monkeypatch) -> None:
+def test_full_surface_render_warms_preview_session_without_unconditional_prepare_progress(monkeypatch) -> None:
     service = ViewerService()
     series = _build_series()
     volume = np.zeros((5, 6, 7), dtype=np.float32)
@@ -460,7 +465,7 @@ def test_full_surface_render_warms_preview_session(monkeypatch) -> None:
     assert len(warm_requests) == 1
     assert warm_requests[0].view_id == view.view_id
     assert warm_requests[0].fast_preview is False
-    assert any(message.get("message") == "正在准备 Surface 数据..." for message in progress_messages)
+    assert not any(message.get("message") == "正在准备 Surface 数据..." for message in progress_messages)
 
 
 def test_surface_fast_preview_render_does_not_warm_preview_session(monkeypatch) -> None:
@@ -515,6 +520,17 @@ def _build_surface_request(view_id: str = "surface-view", *, fast_preview: bool 
         surface_config=create_default_surface_render_config("bone"),
         fast_preview=fast_preview,
     )
+
+
+def test_surface_final_render_supersamples_without_changing_preview_policy() -> None:
+    preview = _build_surface_request(fast_preview=True)
+    final = replace(_build_surface_request(fast_preview=False), canvas_width=800, canvas_height=600)
+
+    assert VtkSurfaceRenderer._resolve_render_size(preview) == (100, 96)
+    assert VtkSurfaceRenderer._resolve_render_size(final) == (1000, 750)
+
+    large_final = replace(final, canvas_width=1500, canvas_height=900)
+    assert VtkSurfaceRenderer._resolve_render_size(large_final) == (1600, 960)
 
 
 def test_surface_preview_warm_deduplicates_pending_requests() -> None:

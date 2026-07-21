@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """DICOM export, corner overlays, orientation, and formatting."""
 
+from app.services.webp_3d_encoder import encode_lossless_3d_webp
 from app.services.viewer.shared import *  # noqa: F403
 
 
@@ -1680,14 +1681,7 @@ class ViewerPresentationMixin:
                 method=WEBP_PREVIEW_METHOD,
             )
         else:
-            # A rendered 3D RGB frame has already passed through transfer functions,
-            # lighting and ray sampling. High-quality lossy WebP avoids the large
-            # lossless encode tail without changing quantitative 2D/MPR transport.
-            image.save(
-                output,
-                format="WEBP",
-                lossless=False,
-                quality=WEBP_3D_FINAL_QUALITY,
-                method=WEBP_3D_FINAL_METHOD,
-            )
+            # The final 3D still overlays the WebRTC preview. Preserve every rendered
+            # pixel so the settled image is not softened by either VP8 or WebP loss.
+            return encode_lossless_3d_webp(image)
         return output.getvalue()

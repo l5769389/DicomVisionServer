@@ -35,6 +35,10 @@ def test_api_docs_can_be_enabled_explicitly() -> None:
     assert Settings(APP_ENV="production", EXPOSE_API_DOCS=True).api_docs_enabled is True
 
 
+def test_web_upload_default_allows_complete_studies_with_more_than_one_thousand_instances() -> None:
+    assert Settings().web_upload_max_files == 20_000
+
+
 def test_3d_transport_settings_are_normalized_and_bounded() -> None:
     settings = Settings(
         DICOMVISION_3D_TRANSPORT="WebRTC",
@@ -42,6 +46,7 @@ def test_3d_transport_settings_are_normalized_and_bounded() -> None:
         DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS=99_000_000,
         DICOMVISION_WEBRTC_VIDEO_FPS=120,
         DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES=9,
+        DICOMVISION_3D_FINAL_WEBP_METHOD="9",
     )
 
     assert settings.normalized_three_d_transport == "webrtc"
@@ -49,7 +54,13 @@ def test_3d_transport_settings_are_normalized_and_bounded() -> None:
     assert settings.normalized_webrtc_video_bitrate_bps == 20_000_000
     assert settings.normalized_webrtc_video_fps == 60
     assert settings.normalized_webrtc_initial_burst_frames == 3
+    assert settings.normalized_three_d_final_webp_method == 6
 
 
 def test_webrtc_default_frame_rate_matches_interactive_render_cadence() -> None:
     assert Settings().normalized_webrtc_video_fps == 30
+
+
+def test_3d_final_webp_method_defaults_and_invalid_values_use_auto() -> None:
+    assert Settings().normalized_three_d_final_webp_method == "auto"
+    assert Settings(DICOMVISION_3D_FINAL_WEBP_METHOD="invalid").normalized_three_d_final_webp_method == "auto"

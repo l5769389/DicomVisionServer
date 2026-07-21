@@ -53,3 +53,19 @@ def test_build_instance_record_collects_compatibility_metadata() -> None:
     assert record.pixel_spacing == (0.7, 0.8)
     assert record.has_image_orientation_patient is True
     assert record.number_of_frames == 12
+
+
+def test_resolve_scan_target_skips_archives_and_metadata_but_keeps_extensionless_dicom_candidates(tmp_path: Path) -> None:
+    dicom_file = tmp_path / "slice.dcm"
+    extensionless_dicom = tmp_path / "IM0001"
+    archive = tmp_path / "study.zip"
+    metadata = tmp_path / "notes.txt"
+    macosx_file = tmp_path / "__MACOSX" / "._slice.dcm"
+    for path in (dicom_file, extensionless_dicom, archive, metadata, macosx_file):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"candidate")
+
+    root, scan_paths = SeriesRegistry._resolve_scan_target(str(tmp_path))
+
+    assert root == tmp_path.resolve()
+    assert scan_paths == [extensionless_dicom, dicom_file]

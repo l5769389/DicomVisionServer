@@ -1,7 +1,8 @@
 # Experimental 3D WebRTC transport
 
 The `feature/webrtc-3d` branch keeps Socket.IO for viewer operations, progress,
-metadata, and errors. Only rendered 3D RGB frames move to a WebRTC video track.
+metadata, errors, and settled lossless stills. Interactive 3D RGB previews move
+to a WebRTC video track.
 The transport is selected once when the server starts; it is not a viewer UI
 preference and cannot be hot-switched.
 
@@ -13,11 +14,26 @@ DICOMVISION_WEBRTC_VIDEO_CODEC=vp8
 DICOMVISION_WEBRTC_VIDEO_BITRATE_BPS=4000000
 DICOMVISION_WEBRTC_VIDEO_FPS=30
 DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES=2
+DICOMVISION_3D_FINAL_WEBP_METHOD=auto
 ```
 
-`webp` uses the stable Socket.IO image path. `webrtc` bypasses WebP encoding and
-uses the latest rendered frame only. WebRTC negotiation failure still falls back
-to WebP so an unsupported browser does not show a blank viewport.
+`webp` uses the stable Socket.IO image path. In `webrtc` mode, continuous 3D
+rotate, pan, zoom, and other preview frames bypass WebP encoding and use the
+latest rendered video frame only. When an operation settles, the server sends a
+lossless WebP final still over Socket.IO and the client layers it above the video.
+This preserves low interaction latency without leaving the viewport on a
+rate-controlled VP8 frame. WebRTC negotiation failure still falls back to WebP
+so an unsupported browser does not show a blank viewport.
+
+Final renders use an adaptive settle delay. The server only waits long enough to
+complete a 35 ms pan/zoom or 50 ms rotate preview-to-final spacing, with a small
+minimum delay for cancellation when another gesture starts. This avoids the old
+fixed 60/100 ms wait when the last preview is already visible.
+
+With `DICOMVISION_3D_FINAL_WEBP_METHOD=auto`, the first real final frame is sampled
+at up to 256 px and lossless WebP methods 0, 1, and 2 are compared once. The
+process caches the fastest method, preferring a smaller payload when timings are
+within 10%. Set the value to an integer from 0 through 6 to bypass calibration.
 
 The first rendered image is repeated briefly to initialize the decoder. Later
 renders emit one latest-state frame only, reducing post-interaction playout lag.
@@ -55,6 +71,9 @@ uv run python scripts/benchmark_3d_transport.py \
   --folder /path/to/dicom \
   --transport webrtc
 ```
+
+The WebRTC report separates interactive `render_to_frame_ms` from the settled
+`final_lossless_webp` latency and payload size.
 
 Restart the server after changing any transport or codec value. Do not remove
 WebP until WebRTC has been verified on LAN, public cloud with TURN, mobile Safari,

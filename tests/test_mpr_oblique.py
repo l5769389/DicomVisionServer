@@ -208,7 +208,7 @@ def test_webp_preview_uses_lossy_quality_and_final_uses_lossless(monkeypatch) ->
     ]
 
 
-def test_3d_webp_uses_fast_preview_and_high_quality_lossy_final(monkeypatch) -> None:
+def test_3d_webp_uses_lossy_preview_and_lossless_final(monkeypatch) -> None:
     save_calls: list[dict[str, object]] = []
 
     def fake_save(self, output, **kwargs):
@@ -217,6 +217,10 @@ def test_3d_webp_uses_fast_preview_and_high_quality_lossy_final(monkeypatch) -> 
         output.write(b"webp")
 
     monkeypatch.setattr(Image.Image, "save", fake_save)
+    monkeypatch.setattr(
+        "app.services.viewer.presentation.encode_lossless_3d_webp",
+        lambda image: b"webp",
+    )
 
     preview_encoded = ViewerService._encode_3d_image(Image.new("RGB", (1, 1)), "webp", fast_preview=True)
     final_encoded = ViewerService._encode_3d_image(Image.new("RGB", (1, 1)), "webp", fast_preview=False)
@@ -225,7 +229,6 @@ def test_3d_webp_uses_fast_preview_and_high_quality_lossy_final(monkeypatch) -> 
     assert final_encoded == b"webp"
     assert save_calls == [
         {"format": "WEBP", "lossless": False, "quality": 80, "method": 0},
-        {"format": "WEBP", "lossless": False, "quality": 94, "method": 2},
     ]
 
 

@@ -31,6 +31,7 @@ RUN sed -i \
       libx11-6 \
       libxext6 \
       libxrender1 \
+      unar \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir -i "${PYPI_INDEX_URL}" uv

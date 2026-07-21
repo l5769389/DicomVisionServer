@@ -576,12 +576,6 @@ class ViewerVolumeMixin:
         render_3d_mode = self._normalize_render_3d_mode(view.render_3d_mode)
         image_started_at = perf_counter()
         if render_3d_mode == "surface":
-            self._emit_render_progress(
-                progress_callback,
-                "preprocess",
-                progress_percent=80,
-                message="正在准备 Surface 数据...",
-            )
             self._resolve_surface_render_config_for_render(
                 view,
                 series=series,

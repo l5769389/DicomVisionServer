@@ -118,6 +118,56 @@ def test_latest_frame_track_bursts_only_for_first_render() -> None:
     assert is_waiting is True
 
 
+def test_latest_frame_track_resync_burst_uses_latest_pixels() -> None:
+    async def run():
+        track = LatestFrameVideoTrack(fps=120, initial_burst_frames=1)
+        track.publish(Image.new("RGB", (4, 4), "black"))
+        await track.recv()
+
+        track.arm_resync_burst(2)
+        track.publish(Image.new("RGB", (4, 4), "red"))
+        first = await track.recv()
+        track.publish(Image.new("RGB", (4, 4), "green"))
+        second = await track.recv()
+        waiting = asyncio.create_task(track.recv())
+        await asyncio.sleep(0)
+        is_waiting = not waiting.done()
+        waiting.cancel()
+        track.stop()
+        return (
+            first.to_ndarray(format="rgb24"),
+            second.to_ndarray(format="rgb24"),
+            is_waiting,
+        )
+
+    first_pixels, second_pixels, is_waiting = asyncio.run(run())
+
+    assert tuple(first_pixels[0, 0]) == (255, 0, 0)
+    assert tuple(second_pixels[0, 0]) == (0, 128, 0)
+    assert is_waiting is True
+
+
+def test_latest_frame_track_resync_discards_pending_old_burst() -> None:
+    async def run():
+        track = LatestFrameVideoTrack(fps=120, initial_burst_frames=2)
+        track.publish(Image.new("RGB", (4, 4), "red"))
+        await track.recv()
+        track.arm_resync_burst(2)
+
+        waiting = asyncio.create_task(track.recv())
+        await asyncio.sleep(0)
+        old_frame_was_discarded = not waiting.done()
+        track.publish(Image.new("RGB", (4, 4), "green"))
+        current = await waiting
+        track.stop()
+        return old_frame_was_discarded, current.to_ndarray(format="rgb24")
+
+    old_frame_was_discarded, current_pixels = asyncio.run(run())
+
+    assert old_frame_was_discarded is True
+    assert tuple(current_pixels[0, 0]) == (0, 128, 0)
+
+
 def test_latest_frame_track_timestamps_follow_actual_frame_arrival() -> None:
     timestamps = iter((10.0, 10.04))
 
@@ -176,6 +226,49 @@ def test_transport_is_active_only_after_peer_is_connected(webrtc_enabled) -> Non
     peer.connectionState = "connected"
 
     assert manager.get_active_sids("view-1", ("sid-1",)) == ("sid-1",)
+    track.stop()
+
+
+def test_request_keyframe_arms_resync_burst_and_notifies_sender(webrtc_enabled) -> None:
+    class _Sender:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _send_keyframe(self) -> None:
+            self.calls += 1
+
+    manager = WebRtc3DTransportManager()
+    track = LatestFrameVideoTrack(fps=60, initial_burst_frames=1)
+    sender = _Sender()
+    manager._sessions[("sid-1", "view-1")] = WebRtc3DSession(
+        sid="sid-1",
+        view_id="view-1",
+        peer=SimpleNamespace(connectionState="connected"),
+        track=track,
+        sender=sender,
+    )
+
+    assert manager.request_keyframe("sid-1", "view-1", burst_frames=2) is True
+    assert sender.calls == 1
+    assert track._next_publish_burst_frames == 2
+    manager.publish("sid-1", "view-1", Image.new("RGB", (4, 4), "green"))
+    assert sender.calls == 2
+    track.stop()
+
+
+def test_request_keyframe_falls_back_to_static_handoff_without_sender_support(webrtc_enabled) -> None:
+    manager = WebRtc3DTransportManager()
+    track = LatestFrameVideoTrack(fps=60, initial_burst_frames=1)
+    manager._sessions[("sid-1", "view-1")] = WebRtc3DSession(
+        sid="sid-1",
+        view_id="view-1",
+        peer=SimpleNamespace(connectionState="connected"),
+        track=track,
+        sender=object(),
+    )
+
+    assert manager.request_keyframe("sid-1", "view-1", burst_frames=2) is False
+    assert track._next_publish_burst_frames == 2
     track.stop()
 
 

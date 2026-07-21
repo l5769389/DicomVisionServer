@@ -43,6 +43,34 @@ DICOM_SR_SOP_CLASS_UIDS = {
     str(KeyObjectSelectionDocumentStorage),
 }
 
+# DICOM instances frequently have no filename suffix, so accept unknown suffixes and
+# only skip the common archive, metadata, and operating-system byproducts that can
+# never be an image instance.
+NON_DICOM_SCAN_SUFFIXES = frozenset({
+    ".7z",
+    ".bz2",
+    ".csv",
+    ".db",
+    ".gz",
+    ".html",
+    ".htm",
+    ".json",
+    ".log",
+    ".md",
+    ".pdf",
+    ".rar",
+    ".tar",
+    ".tgz",
+    ".txt",
+    ".webp",
+    ".xml",
+    ".xz",
+    ".yaml",
+    ".yml",
+    ".zip",
+    ".zst",
+})
+
 
 class SeriesRegistry:
     def __init__(self) -> None:
@@ -103,16 +131,30 @@ class SeriesRegistry:
         return f"{normalize_workspace_id(workspace_id)}::{key}"
 
     @staticmethod
-    def _resolve_scan_target(folder_path: str) -> tuple[Path, list[Path]]:
+    def is_dicom_candidate_name(path: Path) -> bool:
+        """Return whether a filename is worth passing to the DICOM header reader."""
+
+        if path.name.startswith(".") or "__MACOSX" in path.parts:
+            return False
+        return path.suffix.lower() not in NON_DICOM_SCAN_SUFFIXES
+
+    @classmethod
+    def is_dicom_scan_candidate(cls, path: Path) -> bool:
+        """Return whether an existing file is worth passing to the DICOM header reader."""
+
+        return path.is_file() and cls.is_dicom_candidate_name(path)
+
+    @classmethod
+    def _resolve_scan_target(cls, folder_path: str) -> tuple[Path, list[Path]]:
         """Normalize an input file or folder path into a scan root and file list."""
 
         target = Path(folder_path).expanduser().resolve()
         if not target.exists():
             raise HTTPException(status_code=404, detail="DICOM path not found")
         if target.is_file():
-            return target.parent, [target]
+            return target.parent, [target] if cls.is_dicom_scan_candidate(target) else []
         if target.is_dir():
-            return target, sorted(target.rglob("*"))
+            return target, sorted(path for path in target.rglob("*") if cls.is_dicom_scan_candidate(path))
         raise HTTPException(status_code=404, detail="DICOM path is not a file or folder")
 
     @staticmethod
@@ -350,8 +392,6 @@ class SeriesRegistry:
         gsps_datasets: list[tuple[Path, object]] = []
 
         for path in scan_paths:
-            if not path.is_file():
-                continue
 
             dataset = self._read_dataset_header(path)
             if dataset is None:

@@ -138,6 +138,7 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
         self._latest_frame: np.ndarray | None = None
         self._frame_ready = asyncio.Event()
         self._remaining_burst_frames = 0
+        self._next_publish_burst_frames = 0
         self._logged_first_frame = False
         self._has_published_frame = False
         self._timestamp_origin: float | None = None
@@ -145,15 +146,37 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
         self._last_timestamp = -1
         self._clock = clock or time.monotonic
 
-    def publish(self, image: Image.Image) -> None:
+    def publish(self, image: Image.Image) -> bool:
         self._latest_frame = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
         # Some decoders need more than one packetized frame to present the
         # first image. Only the first render gets a short startup burst. Every
         # later render is a single latest-state frame, preventing the browser
         # jitter buffer from continuing to play old camera poses after release.
-        self._remaining_burst_frames = self._initial_burst_frames if not self._has_published_frame else 1
+        burst_frames = self._initial_burst_frames if not self._has_published_frame else 1
+        resumes_after_final = self._next_publish_burst_frames > 0
+        if resumes_after_final:
+            burst_frames = max(burst_frames, self._next_publish_burst_frames)
+            self._next_publish_burst_frames = 0
+        # A newer render replaces the pixels, but it must not shorten an
+        # already-armed recovery burst. Every emitted frame still reads the
+        # latest ndarray immediately before entering the encoder.
+        self._remaining_burst_frames = max(self._remaining_burst_frames, burst_frames)
         self._has_published_frame = True
         self._frame_ready.set()
+        return resumes_after_final
+
+    def arm_resync_burst(self, frame_count: int = 2) -> None:
+        """Send repeated latest-state frames after the next publish."""
+        self._next_publish_burst_frames = max(
+            self._next_publish_burst_frames,
+            max(1, int(frame_count)),
+        )
+        # A settled WebP is now authoritative. Discard any preview that was
+        # queued before it so an old VR/surface or clip state cannot consume
+        # the keyframe request while hidden behind the still.
+        self._latest_frame = None
+        self._remaining_burst_frames = 0
+        self._frame_ready.clear()
 
     async def _next_low_latency_timestamp(self) -> tuple[int, fractions.Fraction]:
         time_base = fractions.Fraction(1, 90_000)
@@ -177,17 +200,24 @@ class LatestFrameVideoTrack(_VideoStreamTrackBase):  # type: ignore[misc,valid-t
         return self._last_timestamp, time_base
 
     async def recv(self):
-        while self._latest_frame is None or self._remaining_burst_frames <= 0:
-            self._frame_ready.clear()
-            await self._frame_ready.wait()
-        pts, time_base = await self._next_low_latency_timestamp()
-        # A newer render may arrive while the track is pacing the encoder.
-        # Select pixels after that wait so the old camera pose is superseded
-        # before it ever enters the encoder or browser jitter buffer.
-        pixels = self._latest_frame
-        self._remaining_burst_frames -= 1
-        if self._remaining_burst_frames <= 0:
-            self._frame_ready.clear()
+        while True:
+            while self._latest_frame is None or self._remaining_burst_frames <= 0:
+                self._frame_ready.clear()
+                await self._frame_ready.wait()
+            pts, time_base = await self._next_low_latency_timestamp()
+            # A final still can invalidate a preview while this coroutine is
+            # pacing. Re-check after the wait rather than returning stale or
+            # cleared pixels to the encoder.
+            if self._latest_frame is None or self._remaining_burst_frames <= 0:
+                continue
+            # A newer render may arrive while the track is pacing the encoder.
+            # Select pixels after that wait so the old camera pose is superseded
+            # before it ever enters the encoder or browser jitter buffer.
+            pixels = self._latest_frame
+            self._remaining_burst_frames -= 1
+            if self._remaining_burst_frames <= 0:
+                self._frame_ready.clear()
+            break
         if not self._logged_first_frame:
             logger.info("3d webrtc encoder consumed first frame shape=%s", pixels.shape)
             self._logged_first_frame = True
@@ -203,6 +233,7 @@ class WebRtc3DSession:
     view_id: str
     peer: Any
     track: LatestFrameVideoTrack
+    sender: Any | None = None
 
 
 class WebRtc3DTransportManager:
@@ -246,7 +277,13 @@ class WebRtc3DTransportManager:
         except Exception:
             logger.debug("failed to set WebRTC 3D codec preferences", exc_info=True)
 
-        session = WebRtc3DSession(sid=sid, view_id=view_id, peer=peer, track=track)
+        session = WebRtc3DSession(
+            sid=sid,
+            view_id=view_id,
+            peer=peer,
+            track=track,
+            sender=transceiver.sender,
+        )
         async with self._lock:
             self._sessions[self._key(sid, view_id)] = session
 
@@ -307,8 +344,43 @@ class WebRtc3DTransportManager:
         if session is None or session.peer.connectionState in {"failed", "closed"}:
             return None
         started_at = perf_counter()
-        session.track.publish(image)
+        resumes_after_final = session.track.publish(image)
+        if resumes_after_final:
+            # Repeat the request immediately before the new pixels can wake
+            # the sender. This protects against an already-queued old frame
+            # consuming the request made when the final still completed.
+            self._request_sender_keyframe(session, sid=sid, view_id=view_id)
         return (perf_counter() - started_at) * 1000.0
+
+    @staticmethod
+    def _request_sender_keyframe(session: WebRtc3DSession, *, sid: str, view_id: str) -> bool:
+        request_sender_keyframe = getattr(session.sender, "_send_keyframe", None)
+        if not callable(request_sender_keyframe):
+            logger.debug(
+                "3d webrtc sender does not expose keyframe request sid=%s view_id=%s",
+                sid,
+                view_id,
+            )
+            return False
+        try:
+            request_sender_keyframe()
+        except Exception:
+            logger.debug(
+                "3d webrtc keyframe request failed sid=%s view_id=%s",
+                sid,
+                view_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def request_keyframe(self, sid: str, view_id: str, *, burst_frames: int = 2) -> bool:
+        """Prepare the next preview to resume with a complete current image."""
+        session = self._sessions.get(self._key(sid, view_id))
+        if session is None or session.peer.connectionState in {"failed", "closed"}:
+            return False
+        session.track.arm_resync_burst(burst_frames)
+        return self._request_sender_keyframe(session, sid=sid, view_id=view_id)
 
     async def close(self, sid: str, view_id: str, *, expected_peer: Any | None = None) -> None:
         key = self._key(sid, view_id)

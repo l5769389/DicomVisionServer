@@ -45,6 +45,7 @@ class ViewSocketHub:
         self._view_final_render_revisions: dict[str, int] = {}
         self._render_revisions: dict[str, int] = defaultdict(int)
         self._view_active_interaction_ids: dict[str, str] = {}
+        self._last_preview_emitted_at: dict[str, float] = {}
         self._delayed_final_render_tasks: dict[str, asyncio.Task[None]] = {}
         self._closed_view_ids: set[str] = set()
 
@@ -98,6 +99,7 @@ class ViewSocketHub:
         self._render_locks.pop(view_queue_key, None)
         self._view_final_render_revisions.pop(view_id, None)
         self._view_active_interaction_ids.pop(view_id, None)
+        self._last_preview_emitted_at.pop(view_id, None)
         preview_task = self._preview_worker_tasks.pop(view_queue_key, None)
         if preview_task is not None and not preview_task.done():
             preview_task.cancel()
@@ -214,6 +216,21 @@ class ViewSocketHub:
             pending_requests.pop(view_id, None)
         if not pending_requests:
             self._pending_render_requests.pop(queue_key, None)
+
+    def adaptive_final_render_delay(
+        self,
+        view_id: str,
+        *,
+        target_preview_spacing_seconds: float,
+        minimum_delay_seconds: float,
+    ) -> float:
+        target = max(0.0, float(target_preview_spacing_seconds))
+        minimum = max(0.0, min(float(minimum_delay_seconds), target))
+        last_preview_at = self._last_preview_emitted_at.get(view_id)
+        if last_preview_at is None:
+            return minimum
+        elapsed = max(0.0, perf_counter() - last_preview_at)
+        return max(minimum, min(target, target - elapsed))
 
     def make_render_request(
         self,
@@ -654,13 +671,18 @@ class ViewSocketHub:
         render_started_at = perf_counter()
         webrtc_sids = webrtc_3d_transport_manager.get_active_sids(view_id, sids)
         webp_sids = tuple(sid for sid in sids if sid not in webrtc_sids)
+        # WebRTC is the low-latency transport for every interactive 3D preview
+        # (rotate, pan, zoom, and future preview operations). Settled frames use
+        # a lossless WebP still so video compression cannot soften the final view.
+        webrtc_preview_sids = webrtc_sids if request.fast_preview else ()
+        webrtc_final_sids = webrtc_sids if not request.fast_preview else ()
         render_kwargs = {
             "image_format": request.image_format,
             "fast_preview": request.fast_preview,
             "fast_preview_full_resolution": request.fast_preview_full_resolution,
             "metadata_mode": request.metadata_mode,
             "progress_callback": progress_callback if should_emit_progress else None,
-            "raw_3d_output": bool(webrtc_sids) and not webp_sids,
+            "raw_3d_output": bool(webrtc_preview_sids) and not webp_sids,
         }
         if self._should_render_on_main_thread(view_id):
             result = viewer_service.render_view_by_id(view_id, **render_kwargs)
@@ -675,16 +697,37 @@ class ViewSocketHub:
         emit_started_at = perf_counter()
         for sid in webp_sids:
             await self._server.emit("image_update", message, to=sid)
+        if webrtc_final_sids:
+            final_payload = {**payload, "imageTransport": "webp-final"}
+            final_message = (
+                (final_payload, result.image_bytes, extra_image_bytes)
+                if extra_image_bytes
+                else (final_payload, result.image_bytes)
+            )
+            for sid in webrtc_final_sids:
+                await self._server.emit("image_update", final_message, to=sid)
+                # The settled still hides the video decoder. Make the next
+                # interactive frame independent from the previous VR/surface
+                # or clip state before the client reveals video again.
+                webrtc_3d_transport_manager.request_keyframe(
+                    sid,
+                    view_id,
+                    burst_frames=2,
+                )
         webrtc_publish_ms = 0.0
         raw_image = getattr(result, "raw_image", None)
         if raw_image is not None:
             webrtc_payload = {**payload, "imageTransport": "webrtc"}
-            for sid in webrtc_sids:
+            for sid in webrtc_preview_sids:
+                # Announce the frame before handing it to WebRTC. The client
+                # keeps its settled WebP visible until the corresponding video
+                # frame is actually presented, preventing stale decoder pixels
+                # from flashing after mode or clip changes.
+                await self._server.emit("image_update_metadata", webrtc_payload, to=sid)
                 publish_ms = webrtc_3d_transport_manager.publish(sid, view_id, raw_image)
                 if publish_ms is None:
                     continue
                 webrtc_publish_ms += publish_ms
-                await self._server.emit("image_update_metadata", webrtc_payload, to=sid)
         emit_ms = (perf_counter() - emit_started_at) * 1000.0
         performance_timings = dict(getattr(result, "performance_timings", None) or {})
         if payload.get("render3dMode"):
@@ -741,6 +784,8 @@ class ViewSocketHub:
             )
         if should_emit_progress:
             await self._emit_progress_message(view_id, sids, {"phase": "complete", "progressPercent": 100})
+        if request.fast_preview:
+            self._last_preview_emitted_at[view_id] = perf_counter()
         return True
 
     async def _emit_render_message_safely(self, view_id: str, request: RenderRequest) -> bool:

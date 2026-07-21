@@ -56,11 +56,14 @@ TRACKBALL_ELEVATION_DEGREES_PER_VIEW_HEIGHT = VTK_TRACKBALL_ELEVATION_DEGREES_PE
 FAST_PREVIEW_IMAGE_SAMPLE_DISTANCE = 1.15
 FINAL_RENDER_IMAGE_SAMPLE_DISTANCE = 1.0
 FAST_PREVIEW_RAY_SAMPLE_FACTOR = 0.9
-FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.55
+FINAL_RENDER_RAY_SAMPLE_FACTOR = 0.45
 FAST_PREVIEW_MAX_SAMPLE_DISTANCE = 1.5
-FINAL_RENDER_MAX_SAMPLE_DISTANCE = 0.9
+FINAL_RENDER_MAX_SAMPLE_DISTANCE = 0.75
 FAST_PREVIEW_MULTI_SAMPLES = 0
-FINAL_RENDER_MULTI_SAMPLES = 4
+FINAL_RENDER_MULTI_SAMPLES = 8
+FINAL_RENDER_SCALE = 1.25
+FINAL_RENDER_MAX_DIMENSION = 1600
+FINAL_RENDER_MIN_SAMPLE_DISTANCE = 0.18
 VOLUME_SESSION_LIMIT = 8
 
 
@@ -353,9 +356,10 @@ class VtkVolumeRenderer:
         )
 
     def _configure_session(self, session: VolumeRenderSession, request: VolumeRenderRequest) -> None:
-        if session.canvas_size != (request.canvas_width, request.canvas_height):
-            session.render_window.SetSize(request.canvas_width, request.canvas_height)
-            session.canvas_size = (request.canvas_width, request.canvas_height)
+        render_size = self._resolve_render_size(request)
+        if session.canvas_size != render_size:
+            session.render_window.SetSize(*render_size)
+            session.canvas_size = render_size
 
         transfer_function_token = self._build_transfer_function_token(
             request.window_width,
@@ -452,6 +456,22 @@ class VtkVolumeRenderer:
         return (bool(request.fast_preview),)
 
     @staticmethod
+    def _resolve_render_size(request: VolumeRenderRequest) -> tuple[int, int]:
+        width = max(1, int(request.canvas_width))
+        height = max(1, int(request.canvas_height))
+        if request.fast_preview:
+            return width, height
+        scale = min(
+            FINAL_RENDER_SCALE,
+            FINAL_RENDER_MAX_DIMENSION / float(max(width, height)),
+        )
+        scale = max(1.0, scale)
+        return (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        )
+
+    @staticmethod
     def _token_float(value: Any) -> float:
         try:
             numeric = float(value)
@@ -500,7 +520,8 @@ class VtkVolumeRenderer:
             min_spacing = max(1e-3, min(abs(float(value)) for value in render_spacing_xyz))
             factor = FAST_PREVIEW_RAY_SAMPLE_FACTOR if request.fast_preview else FINAL_RENDER_RAY_SAMPLE_FACTOR
             max_sample_distance = FAST_PREVIEW_MAX_SAMPLE_DISTANCE if request.fast_preview else FINAL_RENDER_MAX_SAMPLE_DISTANCE
-            sample_distance = max(0.24, min(max_sample_distance, min_spacing * factor))
+            minimum_sample_distance = 0.24 if request.fast_preview else FINAL_RENDER_MIN_SAMPLE_DISTANCE
+            sample_distance = max(minimum_sample_distance, min(max_sample_distance, min_spacing * factor))
             session.mapper.SetSampleDistance(sample_distance)
 
     @staticmethod

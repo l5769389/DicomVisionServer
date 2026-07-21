@@ -31,11 +31,24 @@ class Settings(BaseSettings):
         default=2,
         alias="DICOMVISION_WEBRTC_INITIAL_BURST_FRAMES",
     )
+    three_d_final_webp_method: str = Field(
+        default="auto",
+        alias="DICOMVISION_3D_FINAL_WEBP_METHOD",
+    )
     expose_api_docs: bool | None = Field(default=None, alias="EXPOSE_API_DOCS")
     web_sample_dicom_path: str | None = Field(default=None, alias="WEB_SAMPLE_DICOM_PATH")
     web_upload_dicom_root: str | None = Field(default=None, alias="WEB_UPLOAD_DICOM_ROOT")
-    web_upload_max_files: int = Field(default=5000, alias="WEB_UPLOAD_MAX_FILES")
+    web_upload_max_files: int = Field(default=20_000, alias="WEB_UPLOAD_MAX_FILES")
     web_upload_max_bytes: int = Field(default=2 * 1024 * 1024 * 1024, alias="WEB_UPLOAD_MAX_BYTES")
+    web_upload_max_archive_entries: int = Field(default=20_000, alias="WEB_UPLOAD_MAX_ARCHIVE_ENTRIES")
+    web_upload_max_archive_uncompressed_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        alias="WEB_UPLOAD_MAX_ARCHIVE_UNCOMPRESSED_BYTES",
+    )
+    web_upload_max_archive_compression_ratio: int = Field(
+        default=200,
+        alias="WEB_UPLOAD_MAX_ARCHIVE_COMPRESSION_RATIO",
+    )
     web_upload_max_age_seconds: int = Field(default=30 * 60, alias="WEB_UPLOAD_MAX_AGE_SECONDS")
     web_upload_cleanup_interval_seconds: int = Field(
         default=30 * 60,
@@ -73,6 +86,16 @@ class Settings(BaseSettings):
     @property
     def normalized_webrtc_initial_burst_frames(self) -> int:
         return max(1, min(int(self.webrtc_initial_burst_frames), 3))
+
+    @property
+    def normalized_three_d_final_webp_method(self) -> str | int:
+        value = self.three_d_final_webp_method.strip().lower()
+        if value == "auto":
+            return "auto"
+        try:
+            return max(0, min(int(value), 6))
+        except ValueError:
+            return "auto"
 
     model_config = SettingsConfigDict(
         env_file=".env",

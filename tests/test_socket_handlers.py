@@ -215,6 +215,11 @@ def test_3d_rotate_end_schedules_debounced_final_render(monkeypatch) -> None:
         monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
         monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
         monkeypatch.setattr(
+            handlers.view_socket_hub,
+            "adaptive_final_render_delay",
+            lambda view_id, **kwargs: 0.021,
+        )
+        monkeypatch.setattr(
             handlers.view_registry,
             "get",
             lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="3D"),
@@ -266,7 +271,7 @@ def test_3d_rotate_end_schedules_debounced_final_render(monkeypatch) -> None:
         assert response == {"ok": True}
         return scheduled_finals
 
-    assert asyncio.run(run()) == [("v-3d", handlers.ROTATE3D_FINAL_RENDER_DEBOUNCE_SECONDS, "png", "drag-1")]
+    assert asyncio.run(run()) == [("v-3d", 0.021, "png", "drag-1")]
 
 
 def test_pan_zoom_start_marks_interaction_and_end_debounces_final(monkeypatch) -> None:
@@ -277,6 +282,11 @@ def test_pan_zoom_start_marks_interaction_and_end_debounces_final(monkeypatch) -
 
         monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
         monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(
+            handlers.view_socket_hub,
+            "adaptive_final_render_delay",
+            lambda view_id, **kwargs: 0.014,
+        )
         monkeypatch.setattr(
             handlers.view_registry,
             "get",
@@ -337,8 +347,8 @@ def test_pan_zoom_start_marks_interaction_and_end_debounces_final(monkeypatch) -
     marked, scheduled = asyncio.run(run())
     assert marked == [("v-stack", "pan-1"), ("v-stack", "zoom-1")]
     assert scheduled == [
-        ("v-stack", handlers.PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS, "pan-1"),
-        ("v-stack", handlers.PAN_ZOOM_FINAL_RENDER_DEBOUNCE_SECONDS, "zoom-1"),
+        ("v-stack", 0.014, "pan-1"),
+        ("v-stack", 0.014, "zoom-1"),
     ]
 
 
