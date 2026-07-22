@@ -4,7 +4,16 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-MeasurementToolType = Literal["line", "rect", "ellipse", "angle", "curve", "freeform"]
+MeasurementToolType = Literal[
+    "line",
+    "rect",
+    "ellipse",
+    "angle",
+    "curve",
+    "freeform",
+    "alignment-horizontal",
+    "alignment-vertical",
+]
 MeasurementUnit = Literal["mm", "px"]
 MeasurementAreaUnit = Literal["mm2", "px2"]
 DrawingScope = Literal["image", "series"]

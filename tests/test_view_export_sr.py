@@ -73,3 +73,25 @@ def test_measurement_sr_export_requires_measurements() -> None:
         )
 
     assert exc_info.value.status_code == 400
+
+
+def test_alignment_angle_sr_export_preserves_degree_units() -> None:
+    view = ViewRecord(view_id="view-1", series_id="series-1", view_type="Stack", width=128, height=128)
+    overlays = ViewExportOverlaysPayload(
+        measurements=[
+            ViewExportMeasurementOverlayPayload(
+                measurementId="alignment-1",
+                toolType="alignment-horizontal",
+                points=[ViewExportPointPayload(x=0.1, y=0.4), ViewExportPointPayload(x=0.9, y=0.5)],
+                labelLines=["ΔH 7.1°", "42.0 mm"],
+            )
+        ]
+    )
+
+    dataset = dcmread(BytesIO(build_measurement_sr_dicom_bytes(view, overlays, _reference_dataset())))
+    numeric_items = [item for item in dataset.ContentSequence[0].ContentSequence if item.ValueType == "NUM"]
+    angle_item = next(item for item in numeric_items if float(item.MeasuredValueSequence[0].NumericValue) == 7.1)
+
+    unit = angle_item.MeasuredValueSequence[0].MeasurementUnitsCodeSequence[0]
+    assert unit.CodeValue == "deg"
+    assert unit.CodeMeaning == "degree"

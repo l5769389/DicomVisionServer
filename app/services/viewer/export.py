@@ -657,7 +657,7 @@ class ViewerExportMixin:
         if not points:
             return
 
-        if tool_type == "line" and len(points) >= 2:
+        if tool_type in {"line", "alignment-horizontal", "alignment-vertical"} and len(points) >= 2:
             self._draw_export_polyline(draw, points[:2])
         elif tool_type == "rect" and len(points) >= 2:
             left, right = sorted((points[0][0], points[1][0]))

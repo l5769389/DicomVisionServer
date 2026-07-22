@@ -1,11 +1,13 @@
 import math
 from pathlib import Path
 
+from fastapi import HTTPException
 import numpy as np
 import pytest
-from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
+from app.models.measurement import MeasurementToolType
 from app.schemas.dicom import LoadFolderRequest
 from app.schemas.view import ViewCreateRequest, ViewOperationRequest
 from app.services.dicom_cache import dicom_cache
@@ -31,8 +33,8 @@ def _write_physical_ct_dicom(path: Path) -> None:
     dataset.Modality = "CT"
     dataset.SeriesDescription = "Physical measurement truth"
     dataset.InstanceNumber = 1
-    dataset.Rows = 16
-    dataset.Columns = 16
+    dataset.Rows = 64
+    dataset.Columns = 64
     dataset.SamplesPerPixel = 1
     dataset.PhotometricInterpretation = "MONOCHROME2"
     dataset.PixelRepresentation = 0
@@ -46,7 +48,7 @@ def _write_physical_ct_dicom(path: Path) -> None:
     dataset.RescaleSlope = 2.0
     dataset.RescaleIntercept = -1024.0
     dataset.RescaleType = "HU"
-    dataset.PixelData = np.full((16, 16), 600, dtype=np.uint16).tobytes()
+    dataset.PixelData = np.full((64, 64), 600, dtype=np.uint16).tobytes()
     dataset.save_as(path, enforce_file_format=True)
 
 
@@ -61,8 +63,8 @@ def physical_ct_view(tmp_path: Path):
     series_id = loaded.series_list[0].series_id
     created = view_registry.create(ViewCreateRequest(seriesId=series_id, viewType="Stack"))
     view = view_registry.get(created.view_id)
-    view.width = 16
-    view.height = 16
+    view.width = 64
+    view.height = 64
     view.is_initialized = True
 
     try:
@@ -88,8 +90,8 @@ def test_stack_measurement_uses_dicom_physical_spacing_and_rescaled_ct_values(
                 "actionType": "end",
                 "measurementId": "physical-rect",
                 "points": [
-                    {"x": 4 / 16, "y": 4 / 16},
-                    {"x": 8 / 16, "y": 8 / 16},
+                    {"x": 4 / 64, "y": 4 / 64},
+                    {"x": 8 / 64, "y": 8 / 64},
                 ],
             }
         )
@@ -131,8 +133,8 @@ def test_stack_line_measurement_preserves_physical_length_through_canvas_mapping
                 "actionType": "end",
                 "measurementId": "physical-line",
                 "points": [
-                    {"x": 2 / 16, "y": 3 / 16},
-                    {"x": 10 / 16, "y": 7 / 16},
+                    {"x": 2 / 64, "y": 3 / 64},
+                    {"x": 10 / 64, "y": 7 / 64},
                 ],
             }
         )
@@ -143,3 +145,115 @@ def test_stack_line_measurement_preserves_physical_length_through_canvas_mapping
     assert measurement.metrics.unit == "mm"
     assert measurement.metrics.length == pytest.approx(expected_length_mm)
     assert measurement.label_lines == (f"{expected_length_mm:.1f} mm",)
+
+
+@pytest.mark.parametrize(
+    ("tool_type", "expected_degrees", "expected_label"),
+    [
+        ("alignment-horizontal", math.degrees(math.atan2(2.0, 4.0)), "ΔH 26.6°"),
+        ("alignment-vertical", math.degrees(math.atan2(4.0, 2.0)), "ΔV 63.4°"),
+    ],
+)
+def test_alignment_measurement_uses_real_dicom_physical_axes(
+    physical_ct_view,
+    monkeypatch,
+    tool_type: MeasurementToolType,
+    expected_degrees: float,
+    expected_label: str,
+) -> None:
+    monkeypatch.setattr(viewer_service, "_render_by_view_type", lambda *args, **kwargs: object())
+
+    viewer_service.handle_view_operation(
+        ViewOperationRequest.model_validate(
+            {
+                "viewId": physical_ct_view.view_id,
+                "opType": "measurement",
+                "subOpType": tool_type,
+                "actionType": "end",
+                "measurementId": f"physical-{tool_type}",
+                "points": [
+                    {"x": 0 / 64, "y": 0 / 64},
+                    {"x": 40 / 64, "y": 5 / 64},
+                ],
+            }
+        )
+    )
+
+    [measurement] = physical_ct_view.measurements
+    assert measurement.metrics.unit == "mm"
+    assert measurement.metrics.length == pytest.approx(math.hypot(20.0, 10.0))
+    assert measurement.metrics.angle_degrees == pytest.approx(expected_degrees)
+    assert measurement.label_lines == (expected_label, "22.4 mm")
+
+
+def test_alignment_measurement_never_emits_a_pseudo_physical_result_without_pixel_spacing(
+    physical_ct_view,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(viewer_service, "_render_by_view_type", lambda *args, **kwargs: object())
+    series = series_registry.get(physical_ct_view.series_id)
+    instance = series.instances[physical_ct_view.current_index]
+    cached = dicom_cache.get(instance.sop_instance_uid, instance.path)
+    del cached.dataset.PixelSpacing
+
+    request = ViewOperationRequest.model_validate(
+        {
+            "viewId": physical_ct_view.view_id,
+            "opType": "measurement",
+            "subOpType": "alignment-horizontal",
+            "actionType": "end",
+            "measurementId": "unavailable-spacing-alignment",
+            "points": [
+                {"x": 0.0, "y": 0.0},
+                {"x": 40 / 64, "y": 5 / 64},
+            ],
+        }
+    )
+
+    preview = viewer_service._build_measurement_preview(
+        physical_ct_view,
+        request.model_copy(update={"action_type": "move"}),
+    )
+    assert preview is not None
+    assert preview["labelLines"] == ["DICOM Pixel Spacing unavailable"]
+    assert "metrics" not in preview
+
+    viewer_service.handle_view_operation(request)
+
+    [measurement] = physical_ct_view.measurements
+    assert measurement.metrics.length is None
+    assert measurement.metrics.angle_degrees is None
+    assert measurement.label_lines == ("DICOM Pixel Spacing unavailable",)
+
+    invalid_spacing_dataset = Dataset()
+    invalid_spacing_dataset.PixelSpacing = [0, float("nan")]
+    assert viewer_service._get_stack_spacing_xy(invalid_spacing_dataset) is None
+
+
+@pytest.mark.parametrize(
+    ("view_type", "modality"),
+    [("AX", "CT"), ("Stack", "MR")],
+)
+def test_alignment_measurement_is_rejected_outside_an_ordinary_2d_ct_view(
+    physical_ct_view,
+    view_type: str,
+    modality: str,
+) -> None:
+    physical_ct_view.view_type = view_type
+    series_registry.get(physical_ct_view.series_id).modality = modality
+    request = ViewOperationRequest.model_validate(
+        {
+            "viewId": physical_ct_view.view_id,
+            "opType": "measurement",
+            "subOpType": "alignment-horizontal",
+            "actionType": "end",
+            "measurementId": "unsupported-alignment",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 40 / 64, "y": 5 / 64}],
+        }
+    )
+
+    with pytest.raises(HTTPException, match="Available only in 2D CT views") as exc_info:
+        viewer_service._handle_measurement(physical_ct_view, request)
+
+    assert exc_info.value.status_code == 400
+    assert physical_ct_view.measurements == []

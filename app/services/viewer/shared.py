@@ -144,7 +144,7 @@ from app.services.hover_mapping import map_normalized_canvas_to_image_row_col
 from app.services.layered_renderer import RenderContext, layered_renderer
 from app.services.measurement_geometry import build_smooth_path_points
 from app.services.measurement_rules import get_measurement_point_requirement, has_required_measurement_points
-from app.services.measurement_utils import build_measurement_metrics
+from app.services.measurement_utils import build_measurement_metrics, has_valid_physical_spacing
 from app.services.mpr import (
     MipConfig as ResliceMipConfig,
     MprCursorState,
@@ -294,7 +294,16 @@ class FusionRegistrationPetLayerCacheEntry:
 
 
 CROSSHAIR_HIT_RADIUS = 12.0
-MEASUREMENT_TOOL_TYPES = {"line", "rect", "ellipse", "angle", "curve", "freeform"}
+MEASUREMENT_TOOL_TYPES = {
+    "line",
+    "rect",
+    "ellipse",
+    "angle",
+    "curve",
+    "freeform",
+    "alignment-horizontal",
+    "alignment-vertical",
+}
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
 WEBP_PREVIEW_QUALITY = 80
