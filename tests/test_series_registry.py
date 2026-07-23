@@ -1,7 +1,9 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from pydicom.uid import UID
+import pydicom
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, UID, generate_uid
 
 from app.services.series_registry import SeriesRegistry
 
@@ -69,3 +71,42 @@ def test_resolve_scan_target_skips_archives_and_metadata_but_keeps_extensionless
 
     assert root == tmp_path.resolve()
     assert scan_paths == [extensionless_dicom, dicom_file]
+
+
+def test_resolve_scan_target_skips_hidden_and_symlinked_directories(tmp_path: Path) -> None:
+    visible = tmp_path / "study" / "slice.dcm"
+    hidden = tmp_path / ".cache" / "hidden.dcm"
+    visible.parent.mkdir(parents=True)
+    hidden.parent.mkdir(parents=True)
+    visible.write_bytes(b"candidate")
+    hidden.write_bytes(b"candidate")
+    linked_dir = tmp_path / "linked-study"
+    linked_dir.symlink_to(visible.parent, target_is_directory=True)
+
+    _, scan_paths = SeriesRegistry._resolve_scan_target(str(tmp_path))
+
+    assert scan_paths == [visible]
+
+
+def test_scan_header_reads_only_fields_needed_for_series_grouping(tmp_path: Path) -> None:
+    path = tmp_path / "slice.dcm"
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    dataset = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+    dataset.SOPClassUID = SecondaryCaptureImageStorage
+    dataset.SOPInstanceUID = "1.2.3.4"
+    dataset.SeriesInstanceUID = "1.2.3"
+    dataset.Modality = "CT"
+    dataset.Rows = 8
+    dataset.Columns = 8
+    dataset.InstitutionName = "Not needed while listing"
+    dataset.save_as(path, enforce_file_format=True)
+
+    header = SeriesRegistry._read_dataset_header(path)
+
+    assert header is not None
+    assert header.SeriesInstanceUID == "1.2.3"
+    assert header.Modality == "CT"
+    assert "InstitutionName" not in header

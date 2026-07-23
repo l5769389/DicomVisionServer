@@ -102,6 +102,34 @@ def test_7z_import_extracts_dicom_and_ignores_metadata(tmp_path: Path) -> None:
     dicom_cache.clear()
 
 
+def test_7z_import_accepts_solid_archive_members_without_compressed_sizes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """py7zr may report None for per-file compressed sizes in solid archives."""
+
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "IM0001"
+    _create_dicom(dicom_path)
+    archive_path = tmp_path / "solid-study.7z"
+    with py7zr.SevenZipFile(archive_path, "w") as archive:
+        archive.write(dicom_path, arcname="study/IM0001")
+
+    original_list = py7zr.SevenZipFile.list
+
+    def list_without_member_compressed_size(archive: py7zr.SevenZipFile):
+        entries = original_list(archive)
+        for entry in entries:
+            entry.compressed = None
+        return entries
+
+    monkeypatch.setattr(py7zr.SevenZipFile, "list", list_without_member_compressed_size)
+    service = DicomUploadService(upload_root=tmp_path / "uploads")
+    response = service.load_archive_path(str(archive_path), workspace_id="solid-seven-zip-test")
+
+    assert len(response.series_list) == 1
+    series_registry.clear()
+    dicom_cache.clear()
+
+
 def test_supported_archive_suffixes_are_upload_candidates(tmp_path: Path) -> None:
     service = DicomUploadService(upload_root=tmp_path / "uploads")
 

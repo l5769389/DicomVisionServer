@@ -1,4 +1,5 @@
 import io
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from threading import RLock
@@ -70,6 +71,37 @@ NON_DICOM_SCAN_SUFFIXES = frozenset({
     ".zip",
     ".zst",
 })
+
+# Folder and archive imports only need these fields to group instances and build
+# lightweight series cards. Pixel data is intentionally excluded and richer
+# metadata is read on demand by the viewer APIs.
+SCAN_HEADER_TAGS = (
+    "SOPClassUID",
+    "SOPInstanceUID",
+    "SeriesInstanceUID",
+    "StudyInstanceUID",
+    "PatientID",
+    "PatientName",
+    "StudyDate",
+    "StudyDescription",
+    "AccessionNumber",
+    "Modality",
+    "SeriesDescription",
+    "InstanceNumber",
+    "Rows",
+    "Columns",
+    "PhotometricInterpretation",
+    "SamplesPerPixel",
+    "PixelSpacing",
+    "ImagerPixelSpacing",
+    "ImageOrientationPatient",
+    "ImagePositionPatient",
+    "RescaleSlope",
+    "RescaleIntercept",
+    "WindowWidth",
+    "WindowCenter",
+    "NumberOfFrames",
+)
 
 
 class SeriesRegistry:
@@ -154,13 +186,49 @@ class SeriesRegistry:
         if target.is_file():
             return target.parent, [target] if cls.is_dicom_scan_candidate(target) else []
         if target.is_dir():
-            return target, sorted(path for path in target.rglob("*") if cls.is_dicom_scan_candidate(path))
+            return target, cls._collect_scan_candidates(target)
         raise HTTPException(status_code=404, detail="DICOM path is not a file or folder")
+
+    @classmethod
+    def _collect_scan_candidates(cls, root: Path) -> list[Path]:
+        """Recursively collect candidates without materializing every directory entry first."""
+
+        candidates: list[Path] = []
+        pending = [root]
+        while pending:
+            current_dir = pending.pop()
+            try:
+                with os.scandir(current_dir) as entries:
+                    for entry in entries:
+                        if entry.name.startswith(".") or entry.name == "__MACOSX":
+                            continue
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                path = Path(entry.path)
+                                if cls.is_dicom_candidate_name(path):
+                                    candidates.append(path)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return sorted(candidates)
 
     @staticmethod
     def _read_dataset_header(path: Path):
         try:
-            return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+            dataset = pydicom.dcmread(
+                str(path),
+                stop_before_pixels=True,
+                specific_tags=SCAN_HEADER_TAGS,
+                force=True,
+            )
+            # GSPS stores its references in sequences outside the normal scan
+            # set. It is uncommon, so pay for the full header only when needed.
+            if is_gsps_dataset(dataset):
+                return pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+            return dataset
         except Exception:
             return None
 
