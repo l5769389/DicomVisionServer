@@ -7,6 +7,7 @@ from zipfile import ZipFile
 import numpy as np
 import pydicom
 from fastapi.testclient import TestClient
+from PIL import Image
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.tag import Tag
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
@@ -19,7 +20,13 @@ from app.services.dicom_tag_job_service import DicomTagModifyJobService, dicom_t
 from app.services.series_registry import series_registry
 
 
-def _create_test_dicom(path: Path, *, series_instance_uid: str | None = None, instance_number: int = 1) -> None:
+def _create_test_dicom(
+    path: Path,
+    *,
+    series_instance_uid: str | None = None,
+    instance_number: int = 1,
+    modality: str = "OT",
+) -> None:
     file_meta = FileMetaDataset()
     file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
     file_meta.MediaStorageSOPInstanceUID = generate_uid()
@@ -45,7 +52,7 @@ def _create_test_dicom(path: Path, *, series_instance_uid: str | None = None, in
     dataset.SOPClassUID = SecondaryCaptureImageStorage
     dataset.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
     dataset.SeriesDescription = "Tag API Series"
-    dataset.Modality = "OT"
+    dataset.Modality = modality
     dataset.InstanceNumber = instance_number
     dataset.Rows = 2
     dataset.Columns = 2
@@ -130,6 +137,183 @@ def test_load_folder_response_includes_series_thumbnail(tmp_path: Path) -> None:
     assert thumbnail_response.status_code == 200
     assert thumbnail_response.headers["content-type"] == "image/png"
     assert thumbnail_response.content.startswith(b"\x89PNG")
+
+
+def test_montage_tile_renders_requested_stack_slice_without_mutating_order(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    series_instance_uid = generate_uid()
+    _create_test_dicom(tmp_path / "slice-2.dcm", series_instance_uid=series_instance_uid, instance_number=2)
+    _create_test_dicom(tmp_path / "slice-1.dcm", series_instance_uid=series_instance_uid, instance_number=1)
+
+    client = TestClient(fastapi_app)
+    load_response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+    response = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={
+            "seriesId": series_id,
+            "sliceIndex": 1,
+            "size": 128,
+            "ww": 4,
+            "wl": 2,
+            "pseudocolorPreset": "rainbow",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/webp"
+    assert response.headers["cache-control"] == "private, max-age=300"
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.size == (128, 128)
+        assert image.mode == "RGB"
+
+    series = series_registry.get(series_id)
+    assert [instance.instance_number for instance in series.instances] == [1, 2]
+
+
+def test_montage_tile_rejects_invalid_series_and_slice(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    dicom_path = tmp_path / "montage-test.dcm"
+    _create_test_dicom(dicom_path)
+    client = TestClient(fastapi_app)
+    load_response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+
+    out_of_range = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={"seriesId": series_id, "sliceIndex": 9},
+    )
+    missing_series = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={"seriesId": "missing-series", "sliceIndex": 0},
+    )
+
+    assert out_of_range.status_code == 404
+    assert missing_series.status_code == 404
+
+
+def test_montage_tile_uses_pet_display_conversion_and_clamps_size(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    _create_test_dicom(tmp_path / "pet-slice.dcm", modality="PT")
+    client = TestClient(fastapi_app)
+    load_response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+
+    small_response = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={
+            "seriesId": series_id,
+            "sliceIndex": 0,
+            "size": 16,
+            "pseudocolorPreset": "bwinverse",
+        },
+    )
+    large_response = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={
+            "seriesId": series_id,
+            "sliceIndex": 0,
+            "size": 4096,
+            "pseudocolorPreset": "bwinverse",
+        },
+    )
+
+    assert small_response.status_code == 200
+    assert large_response.status_code == 200
+    with Image.open(BytesIO(small_response.content)) as image:
+        assert image.size == (96, 96)
+        assert image.mode == "RGB"
+    with Image.open(BytesIO(large_response.content)) as image:
+        assert image.size == (512, 512)
+
+
+def test_montage_tile_is_workspace_isolated(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    _create_test_dicom(tmp_path / "workspace-slice.dcm")
+    client = TestClient(fastapi_app)
+    load_response = client.post(
+        "/api/v1/dicom/loadFolder",
+        json={"folderPath": str(tmp_path)},
+        headers={"X-DicomVision-Workspace-Id": "montage-a"},
+    )
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+
+    owner_response = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={"seriesId": series_id, "sliceIndex": 0, "workspaceId": "montage-a"},
+    )
+    cross_workspace_response = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={"seriesId": series_id, "sliceIndex": 0, "workspaceId": "montage-b"},
+    )
+
+    assert owner_response.status_code == 200
+    assert cross_workspace_response.status_code == 404
+
+
+def test_montage_corner_info_returns_requested_slice_without_mutating_order(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    series_instance_uid = generate_uid()
+    first_path = tmp_path / "corner-slice-1.dcm"
+    second_path = tmp_path / "corner-slice-2.dcm"
+    _create_test_dicom(first_path, series_instance_uid=series_instance_uid, instance_number=1)
+    _create_test_dicom(second_path, series_instance_uid=series_instance_uid, instance_number=2)
+    second = pydicom.dcmread(second_path)
+    second.SliceLocation = 12.5
+    second.ImagePositionPatient = [0.0, 0.0, 12.5]
+    second.save_as(second_path, write_like_original=False)
+
+    client = TestClient(fastapi_app)
+    load_response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+    response = client.get(
+        "/api/v1/dicom/montage/corner-info",
+        params={"seriesId": series_id, "sliceIndex": 1, "ww": 500, "wl": 50},
+    )
+
+    assert response.status_code == 200
+    corner_info = response.json()["cornerInfo"]
+    all_lines = [
+        *corner_info["topLeft"],
+        *corner_info["topRight"],
+        *corner_info["bottomLeft"],
+        *corner_info["bottomRight"],
+    ]
+    assert "Im: 2/2" in all_lines
+    assert "W: 500 L: 50" in all_lines
+    assert corner_info["tags"]["instanceNumber"] == ["Instance: 2"]
+    assert corner_info["tags"]["sliceLocation"] == ["Slice loc: 12.5mm"]
+    assert [instance.instance_number for instance in series_registry.get(series_id).instances] == [1, 2]
+
+
+def test_montage_corner_info_rejects_invalid_slice_and_cross_workspace_access(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    _create_test_dicom(tmp_path / "corner-workspace.dcm")
+    client = TestClient(fastapi_app)
+    load_response = client.post(
+        "/api/v1/dicom/loadFolder",
+        json={"folderPath": str(tmp_path)},
+        headers={"X-DicomVision-Workspace-Id": "corner-owner"},
+    )
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+
+    out_of_range = client.get(
+        "/api/v1/dicom/montage/corner-info",
+        params={"seriesId": series_id, "sliceIndex": 5, "workspaceId": "corner-owner"},
+    )
+    cross_workspace = client.get(
+        "/api/v1/dicom/montage/corner-info",
+        params={"seriesId": series_id, "sliceIndex": 0, "workspaceId": "corner-other"},
+    )
+
+    assert out_of_range.status_code == 404
+    assert cross_workspace.status_code == 404
 
 
 def test_load_folder_accepts_single_dicom_file_path(tmp_path: Path) -> None:
