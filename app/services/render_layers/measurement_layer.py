@@ -58,7 +58,7 @@ class MeasurementLayer:
         *,
         scale: int,
     ) -> None:
-        if measurement.tool_type == "line" and len(points) >= 2:
+        if measurement.tool_type in {"line", "alignment-horizontal", "alignment-vertical"} and len(points) >= 2:
             self._draw_line(draw, points[:2], scale=scale)
         elif measurement.tool_type == "rect" and len(points) >= 2:
             self._draw_rect(draw, points[:2], scale=scale)
@@ -156,7 +156,7 @@ class MeasurementLayer:
         measurement: MeasurementRecord,
         points: tuple[tuple[float, float], ...],
     ) -> tuple[float, float]:
-        if measurement.tool_type in {"line", "curve"} and len(points) >= 2:
+        if measurement.tool_type in {"line", "curve", "alignment-horizontal", "alignment-vertical"} and len(points) >= 2:
             anchor = points[-1]
             return (anchor[0] + 20.0, anchor[1] - 56.0)
 

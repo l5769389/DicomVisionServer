@@ -296,7 +296,10 @@ def _unit_code_sequence(unit_text: str | None) -> Sequence:
 
 
 def _normalize_unit_text(unit_text: str | None) -> str:
-    normalized = unicodedata.normalize("NFKD", unit_text or "").encode("ascii", "ignore").decode("ascii")
+    # The degree symbol is not preserved by ASCII transliteration. Convert it
+    # explicitly so angle measurements remain UCUM "deg" in DICOM SR.
+    source = (unit_text or "").replace("°", "deg")
+    normalized = unicodedata.normalize("NFKD", source).encode("ascii", "ignore").decode("ascii")
     normalized = normalized.strip().strip(".").lower().replace("^2", "2")
     if normalized.startswith("sq") and len(normalized) > 2:
         return f"{normalized[2:]}2"

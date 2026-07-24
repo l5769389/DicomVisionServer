@@ -240,8 +240,13 @@ class DicomUploadService:
 
         safe_compressed_size = max(0, int(compressed_size or 0))
         safe_uncompressed_size = max(0, int(uncompressed_size or 0))
-        if safe_uncompressed_size > 0 and (
-            safe_compressed_size <= 0 or safe_uncompressed_size / safe_compressed_size > max_compression_ratio
+        # Solid 7z archives do not reliably expose a compressed size for every
+        # member. A missing member size is validated against the archive as a
+        # whole below instead of being treated as a compression bomb.
+        if (
+            safe_uncompressed_size > 0
+            and safe_compressed_size > 0
+            and safe_uncompressed_size / safe_compressed_size > max_compression_ratio
         ):
             raise HTTPException(status_code=413, detail=f"{archive_label} archive compression ratio is too high")
 
@@ -249,6 +254,21 @@ class DicomUploadService:
         if total_uncompressed_bytes > max_uncompressed_bytes:
             raise HTTPException(status_code=413, detail=f"{archive_label} archive expands to too much data")
         return member_path, entry_count, total_uncompressed_bytes
+
+    def _validate_archive_compression_ratio(
+        self,
+        archive_path: Path,
+        archive_label: str,
+        uncompressed_bytes: int,
+    ) -> None:
+        """Guard solid archives when members do not publish compressed sizes."""
+
+        if uncompressed_bytes <= 0:
+            return
+        archive_bytes = max(0, archive_path.stat().st_size)
+        _, _, max_compression_ratio = self._archive_limits()
+        if archive_bytes <= 0 or uncompressed_bytes / archive_bytes > max_compression_ratio:
+            raise HTTPException(status_code=413, detail=f"{archive_label} archive compression ratio is too high")
 
     def _extract_zip_archive(
         self,
@@ -336,6 +356,8 @@ class DicomUploadService:
                 )
                 if member_path is not None:
                     targets.append(info.filename)
+
+            self._validate_archive_compression_ratio(archive_path, "7z", uncompressed_bytes - byte_offset)
 
             if targets:
                 try:

@@ -13,6 +13,8 @@ from app.models.measurement import (
     MeasurementUnit,
 )
 
+MIN_ALIGNMENT_REFERENCE_LENGTH_MM = 20.0
+
 
 @dataclass(frozen=True)
 class _PixelStats:
@@ -39,6 +41,10 @@ def build_measurement_metrics(
 ) -> tuple[MeasurementMetrics, tuple[str, ...]]:
     if tool_type == "line":
         return _build_line_metrics(points[:2], spacing_xy)
+    if tool_type == "alignment-horizontal":
+        return _build_alignment_angle_metrics(points[:2], spacing_xy, reference_axis="horizontal")
+    if tool_type == "alignment-vertical":
+        return _build_alignment_angle_metrics(points[:2], spacing_xy, reference_axis="vertical")
     if tool_type == "rect":
         return _build_rect_metrics(points[:2], source_pixels, spacing_xy)
     if tool_type == "ellipse":
@@ -66,6 +72,69 @@ def _build_line_metrics(
     length = math.hypot(dx, dy)
     metrics = MeasurementMetrics(unit="px", area_unit="px2", length=length)
     return (metrics, (f"{length:.1f} px",))
+
+
+def _build_alignment_angle_metrics(
+    points: tuple[MeasurementPoint, ...],
+    spacing_xy: tuple[float, float] | None,
+    *,
+    reference_axis: str,
+) -> tuple[MeasurementMetrics, tuple[str, ...]]:
+    """Measure an undirected line's physical deviation from the current plane axes.
+
+    Image points are expressed in the source 2D DICOM image basis.
+    Scaling the vector before calculating the angle is essential: anisotropic DICOM
+    pixel spacing otherwise changes the reported physical inclination.
+    """
+
+    if not has_valid_physical_spacing(spacing_xy):
+        raise ValueError("Alignment measurement requires valid physical pixel spacing")
+
+    start, end = points
+    dx = float(end.x - start.x)
+    dy = float(end.y - start.y)
+    dx *= spacing_xy[0]
+    dy *= spacing_xy[1]
+
+    length = math.hypot(dx, dy)
+    if length < MIN_ALIGNMENT_REFERENCE_LENGTH_MM:
+        metrics = MeasurementMetrics(unit="mm", area_unit="mm2", length=length)
+        return (
+            metrics,
+            (f"Reference line < {MIN_ALIGNMENT_REFERENCE_LENGTH_MM:.0f} mm", f"{length:.1f} mm"),
+        )
+    if reference_axis == "horizontal":
+        deviation_degrees = _normalize_undirected_degrees(math.degrees(math.atan2(dy, dx)))
+    elif reference_axis == "vertical":
+        deviation_degrees = _normalize_undirected_degrees(math.degrees(math.atan2(dx, dy)))
+    else:  # pragma: no cover - protected by the tool type dispatch above
+        raise ValueError(f"Unsupported alignment reference axis: {reference_axis}")
+
+    metrics = MeasurementMetrics(
+        unit="mm",
+        area_unit="mm2",
+        length=length,
+        angle_degrees=deviation_degrees,
+    )
+    axis_label = "H" if reference_axis == "horizontal" else "V"
+    length_label = f"{length:.1f} mm"
+    return (metrics, (f"Δ{axis_label} {abs(deviation_degrees):.1f}°", length_label))
+
+
+def _normalize_undirected_degrees(angle_degrees: float) -> float:
+    """Normalize a line angle into [-90, 90), making reversed endpoints equivalent."""
+
+    return (angle_degrees + 90.0) % 180.0 - 90.0
+
+
+def has_valid_physical_spacing(spacing_xy: tuple[float, float] | None) -> bool:
+    if spacing_xy is None or len(spacing_xy) != 2:
+        return False
+    try:
+        spacing_x, spacing_y = (float(spacing_xy[0]), float(spacing_xy[1]))
+    except (TypeError, ValueError):
+        return False
+    return all(math.isfinite(value) and value > 0.0 for value in (spacing_x, spacing_y))
 
 
 def _build_rect_metrics(

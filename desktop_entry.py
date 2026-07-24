@@ -1,3 +1,5 @@
+import multiprocessing
+
 from app.core.config import get_settings
 from app.main import app
 import uvicorn
@@ -14,4 +16,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

@@ -227,6 +227,57 @@ def get_series_thumbnail(
     )
 
 
+@router.get(
+    "/montage/corner-info",
+    response_model=CornerInfoResponse,
+    summary="Build corner information for a montage slice",
+    description="Returns one slice's complete corner overlay without changing any open viewer state.",
+)
+def get_montage_corner_info(
+    seriesId: str,
+    sliceIndex: int,
+    ww: float | None = None,
+    wl: float | None = None,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> CornerInfoResponse:
+    return viewer_service.get_montage_corner_info(
+        seriesId,
+        sliceIndex,
+        window_width=ww,
+        window_center=wl,
+        workspace_id=workspace_id,
+    )
+
+
+@router.get(
+    "/montage/tile",
+    summary="Render a montage slice tile",
+    description="Returns one WebP stack slice without changing the current index of an open viewer.",
+)
+def get_montage_tile(
+    seriesId: str,
+    sliceIndex: int,
+    size: int = 256,
+    ww: float | None = None,
+    wl: float | None = None,
+    pseudocolorPreset: str | None = None,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> Response:
+    return Response(
+        content=series_registry.get_montage_tile_webp(
+            seriesId,
+            sliceIndex,
+            size=size,
+            window_width=ww,
+            window_center=wl,
+            pseudocolor_preset=pseudocolorPreset,
+            workspace_id=workspace_id,
+        ),
+        media_type="image/webp",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 @router.post(
     "/compatibility",
     response_model=DicomCompatibilityResponse,

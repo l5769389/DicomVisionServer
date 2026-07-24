@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from app.models.measurement import MeasurementPoint
+from app.models.measurement import MeasurementPoint, MeasurementToolType
 from app.services.measurement_utils import build_measurement_metrics
 
 
@@ -60,6 +60,74 @@ def test_line_measurement_uses_anisotropic_dicom_pixel_spacing() -> None:
     assert metrics.unit == "mm"
     assert metrics.length == pytest.approx(math.sqrt((8 * 0.5) ** 2 + (4 * 2.0) ** 2))
     assert label_lines == ("8.9 mm",)
+
+
+@pytest.mark.parametrize(
+    ("tool_type", "expected_angle", "expected_label"),
+    [
+        ("alignment-horizontal", math.degrees(math.atan2(2.0, 4.0)), "ΔH 26.6°"),
+        ("alignment-vertical", math.degrees(math.atan2(4.0, 2.0)), "ΔV 63.4°"),
+    ],
+)
+def test_alignment_angle_uses_dicom_physical_spacing_for_horizontal_and_vertical_references(
+    tool_type: MeasurementToolType,
+    expected_angle: float,
+    expected_label: str,
+) -> None:
+    metrics, label_lines = build_measurement_metrics(
+        tool_type,
+        (
+            MeasurementPoint(x=0.0, y=0.0),
+            MeasurementPoint(x=40.0, y=5.0),
+        ),
+        np.zeros((64, 64), dtype=np.float32),
+        (0.5, 2.0),
+    )
+
+    assert metrics.unit == "mm"
+    assert metrics.length == pytest.approx(math.hypot(20.0, 10.0))
+    assert metrics.angle_degrees == pytest.approx(expected_angle)
+    assert label_lines == (expected_label, "22.4 mm")
+
+
+def test_alignment_angle_is_unchanged_when_the_reference_line_endpoints_are_reversed() -> None:
+    forward_metrics, _ = build_measurement_metrics(
+        "alignment-horizontal",
+        (MeasurementPoint(x=0.0, y=0.0), MeasurementPoint(x=40.0, y=5.0)),
+        np.zeros((64, 64), dtype=np.float32),
+        (0.5, 2.0),
+    )
+    reversed_metrics, _ = build_measurement_metrics(
+        "alignment-horizontal",
+        (MeasurementPoint(x=40.0, y=5.0), MeasurementPoint(x=0.0, y=0.0)),
+        np.zeros((64, 64), dtype=np.float32),
+        (0.5, 2.0),
+    )
+
+    assert reversed_metrics.angle_degrees == pytest.approx(forward_metrics.angle_degrees)
+
+
+def test_alignment_angle_rejects_missing_or_invalid_physical_spacing() -> None:
+    points = (MeasurementPoint(x=0.0, y=0.0), MeasurementPoint(x=8.0, y=1.0))
+    pixels = np.zeros((16, 16), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="valid physical pixel spacing"):
+        build_measurement_metrics("alignment-horizontal", points, pixels, None)
+    with pytest.raises(ValueError, match="valid physical pixel spacing"):
+        build_measurement_metrics("alignment-horizontal", points, pixels, (float("nan"), 0.5))
+
+
+def test_alignment_angle_does_not_report_an_unstable_result_for_a_short_reference_line() -> None:
+    metrics, label_lines = build_measurement_metrics(
+        "alignment-horizontal",
+        (MeasurementPoint(x=0.0, y=0.0), MeasurementPoint(x=8.0, y=1.0)),
+        np.zeros((16, 16), dtype=np.float32),
+        (0.5, 2.0),
+    )
+
+    assert metrics.length == pytest.approx(math.hypot(4.0, 2.0))
+    assert metrics.angle_degrees is None
+    assert label_lines == ("Reference line < 20 mm", "4.5 mm")
 
 
 def test_rect_measurement_reports_physical_size_area_and_source_value_statistics() -> None:

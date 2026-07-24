@@ -2,7 +2,15 @@ from __future__ import annotations
 
 """Hover, measurement, annotation, and operation entry points."""
 
+import math
+
+from app.models.measurement import MeasurementMetrics
 from app.services.viewer.shared import *  # noqa: F403
+
+
+ALIGNMENT_MEASUREMENT_TOOL_TYPES = frozenset({"alignment-horizontal", "alignment-vertical"})
+ALIGNMENT_SPACING_UNAVAILABLE_LABEL = "DICOM Pixel Spacing unavailable"
+ALIGNMENT_UNSUPPORTED_VIEW_LABEL = "Available only in 2D CT views"
 
 
 class ViewerInteractionMixin:
@@ -192,6 +200,78 @@ class ViewerInteractionMixin:
             reference_cached.dataset if reference_cached is not None else None,
         )
         return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(overlay))
+
+    def get_montage_corner_info(
+        self,
+        series_id: str,
+        slice_index: int,
+        *,
+        window_width: float | None = None,
+        window_center: float | None = None,
+        workspace_id: str | None = None,
+    ) -> CornerInfoResponse:
+        """Return full corner metadata for one montage slice without mutating a view."""
+
+        series = compat.series_registry.get(series_id, workspace_id=workspace_id)
+        if not series.is_image_series or not series.instances:
+            raise HTTPException(status_code=400, detail="Series does not contain renderable image instances")
+        if slice_index < 0 or slice_index >= len(series.instances):
+            raise HTTPException(status_code=404, detail="Montage slice index is out of range")
+
+        _, cached = self._get_indexed_instance_and_cache(series, slice_index)
+        if cached is None:
+            raise HTTPException(status_code=422, detail="Montage slice metadata could not be decoded")
+
+        view = ViewRecord(
+            view_id=f"montage-corner-info:{series.series_id}:{slice_index}",
+            series_id=series.series_id,
+            view_type="PET" if str(series.modality or "").strip().upper() in {"PT", "PET"} else "Stack",
+            workspace_id=series.workspace_id,
+        )
+        view.current_index = slice_index
+        view.window_width = (
+            float(window_width)
+            if window_width is not None and math.isfinite(float(window_width)) and float(window_width) > 0
+            else (
+                cached.window_width
+                if cached.window_width is not None
+                else self._derive_default_window_width(cached)
+            )
+        )
+        view.window_center = (
+            float(window_center)
+            if window_center is not None and math.isfinite(float(window_center))
+            else (
+                cached.window_center
+                if cached.window_center is not None
+                else self._derive_default_window_center(cached)
+            )
+        )
+
+        series_overlay = self._build_series_corner_info_overlay(series, cached.dataset)
+        slice_overlay = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            cached.dataset,
+            current_index=slice_index,
+            total_slices=len(series.instances),
+            viewport_label="PET" if view.view_type == "PET" else "Stack",
+        )
+
+        def merge_lines(base: tuple[str, ...], overlay: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(dict.fromkeys((*base, *overlay)))
+
+        merged_overlay = CornerInfoOverlay(
+            top_left=merge_lines(series_overlay.top_left, slice_overlay.top_left),
+            top_right=merge_lines(series_overlay.top_right, slice_overlay.top_right),
+            bottom_left=merge_lines(series_overlay.bottom_left, slice_overlay.bottom_left),
+            bottom_right=merge_lines(series_overlay.bottom_right, slice_overlay.bottom_right),
+            tags={
+                **series_overlay.tags,
+                **slice_overlay.tags,
+            },
+        )
+        return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(merged_overlay))
 
     def analyze_mtf(
         self,
@@ -579,9 +659,18 @@ class ViewerInteractionMixin:
         if tool_type is None or not payload.points:
             return None
 
+        viewport_key = payload.viewport_key or self._resolve_measurement_viewport_key(view)
+        if self._is_alignment_measurement(tool_type) and not self._is_supported_alignment_view(view):
+            return self._build_measurement_preview_payload(
+                view=view,
+                viewport_key=viewport_key,
+                tool_type=tool_type,
+                slice_index=view.current_index,
+                label_lines=(ALIGNMENT_UNSUPPORTED_VIEW_LABEL,),
+            )
+
         image_points = self._resolve_measurement_image_points(view, payload)
         source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
-        viewport_key = payload.viewport_key or self._resolve_measurement_viewport_key(view)
 
         if tool_type == "angle" and len(image_points) < get_measurement_point_requirement(tool_type).min_points:
             return self._build_measurement_preview_payload(
@@ -602,6 +691,15 @@ class ViewerInteractionMixin:
                 slice_index=slice_context.slice_index,
             )
 
+        if self._is_alignment_measurement(tool_type) and not self._has_alignment_physical_context(view, spacing_xy):
+            return self._build_measurement_preview_payload(
+                view=view,
+                viewport_key=viewport_key,
+                tool_type=tool_type,
+                slice_index=slice_context.slice_index,
+                label_lines=(ALIGNMENT_SPACING_UNAVAILABLE_LABEL,),
+            )
+
         metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
         return self._build_measurement_preview_payload(
             view=view,
@@ -619,6 +717,9 @@ class ViewerInteractionMixin:
         if not payload.points:
             raise HTTPException(status_code=400, detail="Measurement points are required")
 
+        if self._is_alignment_measurement(tool_type) and not self._is_supported_alignment_view(view):
+            raise HTTPException(status_code=400, detail=ALIGNMENT_UNSUPPORTED_VIEW_LABEL)
+
         if not has_required_measurement_points(tool_type, len(payload.points)):
             return False
 
@@ -629,7 +730,10 @@ class ViewerInteractionMixin:
 
         source_pixels, spacing_xy, slice_context = self._resolve_measurement_source_context(view)
         slice_context = self._with_operation_slice_index(slice_context, payload.slice_index)
-        metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
+        if self._is_alignment_measurement(tool_type) and not self._has_alignment_physical_context(view, spacing_xy):
+            metrics, label_lines = self._build_alignment_spacing_unavailable_metrics()
+        else:
+            metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
         world_points = self._capture_mpr_measurement_world_points(view, image_points)
 
         label_anchor = image_points[1] if tool_type != "angle" else image_points[1]
@@ -827,12 +931,15 @@ class ViewerInteractionMixin:
 
         try:
             source_pixels, spacing_xy, current_context = self._resolve_measurement_source_context(view)
-            metrics, label_lines = build_measurement_metrics(
-                measurement.tool_type,
-                measurement.points,
-                source_pixels,
-                spacing_xy,
-            )
+            if self._is_alignment_measurement(measurement.tool_type) and not self._has_alignment_physical_context(view, spacing_xy):
+                metrics, label_lines = self._build_alignment_spacing_unavailable_metrics()
+            else:
+                metrics, label_lines = build_measurement_metrics(
+                    measurement.tool_type,
+                    measurement.points,
+                    source_pixels,
+                    spacing_xy,
+                )
         except Exception:
             logger.debug(
                 "Failed to refresh series-scope measurement metrics for current slice",
@@ -995,11 +1102,45 @@ class ViewerInteractionMixin:
         if pixel_spacing is None or len(pixel_spacing) < 2:
             return None
         try:
-            row_spacing = max(abs(float(pixel_spacing[0])), 1e-6)
-            col_spacing = max(abs(float(pixel_spacing[1])), 1e-6)
+            row_spacing = abs(float(pixel_spacing[0]))
+            col_spacing = abs(float(pixel_spacing[1]))
         except (TypeError, ValueError):
             return None
+        if not all(math.isfinite(value) and value > 0.0 for value in (row_spacing, col_spacing)):
+            return None
         return (col_spacing, row_spacing)
+
+    @staticmethod
+    def _is_alignment_measurement(tool_type: str) -> bool:
+        return tool_type in ALIGNMENT_MEASUREMENT_TOOL_TYPES
+
+    def _has_alignment_physical_context(
+        self,
+        view: ViewRecord,
+        spacing_xy: tuple[float, float] | None,
+    ) -> bool:
+        """Return whether a supported 2D CT view has authoritative pixel spacing."""
+
+        return self._is_supported_alignment_view(view) and has_valid_physical_spacing(spacing_xy)
+
+    @staticmethod
+    def _is_supported_alignment_view(view: ViewRecord) -> bool:
+        if view.view_type != "Stack":
+            return False
+        try:
+            series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        except Exception:
+            return False
+        return str(series.modality or "").strip().upper() == "CT"
+
+    @staticmethod
+    def _build_alignment_spacing_unavailable_metrics() -> tuple[MeasurementMetrics, tuple[str, ...]]:
+        """Keep the user-drawn reference line but never emit a numeric pseudo-result."""
+
+        return (
+            MeasurementMetrics(unit="px", area_unit="px2"),
+            (ALIGNMENT_SPACING_UNAVAILABLE_LABEL,),
+        )
 
     def _get_mpr_spacing_xy(
         self,

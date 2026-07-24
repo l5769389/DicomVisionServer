@@ -489,14 +489,22 @@ def test_real_dicom_mpr_measurement_reprojects_after_model_rotation(tmp_path: Pa
             points=[{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.2}],
         ),
     )
-    [before] = viewer_service._build_visible_measurements(view)
+    before_by_id = {
+        measurement.measurement_id: measurement
+        for measurement in viewer_service._build_visible_measurements(view)
+    }
     viewer_service._set_mpr_model_rotation_matrix(
         view.view_group,
         axis_angle_rotation_matrix(np.asarray(pose.normal_world), np.pi / 2.0),
         pivot_world=pose.cursor_center_world,
     )
 
-    [after] = viewer_service._build_visible_measurements(view)
+    after_by_id = {
+        measurement.measurement_id: measurement
+        for measurement in viewer_service._build_visible_measurements(view)
+    }
+    before = before_by_id["rotating-line"]
+    after = after_by_id["rotating-line"]
 
     assert before.points[1].x == pytest.approx(center_x + 2.0)
     assert before.points[1].y == pytest.approx(center_y)
