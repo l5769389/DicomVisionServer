@@ -201,6 +201,78 @@ class ViewerInteractionMixin:
         )
         return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(overlay))
 
+    def get_montage_corner_info(
+        self,
+        series_id: str,
+        slice_index: int,
+        *,
+        window_width: float | None = None,
+        window_center: float | None = None,
+        workspace_id: str | None = None,
+    ) -> CornerInfoResponse:
+        """Return full corner metadata for one montage slice without mutating a view."""
+
+        series = compat.series_registry.get(series_id, workspace_id=workspace_id)
+        if not series.is_image_series or not series.instances:
+            raise HTTPException(status_code=400, detail="Series does not contain renderable image instances")
+        if slice_index < 0 or slice_index >= len(series.instances):
+            raise HTTPException(status_code=404, detail="Montage slice index is out of range")
+
+        _, cached = self._get_indexed_instance_and_cache(series, slice_index)
+        if cached is None:
+            raise HTTPException(status_code=422, detail="Montage slice metadata could not be decoded")
+
+        view = ViewRecord(
+            view_id=f"montage-corner-info:{series.series_id}:{slice_index}",
+            series_id=series.series_id,
+            view_type="PET" if str(series.modality or "").strip().upper() in {"PT", "PET"} else "Stack",
+            workspace_id=series.workspace_id,
+        )
+        view.current_index = slice_index
+        view.window_width = (
+            float(window_width)
+            if window_width is not None and math.isfinite(float(window_width)) and float(window_width) > 0
+            else (
+                cached.window_width
+                if cached.window_width is not None
+                else self._derive_default_window_width(cached)
+            )
+        )
+        view.window_center = (
+            float(window_center)
+            if window_center is not None and math.isfinite(float(window_center))
+            else (
+                cached.window_center
+                if cached.window_center is not None
+                else self._derive_default_window_center(cached)
+            )
+        )
+
+        series_overlay = self._build_series_corner_info_overlay(series, cached.dataset)
+        slice_overlay = self._build_slice_corner_info_overlay(
+            view,
+            series,
+            cached.dataset,
+            current_index=slice_index,
+            total_slices=len(series.instances),
+            viewport_label="PET" if view.view_type == "PET" else "Stack",
+        )
+
+        def merge_lines(base: tuple[str, ...], overlay: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(dict.fromkeys((*base, *overlay)))
+
+        merged_overlay = CornerInfoOverlay(
+            top_left=merge_lines(series_overlay.top_left, slice_overlay.top_left),
+            top_right=merge_lines(series_overlay.top_right, slice_overlay.top_right),
+            bottom_left=merge_lines(series_overlay.bottom_left, slice_overlay.bottom_left),
+            bottom_right=merge_lines(series_overlay.bottom_right, slice_overlay.bottom_right),
+            tags={
+                **series_overlay.tags,
+                **slice_overlay.tags,
+            },
+        )
+        return CornerInfoResponse(cornerInfo=self._serialize_corner_info_overlay(merged_overlay))
+
     def analyze_mtf(
         self,
         payload: ViewMtfAnalyzeRequest,

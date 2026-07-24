@@ -1,5 +1,6 @@
 import io
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from threading import RLock
@@ -29,10 +30,15 @@ from app.services.dicom_cache import dicom_cache
 from app.services.dicom_compatibility import build_dicom_compatibility_issues
 from app.services.dicom_gsps_import_service import is_gsps_dataset, parse_gsps_dataset
 from app.services.four_d_service import four_d_service
+from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor, normalize_pseudocolor_preset
 
 
 logger = get_logger(__name__)
 SERIES_THUMBNAIL_SIZE = (96, 96)
+MONTAGE_TILE_DEFAULT_SIZE = 256
+MONTAGE_TILE_MIN_SIZE = 96
+MONTAGE_TILE_MAX_SIZE = 512
+MONTAGE_TILE_CACHE_LIMIT = 512
 DICOM_SR_SOP_CLASS_UIDS = {
     str(BasicTextSRStorage),
     str(EnhancedSRStorage),
@@ -109,6 +115,7 @@ class SeriesRegistry:
         self._series_by_id: dict[str, SeriesRecord] = {}
         self._series_id_by_key: dict[str, str] = {}
         self._series_id_by_instance_path: dict[str, str] = {}
+        self._montage_tile_cache: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
         self._lock = RLock()
 
     @staticmethod
@@ -635,6 +642,143 @@ class SeriesRegistry:
             raise HTTPException(status_code=404, detail="Series thumbnail is not available")
         return thumbnail
 
+    def get_montage_tile_webp(
+        self,
+        series_id: str,
+        slice_index: int,
+        *,
+        size: int = MONTAGE_TILE_DEFAULT_SIZE,
+        window_width: float | None = None,
+        window_center: float | None = None,
+        pseudocolor_preset: str | None = None,
+        workspace_id: str | None = None,
+    ) -> bytes:
+        """Render one isolated stack slice for the virtualized montage viewer."""
+
+        with self._lock:
+            series = self.get(series_id, workspace_id=workspace_id)
+        if not series.is_image_series or not series.instances:
+            raise HTTPException(status_code=400, detail="Series does not contain renderable image instances")
+        if slice_index < 0 or slice_index >= len(series.instances):
+            raise HTTPException(status_code=404, detail="Montage slice index is out of range")
+
+        normalized_size = max(MONTAGE_TILE_MIN_SIZE, min(int(size), MONTAGE_TILE_MAX_SIZE))
+        instance = series.instances[slice_index]
+        reference_instance = series.instances[0]
+        cache_key = instance.sop_instance_uid or self._build_instance_path_key(instance.path)
+        preset = normalize_pseudocolor_preset(pseudocolor_preset)
+        resolved_window_width = float(window_width) if window_width is not None else None
+        resolved_window_center = float(window_center) if window_center is not None else None
+        tile_cache_key = (
+            normalize_workspace_id(series.workspace_id),
+            series.series_id,
+            dicom_cache.build_instance_content_key(
+                reference_instance.sop_instance_uid,
+                reference_instance.path,
+            ),
+            dicom_cache.build_instance_content_key(instance.sop_instance_uid, instance.path),
+            normalized_size,
+            round(resolved_window_width, 4) if resolved_window_width is not None else None,
+            round(resolved_window_center, 4) if resolved_window_center is not None else None,
+            preset,
+        )
+        with self._lock:
+            cached_tile = self._montage_tile_cache.get(tile_cache_key)
+            if cached_tile is not None:
+                self._montage_tile_cache.move_to_end(tile_cache_key)
+                return cached_tile
+
+        try:
+            cached = dicom_cache.get(cache_key, instance.path)
+            source_pixels = np.asarray(cached.source_pixels)
+            is_pet_series = str(series.modality or "").strip().upper() in {"PT", "PET"}
+            if is_pet_series:
+                # Import lazily to avoid a module cycle while retaining exactly
+                # the same PET unit/SUV conversion used by the standalone view.
+                from app.services.viewer_service import viewer_service
+
+                pet_volume = viewer_service._get_series_volume(series)
+                pet_display = viewer_service._build_fusion_pet_display_volume(
+                    series,
+                    pet_volume,
+                    None,
+                )
+                default_pet_width, default_pet_center = (
+                    viewer_service._derive_default_pet_window_for_display_volume(pet_display)
+                )
+                pet_window_width = (
+                    resolved_window_width
+                    if resolved_window_width is not None and resolved_window_width > 0
+                    else default_pet_width
+                )
+                pet_window_center = (
+                    resolved_window_center
+                    if resolved_window_center is not None
+                    else default_pet_center
+                )
+                source_pixels = viewer_service._prepare_pet_standalone_source_pixels(
+                    np.asarray(pet_display.volume[slice_index], dtype=np.float32),
+                    pet_window_width,
+                    pet_window_center,
+                )
+            if source_pixels.ndim == 3 and source_pixels.shape[-1] in (3, 4):
+                image = Image.fromarray(np.asarray(source_pixels[..., :3], dtype=np.uint8))
+            elif source_pixels.ndim == 2:
+                pixels = np.asarray(source_pixels, dtype=np.float32)
+                low, high = self._resolve_thumbnail_window(
+                    pixels,
+                    (
+                        pet_window_width
+                        if is_pet_series
+                        else resolved_window_width
+                        if resolved_window_width and resolved_window_width > 0
+                        else cached.window_width
+                    ),
+                    (
+                        pet_window_center
+                        if is_pet_series
+                        else resolved_window_center
+                        if resolved_window_center is not None
+                        else cached.window_center
+                    ),
+                )
+                clipped = np.nan_to_num(np.clip(pixels, low, high), nan=low, posinf=high, neginf=low)
+                scale = high - low
+                if scale <= 0:
+                    raise HTTPException(status_code=422, detail="Montage slice has no displayable pixel range")
+                grayscale = ((clipped - low) * (255.0 / scale)).astype(np.uint8)
+                if preset == DEFAULT_PSEUDOCOLOR_PRESET:
+                    image = Image.fromarray(grayscale)
+                else:
+                    image = Image.fromarray(apply_pseudocolor(grayscale, preset))
+            else:
+                raise HTTPException(status_code=422, detail="Montage slice pixel format is not supported")
+
+            image = ImageOps.contain(image, (normalized_size, normalized_size), Image.Resampling.BILINEAR)
+            canvas_mode = "RGB" if image.mode == "RGB" else "L"
+            canvas = Image.new(canvas_mode, (normalized_size, normalized_size), (0, 0, 0) if canvas_mode == "RGB" else 0)
+            canvas.paste(image, ((normalized_size - image.width) // 2, (normalized_size - image.height) // 2))
+            buffer = io.BytesIO()
+            canvas.save(buffer, format="WEBP", quality=82, method=4)
+            payload = buffer.getvalue()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "failed to build montage tile series_id=%s slice_index=%s error=%s",
+                series.series_id,
+                slice_index,
+                exc,
+            )
+            raise HTTPException(status_code=422, detail="Montage slice could not be decoded") from exc
+
+        with self._lock:
+            self._montage_tile_cache[tile_cache_key] = payload
+            self._montage_tile_cache.move_to_end(tile_cache_key)
+            while len(self._montage_tile_cache) > MONTAGE_TILE_CACHE_LIMIT:
+                self._montage_tile_cache.popitem(last=False)
+        return payload
+
     def _build_series_thumbnail_png(self, series: SeriesRecord) -> bytes | None:
         if not series.is_image_series or not series.instances:
             return None
@@ -830,10 +974,16 @@ class SeriesRegistry:
                     for key, series_id in self._series_id_by_instance_path.items()
                     if series_id not in series_ids
                 }
+                self._montage_tile_cache = OrderedDict(
+                    (key, value)
+                    for key, value in self._montage_tile_cache.items()
+                    if key[0] != normalized_workspace_id
+                )
                 return
             self._series_by_id.clear()
             self._series_id_by_key.clear()
             self._series_id_by_instance_path.clear()
+            self._montage_tile_cache.clear()
 
 
 series_registry = SeriesRegistry()
