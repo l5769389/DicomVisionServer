@@ -4,8 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from pydicom.dataset import FileDataset, FileMetaDataset
-from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
+from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.uid import (
+    CTImageStorage,
+    ExplicitVRLittleEndian,
+    PositronEmissionTomographyImageStorage,
+    generate_uid,
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +23,18 @@ class SyntheticDicomSeries:
     origin_patient_mm: tuple[float, float, float]
     rescale_slope: float
     rescale_intercept: float
+
+
+@dataclass(frozen=True)
+class SyntheticPetDicomSeries:
+    paths: tuple[Path, ...]
+    volume_bqml: np.ndarray
+    stored_volume: np.ndarray
+    spacing_zyx_mm: tuple[float, float, float]
+    patient_weight_kg: float
+    patient_height_m: float
+    injected_dose_bq: float
+    radionuclide_half_life_s: float
 
 
 def write_ct_series(
@@ -118,6 +135,103 @@ def write_ct_series(
         origin_patient_mm=origin_patient_mm,
         rescale_slope=slope,
         rescale_intercept=intercept,
+    )
+
+
+def write_pet_bqml_series(
+    root: Path,
+    volume_bqml: np.ndarray,
+    *,
+    spacing_zyx_mm: tuple[float, float, float] = (2.0, 2.0, 2.0),
+    patient_weight_kg: float = 70.0,
+    patient_height_m: float = 1.75,
+    patient_sex: str = "M",
+    injected_dose_bq: float = 350_000_000.0,
+    radionuclide_half_life_s: float = 6586.2,
+    injection_datetime: str = "20260101235000",
+    acquisition_datetime: str = "20260102001000",
+    radiopharmaceutical: str = "F-18 FDG",
+) -> SyntheticPetDicomSeries:
+    """Write a privacy-free quantitative PET phantom with known BQML geometry."""
+
+    requested = np.asarray(volume_bqml, dtype=np.float64)
+    if requested.ndim != 3 or not all(int(value) > 0 for value in requested.shape):
+        raise ValueError("volume_bqml must be a non-empty 3D array")
+    if not np.all(np.isfinite(requested)) or float(np.min(requested)) < 0.0:
+        raise ValueError("volume_bqml must contain finite non-negative values")
+    stored_rounded = np.rint(requested)
+    if not np.allclose(requested, stored_rounded, atol=1e-6, rtol=0.0):
+        raise ValueError("volume_bqml must be exactly representable as integer BQML")
+    if float(np.max(stored_rounded)) > np.iinfo(np.uint32).max:
+        raise ValueError("stored PET pixels must fit unsigned 32-bit storage")
+    stored_volume = stored_rounded.astype(np.uint32)
+    decoded = stored_volume.astype(np.float32)
+
+    root.mkdir(parents=True, exist_ok=True)
+    slice_spacing, row_spacing, col_spacing = (float(value) for value in spacing_zyx_mm)
+    study_uid = generate_uid()
+    series_uid = generate_uid()
+    paths: list[Path] = []
+    for slice_index in range(stored_volume.shape[0]):
+        file_meta = FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = PositronEmissionTomographyImageStorage
+        file_meta.MediaStorageSOPInstanceUID = generate_uid()
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        file_meta.ImplementationClassUID = generate_uid()
+
+        path = root / f"PT{slice_index + 1:04d}.dcm"
+        dataset = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+        dataset.SOPClassUID = PositronEmissionTomographyImageStorage
+        dataset.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        dataset.StudyInstanceUID = study_uid
+        dataset.SeriesInstanceUID = series_uid
+        dataset.PatientName = "Synthetic^PET"
+        dataset.PatientID = "SYNTHETIC-PET"
+        dataset.PatientWeight = float(patient_weight_kg)
+        dataset.PatientSize = float(patient_height_m)
+        dataset.PatientSex = str(patient_sex)
+        dataset.Modality = "PT"
+        dataset.SeriesDescription = "DicomVision quantitative PET truth"
+        dataset.InstanceNumber = slice_index + 1
+        dataset.Rows = int(stored_volume.shape[1])
+        dataset.Columns = int(stored_volume.shape[2])
+        dataset.SamplesPerPixel = 1
+        dataset.PhotometricInterpretation = "MONOCHROME2"
+        dataset.PixelRepresentation = 0
+        dataset.BitsStored = 32
+        dataset.BitsAllocated = 32
+        dataset.HighBit = 31
+        dataset.PixelSpacing = [row_spacing, col_spacing]
+        dataset.SliceThickness = slice_spacing
+        dataset.SpacingBetweenSlices = slice_spacing
+        dataset.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        dataset.ImagePositionPatient = [0.0, 0.0, slice_spacing * slice_index]
+        dataset.RescaleSlope = 1.0
+        dataset.RescaleIntercept = 0.0
+        dataset.Units = "BQML"
+        dataset.CorrectedImage = ["DECY", "ATTN"]
+        dataset.DecayCorrection = "START"
+        dataset.AcquisitionDateTime = acquisition_datetime
+
+        tracer = Dataset()
+        tracer.Radiopharmaceutical = radiopharmaceutical
+        tracer.RadionuclideTotalDose = float(injected_dose_bq)
+        tracer.RadionuclideHalfLife = float(radionuclide_half_life_s)
+        tracer.RadiopharmaceuticalStartDateTime = injection_datetime
+        dataset.RadiopharmaceuticalInformationSequence = [tracer]
+        dataset.PixelData = np.ascontiguousarray(stored_volume[slice_index]).tobytes()
+        dataset.save_as(path, enforce_file_format=True)
+        paths.append(path)
+
+    return SyntheticPetDicomSeries(
+        paths=tuple(paths),
+        volume_bqml=decoded,
+        stored_volume=stored_volume,
+        spacing_zyx_mm=(slice_spacing, row_spacing, col_spacing),
+        patient_weight_kg=float(patient_weight_kg),
+        patient_height_m=float(patient_height_m),
+        injected_dose_bq=float(injected_dose_bq),
+        radionuclide_half_life_s=float(radionuclide_half_life_s),
     )
 
 

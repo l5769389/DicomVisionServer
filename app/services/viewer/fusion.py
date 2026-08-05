@@ -116,6 +116,7 @@ class ViewerFusionMixin:
             bool(view.ver_flip),
             str(group.fusion_pet_unit),
             str(group.fusion_pet_pseudocolor_preset),
+            str(group.fusion_pet_pane_pseudocolor_preset),
             None if group.fusion_pet_window.window_width is None else float(group.fusion_pet_window.window_width),
             None if group.fusion_pet_window.window_center is None else float(group.fusion_pet_window.window_center),
             float(group.fusion_alpha),
@@ -542,6 +543,7 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
                     petUnit=group.fusion_pet_unit,
                     petUnitLabel=pet_unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -552,6 +554,7 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_width,
                         group.fusion_pet_window.window_center,
                     ),
+                    fusionWindowTarget=group.fusion_window_target,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
@@ -612,7 +615,7 @@ class ViewerFusionMixin:
                 transform=self._build_view_transform_payload(view),
                 color=ViewColorInfo(
                     pseudocolorPreset=(
-                        FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+                        group.fusion_pet_pane_pseudocolor_preset
                         if role == FUSION_PANE_PET_AXIAL
                         else group.fusion_pet_pseudocolor_preset
                     )
@@ -622,6 +625,7 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
                     petUnit=group.fusion_pet_unit,
                     petUnitLabel=pet_unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -632,6 +636,7 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_width,
                         group.fusion_pet_window.window_center,
                     ),
+                    fusionWindowTarget=group.fusion_window_target,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
@@ -817,6 +822,7 @@ class ViewerFusionMixin:
             pet_window_width=group.fusion_pet_window.window_width,
             pet_window_center=group.fusion_pet_window.window_center,
             pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
+            pet_standalone_pseudocolor_preset=group.fusion_pet_pane_pseudocolor_preset,
             registration=render_registration,
             alpha=group.fusion_alpha,
             ct_has_patient_geometry=(
@@ -861,17 +867,41 @@ class ViewerFusionMixin:
         pet_standalone_primary = role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}
         if (
             role == FUSION_PANE_OVERLAY_AXIAL
-            and fusion_result.pet_layer_pixels is not None
+            and fusion_result.pet_scalar_pixels is not None
             and (primary_image_unchanged or fusion_result.ct_layer_pixels is not None)
         ):
             preview_pet_canvas_started_at = perf_counter() if primary_image_unchanged else None
-            transformed_pet = compat.viewport_transformer.apply_affine_array(
-                fusion_result.pet_layer_pixels,
+            pet_low = float(fusion_result.pet_window_center or 0.0) - float(
+                fusion_result.pet_window_width or 1.0
+            ) / 2.0
+            transformed_pet_scalar = compat.viewport_transformer.apply_affine_array(
+                fusion_result.pet_scalar_pixels,
                 canvas_width,
                 canvas_height,
                 image_transform,
                 order=interpolation_order,
-                cval=0.0,
+                cval=pet_low,
+            )
+            transformed_pet_uint8 = window_to_uint8(
+                transformed_pet_scalar,
+                fusion_result.pet_window_width,
+                fusion_result.pet_window_center,
+            )
+            transformed_pet_rgb = apply_pseudocolor(
+                transformed_pet_uint8,
+                group.fusion_pet_pseudocolor_preset,
+            )
+            pet_alpha = np.clip(float(group.fusion_alpha), 0.0, 1.0)
+            transformed_pet = np.concatenate(
+                (
+                    transformed_pet_rgb,
+                    np.clip(
+                        transformed_pet_uint8.astype(np.float32) * pet_alpha,
+                        0.0,
+                        255.0,
+                    ).astype(np.uint8)[..., None],
+                ),
+                axis=-1,
             )
             if preview_pet_canvas_started_at is not None:
                 preview_pet_canvas_ms = (perf_counter() - preview_pet_canvas_started_at) * 1000.0
@@ -927,25 +957,81 @@ class ViewerFusionMixin:
             if primary_image_unchanged:
                 image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
             else:
-                transformed_ct = compat.viewport_transformer.apply_affine_array(
-                    fusion_result.ct_layer_pixels,
+                ct_scalar = (
+                    fusion_result.ct_scalar_pixels
+                    if fusion_result.ct_scalar_pixels is not None
+                    else fusion_result.ct_layer_pixels
+                )
+                ct_low = float(fusion_result.ct_window_center or 0.0) - float(
+                    fusion_result.ct_window_width or 1.0
+                ) / 2.0
+                transformed_ct_scalar = compat.viewport_transformer.apply_affine_array(
+                    ct_scalar,
+                    canvas_width,
+                    canvas_height,
+                    image_transform,
+                    order=interpolation_order,
+                    cval=ct_low,
+                )
+                transformed_ct = window_to_uint8(
+                    transformed_ct_scalar,
+                    fusion_result.ct_window_width,
+                    fusion_result.ct_window_center,
+                )
+                image = image_from_pixels(transformed_ct)
+        else:
+            if pet_standalone_primary and fusion_result.pet_scalar_pixels is not None:
+                pet_low = float(fusion_result.pet_window_center or 0.0) - float(
+                    fusion_result.pet_window_width or 1.0
+                ) / 2.0
+                transformed_pet_scalar = compat.viewport_transformer.apply_affine_array(
+                    fusion_result.pet_scalar_pixels,
+                    canvas_width,
+                    canvas_height,
+                    image_transform,
+                    order=interpolation_order,
+                    cval=pet_low,
+                )
+                transformed_pet_uint8 = window_to_uint8(
+                    transformed_pet_scalar,
+                    fusion_result.pet_window_width,
+                    fusion_result.pet_window_center,
+                )
+                image = image_from_pixels(
+                    apply_pseudocolor(
+                        transformed_pet_uint8,
+                        group.fusion_pet_pane_pseudocolor_preset,
+                    )
+                )
+            elif fusion_result.ct_scalar_pixels is not None:
+                ct_low = float(fusion_result.ct_window_center or 0.0) - float(
+                    fusion_result.ct_window_width or 1.0
+                ) / 2.0
+                transformed_ct_scalar = compat.viewport_transformer.apply_affine_array(
+                    fusion_result.ct_scalar_pixels,
+                    canvas_width,
+                    canvas_height,
+                    image_transform,
+                    order=interpolation_order,
+                    cval=ct_low,
+                )
+                image = image_from_pixels(
+                    window_to_uint8(
+                        transformed_ct_scalar,
+                        fusion_result.ct_window_width,
+                        fusion_result.ct_window_center,
+                    )
+                )
+            else:
+                transformed = compat.viewport_transformer.apply_affine_array(
+                    np.asarray(source_image),
                     canvas_width,
                     canvas_height,
                     image_transform,
                     order=interpolation_order,
                     cval=0.0,
                 )
-                image = image_from_pixels(transformed_ct)
-        else:
-            transformed = compat.viewport_transformer.apply_affine_array(
-                np.asarray(source_image),
-                canvas_width,
-                canvas_height,
-                image_transform,
-                order=interpolation_order,
-                cval=FUSION_PET_STANDALONE_BACKGROUND_CVAL if pet_standalone_primary else 0.0,
-            )
-            image = image_from_pixels(transformed)
+                image = image_from_pixels(transformed)
             if role == FUSION_PANE_PET_AXIAL:
                 cache_key = self._build_fusion_registration_pet_layer_cache_key(
                     view,
@@ -1103,6 +1189,7 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
                     petUnit=pet_display.unit,
                     petUnitLabel=pet_display.unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -1113,9 +1200,24 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_width,
                         group.fusion_pet_window.window_center,
                     ),
+                    fusionWindowTarget=group.fusion_window_target,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
+                ),
+                petInfo=self._build_pet_info(
+                    pet_series,
+                    pet_display,
+                    window_width=group.fusion_pet_window.window_width,
+                    window_center=group.fusion_pet_window.window_center,
+                    control_window_max=group.fusion_pet_control_window_max,
+                    pseudocolor_preset=(
+                        group.fusion_pet_pane_pseudocolor_preset
+                        if self._is_fusion_pet_display_role(role)
+                        else group.fusion_pet_pseudocolor_preset
+                    ),
+                    pet_pane_pseudocolor_preset=group.fusion_pet_pane_pseudocolor_preset,
+                    fusion_overlay_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
                 ),
                 fusionComposite=fusion_composite,
             ),

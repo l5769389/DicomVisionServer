@@ -177,4 +177,4 @@ def test_series_scope_measurement_refreshes_metrics_for_current_slice(monkeypatc
     assert visible.slice_context.slice_index == 5
     assert visible.slice_context.sop_instance_uid == "sop-5"
     assert visible.metrics.mean == 42.0
-    assert "Mean 42.0" in visible.label_lines
+    assert "Mean 42" in visible.label_lines

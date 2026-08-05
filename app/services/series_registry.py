@@ -30,7 +30,12 @@ from app.services.dicom_cache import dicom_cache
 from app.services.dicom_compatibility import build_dicom_compatibility_issues
 from app.services.dicom_gsps_import_service import is_gsps_dataset, parse_gsps_dataset
 from app.services.four_d_service import four_d_service
-from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor, normalize_pseudocolor_preset
+from app.services.pseudocolor import (
+    DEFAULT_PSEUDOCOLOR_PRESET,
+    apply_pseudocolor,
+    normalize_pseudocolor_preset,
+    pseudocolor_background_color,
+)
 
 
 logger = get_logger(__name__)
@@ -651,6 +656,7 @@ class SeriesRegistry:
         window_width: float | None = None,
         window_center: float | None = None,
         pseudocolor_preset: str | None = None,
+        pet_unit: str | None = None,
         workspace_id: str | None = None,
     ) -> bytes:
         """Render one isolated stack slice for the virtualized montage viewer."""
@@ -667,6 +673,7 @@ class SeriesRegistry:
         reference_instance = series.instances[0]
         cache_key = instance.sop_instance_uid or self._build_instance_path_key(instance.path)
         preset = normalize_pseudocolor_preset(pseudocolor_preset)
+        normalized_pet_unit = str(pet_unit or "").strip() or None
         resolved_window_width = float(window_width) if window_width is not None else None
         resolved_window_center = float(window_center) if window_center is not None else None
         tile_cache_key = (
@@ -681,6 +688,7 @@ class SeriesRegistry:
             round(resolved_window_width, 4) if resolved_window_width is not None else None,
             round(resolved_window_center, 4) if resolved_window_center is not None else None,
             preset,
+            normalized_pet_unit,
         )
         with self._lock:
             cached_tile = self._montage_tile_cache.get(tile_cache_key)
@@ -701,7 +709,7 @@ class SeriesRegistry:
                 pet_display = viewer_service._build_fusion_pet_display_volume(
                     series,
                     pet_volume,
-                    None,
+                    normalized_pet_unit,
                 )
                 default_pet_width, default_pet_center = (
                     viewer_service._derive_default_pet_window_for_display_volume(pet_display)
@@ -723,6 +731,8 @@ class SeriesRegistry:
                 )
             if source_pixels.ndim == 3 and source_pixels.shape[-1] in (3, 4):
                 image = Image.fromarray(np.asarray(source_pixels[..., :3], dtype=np.uint8))
+                image = ImageOps.contain(image, (normalized_size, normalized_size), Image.Resampling.BILINEAR)
+                canvas = Image.new("RGB", (normalized_size, normalized_size), (0, 0, 0))
             elif source_pixels.ndim == 2:
                 pixels = np.asarray(source_pixels, dtype=np.float32)
                 low, high = self._resolve_thumbnail_window(
@@ -742,21 +752,39 @@ class SeriesRegistry:
                         else cached.window_center
                     ),
                 )
-                clipped = np.nan_to_num(np.clip(pixels, low, high), nan=low, posinf=high, neginf=low)
                 scale = high - low
                 if scale <= 0:
                     raise HTTPException(status_code=422, detail="Montage slice has no displayable pixel range")
+                # Geometry is applied to quantitative scalar samples first.
+                # Resizing an already colorized tile blends LUT colors and makes
+                # Montage disagree with Stack/MPR at identical physical points.
+                scalar_image = Image.fromarray(pixels, mode="F")
+                scalar_image = ImageOps.contain(
+                    scalar_image,
+                    (normalized_size, normalized_size),
+                    Image.Resampling.BILINEAR,
+                )
+                resized_pixels = np.asarray(scalar_image, dtype=np.float32)
+                clipped = np.nan_to_num(
+                    np.clip(resized_pixels, low, high),
+                    nan=low,
+                    posinf=high,
+                    neginf=low,
+                )
                 grayscale = ((clipped - low) * (255.0 / scale)).astype(np.uint8)
                 if preset == DEFAULT_PSEUDOCOLOR_PRESET:
                     image = Image.fromarray(grayscale)
+                    canvas = Image.new("L", (normalized_size, normalized_size), 0)
                 else:
                     image = Image.fromarray(apply_pseudocolor(grayscale, preset))
+                    canvas = Image.new(
+                        "RGB",
+                        (normalized_size, normalized_size),
+                        pseudocolor_background_color(preset),
+                    )
             else:
                 raise HTTPException(status_code=422, detail="Montage slice pixel format is not supported")
 
-            image = ImageOps.contain(image, (normalized_size, normalized_size), Image.Resampling.BILINEAR)
-            canvas_mode = "RGB" if image.mode == "RGB" else "L"
-            canvas = Image.new(canvas_mode, (normalized_size, normalized_size), (0, 0, 0) if canvas_mode == "RGB" else 0)
             canvas.paste(image, ((normalized_size - image.width) // 2, (normalized_size - image.height) // 2))
             buffer = io.BytesIO()
             canvas.save(buffer, format="WEBP", quality=82, method=4)

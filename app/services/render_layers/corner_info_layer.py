@@ -1,5 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
 
+from app.services.pseudocolor import pseudocolor_background_color
 from app.services.render_layers.render_context import LayerSpace, RenderContext
 
 
@@ -21,9 +22,36 @@ class CornerInfoLayer:
         font = _load_font(font_size)
         margin = max(12, int(font_size * 0.75))
         line_gap = max(2, font_size // 5)
+        foreground, outline = _overlay_text_colors(context.view.pseudocolor_preset)
 
-        self._draw_block(draw, font, overlay.top_left, margin, margin, "left", "top", width, height, line_gap)
-        self._draw_block(draw, font, overlay.top_right, width - margin, margin, "right", "top", width, height, line_gap)
+        self._draw_block(
+            draw,
+            font,
+            overlay.top_left,
+            margin,
+            margin,
+            "left",
+            "top",
+            width,
+            height,
+            line_gap,
+            foreground,
+            outline,
+        )
+        self._draw_block(
+            draw,
+            font,
+            overlay.top_right,
+            width - margin,
+            margin,
+            "right",
+            "top",
+            width,
+            height,
+            line_gap,
+            foreground,
+            outline,
+        )
         self._draw_block(
             draw,
             font,
@@ -35,6 +63,8 @@ class CornerInfoLayer:
             width,
             height,
             line_gap,
+            foreground,
+            outline,
         )
         self._draw_block(
             draw,
@@ -47,6 +77,8 @@ class CornerInfoLayer:
             width,
             height,
             line_gap,
+            foreground,
+            outline,
         )
         return image
 
@@ -62,6 +94,8 @@ class CornerInfoLayer:
         width: int,
         height: int,
         line_gap: int,
+        foreground: tuple[int, int, int, int],
+        outline: tuple[int, int, int, int],
     ) -> None:
         normalized_lines = tuple(line for line in lines if line)
         if not normalized_lines:
@@ -84,7 +118,14 @@ class CornerInfoLayer:
                 x = max(0, min(width - line_width, anchor_x - line_width))
             else:
                 x = max(0, min(width - line_width, anchor_x))
-            _draw_shadowed_text(draw, (x, current_y), line, font)
+            _draw_shadowed_text(
+                draw,
+                (x, current_y),
+                line,
+                font,
+                foreground,
+                outline,
+            )
             current_y += line_heights[index] + line_gap
 
 
@@ -93,13 +134,24 @@ def _draw_shadowed_text(
     position: tuple[int, int],
     text: str,
     font: ImageFont.ImageFont | ImageFont.FreeTypeFont,
+    foreground: tuple[int, int, int, int],
+    outline: tuple[int, int, int, int],
 ) -> None:
     x, y = position
-    shadow = (0, 0, 0, 220)
-    foreground = (255, 164, 164, 244)
-    for offset_x, offset_y in ((1, 1), (1, 0), (0, 1)):
-        draw.text((x + offset_x, y + offset_y), text, fill=shadow, font=font)
+    for offset_x, offset_y in ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)):
+        draw.text((x + offset_x, y + offset_y), text, fill=outline, font=font)
     draw.text((x, y), text, fill=foreground, font=font)
+
+
+def _overlay_text_colors(
+    pseudocolor_preset: str | None,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Choose a high-contrast corner label treatment for the active LUT background."""
+    red, green, blue = pseudocolor_background_color(pseudocolor_preset)
+    luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255.0
+    if luminance >= 0.46:
+        return (24, 35, 52, 250), (255, 255, 255, 225)
+    return (248, 250, 252, 250), (0, 0, 0, 225)
 
 
 def _load_font(size: int) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:

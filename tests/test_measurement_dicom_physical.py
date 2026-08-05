@@ -114,7 +114,7 @@ def test_stack_measurement_uses_dicom_physical_spacing_and_rescaled_ct_values(
     assert measurement.label_lines[:3] == (
         "Size 2.0 * 8.0 mm",
         "Area 16.0 mm2",
-        "Mean 176.0",
+        "Mean 176 HU",
     )
 
 

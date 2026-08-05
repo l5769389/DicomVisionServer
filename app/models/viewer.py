@@ -172,24 +172,80 @@ class MprSegmentationVoiBoxState:
 
 
 @dataclass
+class MprIntensityContextState:
+    modality: str = "CT"
+    value_type: str = "HU"
+    unit: str = "HU"
+    label: str = "HU"
+    quantitative: bool = True
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass
 class MprThresholdRegionStatsState:
-    hu_mean: float | None = None
-    hu_min: float | None = None
-    hu_max: float | None = None
-    hu_std_dev: float | None = None
+    status: str = "ready"
+    message: str | None = None
+    value_mean: float | None = None
+    value_min: float | None = None
+    value_max: float | None = None
+    value_std_dev: float | None = None
     volume_cm3: float = 0.0
     sample_count: int = 0
-    effective_threshold_hu: float | None = None
+    effective_threshold_value: float | None = None
+    intensity_context: MprIntensityContextState = field(default_factory=MprIntensityContextState)
+    uptake_peak: float | None = None
+    uptake_peak_reason: str | None = None
+    mtv_cm3: float | None = None
+    tlg: float | None = None
+    tlg_available: bool = False
+    tlg_reason: str | None = None
+
+    @property
+    def hu_mean(self) -> float | None:
+        return self.value_mean
+
+    @property
+    def hu_min(self) -> float | None:
+        return self.value_min
+
+    @property
+    def hu_max(self) -> float | None:
+        return self.value_max
+
+    @property
+    def hu_std_dev(self) -> float | None:
+        return self.value_std_dev
+
+    @property
+    def effective_threshold_hu(self) -> float | None:
+        return self.effective_threshold_value
 
 
 @dataclass
 class MprVoiSphereStatsState:
-    hu_mean: float | None = None
-    hu_min: float | None = None
-    hu_max: float | None = None
-    hu_std_dev: float | None = None
+    value_mean: float | None = None
+    value_min: float | None = None
+    value_max: float | None = None
+    value_std_dev: float | None = None
     volume_cm3: float = 0.0
     sample_count: int = 0
+    intensity_context: MprIntensityContextState = field(default_factory=MprIntensityContextState)
+
+    @property
+    def hu_mean(self) -> float | None:
+        return self.value_mean
+
+    @property
+    def hu_min(self) -> float | None:
+        return self.value_min
+
+    @property
+    def hu_max(self) -> float | None:
+        return self.value_max
+
+    @property
+    def hu_std_dev(self) -> float | None:
+        return self.value_std_dev
 
 
 @dataclass
@@ -204,17 +260,65 @@ class MprThresholdRegionBoxState:
     source_viewport: str = "mpr-ax"
 
 
-@dataclass
+@dataclass(init=False)
 class MprThresholdRegionState:
     id: str
     enabled: bool = True
     label: str = ""
-    threshold_hu: float = 300.0
-    threshold_mode: str = "hu"
-    threshold_percentile: float = 80.0
+    threshold_value: float = 300.0
+    threshold_mode: str = "absolute"
+    threshold_percent_max: float = 40.0
+    component_mode: str = "hotspotConnected"
     color: str = "#ff4df8"
     box: MprThresholdRegionBoxState = field(default_factory=MprThresholdRegionBoxState)
     stats: MprThresholdRegionStatsState | None = None
+    authoritative_mask: object | None = None
+    authoritative_mask_origin: object | None = None
+    authoritative_geometry: object | None = None
+
+    def __init__(
+        self,
+        id: str,
+        *,
+        enabled: bool = True,
+        label: str = "",
+        threshold_value: float | None = None,
+        threshold_hu: float | None = None,
+        threshold_mode: str = "absolute",
+        threshold_percent_max: float | None = None,
+        threshold_percentile: float | None = None,
+        component_mode: str = "hotspotConnected",
+        color: str = "#ff4df8",
+        box: MprThresholdRegionBoxState | None = None,
+        stats: MprThresholdRegionStatsState | None = None,
+    ) -> None:
+        self.id = id
+        self.enabled = enabled
+        self.label = label
+        self.threshold_value = float(
+            threshold_value if threshold_value is not None else threshold_hu if threshold_hu is not None else 300.0
+        )
+        self.threshold_mode = threshold_mode
+        self.threshold_percent_max = float(
+            threshold_percent_max
+            if threshold_percent_max is not None
+            else threshold_percentile if threshold_percentile is not None else 40.0
+        )
+        self.component_mode = str(component_mode or "hotspotConnected")
+        self.color = color
+        self.box = box if box is not None else MprThresholdRegionBoxState()
+        self.stats = stats
+        self.authoritative_mask = None
+        self.authoritative_mask_origin = None
+        self.authoritative_geometry = None
+
+    @property
+    def threshold_hu(self) -> float:
+        return self.threshold_value
+
+    @property
+    def threshold_percentile(self) -> float:
+        return self.threshold_percent_max
 
 
 @dataclass
@@ -228,7 +332,7 @@ class MprVoiSphereState:
     stats: MprVoiSphereStatsState | None = None
 
 
-@dataclass
+@dataclass(init=False)
 class MprSegmentationState:
     enabled: bool = False
     client_revision: int = 0
@@ -238,12 +342,62 @@ class MprSegmentationState:
     threshold_regions: list[MprThresholdRegionState] = field(default_factory=list)
     voi_spheres: list[MprVoiSphereState] = field(default_factory=list)
     voi_sphere: MprVoiSphereState | None = None
-    lower_hu: float = 300.0
-    upper_hu: float = 3071.0
+    lower_value: float = 300.0
+    upper_value: float = 3071.0
+    intensity_context: MprIntensityContextState = field(default_factory=MprIntensityContextState)
     opacity: float = 0.45
     color: str = "#ff4df8"
     voi_box: MprSegmentationVoiBoxState | None = None
     legacy_enabled: bool = False
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        client_revision: int = 0,
+        selected_region_id: str | None = None,
+        selected_voi: bool = False,
+        selected_voi_id: str | None = None,
+        threshold_regions: list[MprThresholdRegionState] | None = None,
+        voi_spheres: list[MprVoiSphereState] | None = None,
+        voi_sphere: MprVoiSphereState | None = None,
+        lower_value: float | None = None,
+        upper_value: float | None = None,
+        lower_hu: float | None = None,
+        upper_hu: float | None = None,
+        intensity_context: MprIntensityContextState | None = None,
+        opacity: float = 0.45,
+        color: str = "#ff4df8",
+        voi_box: MprSegmentationVoiBoxState | None = None,
+        legacy_enabled: bool = False,
+    ) -> None:
+        self.enabled = enabled
+        self.client_revision = client_revision
+        self.selected_region_id = selected_region_id
+        self.selected_voi = selected_voi
+        self.selected_voi_id = selected_voi_id
+        self.threshold_regions = list(threshold_regions or [])
+        self.voi_spheres = list(voi_spheres or [])
+        self.voi_sphere = voi_sphere
+        self.lower_value = float(
+            lower_value if lower_value is not None else lower_hu if lower_hu is not None else 300.0
+        )
+        self.upper_value = float(
+            upper_value if upper_value is not None else upper_hu if upper_hu is not None else 3071.0
+        )
+        self.intensity_context = intensity_context or MprIntensityContextState()
+        self.opacity = opacity
+        self.color = color
+        self.voi_box = voi_box
+        self.legacy_enabled = legacy_enabled
+
+    @property
+    def lower_hu(self) -> float:
+        return self.lower_value
+
+    @property
+    def upper_hu(self) -> float:
+        return self.upper_value
 
 
 @dataclass
@@ -309,13 +463,20 @@ class ViewGroupRecord:
     fusion_view_group_key: str | None = None
     fusion_initialized: bool = False
     fusion_axial_index: int = 0
-    fusion_pet_pseudocolor_preset: str = "petct-rainbow"
-    fusion_pet_unit: str = "SUVbw"
+    fusion_pet_pseudocolor_preset: str = "hotiron"
+    fusion_pet_pane_pseudocolor_preset: str = "hotiron"
+    fusion_pet_unit: str = "source"
+    fusion_window_target: str = "ct"
     fusion_alpha: float = 0.52
     fusion_pet_window: WindowState = field(default_factory=WindowState)
+    fusion_pet_control_window_max: float | None = None
     fusion_revision: int = 0
     fusion_registration: FusionRegistrationState = field(default_factory=FusionRegistrationState)
     active_viewport: str = "mpr-ax"
+    pet_unit: str = "source"
+    pet_unit_label: str = "Source"
+    pet_pseudocolor_preset: str = "hotiron"
+    pet_control_window_max: float | None = None
     axial_index: int = 0
     coronal_index: int = 0
     sagittal_index: int = 0
@@ -353,8 +514,9 @@ class ViewRecord:
     secondary_series_id: str | None = None
     fusion_pane_role: str | None = None
     pseudocolor_preset: str = "bw"
-    pet_unit: str = "SUVbw"
-    pet_unit_label: str = "g/ml (SUVbw)"
+    pet_unit: str = "source"
+    pet_unit_label: str = "Source"
+    pet_control_window_max: float | None = None
     width: int | None = None
     height: int | None = None
     current_index: int = 0

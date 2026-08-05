@@ -542,6 +542,38 @@ def test_viewer_service_keeps_manual_aaa_config_stable() -> None:
     assert view.volume_render_config_token is None
 
 
+def test_pet_volume_display_uses_pet_window_and_lut_instead_of_ct_tissue_layers() -> None:
+    config = ViewerService._apply_pet_volume_display_config(
+        create_default_volume_render_config("bone"),
+        window_width=8.0,
+        window_center=4.0,
+        pseudocolor_preset="rainbow",
+    )
+
+    enabled_layers = [layer for layer in config["layers"] if isinstance(layer, dict) and layer["enabled"]]
+    assert [layer["key"] for layer in enabled_layers] == ["custom"]
+    assert enabled_layers[0]["ww"] == 8.0
+    assert enabled_layers[0]["wl"] == 4.0
+    assert enabled_layers[0]["colorStart"] == "#001f7a"
+    assert enabled_layers[0]["colorEnd"] == "#ff2600"
+    assert config["lighting"]["shading"] is False
+
+
+def test_pet_volume_display_preserves_mip_blend_mode() -> None:
+    source = create_default_volume_render_config("bone")
+    source["blendMode"] = "mip"
+
+    config = ViewerService._apply_pet_volume_display_config(
+        source,
+        window_width=8.0,
+        window_center=4.0,
+        pseudocolor_preset="pet",
+    )
+
+    assert config["blendMode"] == "mip"
+    assert [layer["key"] for layer in config["layers"] if layer["enabled"]] == ["custom"]
+
+
 def test_aaa_gradient_opacity_keeps_low_gradient_body_visible() -> None:
     points = VtkVolumeRenderer._build_gradient_opacity_points("aaa", "composite", True)
 

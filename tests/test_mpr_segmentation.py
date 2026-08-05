@@ -3,10 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL
 from app.models.viewer import (
+    MprIntensityContextState,
     MprSegmentationState,
     MprSegmentationVoiBoxState,
     MprThresholdRegionBoxState,
@@ -354,6 +356,125 @@ def test_mpr_segmentation_region_stats_use_thresholded_box_voxels() -> None:
     assert stats.effective_threshold_hu == 23.0
 
 
+def test_pet_mpr_percent_suvmax_stats_use_pet_units_and_fdg_metrics() -> None:
+    volume = np.full((24, 24, 24), 2.0, dtype=np.float32)
+    volume[4:20, 4:20, 4:20] = 8.0
+    geometry = build_identity_geometry(volume.shape)
+    region = _region(
+        "pet-region",
+        center=(11.5, 11.5, 11.5),
+        threshold_hu=0.0,
+        threshold_mode="percentMax",
+        width_mm=23.0,
+        height_mm=23.0,
+        depth_mm=23.0,
+    )
+    region.threshold_percent_max = 40.0
+
+    stats = ViewerService._compute_mpr_threshold_region_stats(
+        volume,
+        geometry,
+        region,
+        intensity_context=MprIntensityContextState(
+            modality="PT",
+            value_type="SUVbw",
+            unit="SUVbw",
+            label="g/ml (SUVbw)",
+            quantitative=True,
+        ),
+        is_fdg=True,
+    )
+
+    assert stats.effective_threshold_value == pytest.approx(3.2)
+    assert stats.sample_count == 4096
+    assert stats.value_mean == pytest.approx(8.0)
+    assert stats.mtv_cm3 == pytest.approx(4.096)
+    assert stats.uptake_peak == pytest.approx(8.0)
+    assert stats.tlg_available is True
+    assert stats.tlg == pytest.approx(32.768)
+
+
+def test_pet_mpr_stats_keep_only_hottest_connected_lesion() -> None:
+    volume = np.zeros((20, 20, 20), dtype=np.float32)
+    volume[3:6, 3:6, 3:6] = 10.0
+    volume[12:16, 12:16, 12:16] = 8.0
+    geometry = build_identity_geometry(volume.shape)
+    region = _region(
+        "two-hotspots",
+        center=(9.5, 9.5, 9.5),
+        threshold_hu=0.0,
+        threshold_mode="percentMax",
+        width_mm=19.0,
+        height_mm=19.0,
+        depth_mm=19.0,
+    )
+    region.threshold_percent_max = 40.0
+    region.component_mode = "hotspotConnected"
+
+    stats = ViewerService._compute_mpr_threshold_region_stats(
+        volume,
+        geometry,
+        region,
+        intensity_context=MprIntensityContextState(
+            modality="PT",
+            value_type="SUVbw",
+            unit="SUVbw",
+            label="g/ml (SUVbw)",
+            quantitative=True,
+        ),
+        is_fdg=False,
+    )
+
+    assert stats.status == "ready"
+    assert stats.effective_threshold_value == pytest.approx(4.0)
+    assert stats.sample_count == 27
+    assert stats.value_min == pytest.approx(10.0)
+    assert stats.value_max == pytest.approx(10.0)
+    assert stats.value_mean == pytest.approx(10.0)
+    assert stats.mtv_cm3 == pytest.approx(0.027)
+    assert stats.tlg_available is False
+
+    disconnected_plane = np.asarray(volume[13], dtype=np.float32)
+    masks = ViewerService._build_mpr_segmentation_region_plane_masks(
+        disconnected_plane,
+        MprSegmentationState(enabled=True, threshold_regions=[region]),
+        MPR_VIEWPORT_AXIAL,
+        _plane_pose(MPR_VIEWPORT_AXIAL, center=(13.0, 9.5, 9.5)),
+    )
+    assert masks == []
+
+
+def test_pet_mpr_non_fdg_does_not_label_tlg() -> None:
+    volume = np.full((12, 12, 12), 5.0, dtype=np.float32)
+    geometry = build_identity_geometry(volume.shape)
+    region = _region(
+        "zr89",
+        center=(5.5, 5.5, 5.5),
+        threshold_hu=1.0,
+        width_mm=11.0,
+        height_mm=11.0,
+        depth_mm=11.0,
+    )
+
+    stats = ViewerService._compute_mpr_threshold_region_stats(
+        volume,
+        geometry,
+        region,
+        intensity_context=MprIntensityContextState(
+            modality="PT",
+            value_type="SUVbw",
+            unit="SUVbw",
+            label="g/ml (SUVbw)",
+            quantitative=True,
+        ),
+        is_fdg=False,
+    )
+
+    assert stats.tlg_available is False
+    assert stats.tlg is None
+    assert "confirmed FDG" in str(stats.tlg_reason)
+
+
 def test_mpr_voi_sphere_stats_use_all_sphere_voxels() -> None:
     volume = np.arange(27, dtype=np.float32).reshape((3, 3, 3))
     geometry = build_identity_geometry(volume.shape)
@@ -471,6 +592,53 @@ def test_mpr_segmentation_overlay_samples_use_geometry_mask_before_threshold() -
     assert region.samples.points[:6] == [0.5, 0.5, 0.0, 1.5, 0.5, 1.0]
 
 
+def test_mpr_segmentation_overlay_samples_use_authoritative_connected_mask(monkeypatch) -> None:
+    source_pixels = np.arange(25, dtype=np.float32).reshape(5, 5)
+    connected_mask = np.zeros((5, 5), dtype=bool)
+    connected_mask[1:3, 2:4] = True
+    state = MprSegmentationState(
+        enabled=True,
+        threshold_regions=[_region("r1", threshold_hu=-1_000.0)],
+    )
+    monkeypatch.setattr(
+        ViewerService,
+        "_build_mpr_segmentation_region_plane_masks",
+        classmethod(
+            lambda cls, source, segmentation, viewport, plane, **_kwargs: [
+                SimpleNamespace(region_id="r1", mask=connected_mask, color="#ff4df8")
+            ]
+        ),
+    )
+
+    overlay = ViewerService._build_mpr_segmentation_overlay_payload(
+        source_pixels,
+        state,
+        MPR_VIEWPORT_AXIAL,
+        _plane_pose(MPR_VIEWPORT_AXIAL),
+    )
+
+    assert overlay is not None
+    region = overlay.regions[0]
+    assert region.visible is True
+    assert region.samples is not None
+    assert region.samples.total_count == 4
+    assert region.samples.sampled_count == 4
+    assert region.samples.points == [
+        2.5,
+        1.5,
+        7.0,
+        3.5,
+        1.5,
+        8.0,
+        2.5,
+        2.5,
+        12.0,
+        3.5,
+        2.5,
+        13.0,
+    ]
+
+
 def test_mpr_segmentation_fast_preview_overlay_omits_samples() -> None:
     source_pixels = np.arange(25, dtype=np.float32).reshape(5, 5)
     state = MprSegmentationState(
@@ -492,6 +660,63 @@ def test_mpr_segmentation_fast_preview_overlay_omits_samples() -> None:
     assert region.rect is not None
     assert region.sample_revision > 0
     assert region.samples is None
+
+
+def test_mpr_segmentation_overlay_guide_tracks_model_rotation() -> None:
+    source_pixels = np.full((5, 5), 500.0, dtype=np.float32)
+    plane = _plane_pose(MPR_VIEWPORT_AXIAL)
+    state = MprSegmentationState(
+        enabled=True,
+        threshold_regions=[
+            _region(
+                "r1",
+                center=(0.0, 1.0, 2.0),
+                threshold_hu=-1_000.0,
+                width_mm=1.0,
+                height_mm=1.0,
+                depth_mm=1.0,
+            )
+        ],
+    )
+    rotation = np.asarray(
+        (
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, -1.0),
+            (0.0, 1.0, 0.0),
+        ),
+        dtype=np.float64,
+    )
+    pivot = np.asarray((0.0, 2.0, 2.0), dtype=np.float64)
+
+    baseline = ViewerService._build_mpr_segmentation_overlay_payload(
+        source_pixels,
+        state,
+        MPR_VIEWPORT_AXIAL,
+        plane,
+        include_samples=False,
+    )
+    rotated = ViewerService._build_mpr_segmentation_overlay_payload(
+        source_pixels,
+        state,
+        MPR_VIEWPORT_AXIAL,
+        plane,
+        include_samples=False,
+        model_rotation_world=rotation,
+        model_rotation_pivot_world=pivot,
+        guide_authoritative=True,
+    )
+
+    assert baseline is not None
+    assert rotated is not None
+    baseline_region = baseline.regions[0]
+    rotated_region = rotated.regions[0]
+    assert baseline_region.guide_points
+    assert rotated_region.guide_points
+    assert rotated_region.guide_authoritative is True
+    assert baseline_region.sample_revision != rotated_region.sample_revision
+    assert [(point.x, point.y) for point in baseline_region.guide_points] != [
+        (point.x, point.y) for point in rotated_region.guide_points
+    ]
 
 
 def test_mpr_segmentation_overlay_sample_revision_ignores_threshold_but_tracks_geometry() -> None:

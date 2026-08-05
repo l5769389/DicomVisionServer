@@ -1,99 +1,211 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
+from hashlib import sha256
 
 import numpy as np
 
 
 DEFAULT_PSEUDOCOLOR_PRESET = "bw"
+PSEUDOCOLOR_REGISTRY_VERSION = "dicomvision-2026.2"
 
-_PRESET_STOPS: dict[str, tuple[tuple[float, str], ...]] = {
-    "blackbody": (
-        (0.00, "#000000"),
-        (0.22, "#5b0f00"),
-        (0.46, "#c73a00"),
-        (0.70, "#ffb000"),
-        (1.00, "#fff6d5"),
-    ),
-    "bw": (
-        (0.00, "#000000"),
-        (0.36, "#3f3f3f"),
-        (0.70, "#9f9f9f"),
-        (1.00, "#ffffff"),
-    ),
-    "bwinverse": (
-        (0.00, "#ffffff"),
-        (0.34, "#b8b8b8"),
-        (0.68, "#626262"),
-        (1.00, "#000000"),
-    ),
-    "cardiac": (
-        (0.00, "#09111c"),
-        (0.24, "#124d79"),
-        (0.46, "#1da6a6"),
-        (0.72, "#f4d35e"),
-        (1.00, "#f1635e"),
-    ),
-    "hotiron": (
-        (0.00, "#000000"),
-        (0.24, "#520000"),
-        (0.48, "#b10d0d"),
-        (0.72, "#ff7a00"),
-        (1.00, "#fff2bf"),
-    ),
-    "pet": (
-        (0.00, "#14003d"),
-        (0.18, "#1b4cff"),
-        (0.38, "#00b7ff"),
-        (0.56, "#1de5a3"),
-        (0.78, "#ffe14a"),
-        (1.00, "#ff4d5a"),
-    ),
-    "petct-rainbow": (
-        (0.00, "#000000"),
-        (0.12, "#3a0000"),
-        (0.30, "#8d0000"),
-        (0.52, "#e21b00"),
-        (0.72, "#ff8a00"),
-        (0.88, "#ffe100"),
-        (1.00, "#fffef0"),
-    ),
-    "rainbow": (
-        (0.00, "#5b00d6"),
-        (0.18, "#1558ff"),
-        (0.34, "#00b0ff"),
-        (0.52, "#00cf7c"),
-        (0.74, "#ffd000"),
-        (1.00, "#ff5d39"),
-    ),
+
+@dataclass(frozen=True)
+class PseudocolorDefinition:
+    key: str
+    label: str
+    version: str
+    provenance: str
+    license: str
+    lut: np.ndarray
+
+    @property
+    def sha256(self) -> str:
+        return sha256(np.ascontiguousarray(self.lut, dtype=np.uint8).tobytes()).hexdigest()
+
+
+def _channel(values: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(values), 0.0, 255.0).astype(np.uint8)
+
+
+def _linear_gray(*, inverse: bool = False) -> np.ndarray:
+    values = np.arange(256, dtype=np.float64)
+    if inverse:
+        values = 255.0 - values
+    channel = _channel(values)
+    return np.stack((channel, channel, channel), axis=-1)
+
+
+def _normalized_axis() -> np.ndarray:
+    return np.arange(256, dtype=np.float64) / 255.0
+
+
+def _hot_iron() -> np.ndarray:
+    """Continuous black/red/orange/white ramp generated at all 256 entries."""
+    x = _normalized_axis()
+    return _channel(
+        np.stack(
+            (
+                np.clip(2.0 * x, 0.0, 1.0),
+                np.clip(2.0 * x - 1.0, 0.0, 1.0),
+                np.clip(4.0 * x - 3.0, 0.0, 1.0),
+            ),
+            axis=-1,
+        )
+        * 255.0
+    )
+
+
+def _hot_metal() -> np.ndarray:
+    """Metal-style hot ramp with longer red and yellow transition regions."""
+    x = _normalized_axis()
+    return _channel(
+        np.stack(
+            (
+                np.clip(1.4 * x, 0.0, 1.0),
+                np.clip(2.8 * x - 1.4, 0.0, 1.0),
+                np.clip(4.0 * x - 3.0, 0.0, 1.0),
+            ),
+            axis=-1,
+        )
+        * 255.0
+    )
+
+
+def _black_body() -> np.ndarray:
+    x = _normalized_axis()
+    return _channel(
+        np.stack(
+            (
+                np.clip(3.0 * x, 0.0, 1.0),
+                np.clip(3.0 * x - 1.0, 0.0, 1.0),
+                np.clip(3.0 * x - 2.0, 0.0, 1.0),
+            ),
+            axis=-1,
+        )
+        * 255.0
+    )
+
+
+def _hsv_ramp(
+    *,
+    hue_start: float,
+    hue_end: float,
+    saturation_start: float = 1.0,
+    saturation_end: float = 0.0,
+    value_start: float = 0.20,
+    value_end: float = 1.0,
+) -> np.ndarray:
+    count = 256
+    hue = np.linspace(hue_start, hue_end, count, dtype=np.float64)
+    saturation = np.linspace(saturation_start, saturation_end, count, dtype=np.float64)
+    value = np.linspace(value_start, value_end, count, dtype=np.float64)
+    chroma = value * saturation
+    hue_sector = (hue % 1.0) * 6.0
+    x = chroma * (1.0 - np.abs(hue_sector % 2.0 - 1.0))
+    zeros = np.zeros_like(chroma)
+    rgb_prime = np.empty((count, 3), dtype=np.float64)
+    sectors = np.floor(hue_sector).astype(np.int32) % 6
+    candidates = (
+        (chroma, x, zeros),
+        (x, chroma, zeros),
+        (zeros, chroma, x),
+        (zeros, x, chroma),
+        (x, zeros, chroma),
+        (chroma, zeros, x),
+    )
+    for sector, candidate in enumerate(candidates):
+        mask = sectors == sector
+        rgb_prime[mask] = np.stack(candidate, axis=-1)[mask]
+    rgb = rgb_prime + (value - chroma)[:, None]
+    return _channel(rgb * 255.0)
+
+
+def _pet_ramp() -> np.ndarray:
+    # A continuous PET spectrum with a true black zero. Keeping LUT(0) black is
+    # important because padding outside the acquired field must remain background.
+    x = _normalized_axis()
+    red = np.where(
+        x < 0.25,
+        0.0,
+        np.where(x < 0.75, 2.0 * x - 0.5, 1.0),
+    )
+    green = np.where(
+        x < 0.25,
+        2.0 * x,
+        np.where(x < 0.5, 1.0 - 2.0 * x, 2.0 * x - 1.0),
+    )
+    blue = np.where(
+        x < 0.5,
+        2.0 * x,
+        np.where(x < 0.75, 3.0 - 4.0 * x, 4.0 * x - 3.0),
+    )
+    return _channel(np.stack((red, green, blue), axis=-1) * 255.0)
+
+
+def _rainbow() -> np.ndarray:
+    return _hsv_ramp(
+        hue_start=0.75,
+        hue_end=0.0,
+        saturation_start=1.0,
+        saturation_end=0.82,
+        value_start=0.40,
+        value_end=1.0,
+    )
+
+
+def _definition(key: str, label: str, lut: np.ndarray) -> PseudocolorDefinition:
+    frozen = np.ascontiguousarray(lut, dtype=np.uint8)
+    frozen.setflags(write=False)
+    return PseudocolorDefinition(
+        key=key,
+        label=label,
+        version=PSEUDOCOLOR_REGISTRY_VERSION,
+        provenance="DicomVision analytic 256-entry palette",
+        license="DicomVision project license",
+        lut=frozen,
+    )
+
+
+_DEFINITIONS: dict[str, PseudocolorDefinition] = {
+    "bw": _definition("bw", "BW", _linear_gray()),
+    "bwinverse": _definition("bwinverse", "BWInverse", _linear_gray(inverse=True)),
+    "blackbody": _definition("blackbody", "BlackBody", _black_body()),
+    "hotiron": _definition("hotiron", "HotIron", _hot_iron()),
+    "hotmetal": _definition("hotmetal", "HotMetal", _hot_metal()),
+    "pet": _definition("pet", "PET", _pet_ramp()),
+    "rainbow": _definition("rainbow", "Rainbow", _rainbow()),
+}
+
+# Historical fusion palette names remain readable but resolve to a versioned
+# palette instead of maintaining a second, visually different approximation.
+_ALIASES = {
+    "petct-rainbow": "hotmetal",
 }
 
 
 def normalize_pseudocolor_preset(value: str | None) -> str:
     normalized = str(value or "").strip().lower().removeprefix("pseudocolor:")
-    return normalized if normalized in _PRESET_STOPS else DEFAULT_PSEUDOCOLOR_PRESET
+    normalized = _ALIASES.get(normalized, normalized)
+    return normalized if normalized in _DEFINITIONS else DEFAULT_PSEUDOCOLOR_PRESET
+
+
+def pseudocolor_definition(preset: str | None) -> PseudocolorDefinition:
+    return _DEFINITIONS[normalize_pseudocolor_preset(preset)]
 
 
 def apply_pseudocolor(grayscale_pixels: np.ndarray, preset: str | None) -> np.ndarray:
-    normalized_preset = normalize_pseudocolor_preset(preset)
-    lut = build_lut(normalized_preset)
-    return lut[np.asarray(grayscale_pixels, dtype=np.uint8)]
+    return build_lut(normalize_pseudocolor_preset(preset))[
+        np.asarray(grayscale_pixels, dtype=np.uint8)
+    ]
+
+
+def pseudocolor_background_color(preset: str | None) -> tuple[int, int, int]:
+    """Return the active LUT colour for pixels outside the acquired FOV."""
+    return tuple(int(component) for component in build_lut(normalize_pseudocolor_preset(preset))[0])
 
 
 @lru_cache(maxsize=None)
 def build_lut(preset: str) -> np.ndarray:
-    normalized_preset = normalize_pseudocolor_preset(preset)
-    stops = _PRESET_STOPS[normalized_preset]
-    indices = np.arange(256, dtype=np.float32)
-    anchors = np.asarray([position * 255.0 for position, _ in stops], dtype=np.float32)
-    colors = np.asarray([_hex_to_rgb(color) for _, color in stops], dtype=np.float32)
-    channels = [
-        np.interp(indices, anchors, colors[:, channel_index])
-        for channel_index in range(3)
-    ]
-    return np.stack(channels, axis=-1).astype(np.uint8)
-
-
-def _hex_to_rgb(value: str) -> tuple[int, int, int]:
-    stripped = value.strip().removeprefix("#")
-    return tuple(int(stripped[index : index + 2], 16) for index in (0, 2, 4))
+    return pseudocolor_definition(preset).lut

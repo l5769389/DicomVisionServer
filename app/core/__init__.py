@@ -36,8 +36,13 @@ DRAG_ACTION_TYPES: Final = {
     DRAG_ACTION_END,
 }
 
-ZOOM_MIN: Final = 0.1
-ZOOM_MAX: Final = 10.0
+# Zoom is expressed in rendered pixels per source-space millimetre.  PET is
+# commonly reconstructed on a substantially smaller matrix than CT, so a
+# workstation-sized viewport can legitimately need a fit zoom above 10x.
+# Keep the interactive range broad enough for that physical contain fit while
+# still bounding accidental input and expensive transforms.
+ZOOM_MIN: Final = 0.01
+ZOOM_MAX: Final = 64.0
 ZOOM_DRAG_SENSITIVITY: Final = 0.01
 ZOOM_DRAG_SENSITIVITY_3D: Final = 0.0045
 ZOOM_DRAG_LOG_SENSITIVITY: Final = 3.2

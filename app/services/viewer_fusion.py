@@ -36,7 +36,7 @@ FUSION_VIEW_TYPE_TO_PANE_ROLE = {
     "FusionPETCoronalMip": FUSION_PANE_PET_CORONAL_MIP,
 }
 
-FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET = "bwinverse"
+FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET = "hotiron"
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,12 @@ class FusionRenderResult:
     source_projection: FusionSourceProjection | None
     ct_layer_pixels: np.ndarray | None = None
     pet_layer_pixels: np.ndarray | None = None
+    ct_scalar_pixels: np.ndarray | None = None
+    pet_scalar_pixels: np.ndarray | None = None
+    ct_window_width: float | None = None
+    ct_window_center: float | None = None
+    pet_window_width: float | None = None
+    pet_window_center: float | None = None
     plane_pose: PlanePose | None = None
     pet_plane_pose: PlanePose | None = None
 
@@ -421,6 +427,7 @@ def render_fusion_pixels(
     alpha: float,
     ct_has_patient_geometry: bool,
     pet_has_patient_geometry: bool,
+    pet_standalone_pseudocolor_preset: str = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET,
     interpolation_order: int = 1,
     overlay_pet_layer_only: bool = False,
     overlay_plane_override: PlanePose | None = None,
@@ -448,7 +455,7 @@ def render_fusion_pixels(
         pet_mip = np.max(np.asarray(pet_volume, dtype=np.float32), axis=1)
         pet_mip = np.flipud(pet_mip)
         pet_uint8 = window_to_uint8(pet_mip, pet_window_width, pet_window_center)
-        pet_display_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+        pet_display_preset = normalize_pseudocolor_preset(pet_standalone_pseudocolor_preset)
         pet_rgb = apply_pseudocolor(pet_uint8, pet_display_preset)
         row_world, row_spacing = _axis_direction_and_spacing(pet_geometry, 0)
         col_world, col_spacing = _axis_direction_and_spacing(pet_geometry, 2)
@@ -468,6 +475,9 @@ def render_fusion_pixels(
             ),
             plane_pose=None,
             pet_plane_pose=None,
+            pet_scalar_pixels=np.asarray(pet_mip, dtype=np.float32),
+            pet_window_width=pet_window_width,
+            pet_window_center=pet_window_center,
         )
 
     ct_slice: np.ndarray | None = None
@@ -519,11 +529,14 @@ def render_fusion_pixels(
             ),
             plane_pose=plane,
             pet_plane_pose=None,
+            ct_scalar_pixels=np.asarray(ct_slice, dtype=np.float32),
+            ct_window_width=ct_window_width,
+            ct_window_center=ct_window_center,
         )
 
     pet_uint8 = window_to_uint8(pet_slice, pet_window_width, pet_window_center)
     if pane_role == FUSION_PANE_PET_AXIAL:
-        pet_display_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+        pet_display_preset = normalize_pseudocolor_preset(pet_standalone_pseudocolor_preset)
         pet_rgb = apply_pseudocolor(pet_uint8, pet_display_preset)
         return FusionRenderResult(
             pixels=pet_rgb,
@@ -540,6 +553,9 @@ def render_fusion_pixels(
             ),
             plane_pose=pet_plane,
             pet_plane_pose=pet_plane,
+            pet_scalar_pixels=np.asarray(pet_slice, dtype=np.float32),
+            pet_window_width=pet_window_width,
+            pet_window_center=pet_window_center,
         )
 
     overlay_preset = normalize_pseudocolor_preset(pet_pseudocolor_preset)
@@ -570,6 +586,9 @@ def render_fusion_pixels(
             pet_layer_pixels=pet_rgba,
             plane_pose=plane,
             pet_plane_pose=pet_plane,
+            pet_scalar_pixels=np.asarray(pet_slice, dtype=np.float32),
+            pet_window_width=pet_window_width,
+            pet_window_center=pet_window_center,
         )
 
     if ct_slice is None:
@@ -604,6 +623,12 @@ def render_fusion_pixels(
         pet_layer_pixels=pet_rgba,
         plane_pose=plane,
         pet_plane_pose=pet_plane,
+        ct_scalar_pixels=np.asarray(ct_slice, dtype=np.float32),
+        pet_scalar_pixels=np.asarray(pet_slice, dtype=np.float32),
+        ct_window_width=ct_window_width,
+        ct_window_center=ct_window_center,
+        pet_window_width=pet_window_width,
+        pet_window_center=pet_window_center,
     )
 
 

@@ -66,6 +66,7 @@ from app.models.viewer import (
     InstanceRecord,
     MprCursorRecord,
     MprFrameState,
+    MprIntensityContextState,
     MprMipState,
     MprMipViewportState,
     MprObliquePlaneState,
@@ -93,14 +94,17 @@ from app.schemas.view import (
     MprCrosshairInfo,
     MprCursorInfo,
     MprFrameInfo,
+    MprIntensityContext,
     MprMipConfig,
     MprMipViewportConfig,
     MprPlaneInfo,
     MprSegmentationConfig,
     MprSegmentationOverlay,
+    MprSegmentationOverlayPoint,
     MprSegmentationOverlayRect,
     MprSegmentationOverlayRegion,
     MprSegmentationOverlaySamples,
+    MprSegmentationOverlayWorldPoint,
     MprThresholdRegion,
     MprThresholdRegionBox,
     MprThresholdRegionStats,
@@ -125,6 +129,7 @@ from app.schemas.view import (
     FusionInfo,
     FusionCompositeLayerInfo,
     PetInfo,
+    PetUnitAvailability,
     FusionProjectionInfo,
     FusionRegistrationInfo,
     ViewMtfAnalyzeResponse,
@@ -173,7 +178,28 @@ from app.services.dicom_gsps_export_service import build_gsps_dicom_bytes
 from app.services.dicom_sr_export_service import build_measurement_sr_dicom_bytes
 from app.services.mpr_geometry import VolumePatientTransform
 from app.services.mtf_analysis_service import MtfAnalysisService
-from app.services.pseudocolor import DEFAULT_PSEUDOCOLOR_PRESET, apply_pseudocolor, normalize_pseudocolor_preset
+from app.services.pet_quantification import (
+    PET_UNIT_KBQML,
+    PET_UNIT_LABELS,
+    PET_UNIT_PERCENT_ID_G,
+    PET_UNIT_SOURCE,
+    PET_UNIT_SUL,
+    PET_UNIT_SUV_BSA,
+    PET_UNIT_SUV_BW,
+    PetQuantificationContext,
+    apply_pet_mapping,
+    build_pet_quantification_context,
+    derive_pet_auto_range,
+    derive_pet_control_range_max,
+    normalize_pet_unit,
+)
+from app.services.pseudocolor import (
+    DEFAULT_PSEUDOCOLOR_PRESET,
+    apply_pseudocolor,
+    normalize_pseudocolor_preset,
+    pseudocolor_background_color,
+    pseudocolor_definition,
+)
 from app.services.render_layers.render_context import CornerInfoOverlay, MprCrosshairOverlay, OrientationOverlay
 from app.services.representative_slice_selector import (
     build_representative_sample_indexes,
@@ -196,6 +222,7 @@ from app.services.viewer_fusion import (
     image_from_pixels,
     render_fusion_pixels,
     transform_pet_sampling_plane,
+    window_to_uint8,
 )
 from app.services.viewer_render_guards import ensure_view_size
 from app.services.water_phantom_qa_service import WaterPhantomQaService
@@ -224,27 +251,18 @@ from app.services.volume_rendering.contracts import SurfaceRenderRequest, Volume
 
 logger = get_logger(__name__)
 
-FUSION_PET_UNIT_SOURCE = "source"
-FUSION_PET_UNIT_KBQML = "kBqml"
-FUSION_PET_UNIT_SUV_BW = "SUVbw"
-FUSION_PET_UNIT_SUV_BSA = "SUVbsa"
-FUSION_PET_UNIT_SUL = "SUL"
-FUSION_PET_UNIT_PERCENT_ID_G = "percentIDg"
+FUSION_PET_UNIT_SOURCE = PET_UNIT_SOURCE
+FUSION_PET_UNIT_KBQML = PET_UNIT_KBQML
+FUSION_PET_UNIT_SUV_BW = PET_UNIT_SUV_BW
+FUSION_PET_UNIT_SUV_BSA = PET_UNIT_SUV_BSA
+FUSION_PET_UNIT_SUL = PET_UNIT_SUL
+FUSION_PET_UNIT_PERCENT_ID_G = PET_UNIT_PERCENT_ID_G
 MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT = 120_000
-FUSION_PET_STANDALONE_BACKGROUND_CVAL = 255.0
 PET_STANDALONE_PSEUDOCOLOR_PRESET = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
 MPR_SEGMENTATION_OVERLAY_PREVIEW_SAMPLE_LIMIT = 12_000
-FUSION_PET_UNIT_LABELS: dict[str, str] = {
-    FUSION_PET_UNIT_SOURCE: "source",
-    FUSION_PET_UNIT_KBQML: "kBq/ml (uptake)",
-    FUSION_PET_UNIT_SUV_BSA: "cm2/ml (SUVbsa)",
-    FUSION_PET_UNIT_SUV_BW: "g/ml (SUVbw)",
-    FUSION_PET_UNIT_SUL: "g/ml* (SUL)",
-    FUSION_PET_UNIT_PERCENT_ID_G: "%ID/g",
-}
-# SUV fusion display starts from a reference-viewer preset, not from PET intensity percentiles.
+FUSION_PET_UNIT_LABELS: dict[str, str] = PET_UNIT_LABELS
 FUSION_DEFAULT_SUV_WINDOW_MIN = 0.0
-FUSION_DEFAULT_SUV_WINDOW_MAX = 4.49
+FUSION_DEFAULT_SUV_WINDOW_MAX = 1.0
 
 
 @dataclass(frozen=True)
@@ -254,6 +272,8 @@ class FusionPetDisplayVolume:
     unit_label: str
     source_units: str | None = None
     scale: float = 1.0
+    offset: float = 0.0
+    context: PetQuantificationContext | None = None
 
 
 @dataclass(frozen=True)

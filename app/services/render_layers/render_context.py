@@ -67,7 +67,9 @@ class RenderContext:
     mpr_crosshair: MprCrosshairOverlay | None = None
     corner_info: CornerInfoOverlay | None = None
     orientation: OrientationOverlay | None = None
-    background_cval: float = 0.0
+    # A scalar is used for grayscale images. Colour images may provide one
+    # value per channel so their padding follows the active colour LUT.
+    background_cval: float | tuple[int, ...] = 0.0
 
 
 class RenderLayer(Protocol):

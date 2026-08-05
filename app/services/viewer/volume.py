@@ -6,6 +6,62 @@ from app.services.viewer.shared import *  # noqa: F403
 
 
 class ViewerVolumeMixin:
+    @staticmethod
+    def _apply_pet_volume_display_config(
+        config: dict[str, object],
+        *,
+        window_width: float | None,
+        window_center: float | None,
+        pseudocolor_preset: str | None,
+    ) -> dict[str, object]:
+        """Make PET volume rendering follow the PET range and LUT instead of CT tissue presets."""
+
+        preset = normalize_pseudocolor_preset(pseudocolor_preset or PET_STANDALONE_PSEUDOCOLOR_PRESET)
+        color_pairs = {
+            "bw": ("#080808", "#ffffff"),
+            "bwinverse": ("#ffffff", "#080808"),
+            "hotiron": ("#3b0000", "#fff4b0"),
+            "pet": ("#21004d", "#fff15c"),
+            "rainbow": ("#001f7a", "#ff2600"),
+            "blackbody": ("#160000", "#fff8df"),
+        }
+        color_start, color_end = color_pairs.get(
+            preset,
+            color_pairs.get(PET_STANDALONE_PSEUDOCOLOR_PRESET, color_pairs["hotiron"]),
+        )
+        width = max(float(window_width or 1.0), 1e-6)
+        center = float(window_center or width / 2.0)
+        layers = config.get("layers")
+        if isinstance(layers, list):
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                layer["enabled"] = str(layer.get("key") or "") == "custom"
+                if layer["enabled"]:
+                    layer.update(
+                        {
+                            "ww": width,
+                            "wl": center,
+                            "opacity": 0.9,
+                            "colorStart": color_start,
+                            "colorEnd": color_end,
+                        }
+                    )
+        config["blendMode"] = "mip" if str(config.get("blendMode") or "").strip().lower() == "mip" else "composite"
+        lighting = config.get("lighting")
+        if isinstance(lighting, dict):
+            lighting.update(
+                {
+                    "shading": False,
+                    "interpolation": "linear",
+                    "ambient": 1.0,
+                    "diffuse": 0.0,
+                    "specular": 0.0,
+                    "roughness": 1.0,
+                }
+            )
+        return config
+
     def _build_volume_render_request(
         self,
         view: ViewRecord,
@@ -556,13 +612,25 @@ class ViewerVolumeMixin:
         volume_started_at = perf_counter()
         series = compat.series_registry.get(view.series_id)
         self._emit_render_progress(progress_callback, "volume", progress_percent=6)
-        volume = self._get_series_volume(series, progress_callback=progress_callback)
+        source_volume = self._get_series_volume(series, progress_callback=progress_callback)
+        pet_display: FusionPetDisplayVolume | None = None
+        volume = source_volume
+        if self._is_pet_series(series) and view.is_initialized:
+            pet_display = self._build_fusion_pet_display_volume(series, source_volume, view.pet_unit)
+            volume = pet_display.volume
+            view.pet_unit = pet_display.unit
+            view.pet_unit_label = pet_display.unit_label
         volume_token = self._build_series_volume_cache_key(series)
         volume_ms = (perf_counter() - volume_started_at) * 1000.0
         if not view.is_initialized:
             self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_3d_viewport(view)
             view.is_initialized = True
+            if self._is_pet_series(series):
+                pet_display = self._build_fusion_pet_display_volume(series, source_volume, view.pet_unit)
+                volume = pet_display.volume
+        if pet_display is not None:
+            volume_token = f"{volume_token}:pet:{pet_display.unit}:{pet_display.scale:.12g}:{pet_display.offset:.12g}"
 
         spacing_xyz = self._get_3d_spacing_xyz(series)
         render_volume, render_volume_token = self._prepare_3d_render_volume(
@@ -574,6 +642,11 @@ class ViewerVolumeMixin:
             progress_callback=progress_callback,
         )
         render_3d_mode = self._normalize_render_3d_mode(view.render_3d_mode)
+        if pet_display is not None and render_3d_mode == "surface":
+            render_3d_mode = "volume"
+            view.render_3d_mode = "volume"
+            view.surface_render_config = None
+            view.volume_remove_bed = False
         image_started_at = perf_counter()
         if render_3d_mode == "surface":
             self._resolve_surface_render_config_for_render(
@@ -599,12 +672,19 @@ class ViewerVolumeMixin:
             render_height = surface_request.canvas_height
         else:
             self._emit_render_progress(progress_callback, "render", progress_percent=82)
-            self._resolve_volume_render_config_for_render(
+            volume_render_config = self._resolve_volume_render_config_for_render(
                 view,
                 series=series,
                 volume=volume,
                 volume_token=volume_token,
             )
+            if pet_display is not None:
+                view.volume_render_config = self._apply_pet_volume_display_config(
+                    volume_render_config,
+                    window_width=view.window_width,
+                    window_center=view.window_center,
+                    pseudocolor_preset=view.pseudocolor_preset,
+                )
             volume_request = self._build_volume_render_request(
                 view,
                 volume=render_volume,
@@ -614,7 +694,12 @@ class ViewerVolumeMixin:
             )
             image = compat._get_vtk_volume_renderer().render(volume_request)
             vtk_timings = compat._get_vtk_volume_renderer().get_last_timings(view.view_id)
-            viewport_label = "3D VR"
+            viewport_label = (
+                "PET MIP"
+                if pet_display is not None
+                and str(view.volume_render_config.get("blendMode") or "").strip().lower() == "mip"
+                else ("PET VR" if pet_display is not None else "3D VR")
+            )
             render_width = volume_request.canvas_width
             render_height = volume_request.canvas_height
         image_ms = (perf_counter() - image_started_at) * 1000.0
@@ -676,6 +761,22 @@ class ViewerVolumeMixin:
                 imageFormat=image_format,
                 viewId=view.view_id,
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
+                petInfo=(
+                    None
+                    if pet_display is None
+                    else self._build_pet_info(
+                        series,
+                        pet_display,
+                        window_width=view.window_width,
+                        window_center=view.window_center,
+                        pseudocolor_preset=view.pseudocolor_preset,
+                        control_window_max=(
+                            view.view_group.pet_control_window_max
+                            if view.view_group is not None
+                            else view.pet_control_window_max
+                        ),
+                    )
+                ),
                 cornerInfo=self._serialize_corner_info_overlay(corner_info),
                 orientation=self._build_3d_orientation_overlay(view),
                 transform=self._build_view_transform_payload(view),

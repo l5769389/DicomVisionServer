@@ -558,7 +558,11 @@ class ViewSocketHub:
             "fusion-zoom-preview",
         }:
             return "geometry-preview"
-        if request.metadata_mode in {"mpr-segmentation-preview", "fusion-registration-layer-preview"}:
+        if request.metadata_mode in {
+            "mpr-segmentation-preview",
+            "mpr-model-rotate-preview",
+            "fusion-registration-layer-preview",
+        }:
             return "overlay-preview"
         if request.fast_preview:
             return "geometry-preview"
@@ -587,6 +591,10 @@ class ViewSocketHub:
         elif request.metadata_mode in {"mpr-pan-zoom-preview", "mpr-zoom-preview"}:
             payload.pop("cornerInfo", None)
             payload.pop("orientation", None)
+        elif request.metadata_mode == "mpr-model-rotate-preview":
+            payload.pop("cornerInfo", None)
+            payload.pop("orientation", None)
+            payload.pop("scaleBar", None)
         elif request.metadata_mode == "mpr-crosshair-preview":
             payload.pop("cornerInfo", None)
             payload.pop("orientation", None)

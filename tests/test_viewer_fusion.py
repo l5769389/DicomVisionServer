@@ -212,7 +212,7 @@ def test_pet_axial_view_tracks_manual_registration_transform_with_pet_display() 
     assert after.source_projection is not None
     assert not np.allclose(before.source_projection.world_to_source_x, after.source_projection.world_to_source_x)
     assert not np.allclose(before.source_projection.world_to_source_y, after.source_projection.world_to_source_y)
-    assert after.pseudocolor_preset == "bwinverse"
+    assert after.pseudocolor_preset == "hotiron"
 
 
 def test_pet_axial_view_expands_canvas_when_registration_moves_pet() -> None:
@@ -896,7 +896,7 @@ def test_pet_axial_registration_expands_canvas_and_keeps_background() -> None:
     )
 
     assert result.pixels.shape[1] > ct_volume.shape[2]
-    assert np.any(np.all(result.pixels >= 250, axis=-1))
+    assert np.any(np.all(result.pixels <= 5, axis=-1))
     assert int(np.min(result.pixels)) < 10
 
 
@@ -969,9 +969,9 @@ def test_fusion_overlay_positive_registration_rotation_is_screen_clockwise() -> 
     ("role", "expected_preset"),
     [
         (FUSION_PANE_CT_AXIAL, "bw"),
-        (FUSION_PANE_PET_AXIAL, "bwinverse"),
-        (FUSION_PANE_OVERLAY_AXIAL, "petct-rainbow"),
-        (FUSION_PANE_PET_CORONAL_MIP, "bwinverse"),
+        (FUSION_PANE_PET_AXIAL, "hotiron"),
+        (FUSION_PANE_OVERLAY_AXIAL, "hotmetal"),
+        (FUSION_PANE_PET_CORONAL_MIP, "hotiron"),
     ],
 )
 def test_fusion_result_reports_actual_rendered_pseudocolor(role: str, expected_preset: str) -> None:
@@ -996,7 +996,7 @@ def test_fusion_result_reports_actual_rendered_pseudocolor(role: str, expected_p
     assert result.pseudocolor_preset == expected_preset
 
 
-def test_pet_only_views_use_inverse_grayscale_independent_of_fusion_pet_pseudocolor() -> None:
+def test_pet_only_views_use_hotiron_independent_of_fusion_pet_pseudocolor() -> None:
     ct_volume = _volume()
     pet_volume = _volume()
     geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
@@ -1019,10 +1019,10 @@ def test_pet_only_views_use_inverse_grayscale_independent_of_fusion_pet_pseudoco
         pet_has_patient_geometry=True,
     )
 
-    assert result.pseudocolor_preset == "bwinverse"
+    assert result.pseudocolor_preset == "hotiron"
 
 
-def test_pet_only_zero_background_maps_to_white_with_inverse_grayscale() -> None:
+def test_pet_only_zero_background_maps_to_black_with_hotiron() -> None:
     ct_volume = np.zeros((3, 4, 4), dtype=np.float32)
     pet_volume = np.zeros((3, 4, 4), dtype=np.float32)
     geometry = build_identity_geometry(tuple(int(value) for value in ct_volume.shape))
@@ -1045,17 +1045,25 @@ def test_pet_only_zero_background_maps_to_white_with_inverse_grayscale() -> None
         pet_has_patient_geometry=True,
     )
 
-    assert tuple(int(channel) for channel in result.pixels[0, 0]) == (255, 255, 255)
+    assert tuple(int(channel) for channel in result.pixels[0, 0]) == (0, 0, 0)
 
 
 @pytest.mark.parametrize(
-    ("role", "view_type"),
+    ("role", "view_type", "preset", "expected_background"),
     [
-        (FUSION_PANE_PET_AXIAL, "FusionPETAxial"),
-        (FUSION_PANE_PET_CORONAL_MIP, "FusionPETCoronalMip"),
+        (FUSION_PANE_PET_AXIAL, "FusionPETAxial", "hotiron", (0, 0, 0)),
+        (FUSION_PANE_PET_CORONAL_MIP, "FusionPETCoronalMip", "hotiron", (0, 0, 0)),
+        (FUSION_PANE_PET_AXIAL, "FusionPETAxial", "bwinverse", (255, 255, 255)),
+        (FUSION_PANE_PET_CORONAL_MIP, "FusionPETCoronalMip", "bwinverse", (255, 255, 255)),
     ],
 )
-def test_pet_only_rendered_canvas_padding_is_white(monkeypatch, role: str, view_type: str) -> None:
+def test_pet_only_rendered_canvas_padding_follows_active_lut(
+    monkeypatch,
+    role: str,
+    view_type: str,
+    preset: str,
+    expected_background: tuple[int, int, int],
+) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -1064,6 +1072,7 @@ def test_pet_only_rendered_canvas_padding_is_white(monkeypatch, role: str, view_
     group.window.window_center = 40.0
     group.fusion_pet_window.window_width = 12.0
     group.fusion_pet_window.window_center = 6.0
+    group.fusion_pet_pane_pseudocolor_preset = preset
     group.fusion_axial_index = 10
     ct_series = SeriesRecord(
         series_id="ct",
@@ -1126,10 +1135,10 @@ def test_pet_only_rendered_canvas_padding_is_white(monkeypatch, role: str, view_
     pixels = np.asarray(Image.open(io.BytesIO(result.image_bytes)).convert("RGB"))
 
     assert pixels.shape[:2] == (48, 160)
-    _assert_near_white(pixels[:4, :4])
-    _assert_near_white(pixels[:4, -4:])
-    _assert_near_white(pixels[-4:, :4])
-    _assert_near_white(pixels[-4:, -4:])
+    assert tuple(pixels[0, 0]) == expected_background
+    assert tuple(pixels[0, -1]) == expected_background
+    assert tuple(pixels[-1, 0]) == expected_background
+    assert tuple(pixels[-1, -1]) == expected_background
 
 
 def test_pet_coronal_mip_uses_physical_spacing_and_head_first_direction() -> None:
@@ -1568,7 +1577,7 @@ def test_fusion_set_size_initializes_shared_fusion_group(monkeypatch) -> None:
     assert group.fusion_axial_index == 3
     assert view.current_index == 3
     assert view.is_initialized is True
-    assert view.pseudocolor_preset == "bwinverse"
+    assert view.pseudocolor_preset == "hotiron"
 
 
 def test_fusion_view_windows_are_scoped_by_pane_role() -> None:
@@ -1611,6 +1620,130 @@ def test_fusion_view_windows_are_scoped_by_pane_role() -> None:
     assert group.fusion_pet_window.window_center == 6.0
     assert group.window.window_width == 400.0
     assert group.window.window_center == 40.0
+
+
+def _build_fusion_geometry_test_views() -> tuple[ViewGroupRecord, dict[str, ViewRecord]]:
+    group = ViewGroupRecord(group_id="fusion-geometry", group_type="fusion", series_id="ct")
+    views = {
+        role: ViewRecord(
+            view_id=role,
+            series_id="pet" if role != FUSION_PANE_CT_AXIAL else "ct",
+            view_type={
+                FUSION_PANE_CT_AXIAL: "FusionCTAxial",
+                FUSION_PANE_PET_AXIAL: "FusionPETAxial",
+                FUSION_PANE_OVERLAY_AXIAL: "FusionOverlayAxial",
+                FUSION_PANE_PET_CORONAL_MIP: "FusionPETCoronalMip",
+            }[role],
+            fusion_pane_role=role,
+            view_group=group,
+        )
+        for role in (
+            FUSION_PANE_CT_AXIAL,
+            FUSION_PANE_PET_AXIAL,
+            FUSION_PANE_OVERLAY_AXIAL,
+            FUSION_PANE_PET_CORONAL_MIP,
+        )
+    }
+    return group, views
+
+
+def test_fusion_axial_pan_links_ct_pet_and_overlay_but_not_coronal_mip(monkeypatch) -> None:
+    service = ViewerService()
+    group, views = _build_fusion_geometry_test_views()
+    monkeypatch.setattr(service, "_get_group_views", lambda _view: list(views.values()))
+    monkeypatch.setattr(service, "_clear_fusion_registration_overlay_frame_locks", lambda _group: None)
+
+    active = views[FUSION_PANE_CT_AXIAL]
+    service._handle_fusion_drag_pan(
+        active,
+        ViewOperationRequest(viewId=active.view_id, opType="pan", actionType="start", x=0, y=0),
+    )
+    service._handle_fusion_drag_pan(
+        active,
+        ViewOperationRequest(viewId=active.view_id, opType="pan", actionType="move", x=12, y=-7),
+    )
+
+    for role in (FUSION_PANE_CT_AXIAL, FUSION_PANE_PET_AXIAL, FUSION_PANE_OVERLAY_AXIAL):
+        assert views[role].offset_x == pytest.approx(12.0)
+        assert views[role].offset_y == pytest.approx(-7.0)
+    assert views[FUSION_PANE_PET_CORONAL_MIP].offset_x == pytest.approx(0.0)
+    assert views[FUSION_PANE_PET_CORONAL_MIP].offset_y == pytest.approx(0.0)
+    assert group.fusion_revision == 1
+
+
+def test_fusion_coronal_mip_pan_and_zoom_remain_independent(monkeypatch) -> None:
+    service = ViewerService()
+    _, views = _build_fusion_geometry_test_views()
+    monkeypatch.setattr(service, "_get_group_views", lambda _view: list(views.values()))
+    monkeypatch.setattr(service, "_clear_fusion_registration_overlay_frame_locks", lambda _group: None)
+
+    active = views[FUSION_PANE_PET_CORONAL_MIP]
+    service._handle_fusion_drag_pan(
+        active,
+        ViewOperationRequest(viewId=active.view_id, opType="pan", actionType="start", x=0, y=0),
+    )
+    service._handle_fusion_drag_pan(
+        active,
+        ViewOperationRequest(viewId=active.view_id, opType="pan", actionType="move", x=8, y=5),
+    )
+    service._handle_fusion_drag_zoom(
+        active,
+        ViewOperationRequest(viewId=active.view_id, opType="zoom", actionType="start", x=0, y=0),
+    )
+    service._handle_fusion_drag_zoom(
+        active,
+        ViewOperationRequest(viewId=active.view_id, opType="zoom", actionType="move", x=0, y=-20),
+    )
+
+    assert active.offset_x == pytest.approx(8.0)
+    assert active.offset_y == pytest.approx(5.0)
+    assert active.zoom > 1.0
+    for role in (FUSION_PANE_CT_AXIAL, FUSION_PANE_PET_AXIAL, FUSION_PANE_OVERLAY_AXIAL):
+        assert views[role].offset_x == pytest.approx(0.0)
+        assert views[role].offset_y == pytest.approx(0.0)
+        assert views[role].zoom == pytest.approx(1.0)
+
+
+def test_reset_active_fusion_overlay_preserves_registration_and_modality_windows(monkeypatch) -> None:
+    service = ViewerService()
+    group, views = _build_fusion_geometry_test_views()
+    group.window.window_width = 450.0
+    group.window.window_center = 55.0
+    group.fusion_pet_window.window_width = 9.0
+    group.fusion_pet_window.window_center = 4.5
+    group.fusion_pet_pseudocolor_preset = "hotiron"
+    group.fusion_window_target = "pet"
+    group.fusion_alpha = 0.8
+    group.fusion_registration.translate_row_mm = 7.0
+    group.fusion_registration.translate_col_mm = -3.0
+    group.fusion_registration.rotation_degrees = 11.0
+    monkeypatch.setattr(service, "_get_group_views", lambda _view: list(views.values()))
+    monkeypatch.setattr(
+        service,
+        "_resolve_fusion_group_series",
+        lambda _view: (
+            group,
+            SeriesRecord("ct", "", None, None, None, None, None, None, None, "CT", "CT"),
+            SeriesRecord("pet", "", None, None, None, None, None, None, None, "PT", "PET"),
+        ),
+    )
+    monkeypatch.setattr(service, "_get_series_volume", lambda _series: np.zeros((2, 2, 2), dtype=np.float32))
+    monkeypatch.setattr(service, "_initialize_fusion_viewport", lambda _view: None)
+    monkeypatch.setattr(service, "_sync_fusion_view_state_from_group", lambda _view: None)
+    monkeypatch.setattr(service, "_clear_fusion_registration_overlay_frame_locks", lambda _group: None)
+
+    service._reset_active_fusion_pane(views[FUSION_PANE_OVERLAY_AXIAL])
+
+    assert group.window.window_width == pytest.approx(450.0)
+    assert group.window.window_center == pytest.approx(55.0)
+    assert group.fusion_pet_window.window_width == pytest.approx(9.0)
+    assert group.fusion_pet_window.window_center == pytest.approx(4.5)
+    assert group.fusion_pet_pseudocolor_preset == "hotiron"
+    assert group.fusion_window_target == "ct"
+    assert group.fusion_alpha == pytest.approx(0.52)
+    assert group.fusion_registration.translate_row_mm == pytest.approx(7.0)
+    assert group.fusion_registration.translate_col_mm == pytest.approx(-3.0)
+    assert group.fusion_registration.rotation_degrees == pytest.approx(11.0)
 
 
 def test_fusion_info_reports_pet_window_for_overlay_pane(monkeypatch) -> None:
@@ -1684,7 +1817,7 @@ def test_fusion_info_reports_pet_window_for_overlay_pane(monkeypatch) -> None:
 
     assert result.meta.fusion_info is not None
     assert result.meta.fusion_info.pet_window_min == pytest.approx(0.0)
-    assert result.meta.fusion_info.pet_window_max == pytest.approx(4.49)
+    assert result.meta.fusion_info.pet_window_max == pytest.approx(np.percentile(pet_volume, 99.5), abs=0.01)
 
 
 def test_fusion_pet_bqml_can_be_displayed_as_suvbw() -> None:
@@ -1708,15 +1841,14 @@ def test_fusion_pet_bqml_can_be_displayed_as_suvbw() -> None:
     assert scale == pytest.approx(0.0002)
 
 
-def test_fusion_pet_missing_required_suv_fields_falls_back_to_source() -> None:
+def test_fusion_pet_missing_required_suv_fields_rejects_unavailable_unit() -> None:
     dataset = Dataset()
     dataset.Units = "BQML"
 
-    scale, unit, label = ViewerService()._resolve_pet_display_scale(dataset, "SUVbw")
-
-    assert scale == pytest.approx(1.0)
-    assert unit == "source"
-    assert label == "BQML"
+    with pytest.raises(HTTPException) as error:
+        ViewerService()._resolve_pet_display_scale(dataset, "SUVbw")
+    assert error.value.status_code == 422
+    assert "unavailable" in str(error.value.detail)
 
 
 def test_fusion_registration_move_broadcasts_overlay_and_pet_axial_backend_preview() -> None:
@@ -2509,11 +2641,13 @@ def test_fusion_suv_default_window_matches_pet_display_range() -> None:
 
     ww, wl = ViewerService()._derive_default_pet_window_for_display_volume(display)
 
-    assert ww == pytest.approx(4.49)
-    assert wl == pytest.approx(2.245)
+    positive = display.volume[display.volume > 0]
+    expected_high = float(np.percentile(positive, 99.5))
+    assert ww == pytest.approx(expected_high)
+    assert wl == pytest.approx(expected_high / 2.0)
 
 
-def test_fusion_suv_default_window_uses_reference_suv_range_for_low_activity_pet() -> None:
+def test_fusion_suv_default_window_preserves_low_activity_pet_range() -> None:
     display = FusionPetDisplayVolume(
         volume=np.linspace(0.0, 0.8, num=32, dtype=np.float32).reshape(2, 4, 4),
         unit="SUVbw",
@@ -2522,8 +2656,10 @@ def test_fusion_suv_default_window_uses_reference_suv_range_for_low_activity_pet
 
     ww, wl = ViewerService()._derive_default_pet_window_for_display_volume(display)
 
-    assert ww == pytest.approx(4.49)
-    assert wl == pytest.approx(2.245)
+    positive = display.volume[display.volume > 0]
+    expected_high = float(np.percentile(positive, 99.5))
+    assert ww == pytest.approx(expected_high)
+    assert wl == pytest.approx(expected_high / 2.0)
 
 
 def test_fusion_config_updates_pet_window_range() -> None:
@@ -2678,12 +2814,12 @@ def _patch_export_dependencies(
     monkeypatch.setattr(
         service,
         "_build_fusion_pet_display_volume",
-        lambda _series, volume, _unit: FusionPetDisplayVolume(
+        lambda _series, volume, unit: FusionPetDisplayVolume(
             volume=np.asarray(volume, dtype=np.float32),
-            unit="SUVbw",
-            unit_label="g/ml (SUVbw)",
+            unit="source" if unit == "source" else "SUVbw",
+            unit_label="Source (BQML)" if unit == "source" else "g/ml (SUVbw)",
             source_units="BQML",
-            scale=0.0002,
+            scale=1.0 if unit == "source" else 0.0002,
         ),
     )
     return (ct_series, pet_series)
@@ -2753,6 +2889,7 @@ def test_fusion_registration_export_writes_br_sidecar(tmp_path, monkeypatch) -> 
 def test_fusion_registration_export_writes_derived_dicom_series(tmp_path, monkeypatch) -> None:
     service = ViewerService()
     group, view = _export_test_group_and_view()
+    group.fusion_pet_unit = "source"
     _, pet_series = _patch_export_dependencies(
         monkeypatch,
         service,
@@ -2793,9 +2930,9 @@ def test_fusion_registration_export_writes_derived_dicom_series(tmp_path, monkey
     assert dataset.Rows == 4
     assert dataset.Columns == 5
     assert int(dataset.SeriesNumber) == 1007
-    assert dataset.Units == "GML"
-    assert dataset[(0x0011, 0x1001)].value == "SUVbw"
-    assert dataset[(0x0011, 0x1002)].value == "g/ml (SUVbw)"
+    assert dataset.Units == "BQML"
+    assert dataset[(0x0011, 0x1001)].value == "source"
+    assert dataset[(0x0011, 0x1002)].value == "Source (BQML)"
     assert float(dataset[(0x0011, 0x1003)].value) == pytest.approx(1.5)
     assert float(dataset[(0x0011, 0x1004)].value) == pytest.approx(-2.25)
     assert float(dataset[(0x0011, 0x1005)].value) == pytest.approx(6.0)
@@ -2827,6 +2964,7 @@ def test_fusion_registration_artifact_exports_br_json(monkeypatch) -> None:
 def test_fusion_registration_artifact_exports_derived_dicom_zip(monkeypatch) -> None:
     service = ViewerService()
     group, view = _export_test_group_and_view()
+    group.fusion_pet_unit = "source"
     _, pet_series = _patch_export_dependencies(
         monkeypatch,
         service,
@@ -2861,8 +2999,29 @@ def test_fusion_registration_artifact_exports_derived_dicom_zip(monkeypatch) -> 
     assert dataset.SeriesInstanceUID != pet_series.series_instance_uid
     assert dataset.Rows == 3
     assert dataset.Columns == 4
-    assert dataset[(0x0011, 0x1001)].value == "SUVbw"
+    assert dataset[(0x0011, 0x1001)].value == "source"
     assert group.fusion_registration.saved is True
+
+
+def test_fusion_registration_quantitative_dicom_export_rejects_non_source_unit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = ViewerService()
+    group, view = _export_test_group_and_view()
+    _patch_export_dependencies(monkeypatch, service, group, view)
+
+    with pytest.raises(HTTPException) as error:
+        service.export_fusion_registration(
+            FusionRegistrationExportRequest(
+                viewId="overlay",
+                mode="newDicom",
+                outputDirectory=str(tmp_path),
+            )
+        )
+
+    assert error.value.status_code == 422
+    assert "Source unit" in str(error.value.detail)
 
 
 def test_fusion_registration_load_applies_matching_br_payload(monkeypatch) -> None:

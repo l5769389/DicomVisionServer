@@ -1265,6 +1265,39 @@ class ViewerPresentationMixin:
             is_oblique=bool(plane_pose.is_oblique),
         )
 
+    @staticmethod
+    def _build_volume_bounds_world_payload(
+        geometry: VolumeGeometry | None,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ] | None:
+        if geometry is None:
+            return None
+        shape = tuple(max(int(value), 1) for value in geometry.shape_ijk)
+        corners: list[tuple[float, float, float]] = []
+        for i in (0.0, float(shape[0] - 1)):
+            for j in (0.0, float(shape[1] - 1)):
+                for k in (0.0, float(shape[2] - 1)):
+                    world = ijk_to_world_point(geometry, np.asarray([i, j, k], dtype=np.float64))
+                    corners.append(tuple(float(value) for value in world))
+        return (
+            corners[0],
+            corners[1],
+            corners[2],
+            corners[3],
+            corners[4],
+            corners[5],
+            corners[6],
+            corners[7],
+        )
+
     def _build_mpr_plane_payload(
         self,
         view: ViewRecord,
@@ -1299,6 +1332,7 @@ class ViewerPresentationMixin:
             pixelSpacingColMm=float(plane_pose.pixel_spacing_col_mm) if plane_pose is not None else 1.0,
             pixelSpacingNormalMm=float(pixel_spacing_normal_mm),
             outputShape=(int(output_shape[0]), int(output_shape[1])),
+            volumeBoundsWorld=self._build_volume_bounds_world_payload(geometry),
             row=tuple(float(value) for value in plane.row),
             col=tuple(float(value) for value in plane.col),
             normal=tuple(float(value) for value in plane.normal),
