@@ -719,6 +719,41 @@ def test_mpr_segmentation_overlay_guide_tracks_model_rotation() -> None:
     ]
 
 
+def test_mpr_segmentation_authoritative_guide_uses_threshold_mask() -> None:
+    source_pixels = np.zeros((5, 5), dtype=np.float32)
+    source_pixels[1:3, 3:5] = 500.0
+    state = MprSegmentationState(
+        enabled=True,
+        threshold_regions=[
+            _region(
+                "r1",
+                threshold_hu=100.0,
+                width_mm=5.0,
+                height_mm=5.0,
+                depth_mm=1.0,
+            )
+        ],
+    )
+
+    overlay = ViewerService._build_mpr_segmentation_overlay_payload(
+        source_pixels,
+        state,
+        MPR_VIEWPORT_AXIAL,
+        _plane_pose(MPR_VIEWPORT_AXIAL),
+        include_samples=True,
+        guide_authoritative=True,
+    )
+
+    assert overlay is not None
+    region = overlay.regions[0]
+    assert region.guide_authoritative is True
+    assert region.guide_points
+    assert min(point.x for point in region.guide_points) == pytest.approx(3.0 / 5.0)
+    assert max(point.x for point in region.guide_points) == pytest.approx(1.0)
+    assert min(point.y for point in region.guide_points) == pytest.approx(1.0 / 5.0)
+    assert max(point.y for point in region.guide_points) == pytest.approx(3.0 / 5.0)
+
+
 def test_mpr_segmentation_overlay_sample_revision_ignores_threshold_but_tracks_geometry() -> None:
     source_pixels = np.arange(25, dtype=np.float32).reshape(5, 5)
     plane = _plane_pose(MPR_VIEWPORT_AXIAL)

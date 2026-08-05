@@ -2117,6 +2117,7 @@ class ViewerMprMixin:
             geometry_mask: np.ndarray | None = None
             guide_points: list[MprSegmentationOverlayPoint] = []
             guide_intersects_plane = True
+            requested_authoritative_guide = bool(guide_authoritative)
             samples: MprSegmentationOverlaySamples | None = None
             sample_revision = 0
             if region.enabled and plane_pose is not None and plane_grid is not None:
@@ -2128,7 +2129,12 @@ class ViewerMprMixin:
                     model_rotation_world=model_rotation_world,
                     model_rotation_pivot_world=model_rotation_pivot_world,
                 )
-                guide_points = cls._build_mpr_segmentation_mask_guide_points(geometry_mask)
+                guide_source_mask = (
+                    mask
+                    if requested_authoritative_guide and mask is not None
+                    else geometry_mask
+                )
+                guide_points = cls._build_mpr_segmentation_mask_guide_points(guide_source_mask)
                 guide_intersects_plane = bool(guide_points)
                 sample_revision = cls._build_mpr_segmentation_sample_revision(
                     region,
@@ -2144,15 +2150,14 @@ class ViewerMprMixin:
                         display_shape=resolved_display_shape,
                         sample_limit=sample_limit,
                     )
-            authoritative_guide = bool(guide_authoritative and guide_points)
             regions.append(
                 MprSegmentationOverlayRegion(
                     regionId=str(region.id),
-                    visible=rect is not None or authoritative_guide,
+                    visible=rect is not None or (requested_authoritative_guide and bool(guide_points)),
                     rect=rect,
                     guidePoints=guide_points,
                     guideWorldPoints=[],
-                    guideAuthoritative=authoritative_guide,
+                    guideAuthoritative=requested_authoritative_guide,
                     guideIntersectsPlane=guide_intersects_plane,
                     sampleRevision=sample_revision,
                     samples=samples,
