@@ -542,8 +542,13 @@ class MprSegmentationOverlayRegion(BaseModel):
     region_id: str = Field(alias="regionId")
     visible: bool = False
     rect: MprSegmentationOverlayRect | None = None
+    display_box: MprThresholdRegionBox | None = Field(default=None, alias="displayBox")
     guide_points: list[MprSegmentationOverlayPoint] = Field(default_factory=list, alias="guidePoints")
     guide_world_points: list[MprSegmentationOverlayWorldPoint] = Field(default_factory=list, alias="guideWorldPoints")
+    contour_world_points: list[list[MprSegmentationOverlayWorldPoint]] = Field(
+        default_factory=list,
+        alias="contourWorldPoints",
+    )
     guide_authoritative: bool = Field(default=False, alias="guideAuthoritative")
     guide_intersects_plane: bool = Field(default=True, alias="guideIntersectsPlane")
     sample_revision: int = Field(default=0, ge=0, alias="sampleRevision")

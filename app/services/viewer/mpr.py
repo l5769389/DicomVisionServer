@@ -792,11 +792,73 @@ class ViewerMprMixin:
             return False
         if payload.mpr_segmentation_config is None:
             return False
+        previous_regions = {
+            str(region.id): region
+            for region in view.view_group.mpr_segmentation.threshold_regions
+        }
         next_state = self._normalize_mpr_segmentation_state(payload.mpr_segmentation_config)
+        self._normalize_changed_mpr_segmentation_regions_to_model_space(
+            next_state,
+            previous_regions,
+            view.view_group,
+        )
         if refresh_stats:
             self._refresh_mpr_segmentation_stats_for_view(view, next_state, series=series)
         view.view_group.mpr_segmentation = next_state
         return True
+
+    @classmethod
+    def _normalize_changed_mpr_segmentation_regions_to_model_space(
+        cls,
+        state: MprSegmentationState,
+        previous_regions: dict[str, MprThresholdRegionState],
+        group: ViewGroupRecord,
+    ) -> None:
+        rotation = cls._get_mpr_model_rotation_matrix(group)
+        fallback_pivot = np.zeros(3, dtype=np.float64)
+        pivot = cls._get_mpr_model_rotation_pivot_world(group, fallback_pivot)
+        if not cls._mpr_model_rotation_is_active(rotation, pivot):
+            return
+        inverse_rotation = rotation.T
+
+        def normalized(vector: np.ndarray, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
+            transformed = inverse_rotation @ vector
+            length = float(np.linalg.norm(transformed))
+            if not np.all(np.isfinite(transformed)) or not np.isfinite(length) or length <= 1e-12:
+                return fallback
+            return tuple(float(value) for value in transformed / length)
+
+        for region in state.threshold_regions:
+            previous_region = previous_regions.get(str(region.id))
+            if previous_region is not None and cls._mpr_threshold_region_boxes_equal(
+                region.box,
+                previous_region.box,
+            ):
+                continue
+            box = region.box
+            display_center = np.asarray(box.center_world, dtype=np.float64)
+            source_center = pivot + inverse_rotation @ (display_center - pivot)
+            if source_center.shape == (3,) and np.all(np.isfinite(source_center)):
+                box.center_world = tuple(float(value) for value in source_center)
+            box.row_world = normalized(np.asarray(box.row_world, dtype=np.float64), box.row_world)
+            box.col_world = normalized(np.asarray(box.col_world, dtype=np.float64), box.col_world)
+            box.normal_world = normalized(np.asarray(box.normal_world, dtype=np.float64), box.normal_world)
+
+    @staticmethod
+    def _mpr_threshold_region_boxes_equal(
+        first: MprThresholdRegionBoxState,
+        second: MprThresholdRegionBoxState,
+    ) -> bool:
+        return bool(
+            np.allclose(first.center_world, second.center_world, atol=1e-6)
+            and np.allclose(first.row_world, second.row_world, atol=1e-6)
+            and np.allclose(first.col_world, second.col_world, atol=1e-6)
+            and np.allclose(first.normal_world, second.normal_world, atol=1e-6)
+            and abs(float(first.width_mm) - float(second.width_mm)) <= 1e-6
+            and abs(float(first.height_mm) - float(second.height_mm)) <= 1e-6
+            and abs(float(first.depth_mm) - float(second.depth_mm)) <= 1e-6
+            and str(first.source_viewport) == str(second.source_viewport)
+        )
 
     @classmethod
     def _normalize_mpr_segmentation_state(cls, config: MprSegmentationConfig) -> MprSegmentationState:
@@ -2116,6 +2178,9 @@ class ViewerMprMixin:
             rect = cls._build_mpr_segmentation_mask_rect(mask) if mask is not None else None
             geometry_mask: np.ndarray | None = None
             guide_points: list[MprSegmentationOverlayPoint] = []
+            guide_world_points: list[MprSegmentationOverlayWorldPoint] = []
+            contour_world_points: list[list[MprSegmentationOverlayWorldPoint]] = []
+            display_box: MprThresholdRegionBox | None = None
             guide_intersects_plane = True
             requested_authoritative_guide = bool(guide_authoritative)
             samples: MprSegmentationOverlaySamples | None = None
@@ -2129,13 +2194,24 @@ class ViewerMprMixin:
                     model_rotation_world=model_rotation_world,
                     model_rotation_pivot_world=model_rotation_pivot_world,
                 )
-                guide_source_mask = (
-                    mask
-                    if requested_authoritative_guide and mask is not None
-                    else geometry_mask
+                guide_points = cls._build_mpr_segmentation_mask_guide_points(geometry_mask)
+                display_box = cls._build_mpr_threshold_region_display_box(
+                    region,
+                    model_rotation_world=model_rotation_world,
+                    model_rotation_pivot_world=model_rotation_pivot_world,
                 )
-                guide_points = cls._build_mpr_segmentation_mask_guide_points(guide_source_mask)
-                guide_intersects_plane = bool(guide_points)
+                guide_world_points = cls._build_mpr_threshold_region_plane_world_points(
+                    region,
+                    plane_pose,
+                    model_rotation_world=model_rotation_world,
+                    model_rotation_pivot_world=model_rotation_pivot_world,
+                )
+                guide_intersects_plane = bool(guide_world_points)
+                if mask is not None:
+                    contour_world_points = cls._build_mpr_segmentation_mask_contour_world_points(
+                        mask,
+                        plane_pose,
+                    )
                 sample_revision = cls._build_mpr_segmentation_sample_revision(
                     region,
                     plane_pose,
@@ -2153,10 +2229,12 @@ class ViewerMprMixin:
             regions.append(
                 MprSegmentationOverlayRegion(
                     regionId=str(region.id),
-                    visible=rect is not None or (requested_authoritative_guide and bool(guide_points)),
+                    visible=bool(guide_world_points) or bool(contour_world_points),
                     rect=rect,
+                    displayBox=display_box,
                     guidePoints=guide_points,
-                    guideWorldPoints=[],
+                    guideWorldPoints=guide_world_points,
+                    contourWorldPoints=contour_world_points,
                     guideAuthoritative=requested_authoritative_guide,
                     guideIntersectsPlane=guide_intersects_plane,
                     sampleRevision=sample_revision,
@@ -2262,16 +2340,83 @@ class ViewerMprMixin:
             sampledCount=int(values.size),
         )
 
-    @staticmethod
+    @classmethod
     def _build_mpr_segmentation_mask_guide_points(
+        cls,
         geometry_mask: np.ndarray | None,
     ) -> list[MprSegmentationOverlayPoint]:
-        if geometry_mask is None:
+        mask = cls._coerce_mpr_segmentation_mask(geometry_mask)
+        if mask is None:
             return []
-        mask = np.asarray(geometry_mask, dtype=bool)
-        if mask.ndim != 2 or not bool(np.any(mask)):
+        height, width = mask.shape
+        hull = cls._build_mpr_segmentation_mask_guide_cell_points(mask)
+        if len(hull) < 3:
             return []
 
+        return [
+            MprSegmentationOverlayPoint(
+                x=float(np.clip(point[0] / float(width), 0.0, 1.0)),
+                y=float(np.clip(point[1] / float(height), 0.0, 1.0)),
+            )
+            for point in hull
+        ]
+
+    @classmethod
+    def _build_mpr_segmentation_mask_guide_world_points(
+        cls,
+        geometry_mask: np.ndarray | None,
+        plane_pose: PlanePose,
+    ) -> list[MprSegmentationOverlayWorldPoint]:
+        mask = cls._coerce_mpr_segmentation_mask(geometry_mask)
+        if mask is None:
+            return []
+        hull = cls._build_mpr_segmentation_mask_guide_cell_points(mask)
+        if len(hull) < 3:
+            return []
+        return [
+            cls._mpr_plane_mask_boundary_point_to_world_point(plane_pose, point)
+            for point in hull
+        ]
+
+    @classmethod
+    def _build_mpr_segmentation_mask_contour_world_points(
+        cls,
+        geometry_mask: np.ndarray | None,
+        plane_pose: PlanePose,
+        *,
+        point_limit: int = MPR_SEGMENTATION_OVERLAY_CONTOUR_POINT_LIMIT,
+    ) -> list[list[MprSegmentationOverlayWorldPoint]]:
+        mask = cls._coerce_mpr_segmentation_mask(geometry_mask)
+        if mask is None:
+            return []
+        contours = cls._build_mpr_segmentation_mask_boundary_contours(mask)
+        if not contours:
+            return []
+        resolved_point_limit = max(3, int(point_limit))
+        world_contours: list[list[MprSegmentationOverlayWorldPoint]] = []
+        for contour in contours:
+            limited_contour = cls._limit_mpr_segmentation_contour_points(contour, resolved_point_limit)
+            world_points = [
+                cls._mpr_plane_mask_boundary_point_to_world_point(plane_pose, point)
+                for point in limited_contour
+            ]
+            if len(world_points) >= 3:
+                world_contours.append(world_points)
+        return world_contours
+
+    @staticmethod
+    def _coerce_mpr_segmentation_mask(geometry_mask: np.ndarray | None) -> np.ndarray | None:
+        if geometry_mask is None:
+            return None
+        mask = np.asarray(geometry_mask, dtype=bool)
+        if mask.ndim != 2 or not bool(np.any(mask)):
+            return None
+        return mask
+
+    @staticmethod
+    def _build_mpr_segmentation_mask_guide_cell_points(
+        mask: np.ndarray,
+    ) -> list[tuple[float, float]]:
         height, width = mask.shape
         padded = np.pad(mask, 1, mode="constant", constant_values=False)
         interior = (
@@ -2318,16 +2463,95 @@ class ViewerMprMixin:
                 upper.pop()
             upper.append(point)
         hull = lower[:-1] + upper[:-1]
-        if len(hull) < 3:
-            return []
+        return hull if len(hull) >= 3 else []
 
-        return [
-            MprSegmentationOverlayPoint(
-                x=float(np.clip(point[0] / float(width), 0.0, 1.0)),
-                y=float(np.clip(point[1] / float(height), 0.0, 1.0)),
-            )
-            for point in hull
-        ]
+    @staticmethod
+    def _build_mpr_segmentation_mask_boundary_contours(
+        mask: np.ndarray,
+    ) -> list[list[tuple[float, float]]]:
+        mask_array = np.asarray(mask, dtype=bool)
+        if mask_array.ndim != 2 or not bool(np.any(mask_array)):
+            return []
+        height, width = mask_array.shape
+        edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
+
+        rows, cols = np.nonzero(mask_array)
+        for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
+            if row <= 0 or not bool(mask_array[row - 1, col]):
+                edges.append(((float(col), float(row)), (float(col + 1), float(row))))
+            if col >= width - 1 or not bool(mask_array[row, col + 1]):
+                edges.append(((float(col + 1), float(row)), (float(col + 1), float(row + 1))))
+            if row >= height - 1 or not bool(mask_array[row + 1, col]):
+                edges.append(((float(col + 1), float(row + 1)), (float(col), float(row + 1))))
+            if col <= 0 or not bool(mask_array[row, col - 1]):
+                edges.append(((float(col), float(row + 1)), (float(col), float(row))))
+
+        edges_by_start: dict[tuple[float, float], list[int]] = {}
+        for index, (start, _end) in enumerate(edges):
+            edges_by_start.setdefault(start, []).append(index)
+
+        used: set[int] = set()
+        contours: list[list[tuple[float, float]]] = []
+        for start_edge_index, (start, _end) in enumerate(edges):
+            if start_edge_index in used:
+                continue
+            contour: list[tuple[float, float]] = [start]
+            edge_index = start_edge_index
+            for _guard in range(len(edges) + 1):
+                if edge_index in used:
+                    break
+                used.add(edge_index)
+                _edge_start, edge_end = edges[edge_index]
+                contour.append(edge_end)
+                if edge_end == start:
+                    break
+                next_edge_index = next(
+                    (
+                        candidate
+                        for candidate in edges_by_start.get(edge_end, [])
+                        if candidate not in used
+                    ),
+                    None,
+                )
+                if next_edge_index is None:
+                    break
+                edge_index = next_edge_index
+            if len(contour) < 4:
+                continue
+            if contour[0] == contour[-1]:
+                contour.pop()
+            if len(contour) >= 3:
+                contours.append(contour)
+        return contours
+
+    @staticmethod
+    def _limit_mpr_segmentation_contour_points(
+        contour: list[tuple[float, float]],
+        point_limit: int,
+    ) -> list[tuple[float, float]]:
+        if len(contour) <= point_limit:
+            return contour
+        stride = max(1, int(np.ceil(float(len(contour)) / float(point_limit))))
+        return contour[::stride][:point_limit]
+
+    @staticmethod
+    def _mpr_plane_mask_boundary_point_to_world_point(
+        plane_pose: PlanePose,
+        point: tuple[float, float],
+    ) -> MprSegmentationOverlayWorldPoint:
+        height, width = plane_pose.output_shape
+        col_offset_mm = (float(point[0]) - float(width) / 2.0) * float(plane_pose.pixel_spacing_col_mm)
+        row_offset_mm = (float(point[1]) - float(height) / 2.0) * float(plane_pose.pixel_spacing_row_mm)
+        world = (
+            np.asarray(plane_pose.center_world, dtype=np.float64)
+            + np.asarray(plane_pose.col_world, dtype=np.float64) * col_offset_mm
+            + np.asarray(plane_pose.row_world, dtype=np.float64) * row_offset_mm
+        )
+        return MprSegmentationOverlayWorldPoint(
+            x=float(world[0]),
+            y=float(world[1]),
+            z=float(world[2]),
+        )
 
     @staticmethod
     def _build_mpr_segmentation_mask_rect(mask: np.ndarray | None) -> MprSegmentationOverlayRect | None:
@@ -2572,6 +2796,138 @@ class ViewerMprMixin:
         if display_row is None or display_col is None or display_normal is None:
             return None
         return display_center, display_row, display_col, display_normal
+
+    @classmethod
+    def _build_mpr_threshold_region_plane_world_points(
+        cls,
+        region: MprThresholdRegionState,
+        plane_pose: PlanePose,
+        *,
+        model_rotation_world: np.ndarray | None = None,
+        model_rotation_pivot_world: np.ndarray | None = None,
+    ) -> list[MprSegmentationOverlayWorldPoint]:
+        geometry = cls._resolve_display_mpr_threshold_region_box(
+            region,
+            model_rotation_world,
+            model_rotation_pivot_world,
+        )
+        if geometry is None:
+            return []
+        center, row, col, normal = geometry
+        plane_center = np.asarray(plane_pose.center_world, dtype=np.float64)
+        plane_normal = np.asarray(plane_pose.normal_world, dtype=np.float64)
+        plane_normal_length = float(np.linalg.norm(plane_normal))
+        if (
+            plane_center.shape != (3,)
+            or plane_normal.shape != (3,)
+            or not np.all(np.isfinite(plane_center))
+            or not np.all(np.isfinite(plane_normal))
+            or not np.isfinite(plane_normal_length)
+            or plane_normal_length <= 1e-12
+        ):
+            return []
+        plane_normal = plane_normal / plane_normal_length
+
+        half_axes = (
+            row * (float(region.box.height_mm) / 2.0),
+            col * (float(region.box.width_mm) / 2.0),
+            normal * (float(region.box.depth_mm) / 2.0),
+        )
+        vertices = np.asarray(
+            [
+                center
+                + row_sign * half_axes[0]
+                + col_sign * half_axes[1]
+                + normal_sign * half_axes[2]
+                for row_sign in (-1.0, 1.0)
+                for col_sign in (-1.0, 1.0)
+                for normal_sign in (-1.0, 1.0)
+            ],
+            dtype=np.float64,
+        )
+        signed_distances = (vertices - plane_center) @ plane_normal
+        epsilon = 1e-6
+        edge_indices = (
+            (0, 1), (0, 2), (0, 4),
+            (1, 3), (1, 5),
+            (2, 3), (2, 6),
+            (3, 7),
+            (4, 5), (4, 6),
+            (5, 7), (6, 7),
+        )
+        intersections: list[np.ndarray] = []
+
+        def append_unique(point: np.ndarray) -> None:
+            if not np.all(np.isfinite(point)):
+                return
+            if any(float(np.linalg.norm(point - existing)) <= epsilon for existing in intersections):
+                return
+            intersections.append(np.asarray(point, dtype=np.float64))
+
+        for start_index, end_index in edge_indices:
+            start = vertices[start_index]
+            end = vertices[end_index]
+            start_distance = float(signed_distances[start_index])
+            end_distance = float(signed_distances[end_index])
+            start_on_plane = abs(start_distance) <= epsilon
+            end_on_plane = abs(end_distance) <= epsilon
+            if start_on_plane:
+                append_unique(start)
+            if end_on_plane:
+                append_unique(end)
+            if start_on_plane or end_on_plane or start_distance * end_distance >= 0.0:
+                continue
+            fraction = start_distance / (start_distance - end_distance)
+            append_unique(start + fraction * (end - start))
+
+        if len(intersections) < 3:
+            return []
+        centroid = np.mean(np.asarray(intersections), axis=0)
+        plane_row = np.asarray(plane_pose.row_world, dtype=np.float64)
+        plane_col = np.asarray(plane_pose.col_world, dtype=np.float64)
+        intersections.sort(
+            key=lambda point: float(
+                np.arctan2(
+                    np.dot(point - centroid, plane_row),
+                    np.dot(point - centroid, plane_col),
+                )
+            )
+        )
+        return [
+            MprSegmentationOverlayWorldPoint(
+                x=float(point[0]),
+                y=float(point[1]),
+                z=float(point[2]),
+            )
+            for point in intersections
+        ]
+
+    @classmethod
+    def _build_mpr_threshold_region_display_box(
+        cls,
+        region: MprThresholdRegionState,
+        *,
+        model_rotation_world: np.ndarray | None = None,
+        model_rotation_pivot_world: np.ndarray | None = None,
+    ) -> MprThresholdRegionBox | None:
+        geometry = cls._resolve_display_mpr_threshold_region_box(
+            region,
+            model_rotation_world,
+            model_rotation_pivot_world,
+        )
+        if geometry is None:
+            return None
+        center, row, col, normal = geometry
+        return MprThresholdRegionBox(
+            centerWorld=tuple(float(value) for value in center),
+            rowWorld=tuple(float(value) for value in row),
+            colWorld=tuple(float(value) for value in col),
+            normalWorld=tuple(float(value) for value in normal),
+            widthMm=float(region.box.width_mm),
+            heightMm=float(region.box.height_mm),
+            depthMm=float(region.box.depth_mm),
+            sourceViewport=str(region.box.source_viewport),
+        )
 
     @classmethod
     def _build_legacy_mpr_segmentation_plane_mask(
