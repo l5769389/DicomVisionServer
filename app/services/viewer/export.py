@@ -106,6 +106,14 @@ class ViewerExportMixin:
 
         if payload.mode != "newDicom":
             raise HTTPException(status_code=400, detail="Unsupported fusion registration export mode")
+        if context.pet_display.unit != PET_UNIT_SOURCE:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Quantitative DICOM export is currently limited to the original PET Source unit. "
+                    "Use a screenshot/Secondary Capture export or switch to Source before exporting."
+                ),
+            )
 
         directory_path, file_count = self._write_fusion_registration_dicom_series(
             output_directory,
@@ -162,6 +170,14 @@ class ViewerExportMixin:
 
         if payload.mode != "newDicom":
             raise HTTPException(status_code=400, detail="Unsupported fusion registration export mode")
+        if context.pet_display.unit != PET_UNIT_SOURCE:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Quantitative DICOM export is currently limited to the original PET Source unit. "
+                    "Use a screenshot/Secondary Capture export or switch to Source before exporting."
+                ),
+            )
 
         series_folder = self._safe_fusion_file_name_part(context.series_description)
         datasets = self._build_fusion_registration_dicom_datasets(

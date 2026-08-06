@@ -1,3 +1,4 @@
+import numpy as np
 from PIL import Image
 
 from app.services.render_layers.base_image_layer import BaseImageLayer
@@ -18,15 +19,29 @@ class LayeredRenderer:
         canvas_width = context.view.width or 0
         canvas_height = context.view.height or 0
 
-        base_pixels = self._base_layer.render_pixels(context)
-        transformed_base = viewport_transformer.apply_affine_array(
-            base_pixels,
-            canvas_width,
-            canvas_height,
-            context.image_transform,
-            order=1,
-            cval=context.background_cval,
-        )
+        source_pixels = context.source_pixels
+        if source_pixels.ndim == 2:
+            lower, upper = self._base_layer.window_bounds(context)
+            scalar_padding = upper if self._base_layer.is_monochrome1(context) else lower
+            transformed_scalar = viewport_transformer.apply_affine_array(
+                np.asarray(source_pixels, dtype=np.float32),
+                canvas_width,
+                canvas_height,
+                context.image_transform,
+                order=1,
+                cval=scalar_padding,
+            )
+            transformed_base = self._base_layer.render_pixels(context, transformed_scalar)
+        else:
+            base_pixels = self._base_layer.render_pixels(context)
+            transformed_base = viewport_transformer.apply_affine_array(
+                base_pixels,
+                canvas_width,
+                canvas_height,
+                context.image_transform,
+                order=1,
+                cval=context.background_cval,
+            )
 
         base_image = self._build_base_image(transformed_base)
         if not self._has_overlay_content(context):

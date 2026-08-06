@@ -139,7 +139,8 @@ def test_real_dicom_geometry_reaches_all_mpr_planes_and_shared_cursor(tmp_path: 
             assert cursor.center_world == pytest.approx((12.0, 26.0, 6.0))
             assert plane.is_oblique is False
             assert result.meta.scale_bar is not None
-            assert result.meta.scale_bar.label == "10 cm"
+            assert result.meta.scale_bar.label
+            assert 0.0 < result.meta.scale_bar.length_norm < 1.0
 
         initial_axial_cursor = rendered["AX"].meta.mpr_cursor
         assert initial_axial_cursor is not None

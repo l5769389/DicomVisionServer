@@ -10,6 +10,13 @@ class ViewerOperationsMixin:
     def _normalize_render_3d_mode(value: object) -> str:
         return "surface" if str(value or "").strip().lower() == "surface" else "volume"
 
+    def _is_pet_view_series(self, view: ViewRecord) -> bool:
+        try:
+            series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        except Exception:
+            return self._is_pet_view_type(view.view_type)
+        return self._is_pet_series(series)
+
     def _resolve_representative_stack_index(self, series: SeriesRecord) -> int:
         instance_count = len(series.instances)
         if instance_count <= 1:
@@ -484,6 +491,8 @@ class ViewerOperationsMixin:
     def _handle_volume_preset(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
             return
+        if self._is_pet_view_series(view):
+            return
 
         view.volume_preset = normalize_volume_preset_name(payload.sub_op_type or "bone")
         view.volume_render_config = create_default_volume_render_config(view.volume_preset)
@@ -494,7 +503,8 @@ class ViewerOperationsMixin:
     def _handle_render_3d_mode(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
             return
-        view.render_3d_mode = self._normalize_render_3d_mode(payload.render_3d_mode or payload.sub_op_type)
+        requested_mode = self._normalize_render_3d_mode(payload.render_3d_mode or payload.sub_op_type)
+        view.render_3d_mode = "volume" if self._is_pet_view_series(view) else requested_mode
         if view.surface_render_config is None:
             view.surface_render_config = create_default_surface_render_config("bone")
             view.surface_render_config_source = "preset"
@@ -503,6 +513,11 @@ class ViewerOperationsMixin:
 
     def _handle_surface_config(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         if not self._is_3d_view_type(view.view_type):
+            return
+        if self._is_pet_view_series(view):
+            view.render_3d_mode = "volume"
+            view.surface_render_config = None
+            view.is_initialized = True
             return
         sub_op_type = str(payload.sub_op_type or "").strip()
         is_preset_operation = sub_op_type.startswith("surfacePreset")
@@ -529,7 +544,7 @@ class ViewerOperationsMixin:
             next_remove_bed = bool(payload.volume_render_options.remove_bed)
         if next_remove_bed is None:
             return False
-        view.volume_remove_bed = bool(next_remove_bed)
+        view.volume_remove_bed = False if self._is_pet_view_series(view) else bool(next_remove_bed)
         view.is_initialized = True
         return True
 
@@ -689,6 +704,17 @@ class ViewerOperationsMixin:
         group_views = compat.view_registry.list_view_group(view.view_group.group_id, workspace_id=view.workspace_id)
         return group_views or [view]
 
+    def _get_fusion_geometry_views(self, view: ViewRecord) -> list[ViewRecord]:
+        """Keep axial CT/PET/fusion geometry linked while leaving the coronal MIP independent."""
+
+        if self._resolve_fusion_pane_role(view) == FUSION_PANE_PET_CORONAL_MIP:
+            return [view]
+        return [
+            group_view
+            for group_view in self._get_group_views(view)
+            if self._resolve_fusion_pane_role(group_view) != FUSION_PANE_PET_CORONAL_MIP
+        ] or [view]
+
     @staticmethod
     def _resolve_fusion_pane_role(view: ViewRecord) -> str:
         return view.fusion_pane_role or FUSION_VIEW_TYPE_TO_PANE_ROLE.get(view.view_type, FUSION_PANE_OVERLAY_AXIAL)
@@ -770,6 +796,13 @@ class ViewerOperationsMixin:
 
     def _handle_pet_window(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
         current_high = self._resolve_window_max(view.window_width, view.window_center)
+        group = view.view_group if self._is_mpr_view_type(view.view_type) else None
+        control_high = group.pet_control_window_max if group is not None else view.pet_control_window_max
+
+        def clamp_to_control(value: float) -> float:
+            upper = float(control_high) if control_high is not None and np.isfinite(float(control_high)) else None
+            return max(1e-6, min(float(value), upper)) if upper is not None else max(1e-6, float(value))
+
         if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
             if payload.ww is not None and payload.wl is not None:
                 next_high = float(payload.wl) + float(payload.ww) / 2.0
@@ -777,7 +810,11 @@ class ViewerOperationsMixin:
                 next_high = float(payload.ww)
             else:
                 next_high = float(payload.wl or 0.0) * 2.0
-            changed = self._set_pet_window_range(view, min_value=0.0, max_value=next_high)
+            changed = self._set_pet_window_range(
+                view,
+                min_value=0.0,
+                max_value=clamp_to_control(next_high),
+            )
         elif payload.action_type == DRAG_ACTION_START:
             view.drag_origin_window_width = float(
                 current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
@@ -792,7 +829,11 @@ class ViewerOperationsMixin:
             )
             delta = float(payload.x or 0.0) - float(payload.y or 0.0)
             next_high = base_high + delta * self._resolve_fusion_pet_window_drag_sensitivity(base_high)
-            changed = self._set_pet_window_range(view, min_value=0.0, max_value=max(1e-6, next_high))
+            changed = self._set_pet_window_range(
+                view,
+                min_value=0.0,
+                max_value=clamp_to_control(next_high),
+            )
             if payload.action_type == DRAG_ACTION_END:
                 view.drag_origin_window_width = None
                 view.drag_origin_window_center = None
@@ -808,24 +849,65 @@ class ViewerOperationsMixin:
         return changed
 
     def _handle_pet_config(self, view: ViewRecord, payload: ViewOperationRequest) -> bool:
+        series: SeriesRecord | None = None
         if not self._is_pet_view_type(view.view_type):
-            return False
+            series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+            if not self._is_pet_series(series):
+                return False
         changed = False
-        next_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
-        if view.pseudocolor_preset != next_preset:
-            view.pseudocolor_preset = next_preset
-            changed = True
+        group = view.view_group if self._is_mpr_view_type(view.view_type) else None
+        if payload.pseudocolor_preset is not None:
+            next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+            current_preset = group.pet_pseudocolor_preset if group is not None else view.pseudocolor_preset
+            if current_preset != next_preset:
+                if group is not None:
+                    group.pet_pseudocolor_preset = next_preset
+                view.pseudocolor_preset = next_preset
+                changed = True
         if payload.pet_unit is not None:
             next_unit = self._normalize_fusion_pet_unit(payload.pet_unit)
-            if view.pet_unit != next_unit:
-                series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+            current_unit = group.pet_unit if group is not None else view.pet_unit
+            if current_unit != next_unit:
+                if series is None:
+                    series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
                 pet_volume = self._get_series_volume(series)
+                previous_display = self._build_fusion_pet_display_volume(series, pet_volume, current_unit)
                 pet_display = self._build_fusion_pet_display_volume(series, pet_volume, next_unit)
                 view.pet_unit = pet_display.unit
                 view.pet_unit_label = pet_display.unit_label
+                if group is not None:
+                    group.pet_unit = pet_display.unit
+                    group.pet_unit_label = pet_display.unit_label
+                    previous_scale = float(previous_display.scale)
+                    if abs(previous_scale) > 1e-12:
+                        scale_ratio = float(pet_display.scale) / previous_scale
+                        offset_delta = float(pet_display.offset) - float(previous_display.offset) * scale_ratio
+                        segmentation = group.mpr_segmentation
+                        segmentation.lower_value = segmentation.lower_value * scale_ratio + offset_delta
+                        segmentation.upper_value = segmentation.upper_value * scale_ratio + offset_delta
+                        for region in segmentation.threshold_regions:
+                            if self._normalize_mpr_threshold_mode(region.threshold_mode) == "absolute":
+                                region.threshold_value = region.threshold_value * scale_ratio + offset_delta
+                        self._refresh_mpr_segmentation_stats_for_view(
+                            view,
+                            segmentation,
+                            series=series,
+                        )
                 pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
                 view.window_width = pet_ww
                 view.window_center = pet_wl
+                _auto_low, auto_high = derive_pet_auto_range(pet_display.volume, pet_display.unit)
+                if group is not None:
+                    group.pet_control_window_max = derive_pet_control_range_max(
+                        auto_high,
+                        pet_display.unit,
+                    )
+                    self._bump_mpr_revision(group)
+                else:
+                    view.pet_control_window_max = derive_pet_control_range_max(
+                        auto_high,
+                        pet_display.unit,
+                    )
                 changed = True
         if payload.pet_window_min is not None or payload.pet_window_max is not None:
             current_low = self._resolve_window_min(view.window_width, view.window_center)
@@ -840,10 +922,48 @@ class ViewerOperationsMixin:
                 if payload.pet_window_max is not None
                 else float(current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX)
             )
+            control_high = group.pet_control_window_max if group is not None else view.pet_control_window_max
+            if control_high is not None and np.isfinite(float(control_high)):
+                next_high = min(next_high, float(control_high))
             if self._set_pet_window_range(view, min_value=next_low, max_value=next_high):
                 changed = True
+        if payload.pet_control_window_max is not None:
+            next_control_max = float(payload.pet_control_window_max)
+            if not np.isfinite(next_control_max) or next_control_max <= 0:
+                raise HTTPException(status_code=400, detail="PET control window max must be positive and finite")
+            current_control_max = (
+                group.pet_control_window_max if group is not None else view.pet_control_window_max
+            )
+            if current_control_max is None or abs(float(current_control_max) - next_control_max) > 1e-6:
+                if group is not None:
+                    group.pet_control_window_max = next_control_max
+                else:
+                    view.pet_control_window_max = next_control_max
+                changed = True
+            current_high = self._resolve_window_max(view.window_width, view.window_center)
+            if current_high is not None and float(current_high) > next_control_max:
+                if self._set_pet_window_range(view, min_value=0.0, max_value=next_control_max):
+                    changed = True
         if changed:
-            view.is_initialized = True
+            # PET configuration can arrive before the DOM reports its real
+            # viewport size. It is display state, not proof that geometry was
+            # fitted. Do not mark a fresh standalone viewport initialized here:
+            # doing so skips the first physical contain-fit and leaves PET at
+            # the dataclass default 1x zoom until the user presses Reset.
+            if self._is_3d_view_type(view.view_type):
+                view.volume_render_config_token = None
+                view.surface_render_config_token = None
+            if group is not None:
+                for group_view in self._get_mpr_group_views(view):
+                    group_view.pet_unit = group.pet_unit
+                    group_view.pet_unit_label = group.pet_unit_label
+                    group_view.pseudocolor_preset = group.pet_pseudocolor_preset
+                    # PET config may be sent before the first MPR render so the first
+                    # frame can use the correct unit/LUT/range. Do not mark a fresh
+                    # MPR viewport initialized here: geometry centering and fit-to-plane
+                    # still need to run in _initialize_mpr_viewport. Otherwise the
+                    # render path builds a cursor from the group's default 0/0/0 indices
+                    # and the first PET MPR frame lands on the volume edge until reset.
         return changed
 
     def _bump_fusion_revision(self, group: ViewGroupRecord | None) -> int | None:
@@ -1266,7 +1386,7 @@ class ViewerOperationsMixin:
 
     def _handle_fusion_drag_pan(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         group = view.view_group
-        group_views = self._get_group_views(view)
+        group_views = self._get_fusion_geometry_views(view)
         if payload.action_type == DRAG_ACTION_START:
             for group_view in group_views:
                 group_view.drag_origin_offset_x = group_view.offset_x
@@ -1290,7 +1410,7 @@ class ViewerOperationsMixin:
 
     def _handle_fusion_drag_zoom(self, view: ViewRecord, payload: ViewOperationRequest) -> None:
         group = view.view_group
-        group_views = self._get_group_views(view)
+        group_views = self._get_fusion_geometry_views(view)
         if payload.action_type == DRAG_ACTION_START:
             for group_view in group_views:
                 group_view.drag_origin_zoom = group_view.zoom
@@ -1327,7 +1447,18 @@ class ViewerOperationsMixin:
         if group is None:
             return False
         role = self._resolve_fusion_pane_role(view)
-        if self._is_fusion_pet_display_role(role):
+        if self._is_fusion_pet_display_role(role) or (
+            role == FUSION_PANE_OVERLAY_AXIAL and group.fusion_window_target == "pet"
+        ):
+            def clamp_pet_high(value: float) -> float:
+                upper = (
+                    float(group.fusion_pet_control_window_max)
+                    if group.fusion_pet_control_window_max is not None
+                    and np.isfinite(float(group.fusion_pet_control_window_max))
+                    else None
+                )
+                return max(1e-6, min(float(value), upper)) if upper is not None else max(1e-6, float(value))
+
             current_high = self._resolve_window_max(
                 group.fusion_pet_window.window_width,
                 group.fusion_pet_window.window_center,
@@ -1339,7 +1470,11 @@ class ViewerOperationsMixin:
                     next_high = float(payload.ww)
                 else:
                     next_high = float(payload.wl or 0.0) * 2.0
-                changed = self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high)
+                changed = self._set_fusion_pet_window_range(
+                    group,
+                    min_value=0.0,
+                    max_value=clamp_pet_high(next_high),
+                )
             elif payload.action_type == DRAG_ACTION_START:
                 group.drag_origin_window_width = float(
                     current_high if current_high is not None else FUSION_DEFAULT_SUV_WINDOW_MAX
@@ -1354,7 +1489,11 @@ class ViewerOperationsMixin:
                 )
                 delta = float(payload.x or 0.0) - float(payload.y or 0.0)
                 next_high = base_high + delta * self._resolve_fusion_pet_window_drag_sensitivity(base_high)
-                changed = self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high)
+                changed = self._set_fusion_pet_window_range(
+                    group,
+                    min_value=0.0,
+                    max_value=clamp_pet_high(next_high),
+                )
                 if payload.action_type == DRAG_ACTION_END:
                     group.drag_origin_window_width = None
                     group.drag_origin_window_center = None
@@ -1412,9 +1551,15 @@ class ViewerOperationsMixin:
         if group is None or payload.pseudocolor_preset is None:
             return False
         next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
-        if group.fusion_pet_pseudocolor_preset == next_preset:
+        role = self._resolve_fusion_pane_role(view)
+        if self._is_fusion_pet_display_role(role):
+            if group.fusion_pet_pane_pseudocolor_preset == next_preset:
+                return False
+            group.fusion_pet_pane_pseudocolor_preset = next_preset
+        elif group.fusion_pet_pseudocolor_preset == next_preset:
             return False
-        group.fusion_pet_pseudocolor_preset = next_preset
+        else:
+            group.fusion_pet_pseudocolor_preset = next_preset
         self._clear_fusion_registration_overlay_frame_locks(group)
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
@@ -1438,20 +1583,31 @@ class ViewerOperationsMixin:
             if group.fusion_pet_pseudocolor_preset != next_preset:
                 group.fusion_pet_pseudocolor_preset = next_preset
                 changed = True
+        if payload.fusion_pet_pane_pseudocolor_preset is not None:
+            next_pane_preset = normalize_pseudocolor_preset(payload.fusion_pet_pane_pseudocolor_preset)
+            if group.fusion_pet_pane_pseudocolor_preset != next_pane_preset:
+                group.fusion_pet_pane_pseudocolor_preset = next_pane_preset
+                changed = True
+        if payload.fusion_window_target is not None:
+            next_target = "pet" if payload.fusion_window_target == "pet" else "ct"
+            if group.fusion_window_target != next_target:
+                group.fusion_window_target = next_target
+                changed = True
         if payload.fusion_pet_unit is not None:
             next_unit = self._normalize_fusion_pet_unit(payload.fusion_pet_unit)
             if group.fusion_pet_unit != next_unit:
-                group.fusion_pet_unit = next_unit
-                try:
-                    _, _, pet_series = self._resolve_fusion_group_series(view)
-                    pet_volume = self._get_series_volume(pet_series)
-                    pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, next_unit)
-                    group.fusion_pet_unit = pet_display.unit
-                    pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
-                    group.fusion_pet_window.window_width = pet_ww
-                    group.fusion_pet_window.window_center = pet_wl
-                except Exception:
-                    logger.debug("failed to reset fusion PET window for unit=%s", next_unit, exc_info=True)
+                _, _, pet_series = self._resolve_fusion_group_series(view)
+                pet_volume = self._get_series_volume(pet_series)
+                pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, next_unit)
+                group.fusion_pet_unit = pet_display.unit
+                pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+                group.fusion_pet_window.window_width = pet_ww
+                group.fusion_pet_window.window_center = pet_wl
+                _auto_low, auto_high = derive_pet_auto_range(pet_display.volume, pet_display.unit)
+                group.fusion_pet_control_window_max = derive_pet_control_range_max(
+                    auto_high,
+                    pet_display.unit,
+                )
                 changed = True
         if payload.fusion_pet_window_min is not None or payload.fusion_pet_window_max is not None:
             current_high = self._resolve_window_max(group.fusion_pet_window.window_width, group.fusion_pet_window.window_center)
@@ -1462,8 +1618,34 @@ class ViewerOperationsMixin:
             )
             if not np.isfinite(next_high):
                 next_high = FUSION_DEFAULT_SUV_WINDOW_MAX
+            if (
+                group.fusion_pet_control_window_max is not None
+                and np.isfinite(float(group.fusion_pet_control_window_max))
+            ):
+                next_high = min(next_high, float(group.fusion_pet_control_window_max))
             if self._set_fusion_pet_window_range(group, min_value=0.0, max_value=next_high):
                 changed = True
+        if payload.fusion_pet_control_window_max is not None:
+            next_control_max = float(payload.fusion_pet_control_window_max)
+            if not np.isfinite(next_control_max) or next_control_max <= 0:
+                raise HTTPException(status_code=400, detail="Fusion PET control window max must be positive and finite")
+            if (
+                group.fusion_pet_control_window_max is None
+                or abs(float(group.fusion_pet_control_window_max) - next_control_max) > 1e-6
+            ):
+                group.fusion_pet_control_window_max = next_control_max
+                changed = True
+            current_high = self._resolve_window_max(
+                group.fusion_pet_window.window_width,
+                group.fusion_pet_window.window_center,
+            )
+            if current_high is not None and float(current_high) > next_control_max:
+                if self._set_fusion_pet_window_range(
+                    group,
+                    min_value=0.0,
+                    max_value=next_control_max,
+                ):
+                    changed = True
         if changed:
             self._clear_fusion_registration_overlay_frame_locks(group)
             group.fusion_revision += 1
@@ -2197,12 +2379,28 @@ class ViewerOperationsMixin:
         if not np.isfinite(mm_per_canvas_pixel) or mm_per_canvas_pixel <= 0.0:
             return None
 
-        selected_length_mm = 100.0
-        selected_length_px = selected_length_mm / mm_per_canvas_pixel
-        if not np.isfinite(selected_length_px) or selected_length_px <= 0.0:
+        max_length_px = max(8.0, float(render_view.width or 0) - 32.0)
+        scale_candidates_mm = (100.0, 50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1)
+        selected_length_mm: float | None = None
+        selected_length_px: float | None = None
+        for candidate in scale_candidates_mm:
+            candidate_px = candidate / mm_per_canvas_pixel
+            if 8.0 <= candidate_px <= max_length_px:
+                selected_length_mm = candidate
+                selected_length_px = candidate_px
+                break
+        if selected_length_mm is None or selected_length_px is None:
             return None
 
         return ScaleBarInfo(
             lengthNorm=float(selected_length_px) / float(render_view.width),
-            label="10 cm",
+            label=compat.ViewerService._format_scale_bar_label(selected_length_mm),
         )
+
+    @staticmethod
+    def _format_scale_bar_label(length_mm: float) -> str:
+        if length_mm >= 10.0 and abs(length_mm % 10.0) <= 1e-6:
+            return f"{length_mm / 10.0:g} cm"
+        if length_mm < 1.0:
+            return f"{length_mm * 1000.0:g} μm"
+        return f"{length_mm:g} mm"

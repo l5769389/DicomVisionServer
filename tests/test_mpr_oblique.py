@@ -54,6 +54,121 @@ def _build_axial_view(service: ViewerService, series, volume: np.ndarray) -> tup
     return group, view
 
 
+def test_mpr_rotate_3d_broadcasts_matching_plane_state_for_all_viewports(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (axial_view, coronal_view, sagittal_view):
+        candidate_view.width = 240
+        candidate_view.height = 240
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="rotate3d",
+                actionType="start",
+                x=0.5,
+                y=0.125,
+            )
+        )
+        move_outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="rotate3d",
+                actionType="move",
+                x=0.875,
+                y=0.5,
+            )
+        )
+        end_outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="rotate3d",
+                actionType="end",
+                x=0.875,
+                y=0.5,
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    expected_view_ids = ("v-ax", "v-cor", "v-sag")
+    assert move_outcome.broadcast_view_ids == expected_view_ids
+    assert move_outcome.mpr_state_view_ids == expected_view_ids
+    assert move_outcome.broadcast_fast_preview is True
+    assert move_outcome.broadcast_metadata_mode == "mpr-model-rotate-preview"
+    assert end_outcome.broadcast_view_ids == expected_view_ids
+    assert end_outcome.mpr_state_view_ids == expected_view_ids
+
+
+def test_mpr_rotate_3d_reset_broadcasts_matching_plane_state(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    group, axial_view = _build_axial_view(service, series, volume)
+    coronal_view = ViewRecord(view_id="v-cor", series_id=series.series_id, view_type="COR", view_group=group)
+    sagittal_view = ViewRecord(view_id="v-sag", series_id=series.series_id, view_type="SAG", view_group=group)
+    for candidate_view in (axial_view, coronal_view, sagittal_view):
+        candidate_view.width = 240
+        candidate_view.height = 240
+
+    rotation_angle = math.radians(31.0)
+    model_rotation = np.asarray(
+        [
+            [math.cos(rotation_angle), -math.sin(rotation_angle), 0.0],
+            [math.sin(rotation_angle), math.cos(rotation_angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    service._set_mpr_model_rotation_matrix(
+        group,
+        model_rotation,
+        pivot_world=np.asarray([12.0, 18.0, 24.0], dtype=np.float64),
+    )
+    assert not np.allclose(service._get_mpr_model_rotation_matrix(group), np.eye(3))
+    assert group.mpr_model_rotation_pivot_world == (12.0, 18.0, 24.0)
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(
+            {
+                axial_view.view_id: axial_view,
+                coronal_view.view_id: coronal_view,
+                sagittal_view.view_id: sagittal_view,
+            }
+        )
+        outcome = service.handle_view_operation(
+            ViewOperationRequest(
+                viewId=axial_view.view_id,
+                opType="reset",
+                subOpType="rotate3d",
+            )
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert outcome.broadcast_view_ids == ("v-ax", "v-cor", "v-sag")
+    assert outcome.mpr_state_view_ids == ("v-ax", "v-cor", "v-sag")
+    assert np.allclose(service._get_mpr_model_rotation_matrix(group), np.eye(3))
+    assert group.mpr_model_rotation_pivot_world is None
+    assert group.rotation_drag is None
+    assert all(view.is_initialized for view in (axial_view, coronal_view, sagittal_view))
+
+
 def test_mpr_render_by_id_uses_view_state_snapshot(monkeypatch) -> None:
     service, series, volume = _build_service_with_stubbed_series(monkeypatch)
     group, view = _build_axial_view(service, series, volume)
@@ -118,6 +233,8 @@ def test_mpr_state_update_payload_builds_crosshair_metadata_without_reslice(monk
     assert 0 <= slice_info["current"] < slice_info["total"]
     assert payload["mprCrosshairMode"] == "orthogonal"
     assert "mprFrame" in payload
+    assert payload["mprSegmentationConfig"]["clientRevision"] == 0
+    assert payload["mprSegmentationConfig"]["thresholdRegions"] == []
     assert "mprCursor" in payload
     assert "mprPlane" in payload
     assert "mpr_crosshair" in payload
@@ -235,8 +352,8 @@ def test_3d_webp_uses_lossy_preview_and_lossless_final(monkeypatch) -> None:
 def test_view_transform_payload_reports_clamped_zoom() -> None:
     view = ViewRecord(view_id="v", series_id="s", view_type="Stack")
 
-    assert ZOOM_MIN == pytest.approx(0.1)
-    assert ZOOM_MAX == pytest.approx(10.0)
+    assert ZOOM_MIN == pytest.approx(0.01)
+    assert ZOOM_MAX == pytest.approx(64.0)
 
     view.zoom = ZOOM_MAX * 4
     payload = ViewerService._build_view_transform_payload(view)

@@ -177,6 +177,9 @@ class ViewerInteractionMixin:
             "slice_info": SliceInfo(current=current, total=total).model_dump(by_alias=True),
             "mprRevision": mpr_revision if mpr_revision is not None else self._get_mpr_revision(view.view_group),
             "mprCrosshairMode": self._get_mpr_crosshair_mode(view.view_group),
+            "mprSegmentationConfig": self._serialize_mpr_segmentation_config(
+                view.mpr_segmentation
+            ).model_dump(by_alias=True),
         }
         if frame_payload is not None:
             payload["mprFrame"] = frame_payload.model_dump(by_alias=True)
@@ -347,10 +350,6 @@ class ViewerInteractionMixin:
         if not np.isfinite(pixel_value):
             return (row, col, None, value_label, value_unit)
 
-        # source_pixels are presentation-inverted for MONOCHROME1. Recover the
-        # modality value used for quantitative cursor readout.
-        if str(getattr(dataset, "PhotometricInterpretation", "") or "").upper() == "MONOCHROME1":
-            pixel_value = -pixel_value
         if modality == "CT":
             value_label = "CT"
             value_unit = "HU"
@@ -374,16 +373,23 @@ class ViewerInteractionMixin:
 
         if self._is_mpr_view_type(view.view_type):
             volume = self._get_series_volume(series)
+            pet_display: FusionPetDisplayVolume | None = None
+            if self._is_pet_series(series):
+                requested_unit = view.view_group.pet_unit if view.view_group is not None else view.pet_unit
+                pet_display = self._build_fusion_pet_display_volume(series, volume, requested_unit)
+                volume = pet_display.volume
             if not view.is_initialized:
                 self._initialize_mpr_viewport(view)
                 view.is_initialized = True
             target_viewport = self._resolve_mpr_viewport(view)
             source_pixels, _, _ = self._extract_mpr_plane(view, volume, target_viewport)
+            if pet_display is not None:
+                return source_pixels, dataset, modality, "PET", pet_display.unit_label
         elif self._is_pet_series(series):
             pet_display = self._build_fusion_pet_display_volume(series, self._get_series_volume(series), view.pet_unit)
             index = max(0, min(int(view.current_index), pet_display.volume.shape[0] - 1))
             source_pixels = np.asarray(pet_display.volume[index], dtype=np.float32)
-            return source_pixels, dataset, modality, "PET", pet_display.unit
+            return source_pixels, dataset, modality, "PET", pet_display.unit_label
         elif cached is not None:
             source_pixels = cached.source_pixels
         else:
@@ -486,6 +492,9 @@ class ViewerInteractionMixin:
         if self._is_mpr_view_type(view.view_type):
             series = compat.series_registry.get(view.series_id)
             volume = self._get_series_volume(series)
+            if self._is_pet_series(series):
+                requested_unit = view.view_group.pet_unit if view.view_group is not None else view.pet_unit
+                volume = self._build_fusion_pet_display_volume(series, volume, requested_unit).volume
             target_viewport = self._resolve_mpr_viewport(view)
             plane_pixels, current_index, _ = self._extract_mpr_plane(view, volume, target_viewport)
             pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
@@ -500,11 +509,42 @@ class ViewerInteractionMixin:
         if not instance.sop_instance_uid:
             raise HTTPException(status_code=400, detail="DICOM instance does not contain SOPInstanceUID")
         cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
+        source_pixels = cached.source_pixels
+        if self._is_pet_series(series):
+            pet_display = self._build_fusion_pet_display_volume(
+                series,
+                self._get_series_volume(series),
+                view.pet_unit,
+            )
+            index = max(0, min(int(view.current_index), pet_display.volume.shape[0] - 1))
+            source_pixels = np.asarray(pet_display.volume[index], dtype=np.float32)
         return (
-            cached.source_pixels,
+            source_pixels,
             self._get_stack_spacing_xy(cached.dataset),
             MeasurementSliceContext(kind="stack", slice_index=view.current_index, sop_instance_uid=instance.sop_instance_uid),
         )
+
+    def _resolve_measurement_intensity_unit(self, view: ViewRecord) -> str | None:
+        try:
+            series = compat.series_registry.get(view.series_id)
+        except Exception:
+            # Measurements can be restored before the backing series registry
+            # has finished loading.  Geometry and cached metrics must remain
+            # usable in that state; the quantitative unit is added on the next
+            # refresh once the series metadata is available.
+            return None
+        if self._is_pet_series(series):
+            requested_unit = (
+                view.view_group.pet_unit
+                if self._is_mpr_view_type(view.view_type) and view.view_group is not None
+                else view.pet_unit
+            )
+            return self._build_fusion_pet_display_volume(
+                series,
+                self._get_series_volume(series),
+                requested_unit,
+            ).unit_label
+        return "HU" if str(getattr(series, "modality", "") or "").strip().upper() == "CT" else None
 
     def _resolve_mpr_measurement_plane_pose(self, view: ViewRecord) -> PlanePose:
         series = compat.series_registry.get(view.series_id)
@@ -574,6 +614,7 @@ class ViewerInteractionMixin:
             next_points,
             source_pixels,
             spacing_xy,
+            intensity_unit=self._resolve_measurement_intensity_unit(view),
         )
         next_context = (
             MeasurementSliceContext(
@@ -700,7 +741,13 @@ class ViewerInteractionMixin:
                 label_lines=(ALIGNMENT_SPACING_UNAVAILABLE_LABEL,),
             )
 
-        metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
+        metrics, label_lines = build_measurement_metrics(
+            tool_type,
+            image_points,
+            source_pixels,
+            spacing_xy,
+            intensity_unit=self._resolve_measurement_intensity_unit(view),
+        )
         return self._build_measurement_preview_payload(
             view=view,
             viewport_key=viewport_key,
@@ -733,7 +780,13 @@ class ViewerInteractionMixin:
         if self._is_alignment_measurement(tool_type) and not self._has_alignment_physical_context(view, spacing_xy):
             metrics, label_lines = self._build_alignment_spacing_unavailable_metrics()
         else:
-            metrics, label_lines = build_measurement_metrics(tool_type, image_points, source_pixels, spacing_xy)
+            metrics, label_lines = build_measurement_metrics(
+                tool_type,
+                image_points,
+                source_pixels,
+                spacing_xy,
+                intensity_unit=self._resolve_measurement_intensity_unit(view),
+            )
         world_points = self._capture_mpr_measurement_world_points(view, image_points)
 
         label_anchor = image_points[1] if tool_type != "angle" else image_points[1]
@@ -939,6 +992,7 @@ class ViewerInteractionMixin:
                     measurement.points,
                     source_pixels,
                     spacing_xy,
+                    intensity_unit=self._resolve_measurement_intensity_unit(view),
                 )
         except Exception:
             logger.debug(

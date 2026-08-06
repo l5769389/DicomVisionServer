@@ -382,7 +382,24 @@ class MprSegmentationVoiBox(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprIntensityContext(BaseModel):
+    modality: str = "CT"
+    value_type: str = Field(default="HU", alias="valueType")
+    unit: str = "HU"
+    label: str = "HU"
+    quantitative: bool = True
+    warnings: list[str] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
 class MprThresholdRegionStats(BaseModel):
+    status: Literal["ready", "empty", "error"] = "ready"
+    message: str | None = None
+    value_mean: float | None = Field(default=None, alias="valueMean")
+    value_min: float | None = Field(default=None, alias="valueMin")
+    value_max: float | None = Field(default=None, alias="valueMax")
+    value_std_dev: float | None = Field(default=None, alias="valueStdDev")
     hu_mean: float | None = Field(default=None, alias="huMean")
     hu_min: float | None = Field(default=None, alias="huMin")
     hu_max: float | None = Field(default=None, alias="huMax")
@@ -390,6 +407,17 @@ class MprThresholdRegionStats(BaseModel):
     volume_cm3: float = Field(default=0.0, ge=0.0, alias="volumeCm3")
     sample_count: int = Field(default=0, ge=0, alias="sampleCount")
     effective_threshold_hu: float | None = Field(default=None, alias="effectiveThresholdHu")
+    effective_threshold_value: float | None = Field(default=None, alias="effectiveThresholdValue")
+    intensity_context: MprIntensityContext = Field(
+        default_factory=MprIntensityContext,
+        alias="intensityContext",
+    )
+    uptake_peak: float | None = Field(default=None, alias="uptakePeak")
+    uptake_peak_reason: str | None = Field(default=None, alias="uptakePeakReason")
+    mtv_cm3: float | None = Field(default=None, ge=0.0, alias="mtvCm3")
+    tlg: float | None = None
+    tlg_available: bool = Field(default=False, alias="tlgAvailable")
+    tlg_reason: str | None = Field(default=None, alias="tlgReason")
 
     model_config = {"populate_by_name": True}
 
@@ -411,9 +439,15 @@ class MprThresholdRegion(BaseModel):
     id: str
     enabled: bool = True
     label: str = ""
-    threshold_hu: float = Field(default=300.0, ge=-1024.0, le=3071.0, alias="thresholdHu")
-    threshold_mode: str = Field(default="hu", alias="thresholdMode")
+    threshold_value: float | None = Field(default=None, alias="thresholdValue")
+    threshold_hu: float | None = Field(default=300.0, alias="thresholdHu")
+    threshold_mode: str = Field(default="absolute", alias="thresholdMode")
+    threshold_percent_max: float | None = Field(default=None, ge=0.0, le=100.0, alias="thresholdPercentMax")
     threshold_percentile: float = Field(default=80.0, ge=0.0, le=100.0, alias="thresholdPercentile")
+    component_mode: Literal["all", "hotspotConnected"] = Field(
+        default="hotspotConnected",
+        alias="componentMode",
+    )
     color: str = "#ff4df8"
     box: MprThresholdRegionBox
     stats: MprThresholdRegionStats | None = None
@@ -422,12 +456,20 @@ class MprThresholdRegion(BaseModel):
 
 
 class MprVoiSphereStats(BaseModel):
+    value_mean: float | None = Field(default=None, alias="valueMean")
+    value_min: float | None = Field(default=None, alias="valueMin")
+    value_max: float | None = Field(default=None, alias="valueMax")
+    value_std_dev: float | None = Field(default=None, alias="valueStdDev")
     hu_mean: float | None = Field(default=None, alias="huMean")
     hu_min: float | None = Field(default=None, alias="huMin")
     hu_max: float | None = Field(default=None, alias="huMax")
     hu_std_dev: float | None = Field(default=None, alias="huStdDev")
     volume_cm3: float = Field(default=0.0, ge=0.0, alias="volumeCm3")
     sample_count: int = Field(default=0, ge=0, alias="sampleCount")
+    intensity_context: MprIntensityContext = Field(
+        default_factory=MprIntensityContext,
+        alias="intensityContext",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -453,8 +495,14 @@ class MprSegmentationConfig(BaseModel):
     threshold_regions: list[MprThresholdRegion] = Field(default_factory=list, alias="thresholdRegions")
     voi_spheres: list[MprVoiSphere] = Field(default_factory=list, alias="voiSpheres")
     voi_sphere: MprVoiSphere | None = Field(default=None, alias="voiSphere")
-    lower_hu: float | None = Field(default=None, ge=-1024.0, le=3071.0, alias="lowerHu")
-    upper_hu: float | None = Field(default=None, ge=-1024.0, le=3071.0, alias="upperHu")
+    lower_value: float | None = Field(default=None, alias="lowerValue")
+    upper_value: float | None = Field(default=None, alias="upperValue")
+    lower_hu: float | None = Field(default=None, alias="lowerHu")
+    upper_hu: float | None = Field(default=None, alias="upperHu")
+    intensity_context: MprIntensityContext = Field(
+        default_factory=MprIntensityContext,
+        alias="intensityContext",
+    )
     opacity: float = Field(default=0.45, ge=0.0, le=1.0)
     color: str = "#ff4df8"
     voi_box: MprSegmentationVoiBox | None = Field(default=None, alias="voiBox")
@@ -479,10 +527,30 @@ class MprSegmentationOverlaySamples(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MprSegmentationOverlayPoint(BaseModel):
+    x: float
+    y: float
+
+
+class MprSegmentationOverlayWorldPoint(BaseModel):
+    x: float
+    y: float
+    z: float
+
+
 class MprSegmentationOverlayRegion(BaseModel):
     region_id: str = Field(alias="regionId")
     visible: bool = False
     rect: MprSegmentationOverlayRect | None = None
+    display_box: MprThresholdRegionBox | None = Field(default=None, alias="displayBox")
+    guide_points: list[MprSegmentationOverlayPoint] = Field(default_factory=list, alias="guidePoints")
+    guide_world_points: list[MprSegmentationOverlayWorldPoint] = Field(default_factory=list, alias="guideWorldPoints")
+    contour_world_points: list[list[MprSegmentationOverlayWorldPoint]] = Field(
+        default_factory=list,
+        alias="contourWorldPoints",
+    )
+    guide_authoritative: bool = Field(default=False, alias="guideAuthoritative")
+    guide_intersects_plane: bool = Field(default=True, alias="guideIntersectsPlane")
     sample_revision: int = Field(default=0, ge=0, alias="sampleRevision")
     samples: MprSegmentationOverlaySamples | None = None
 
@@ -509,10 +577,12 @@ class FusionInfo(BaseModel):
     ct_series_id: str = Field(alias="ctSeriesId")
     pet_series_id: str = Field(alias="petSeriesId")
     pet_pseudocolor_preset: str = Field(alias="petPseudocolorPreset")
-    pet_unit: str = Field(default="SUVbw", alias="petUnit")
-    pet_unit_label: str = Field(default="g/ml (SUVbw)", alias="petUnitLabel")
+    pet_pane_pseudocolor_preset: str = Field(default="hotiron", alias="petPanePseudocolorPreset")
+    pet_unit: str = Field(default="source", alias="petUnit")
+    pet_unit_label: str = Field(default="Source", alias="petUnitLabel")
     pet_window_min: float | None = Field(default=None, alias="petWindowMin")
     pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    fusion_window_target: Literal["ct", "pet"] = Field(default="ct", alias="fusionWindowTarget")
     alpha: float
     revision: int
     registration: FusionRegistrationInfo
@@ -541,13 +611,64 @@ class FusionCompositeInfo(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class PetUnitAvailability(BaseModel):
+    unit: str
+    label: str
+    available: bool
+    reason: str | None = None
+    provenance: str | None = None
+    scale: float | None = None
+    offset: float | None = None
+    auto_window_min: float | None = Field(default=None, alias="autoWindowMin")
+    auto_window_max: float | None = Field(default=None, alias="autoWindowMax")
+    control_window_max: float | None = Field(default=None, alias="controlWindowMax")
+
+    model_config = {"populate_by_name": True}
+
+
 class PetInfo(BaseModel):
     series_id: str = Field(alias="seriesId")
-    pet_unit: str = Field(default="SUVbw", alias="petUnit")
-    pet_unit_label: str = Field(default="g/ml (SUVbw)", alias="petUnitLabel")
+    source_unit: str = Field(default="UNKNOWN", alias="sourceUnit")
+    source_unit_label: str = Field(default="stored value", alias="sourceUnitLabel")
+    pet_unit: str = Field(default="source", alias="petUnit")
+    pet_unit_label: str = Field(default="Source", alias="petUnitLabel")
+    unit_options: list[PetUnitAvailability] = Field(default_factory=list, alias="unitOptions")
+    quantitative: bool = False
+    quantification_status: Literal[
+        "valid",
+        "degraded",
+        "unsupported",
+        "quantitative",
+        "source-only",
+        "warning",
+    ] = Field(
+        default="unsupported",
+        alias="quantificationStatus",
+    )
+    dicom_units: str | None = Field(default=None, alias="dicomUnits")
+    dicom_suv_type: str | None = Field(default=None, alias="dicomSuvType")
+    mapping_provenance: str | None = Field(default=None, alias="mappingProvenance")
+    support_status: Literal["static-supported", "unsupported"] = Field(
+        default="static-supported",
+        alias="supportStatus",
+    )
+    support_reason: str | None = Field(default=None, alias="supportReason")
+    photometric_interpretation: str | None = Field(default=None, alias="photometricInterpretation")
+    warnings: list[str] = Field(default_factory=list)
     pet_window_min: float | None = Field(default=None, alias="petWindowMin")
     pet_window_max: float | None = Field(default=None, alias="petWindowMax")
-    pseudocolor_preset: str = Field(default="bwinverse", alias="pseudocolorPreset")
+    auto_window_min: float | None = Field(default=None, alias="autoWindowMin")
+    auto_window_max: float | None = Field(default=None, alias="autoWindowMax")
+    control_window_max: float | None = Field(default=None, alias="controlWindowMax")
+    range_is_auto_suggestion: bool = Field(default=False, alias="rangeIsAutoSuggestion")
+    pseudocolor_preset: str = Field(default="hotiron", alias="pseudocolorPreset")
+    lut_id: str | None = Field(default=None, alias="lutId")
+    lut_version: str | None = Field(default=None, alias="lutVersion")
+    lut_hash: str | None = Field(default=None, alias="lutHash")
+    pet_pane_pseudocolor_preset: str | None = Field(default=None, alias="petPanePseudocolorPreset")
+    fusion_overlay_pseudocolor_preset: str | None = Field(default=None, alias="fusionOverlayPseudocolorPreset")
+    tracer_name: str | None = Field(default=None, alias="tracerName")
+    is_fdg: bool = Field(default=False, alias="isFdg")
 
     model_config = {"populate_by_name": True}
 
@@ -687,11 +808,18 @@ class ViewOperationRequest(BaseModel):
     fusion_alpha: float | None = Field(default=None, alias="fusionAlpha")
     fusion_manual_registration: bool | None = Field(default=None, alias="fusionManualRegistration")
     fusion_pet_unit: str | None = Field(default=None, alias="fusionPetUnit")
+    fusion_pet_pane_pseudocolor_preset: str | None = Field(
+        default=None,
+        alias="fusionPetPanePseudocolorPreset",
+    )
+    fusion_window_target: Literal["ct", "pet"] | None = Field(default=None, alias="fusionWindowTarget")
     fusion_pet_window_min: float | None = Field(default=None, alias="fusionPetWindowMin")
     fusion_pet_window_max: float | None = Field(default=None, alias="fusionPetWindowMax")
+    fusion_pet_control_window_max: float | None = Field(default=None, alias="fusionPetControlWindowMax")
     pet_unit: str | None = Field(default=None, alias="petUnit")
     pet_window_min: float | None = Field(default=None, alias="petWindowMin")
     pet_window_max: float | None = Field(default=None, alias="petWindowMax")
+    pet_control_window_max: float | None = Field(default=None, alias="petControlWindowMax")
     fusion_registration_file: dict[str, Any] | None = Field(default=None, alias="fusionRegistrationFile")
     mpr_mip_config: MprMipConfig | None = Field(default=None, alias="mprMipConfig")
     mpr_segmentation_config: MprSegmentationConfig | None = Field(default=None, alias="mprSegmentationConfig")

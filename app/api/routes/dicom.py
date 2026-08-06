@@ -261,6 +261,7 @@ def get_montage_tile(
     ww: float | None = None,
     wl: float | None = None,
     pseudocolorPreset: str | None = None,
+    petUnit: str | None = None,
     workspace_id: str = Depends(get_request_workspace_id),
 ) -> Response:
     return Response(
@@ -271,6 +272,7 @@ def get_montage_tile(
             window_width=ww,
             window_center=wl,
             pseudocolor_preset=pseudocolorPreset,
+            pet_unit=petUnit,
             workspace_id=workspace_id,
         ),
         media_type="image/webp",

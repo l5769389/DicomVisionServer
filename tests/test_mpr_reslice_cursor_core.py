@@ -393,7 +393,7 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     assert encode_calls == [("webp", False), ("webp", False)]
 
 
-def test_fast_preview_reuses_windowed_base_pixels_for_pan_zoom(monkeypatch) -> None:
+def test_fast_preview_resamples_scalar_pixels_before_windowing(monkeypatch) -> None:
     service = ViewerService()
     source_pixels = np.arange(16, dtype=np.float32).reshape(4, 4)
     view = ViewRecord(
@@ -439,11 +439,14 @@ def test_fast_preview_reuses_windowed_base_pixels_for_pan_zoom(monkeypatch) -> N
     view.offset_y = -3.0
     view.zoom = 1.4
     render_once()
-    assert window_calls == 1
+    # Geometric resampling must happen while pixels are still quantitative
+    # scalars. Reusing a windowed base image here would interpolate display
+    # values and make PET/ROI results depend on the current LUT.
+    assert window_calls == 2
 
     view.window_center = 40.0
     render_once()
-    assert window_calls == 2
+    assert window_calls == 3
 
 
 def test_stack_fast_preview_without_server_overlay_stays_luminance(monkeypatch) -> None:
@@ -653,9 +656,13 @@ def test_mpr_model_rotation_changes_reslice_without_rotating_cursor() -> None:
     assert np.allclose(resolved_cursor.orientation_world, cursor.orientation_world, atol=1e-6)
 
 
-def test_mpr_measurement_world_points_reproject_with_rotated_model(monkeypatch) -> None:
+@pytest.mark.parametrize("modality", ("CT", "PT"))
+def test_mpr_measurement_world_points_reproject_with_rotated_model(
+    monkeypatch,
+    modality: str,
+) -> None:
     service = ViewerService()
-    series = SimpleNamespace(series_id="s", instances=[])
+    series = SimpleNamespace(series_id="s", instances=[], modality=modality)
     volume = np.zeros((5, 6, 7), dtype=np.float32)
     monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
     monkeypatch.setattr(service, "_get_series_volume", lambda resolved_series: volume)

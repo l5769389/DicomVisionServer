@@ -6,6 +6,13 @@ from app.services.viewer.shared import *  # noqa: F403
 
 
 class ViewerStateMixin:
+    # PET acquisitions are often reconstructed on a small matrix (for example
+    # 70 x 140).  Fit is based on physical pixel spacing and needs to be able
+    # to exceed the old 10x interaction ceiling on a workstation viewport.
+    # Leave a tiny rounding-safe perimeter, but never deliberately under-fit
+    # the image merely because it is PET.
+    _PET_AUTO_FIT_MARGIN = 0.98
+
     def _render_by_view_type(
         self,
         view: ViewRecord,
@@ -121,7 +128,11 @@ class ViewerStateMixin:
 
     @staticmethod
     def _is_pet_series(series: SeriesRecord | None) -> bool:
-        return str(series.modality or "").strip().upper() in {"PT", "PET"} if series is not None else False
+        return (
+            str(getattr(series, "modality", "") or "").strip().upper() in {"PT", "PET"}
+            if series is not None
+            else False
+        )
 
     def _initialize_pet_viewport(self, view: ViewRecord) -> None:
         ensure_view_size(view)
@@ -133,26 +144,21 @@ class ViewerStateMixin:
             raise HTTPException(status_code=400, detail="PET series does not contain image instances")
 
         pet_volume = self._get_series_volume(series)
-        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, None)
         view.pet_unit = pet_display.unit
         view.pet_unit_label = pet_display.unit_label
         view.current_index = max(0, min(self._resolve_representative_stack_index(series), pet_display.volume.shape[0] - 1))
-        image_height = int(pet_display.volume.shape[1]) if pet_display.volume.ndim >= 2 else 1
-        image_width = int(pet_display.volume.shape[2]) if pet_display.volume.ndim >= 3 else 1
-        view.zoom = compat.viewport_transformer.calculate_contain_zoom(
-            image_width=image_width,
-            image_height=image_height,
-            canvas_width=view.width,
-            canvas_height=view.height,
-        )
+        view.zoom = self._calculate_pet_fit_zoom_for_size(view, series, pet_display)
         view.offset_x = 0.0
         view.offset_y = 0.0
         view.rotation_degrees = 0
         view.hor_flip = False
         view.ver_flip = False
         view.pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
-        view.window_width = FUSION_DEFAULT_SUV_WINDOW_MAX - FUSION_DEFAULT_SUV_WINDOW_MIN
-        view.window_center = (FUSION_DEFAULT_SUV_WINDOW_MAX + FUSION_DEFAULT_SUV_WINDOW_MIN) / 2.0
+        auto_low, auto_high = derive_pet_auto_range(pet_display.volume, pet_display.unit)
+        view.window_width = auto_high - auto_low
+        view.window_center = (auto_high + auto_low) / 2.0
+        view.pet_control_window_max = derive_pet_control_range_max(auto_high, pet_display.unit)
         self._reset_drag_state(view)
         logger.info(
             "PET viewport initialized view_id=%s volume=%s unit=%s zoom=%.4f ww=%s wl=%s",
@@ -164,11 +170,65 @@ class ViewerStateMixin:
             view.window_center,
         )
 
+    def _get_pet_display_shape_and_aspect(
+        self,
+        series: SeriesRecord,
+        pet_display: FusionPetDisplayVolume,
+        current_index: int,
+    ) -> tuple[int, int, float, float]:
+        image_height = int(pet_display.volume.shape[1]) if pet_display.volume.ndim >= 2 else 1
+        image_width = int(pet_display.volume.shape[2]) if pet_display.volume.ndim >= 3 else 1
+        _, cached = self._get_indexed_instance_and_cache(series, current_index)
+        spacing_xy = self._get_stack_spacing_xy(cached.dataset) if cached is not None else None
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
+        return image_height, image_width, pixel_aspect_x, pixel_aspect_y
+
+    def _calculate_pet_fit_zoom_for_size(
+        self,
+        view: ViewRecord,
+        series: SeriesRecord,
+        pet_display: FusionPetDisplayVolume,
+        *,
+        canvas_width: int | None = None,
+        canvas_height: int | None = None,
+    ) -> float:
+        current_index = max(0, min(int(view.current_index or 0), pet_display.volume.shape[0] - 1))
+        image_height, image_width, pixel_aspect_x, pixel_aspect_y = self._get_pet_display_shape_and_aspect(
+            series,
+            pet_display,
+            current_index,
+        )
+        contain_zoom = compat.viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=canvas_width or view.width or image_width,
+            canvas_height=canvas_height or view.height or image_height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+            clamp_to_interaction_range=False,
+        )
+        return compat.viewport_transformer.clamp_zoom(contain_zoom * self._PET_AUTO_FIT_MARGIN)
+
     def _initialize_mpr_viewport(self, view: ViewRecord) -> None:
         ensure_view_size(view)
 
         series = compat.series_registry.get(view.series_id)
-        volume = self._get_series_volume(series)
+        source_volume = self._get_series_volume(series)
+        volume = source_volume
+        pet_display: FusionPetDisplayVolume | None = None
+        if self._is_pet_series(series):
+            requested_unit = (
+                view.view_group.pet_unit
+                if view.view_group is not None and view.view_group.window.window_width is not None
+                else None
+            )
+            pet_display = self._build_fusion_pet_display_volume(series, source_volume, requested_unit)
+            volume = pet_display.volume
+            view.pet_unit = pet_display.unit
+            view.pet_unit_label = pet_display.unit_label
+            if view.view_group is not None:
+                view.view_group.pet_unit = pet_display.unit
+                view.view_group.pet_unit_label = pet_display.unit_label
         if view.view_group is not None:
             if view.view_group.mpr_cursor is None:
                 self._reset_mpr_group_geometry(view.view_group, volume.shape, series=series)
@@ -178,7 +238,28 @@ class ViewerStateMixin:
             view.mpr_coronal_index = height // 2
             view.mpr_sagittal_index = width // 2
         self._reset_mpr_view_display_state(view)
-        self._reset_mpr_view_window(view, series, volume)
+        if pet_display is not None:
+            view.pseudocolor_preset = (
+                view.view_group.pet_pseudocolor_preset
+                if view.view_group is not None
+                else PET_STANDALONE_PSEUDOCOLOR_PRESET
+            )
+        existing_pet_window = (
+            (float(view.window_width), float(view.window_center))
+            if pet_display is not None and view.window_width is not None and view.window_center is not None
+            else None
+        )
+        if existing_pet_window is None:
+            self._reset_mpr_view_window(view, series, volume)
+        else:
+            view.window_width, view.window_center = existing_pet_window
+        if pet_display is not None and view.view_group is not None:
+            _auto_low, auto_high = derive_pet_auto_range(pet_display.volume, pet_display.unit)
+            if view.view_group.pet_control_window_max is None:
+                view.view_group.pet_control_window_max = derive_pet_control_range_max(
+                    auto_high,
+                    pet_display.unit,
+                )
         self._fit_mpr_view_to_plane(view, series, volume)
         logger.info(
             "mpr viewport initialized view_id=%s volume=%s axial=%s coronal=%s sagittal=%s zoom=%.4f",
@@ -255,11 +336,21 @@ class ViewerStateMixin:
         ensure_view_size(view)
 
         series = compat.series_registry.get(view.series_id)
-        volume = self._get_series_volume(series)
+        source_volume = self._get_series_volume(series)
+        pet_display: FusionPetDisplayVolume | None = None
+        if self._is_pet_series(series):
+            pet_display = self._build_fusion_pet_display_volume(series, source_volume, None)
+            volume = pet_display.volume
+            view.pet_unit = pet_display.unit
+            view.pet_unit_label = pet_display.unit_label
+        else:
+            volume = source_volume
         view.current_index = self._resolve_representative_stack_index(series)
 
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
-        if first_instance is not None and first_instance.sop_instance_uid:
+        if pet_display is not None:
+            view.window_width, view.window_center = self._derive_default_pet_window_for_display_volume(pet_display)
+        elif first_instance is not None and first_instance.sop_instance_uid:
             cached = compat.dicom_cache.get(first_instance.sop_instance_uid, first_instance.path)
             view.window_width = cached.window_width or self._derive_default_window_width(cached)
             view.window_center = cached.window_center or self._derive_default_window_center(cached)
@@ -273,7 +364,11 @@ class ViewerStateMixin:
         view.offset_x = 0.0
         view.offset_y = 0.0
         view.rotation_quaternion = compat._get_vtk_volume_renderer().get_default_rotation_quaternion()
-        view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
+        view.pseudocolor_preset = (
+            PET_STANDALONE_PSEUDOCOLOR_PRESET
+            if pet_display is not None
+            else DEFAULT_PSEUDOCOLOR_PRESET
+        )
         stats = build_volume_intensity_stats(volume, modality=series.modality)
         default_volume_preset = select_default_volume_preset(series, volume, stats=stats)
         view.volume_preset = default_volume_preset
@@ -323,23 +418,7 @@ class ViewerStateMixin:
 
     @staticmethod
     def _normalize_fusion_pet_unit(value: str | None) -> str:
-        normalized = str(value or FUSION_PET_UNIT_SUV_BW).strip()
-        aliases = {
-            "raw": FUSION_PET_UNIT_SOURCE,
-            "source": FUSION_PET_UNIT_SOURCE,
-            "BQML": FUSION_PET_UNIT_SOURCE,
-            "kBq/ml": FUSION_PET_UNIT_KBQML,
-            "kBqml": FUSION_PET_UNIT_KBQML,
-            "uptake": FUSION_PET_UNIT_KBQML,
-            "SUV": FUSION_PET_UNIT_SUV_BW,
-            "SUVbw": FUSION_PET_UNIT_SUV_BW,
-            "GML": FUSION_PET_UNIT_SUV_BW,
-            "SUVbsa": FUSION_PET_UNIT_SUV_BSA,
-            "SUL": FUSION_PET_UNIT_SUL,
-            "%ID/g": FUSION_PET_UNIT_PERCENT_ID_G,
-            "percentIDg": FUSION_PET_UNIT_PERCENT_ID_G,
-        }
-        return aliases.get(normalized, aliases.get(normalized.upper(), FUSION_PET_UNIT_SUV_BW))
+        return normalize_pet_unit(value)
 
     @staticmethod
     def _parse_dicom_datetime(date_value: object | None, time_value: object | None = None) -> datetime | None:
@@ -435,45 +514,16 @@ class ViewerStateMixin:
         return result if np.isfinite(result) else None
 
     def _resolve_pet_display_scale(self, dataset: Dataset | None, requested_unit: str) -> tuple[float, str, str]:
-        source_units = str(getattr(dataset, "Units", "") or "").strip().upper() if dataset is not None else ""
+        context = build_pet_quantification_context(dataset)
         unit = self._normalize_fusion_pet_unit(requested_unit)
-        if unit == FUSION_PET_UNIT_SOURCE:
-            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
-
-        if unit == FUSION_PET_UNIT_KBQML:
-            if source_units == "BQML":
-                return (0.001, unit, FUSION_PET_UNIT_LABELS[unit])
-            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
-
-        if source_units in {"GML", "SUVBW"} and unit == FUSION_PET_UNIT_SUV_BW:
-            return (1.0, FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SUV_BW])
-        if source_units != "BQML":
-            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
-
-        dose = self._resolve_pet_decay_corrected_dose_bq(dataset)
-        if dose is None or dose <= 0.0:
-            return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
-
-        weight_kg = self._safe_float(getattr(dataset, "PatientWeight", None))
-        height_m = self._safe_float(getattr(dataset, "PatientSize", None))
-        sex = str(getattr(dataset, "PatientSex", "") or "").upper()
-        if unit == FUSION_PET_UNIT_SUV_BW and weight_kg is not None and weight_kg > 0.0:
-            return ((weight_kg * 1000.0) / dose, unit, FUSION_PET_UNIT_LABELS[unit])
-        if unit == FUSION_PET_UNIT_SUV_BSA and weight_kg is not None and weight_kg > 0.0 and height_m is not None and height_m > 0.0:
-            height_cm = height_m * 100.0
-            bsa_cm2 = 0.007184 * (height_cm ** 0.725) * (weight_kg ** 0.425) * 10000.0
-            return (bsa_cm2 / dose, unit, FUSION_PET_UNIT_LABELS[unit])
-        if unit == FUSION_PET_UNIT_SUL and weight_kg is not None and weight_kg > 0.0 and height_m is not None and height_m > 0.0:
-            height_cm = height_m * 100.0
-            if sex == "F":
-                lbm_kg = 1.07 * weight_kg - 148.0 * ((weight_kg / height_cm) ** 2)
-            else:
-                lbm_kg = 1.10 * weight_kg - 128.0 * ((weight_kg / height_cm) ** 2)
-            if lbm_kg > 0.0:
-                return ((lbm_kg * 1000.0) / dose, unit, FUSION_PET_UNIT_LABELS[unit])
-        if unit == FUSION_PET_UNIT_PERCENT_ID_G:
-            return (100.0 / dose, unit, FUSION_PET_UNIT_LABELS[unit])
-        return (1.0, FUSION_PET_UNIT_SOURCE, source_units or FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SOURCE])
+        mapping = context.mapping_for(unit)
+        if mapping is None:
+            option = context.option_for(unit)
+            raise HTTPException(
+                status_code=422,
+                detail=f"PET unit {option.label} is unavailable: {option.reason or 'required metadata is missing'}",
+            )
+        return mapping.scale, unit, context.option_for(unit).label
 
     def _build_fusion_pet_display_volume(
         self,
@@ -482,42 +532,149 @@ class ViewerStateMixin:
         requested_unit: str | None,
     ) -> FusionPetDisplayVolume:
         _, cached = self._get_reference_instance_and_cache(pet_series)
-        scale, actual_unit, actual_label = self._resolve_pet_display_scale(
-            cached.dataset if cached is not None else None,
-            requested_unit or FUSION_PET_UNIT_SUV_BW,
+        dataset = cached.dataset if cached is not None else None
+        context = build_pet_quantification_context(dataset)
+        if context.support_status == "unsupported":
+            raise HTTPException(
+                status_code=422,
+                detail=context.support_reason or "This PET acquisition is not supported.",
+            )
+        actual_unit = (
+            self._normalize_fusion_pet_unit(requested_unit)
+            if requested_unit is not None
+            else context.preferred_unit()
         )
-        if abs(scale - 1.0) <= 1e-12:
-            display_volume = pet_volume
-        else:
-            display_volume = np.asarray(pet_volume, dtype=np.float32) * np.float32(scale)
+        mapping = context.mapping_for(actual_unit)
+        if mapping is None:
+            option = context.option_for(actual_unit)
+            raise HTTPException(
+                status_code=422,
+                detail=f"PET unit {option.label} is unavailable: {option.reason or 'required metadata is missing'}",
+            )
+        display_volume = apply_pet_mapping(pet_volume, mapping)
+        actual_label = context.option_for(actual_unit).label
         source_units = str(getattr(cached.dataset, "Units", "") or "").strip() if cached is not None else None
         return FusionPetDisplayVolume(
             volume=display_volume,
             unit=actual_unit,
             unit_label=actual_label,
             source_units=source_units or None,
-            scale=float(scale),
+            scale=float(mapping.scale),
+            offset=float(mapping.offset),
+            context=context,
         )
 
     def _derive_default_pet_window_for_display_volume(
         self,
         display: FusionPetDisplayVolume,
     ) -> tuple[float, float]:
-        finite = np.asarray(display.volume, dtype=np.float32)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            return (1.0, 0.5)
-        if display.unit in {FUSION_PET_UNIT_SUV_BW, FUSION_PET_UNIT_SUV_BSA, FUSION_PET_UNIT_SUL}:
-            window_width = FUSION_DEFAULT_SUV_WINDOW_MAX - FUSION_DEFAULT_SUV_WINDOW_MIN
-            window_center = (FUSION_DEFAULT_SUV_WINDOW_MAX + FUSION_DEFAULT_SUV_WINDOW_MIN) / 2.0
-            return (window_width, window_center)
-        positive = finite[finite > 0.0]
-        pet_window_values = positive if positive.size else finite
-        low = 0.0 if float(np.nanmin(finite)) >= 0.0 else float(np.nanpercentile(finite, 1.0))
-        high = float(np.nanpercentile(pet_window_values, 99.5))
-        if not np.isfinite(high) or high <= low:
-            high = low + 1.0
-        return (max(WINDOW_WIDTH_MIN, high - low), (high + low) / 2.0)
+        low, high = derive_pet_auto_range(display.volume, display.unit)
+        # PET uptake values can legitimately live far below 1.0 (for example
+        # low-activity BQML/SUV animal acquisitions).  The CT-wide minimum
+        # window width of 1 would silently expand 0..0.8 into a different
+        # display range. Keep the PET saturation point exact.
+        return (max(1e-6, high - low), (high + low) / 2.0)
+
+    def _build_pet_info(
+        self,
+        series: SeriesRecord,
+        display: FusionPetDisplayVolume,
+        *,
+        window_width: float | None,
+        window_center: float | None,
+        pseudocolor_preset: str,
+        control_window_max: float | None = None,
+        pet_pane_pseudocolor_preset: str | None = None,
+        fusion_overlay_pseudocolor_preset: str | None = None,
+    ) -> PetInfo:
+        context = display.context
+        if context is None:
+            _, cached = self._get_reference_instance_and_cache(series)
+            context = build_pet_quantification_context(cached.dataset if cached is not None else None)
+        auto_low, auto_high = derive_pet_auto_range(display.volume, display.unit)
+        status = (
+            "unsupported"
+            if context.support_status == "unsupported"
+            else "degraded"
+            if context.warnings or not context.quantitative
+            else "valid"
+        )
+        lut = pseudocolor_definition(pseudocolor_preset)
+        current_high = self._resolve_window_max(window_width, window_center)
+        unit_options: list[PetUnitAvailability] = []
+        display_scale = float(display.scale)
+        display_offset = float(display.offset)
+        for option in context.unit_options:
+            mapping = context.mapping_for(option.unit)
+            option_auto_low: float | None = None
+            option_auto_high: float | None = None
+            option_control_high: float | None = None
+            if mapping is not None and abs(display_scale) > 1e-12:
+                source_auto_low = (float(auto_low) - display_offset) / display_scale
+                source_auto_high = (float(auto_high) - display_offset) / display_scale
+                option_auto_low = source_auto_low * float(mapping.scale) + float(mapping.offset)
+                option_auto_high = source_auto_high * float(mapping.scale) + float(mapping.offset)
+                if option_auto_high < option_auto_low:
+                    option_auto_low, option_auto_high = option_auto_high, option_auto_low
+                option_control_high = derive_pet_control_range_max(option_auto_high, option.unit)
+            unit_options.append(
+                PetUnitAvailability(
+                    unit=option.unit,
+                    label=option.label,
+                    available=option.available,
+                    reason=option.reason,
+                    provenance=option.provenance,
+                    scale=float(mapping.scale) if mapping is not None else None,
+                    offset=float(mapping.offset) if mapping is not None else None,
+                    autoWindowMin=option_auto_low,
+                    autoWindowMax=option_auto_high,
+                    controlWindowMax=option_control_high,
+                )
+            )
+        return PetInfo(
+            seriesId=series.series_id,
+            sourceUnit=context.source_units,
+            sourceUnitLabel=context.source_unit_label,
+            petUnit=display.unit,
+            petUnitLabel=display.unit_label,
+            unitOptions=unit_options,
+            quantitative=context.quantitative,
+            quantificationStatus=status,
+            dicomUnits=context.source_units,
+            dicomSuvType=context.suv_type,
+            mappingProvenance=(
+                display.context.mapping_for(display.unit).provenance
+                if display.context is not None and display.context.mapping_for(display.unit) is not None
+                else context.mapping_provenance
+            ),
+            supportStatus=context.support_status,
+            supportReason=context.support_reason,
+            photometricInterpretation=context.photometric_interpretation,
+            warnings=list(context.warnings),
+            petWindowMin=self._resolve_window_min(window_width, window_center),
+            petWindowMax=self._resolve_window_max(window_width, window_center),
+            autoWindowMin=auto_low,
+            autoWindowMax=auto_high,
+            controlWindowMax=(
+                max(1e-6, float(control_window_max))
+                if control_window_max is not None and np.isfinite(float(control_window_max))
+                else max(
+                    derive_pet_control_range_max(auto_high, display.unit),
+                    float(current_high or auto_high),
+                )
+            ),
+            rangeIsAutoSuggestion=(
+                current_high is not None and abs(float(current_high) - float(auto_high)) <= 1e-6
+            ),
+            pseudocolorPreset=pseudocolor_preset,
+            lutId=lut.key,
+            lutVersion=lut.version,
+            lutHash=lut.sha256,
+            petPanePseudocolorPreset=pet_pane_pseudocolor_preset,
+            fusionOverlayPseudocolorPreset=fusion_overlay_pseudocolor_preset,
+            tracerName=context.tracer_name,
+            isFdg=context.is_fdg,
+        )
 
     @staticmethod
     def _prepare_pet_standalone_source_pixels(
@@ -525,37 +682,17 @@ class ViewerStateMixin:
         window_width: float | None,
         window_center: float | None,
     ) -> np.ndarray:
-        low = compat.ViewerService._resolve_window_min(window_width, window_center)
-        high = compat.ViewerService._resolve_window_max(window_width, window_center)
-        if low is None or high is None or not np.isfinite(low) or not np.isfinite(high) or high <= low:
-            return source_pixels
+        """Return quantitative PET pixels unchanged before display mapping.
 
-        pixels = np.asarray(source_pixels, dtype=np.float32)
-        if pixels.ndim < 2 or pixels.size == 0:
-            return pixels
-
-        edge_pixels = np.concatenate(
-            (
-                pixels[0, :].ravel(),
-                pixels[-1, :].ravel(),
-                pixels[:, 0].ravel(),
-                pixels[:, -1].ravel(),
-            )
-        )
-        edge_pixels = edge_pixels[np.isfinite(edge_pixels)]
-        if edge_pixels.size == 0:
-            return pixels
-
-        window_span = float(high) - float(low)
-        edge_threshold = float(np.nanpercentile(edge_pixels, 75.0))
-        threshold = min(edge_threshold, float(low) + window_span * 0.35)
-        if not np.isfinite(threshold) or threshold <= float(low):
-            return pixels
-
-        background_value = float(low) - max(1.0, window_span * 0.02)
-        prepared = pixels.copy()
-        prepared[prepared <= threshold] = background_value
-        return prepared
+        PET's low uptake is diagnostically meaningful.  The former edge-based
+        suppression replaced a variable portion of it with a synthetic zero
+        before the LUT was applied, so the same SUV range could look markedly
+        darker than a conventional PET workstation.  The window/LUT pipeline
+        already maps true zero to the active palette background; it must not
+        manufacture additional zero-valued pixels.
+        """
+        del window_width, window_center
+        return np.asarray(source_pixels, dtype=np.float32)
 
     def _derive_default_window_for_volume(self, series: SeriesRecord, volume: np.ndarray) -> tuple[float, float]:
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
@@ -743,6 +880,54 @@ class ViewerStateMixin:
         tolerance = max(1e-3, abs(float(expected_zoom)) * 1e-3)
         return abs(float(view.zoom) - float(expected_zoom)) <= tolerance
 
+    def _is_pet_view_at_auto_fit_size(
+        self,
+        view: ViewRecord,
+        *,
+        canvas_width: int | None,
+        canvas_height: int | None,
+    ) -> bool:
+        if not canvas_width or not canvas_height:
+            return False
+        if (
+            abs(float(view.offset_x)) > 1e-6
+            or abs(float(view.offset_y)) > 1e-6
+            or int(view.rotation_degrees) != 0
+            or bool(view.hor_flip)
+            or bool(view.ver_flip)
+        ):
+            return False
+
+        series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        if not self._is_pet_series(series):
+            return False
+        pet_volume = self._get_series_volume(series)
+        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        expected_zoom = self._calculate_pet_fit_zoom_for_size(
+            view,
+            series,
+            pet_display,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
+        tolerance = max(1e-3, abs(float(expected_zoom)) * 1e-3)
+        return abs(float(view.zoom) - float(expected_zoom)) <= tolerance
+
+    def _fit_initialized_pet_view_to_source(self, view: ViewRecord) -> None:
+        series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        if not self._is_pet_series(series):
+            return
+        pet_volume = self._get_series_volume(series)
+        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        view.pet_unit = pet_display.unit
+        view.pet_unit_label = pet_display.unit_label
+        view.current_index = max(0, min(int(view.current_index or 0), pet_display.volume.shape[0] - 1))
+        view.zoom = self._calculate_pet_fit_zoom_for_size(view, series, pet_display)
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        self._reset_drag_state(view)
+        view.is_initialized = True
+
     def _fit_initialized_fusion_view_to_source(self, view: ViewRecord) -> None:
         _group, ct_series, pet_series = self._resolve_fusion_group_series(view)
         ct_volume = self._get_series_volume(ct_series)
@@ -809,6 +994,26 @@ class ViewerStateMixin:
     def _initialize_fusion_viewport(self, view: ViewRecord) -> None:
         ensure_view_size(view)
         group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        _, ct_cached = self._get_reference_instance_and_cache(ct_series)
+        _, pet_cached = self._get_reference_instance_and_cache(pet_series)
+        ct_frame_uid = str(getattr(ct_cached.dataset, "FrameOfReferenceUID", "") or "") if ct_cached else ""
+        pet_frame_uid = str(getattr(pet_cached.dataset, "FrameOfReferenceUID", "") or "") if pet_cached else ""
+        has_manual_registration = any(
+            abs(float(value)) > 1e-6
+            for value in (
+                group.fusion_registration.translate_row_mm,
+                group.fusion_registration.translate_col_mm,
+                group.fusion_registration.rotation_degrees,
+            )
+        )
+        if ct_frame_uid and pet_frame_uid and ct_frame_uid != pet_frame_uid and not has_manual_registration:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "PET/CT Frame of Reference does not match. "
+                    "Automatic fusion is blocked until a valid registration is provided."
+                ),
+            )
         ct_volume = self._get_series_volume(ct_series)
         pet_volume = self._get_series_volume(pet_series)
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
@@ -816,15 +1021,23 @@ class ViewerStateMixin:
         if not group.fusion_initialized:
             group.fusion_axial_index = ct_volume.shape[0] // 2
             ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
-            group.fusion_pet_unit = self._normalize_fusion_pet_unit(group.fusion_pet_unit)
-            pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
+            pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, None)
             group.fusion_pet_unit = pet_display.unit
             pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
             group.window.window_width = ct_ww
             group.window.window_center = ct_wl
             group.fusion_pet_window.window_width = pet_ww
             group.fusion_pet_window.window_center = pet_wl
-            group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(group.fusion_pet_pseudocolor_preset or "petct-rainbow")
+            group.fusion_pet_control_window_max = derive_pet_control_range_max(
+                derive_pet_auto_range(pet_display.volume, pet_display.unit)[1],
+                pet_display.unit,
+            )
+            group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(
+                group.fusion_pet_pseudocolor_preset or PET_STANDALONE_PSEUDOCOLOR_PRESET
+            )
+            group.fusion_pet_pane_pseudocolor_preset = normalize_pseudocolor_preset(
+                group.fusion_pet_pane_pseudocolor_preset or PET_STANDALONE_PSEUDOCOLOR_PRESET
+            )
             group.fusion_initialized = True
         self._fit_fusion_view_to_source(
             view,
@@ -845,7 +1058,7 @@ class ViewerStateMixin:
         if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
             view.window_width = group.fusion_pet_window.window_width
             view.window_center = group.fusion_pet_window.window_center
-            view.pseudocolor_preset = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET
+            view.pseudocolor_preset = group.fusion_pet_pane_pseudocolor_preset
         elif role == FUSION_PANE_OVERLAY_AXIAL:
             view.window_width = group.window.window_width
             view.window_center = group.window.window_center
@@ -863,8 +1076,15 @@ class ViewerStateMixin:
         self._clear_fusion_registration_overlay_frame_locks(group)
         self._fusion_registration_preview_drags.pop(group.group_id, None)
         group.fusion_initialized = False
-        group.fusion_pet_pseudocolor_preset = "petct-rainbow"
-        group.fusion_pet_unit = FUSION_PET_UNIT_SUV_BW
+        group.fusion_pet_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        group.fusion_pet_pane_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        # The next initialization resolves the preferred available PET unit.
+        # Keep this empty meanwhile instead of publishing a transient Source
+        # state that can race the SUV response in the client.
+        group.fusion_pet_unit = ""
+        group.fusion_pet_control_window_max = None
+        group.fusion_window_target = "ct"
+        group.fusion_alpha = 0.52
         group.fusion_registration = FusionRegistrationState()
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
@@ -877,6 +1097,54 @@ class ViewerStateMixin:
             self._reset_drag_state(group_view)
             self._initialize_fusion_viewport(group_view)
 
+    def _reset_active_fusion_pane(self, view: ViewRecord) -> None:
+        """Reset only the active fusion capability without discarding registration or the other modality."""
+
+        group = view.view_group
+        if group is None:
+            self._initialize_fusion_viewport(view)
+            return
+        group, ct_series, pet_series = self._resolve_fusion_group_series(view)
+        ct_volume = self._get_series_volume(ct_series)
+        pet_volume = self._get_series_volume(pet_series)
+        role = self._resolve_fusion_pane_role(view)
+
+        if role == FUSION_PANE_CT_AXIAL:
+            ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
+            group.window.window_width = ct_ww
+            group.window.window_center = ct_wl
+        elif role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
+            pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, None)
+            pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
+            group.fusion_pet_unit = pet_display.unit
+            group.fusion_pet_window.window_width = pet_ww
+            group.fusion_pet_window.window_center = pet_wl
+            group.fusion_pet_control_window_max = derive_pet_control_range_max(
+                derive_pet_auto_range(pet_display.volume, pet_display.unit)[1],
+                pet_display.unit,
+            )
+            group.fusion_pet_pane_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        else:
+            group.fusion_pet_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+            group.fusion_window_target = "ct"
+            group.fusion_alpha = 0.52
+
+        self._clear_fusion_registration_overlay_frame_locks(group)
+        self._fusion_registration_preview_drags.pop(group.group_id, None)
+        group.fusion_revision += 1
+        for group_view in self._get_fusion_geometry_views(view):
+            group_view.offset_x = 0.0
+            group_view.offset_y = 0.0
+            group_view.zoom = 1.0
+            group_view.rotation_degrees = 0
+            group_view.hor_flip = False
+            group_view.ver_flip = False
+            self._reset_drag_state(group_view)
+            self._initialize_fusion_viewport(group_view)
+        for group_view in self._get_group_views(view):
+            self._sync_fusion_view_state_from_group(group_view)
+            group_view.is_initialized = True
+
     def _reset_view(self, view: ViewRecord) -> None:
         if self._is_mpr_view_type(view.view_type):
             self._reset_mpr_view_group(view)
@@ -888,8 +1156,6 @@ class ViewerStateMixin:
         elif self._is_fusion_view_type(view.view_type):
             self._reset_fusion_view_group(view)
         elif self._is_pet_view_type(view.view_type):
-            view.pet_unit = FUSION_PET_UNIT_SUV_BW
-            view.pet_unit_label = FUSION_PET_UNIT_LABELS[FUSION_PET_UNIT_SUV_BW]
             self._initialize_pet_viewport(view)
         else:
             view.rotation_degrees = 0
@@ -899,13 +1165,80 @@ class ViewerStateMixin:
 
         view.is_initialized = True
 
+    def _reset_view_zoom_state(self, view: ViewRecord, series: SeriesRecord) -> bool:
+        ensure_view_size(view)
+
+        if self._is_mpr_view_type(view.view_type):
+            source_volume = self._get_series_volume(series)
+            volume = source_volume
+            if self._is_pet_series(series):
+                requested_unit = (
+                    view.view_group.pet_unit
+                    if view.view_group is not None and view.view_group.pet_unit
+                    else view.pet_unit
+                )
+                pet_display = self._build_fusion_pet_display_volume(series, source_volume, requested_unit)
+                volume = pet_display.volume
+                view.pet_unit = pet_display.unit
+                view.pet_unit_label = pet_display.unit_label
+                if view.view_group is not None:
+                    view.view_group.pet_unit = pet_display.unit
+                    view.view_group.pet_unit_label = pet_display.unit_label
+            self._fit_mpr_view_to_plane(view, series, volume)
+            self._reset_drag_state(view)
+            view.is_initialized = True
+            return True
+
+        if self._is_pet_view_type(view.view_type):
+            self._fit_initialized_pet_view_to_source(view)
+            return True
+
+        if self._is_fusion_view_type(view.view_type):
+            self._fit_initialized_fusion_view_to_source(view)
+            self._reset_drag_state(view)
+            view.is_initialized = True
+            return True
+
+        if self._is_3d_view_type(view.view_type):
+            view.zoom = 1.0
+            self._reset_drag_state(view)
+            view.is_initialized = True
+            return True
+
+        if not series.instances:
+            return False
+        current_index = max(0, min(int(view.current_index or 0), len(series.instances) - 1))
+        instance = series.instances[current_index]
+        if not instance.sop_instance_uid:
+            return False
+        cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
+        image_height, image_width = cached.source_pixels.shape[:2]
+        view.zoom = compat.viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=view.width or image_width,
+            canvas_height=view.height or image_height,
+        )
+        self._reset_drag_state(view)
+        view.is_initialized = True
+        return True
+
     def _reset_mpr_view_group(self, view: ViewRecord) -> None:
         group_views = self._get_mpr_group_views(view)
         group = view.view_group
         if group is not None:
+            active_viewport = self._normalize_mpr_active_viewport(group.active_viewport)
             series = compat.series_registry.get(view.series_id)
-            volume = self._get_series_volume(series)
-            self._reset_mpr_group_geometry(group, volume.shape, series=series)
+            source_volume = self._get_series_volume(series)
+            if self._is_pet_series(series):
+                pet_display = self._build_fusion_pet_display_volume(series, source_volume, None)
+                group.pet_unit = pet_display.unit
+                group.pet_unit_label = pet_display.unit_label
+                group.pet_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+                volume = pet_display.volume
+            else:
+                volume = source_volume
+            self._reset_mpr_group_geometry(group, volume.shape, series=series, active_viewport=active_viewport)
         else:
             series = None
             volume = None
@@ -913,6 +1246,10 @@ class ViewerStateMixin:
         for group_view in group_views:
             if group is not None and series is not None and volume is not None:
                 self._reset_mpr_view_display_state(group_view)
+                if self._is_pet_series(series):
+                    group_view.pet_unit = group.pet_unit
+                    group_view.pet_unit_label = group.pet_unit_label
+                    group_view.pseudocolor_preset = group.pet_pseudocolor_preset
                 self._reset_mpr_view_window(group_view, series, volume)
                 self._fit_mpr_view_to_plane(group_view, series, volume)
             else:
@@ -924,13 +1261,19 @@ class ViewerStateMixin:
         if group is None:
             return False
         series = compat.series_registry.get(view.series_id)
-        volume = self._get_series_volume(series)
+        source_volume = self._get_series_volume(series)
+        volume = (
+            self._build_fusion_pet_display_volume(series, source_volume, group.pet_unit).volume
+            if self._is_pet_series(series)
+            else source_volume
+        )
         volume_shape = volume.shape
         default_frame = self._build_default_mpr_frame_state(volume_shape)
         geometry = self._get_series_volume_geometry(series, volume_shape)
         default_cursor = legacy_frame_to_cursor(default_frame, geometry, reference_center=default_frame.center)
+        active_viewport = self._normalize_mpr_active_viewport(group.active_viewport)
 
-        group.active_viewport = MPR_VIEWPORT_AXIAL
+        group.active_viewport = active_viewport
         group.crosshair_drag_active = False
         group.crosshair_drag_origin_center = None
         group.crosshair_drag_origin_image = None
@@ -973,8 +1316,9 @@ class ViewerStateMixin:
         volume_shape: tuple[int, int, int],
         *,
         series: SeriesRecord | None = None,
+        active_viewport: str | None = None,
     ) -> None:
-        group.active_viewport = MPR_VIEWPORT_AXIAL
+        group.active_viewport = self._normalize_mpr_active_viewport(active_viewport)
         group.crosshair_drag_active = False
         group.crosshair_drag_origin_center = None
         group.crosshair_drag_origin_image = None
@@ -993,6 +1337,12 @@ class ViewerStateMixin:
         self._sync_group_from_mpr_cursor(group, default_cursor, geometry, volume_shape)
         self._reset_mpr_rotation_state(group)
 
+    @staticmethod
+    def _normalize_mpr_active_viewport(value: object) -> str:
+        if value in (MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL):
+            return str(value)
+        return MPR_VIEWPORT_AXIAL
+
     def _reset_mpr_view_display_state(self, view: ViewRecord) -> None:
         view.current_index = view.mpr_axial_index
         view.offset_x = 0.0
@@ -1005,6 +1355,17 @@ class ViewerStateMixin:
         self._reset_drag_state(view)
 
     def _reset_mpr_view_window(self, view: ViewRecord, series: SeriesRecord, volume: np.ndarray) -> None:
+        if self._is_pet_series(series):
+            unit = view.view_group.pet_unit if view.view_group is not None else view.pet_unit
+            low, high = derive_pet_auto_range(volume, unit)
+            # PET is a quantitative floating-point modality.  Its useful
+            # display range is commonly well below 1 SUV (and can be far
+            # smaller in Source/BQML-derived units), so the CT-oriented
+            # WINDOW_WIDTH_MIN=1 guard would silently expand e.g. 0..0.08 to
+            # 0..1 and make the first MPR render much darker than reset/2D.
+            view.window_width = max(1e-6, high - low)
+            view.window_center = (high + low) / 2.0
+            return
         first_instance = next((instance for instance in series.instances if instance.sop_instance_uid), None)
         if first_instance is not None and first_instance.sop_instance_uid:
             cached = compat.dicom_cache.get(first_instance.sop_instance_uid, first_instance.path)
@@ -1016,18 +1377,81 @@ class ViewerStateMixin:
         view.window_width = max(WINDOW_WIDTH_MIN, pixel_max - pixel_min)
         view.window_center = (pixel_max + pixel_min) / 2.0
 
-    def _fit_mpr_view_to_plane(self, view: ViewRecord, series: SeriesRecord, volume: np.ndarray) -> None:
+    def _calculate_mpr_fit_zoom_for_size(
+        self,
+        view: ViewRecord,
+        series: SeriesRecord,
+        volume: np.ndarray,
+        *,
+        canvas_width: int | None = None,
+        canvas_height: int | None = None,
+    ) -> float:
         plane_pixels, _, _ = self._extract_mpr_plane(view, volume)
         target_viewport = self._resolve_mpr_viewport(view)
         pose_context = self._build_mpr_pose_context(view, volume.shape, series=series)
         pixel_aspect_x, pixel_aspect_y = self._get_mpr_display_aspect_xy_from_pose(
             pose_context.poses[target_viewport]
         )
-        view.zoom = compat.viewport_transformer.calculate_contain_zoom(
+        contain_zoom = compat.viewport_transformer.calculate_contain_zoom(
             image_width=plane_pixels.shape[1],
             image_height=plane_pixels.shape[0],
-            canvas_width=view.width or plane_pixels.shape[1],
-            canvas_height=view.height or plane_pixels.shape[0],
+            canvas_width=canvas_width or view.width or plane_pixels.shape[1],
+            canvas_height=canvas_height or view.height or plane_pixels.shape[0],
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
+            clamp_to_interaction_range=not self._is_pet_series(series),
         )
+        return (
+            compat.viewport_transformer.clamp_zoom(contain_zoom * self._PET_AUTO_FIT_MARGIN)
+            if self._is_pet_series(series)
+            else contain_zoom
+        )
+
+    def _fit_mpr_view_to_plane(self, view: ViewRecord, series: SeriesRecord, volume: np.ndarray) -> None:
+        view.zoom = self._calculate_mpr_fit_zoom_for_size(view, series, volume)
+
+    def _is_mpr_view_at_auto_fit_size(
+        self,
+        view: ViewRecord,
+        *,
+        canvas_width: int | None,
+        canvas_height: int | None,
+    ) -> bool:
+        if not canvas_width or not canvas_height:
+            return False
+        if (
+            abs(float(view.offset_x)) > 1e-6
+            or abs(float(view.offset_y)) > 1e-6
+            or int(view.rotation_degrees) != 0
+            or bool(view.hor_flip)
+            or bool(view.ver_flip)
+        ):
+            return False
+        series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        volume = self._get_series_volume(series)
+        if self._is_pet_series(series):
+            pet_display = self._build_fusion_pet_display_volume(series, volume, view.pet_unit)
+            volume = pet_display.volume
+        expected_zoom = self._calculate_mpr_fit_zoom_for_size(
+            view,
+            series,
+            volume,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
+        tolerance = max(1e-3, abs(float(expected_zoom)) * 1e-3)
+        return abs(float(view.zoom) - float(expected_zoom)) <= tolerance
+
+    def _fit_initialized_mpr_view_to_source(self, view: ViewRecord) -> None:
+        series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        volume = self._get_series_volume(series)
+        if self._is_pet_series(series):
+            pet_display = self._build_fusion_pet_display_volume(series, volume, view.pet_unit)
+            volume = pet_display.volume
+            view.pet_unit = pet_display.unit
+            view.pet_unit_label = pet_display.unit_label
+        self._fit_mpr_view_to_plane(view, series, volume)
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        self._reset_drag_state(view)
+        view.is_initialized = True

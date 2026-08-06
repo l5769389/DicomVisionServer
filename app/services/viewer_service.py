@@ -88,6 +88,26 @@ class ViewerService(
                 canvas_height=previous_height,
             )
         )
+        should_refit_pet = (
+            self._is_pet_view_type(view.view_type)
+            and view.is_initialized
+            and size_changed
+            and self._is_pet_view_at_auto_fit_size(
+                view,
+                canvas_width=previous_width,
+                canvas_height=previous_height,
+            )
+        )
+        should_refit_mpr = (
+            self._is_mpr_view_type(view.view_type)
+            and view.is_initialized
+            and size_changed
+            and self._is_mpr_view_at_auto_fit_size(
+                view,
+                canvas_width=previous_width,
+                canvas_height=previous_height,
+            )
+        )
         view.width = payload.size.width
         view.height = payload.size.height
         if (
@@ -102,7 +122,11 @@ class ViewerService(
             view.height,
         )
 
-        if not view.is_initialized:
+        needs_initialization = not view.is_initialized or (
+            self._is_pet_view_type(view.view_type)
+            and (not previous_width or not previous_height)
+        )
+        if needs_initialization:
             if self._is_fusion_view_type(view.view_type):
                 self._initialize_fusion_viewport(view)
             elif self._is_pet_view_type(view.view_type):
@@ -113,6 +137,10 @@ class ViewerService(
                 view.is_initialized = True
         elif should_refit_fusion:
             self._fit_initialized_fusion_view_to_source(view)
+        elif should_refit_pet:
+            self._fit_initialized_pet_view_to_source(view)
+        elif should_refit_mpr:
+            self._fit_initialized_mpr_view_to_source(view)
 
         return OperationAcceptedResponse(message="View size updated", viewId=view.view_id)
 

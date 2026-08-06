@@ -213,6 +213,7 @@ def _render_full_resolution_preview_broadcast(
     *,
     viewports: tuple[str, ...] | None = None,
     metadata_mode: str = "full",
+    emit_mpr_state_update: bool = False,
 ) -> RenderDecision:
     return _render_broadcast(
         "webp",
@@ -220,6 +221,7 @@ def _render_full_resolution_preview_broadcast(
         fast_preview_full_resolution=True,
         metadata_mode=metadata_mode,
         viewports=viewports,
+        emit_mpr_state_update=emit_mpr_state_update,
     )
 
 
@@ -449,11 +451,15 @@ def _handle_window_operation(
             return _render_full_resolution_preview_broadcast(metadata_mode="mpr-pixel-preview")
         return _render_broadcast()
 
-    if service._is_pet_view_type(view.view_type):
+    if service._is_pet_view_type(view.view_type) or service._is_pet_series(series):
         if not service._handle_pet_window(view, payload):
             return _render_none()
         if payload.action_type == DRAG_ACTION_START:
             return _render_none()
+        if is_mpr_view:
+            if payload.action_type == DRAG_ACTION_MOVE:
+                return _render_full_resolution_preview_broadcast(metadata_mode="mpr-pixel-preview")
+            return _render_broadcast()
         return _render_single(
             "webp",
             fast_preview=payload.action_type == DRAG_ACTION_MOVE,
@@ -530,13 +536,16 @@ def _handle_pseudocolor_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series, is_mpr_view
     if payload.pseudocolor_preset is None:
         return _render_none()
     if service._is_fusion_view_type(view.view_type):
         if not service._handle_fusion_pseudocolor(view, payload):
             return _render_none()
         return _render_broadcast()
+    if service._is_pet_series(series):
+        if not service._handle_pet_config(view, payload):
+            return _render_none()
+        return _render_broadcast() if is_mpr_view else _render_single()
     service._handle_pseudocolor(view, payload)
     if not view.width or not view.height:
         return _render_none()
@@ -559,8 +568,11 @@ def _handle_rotate_3d_operation(
         if not service._handle_mpr_model_rotate_3d(view, payload):
             return _render_none()
         if payload.action_type == DRAG_ACTION_MOVE:
-            return _render_full_resolution_preview_broadcast(metadata_mode="mpr-pan-zoom-preview")
-        return _render_broadcast()
+            return _render_full_resolution_preview_broadcast(
+                metadata_mode="mpr-model-rotate-preview",
+                emit_mpr_state_update=True,
+            )
+        return _render_broadcast(emit_mpr_state_update=True)
     service._handle_drag_rotate_3d(view, payload)
     return _resolve_drag_single_render_decision(
         service,
@@ -593,6 +605,28 @@ def _handle_transform_2d_operation(
     return _render_single()
 
 
+def _reset_payload_has_pet_config(payload: ViewOperationRequest) -> bool:
+    return (
+        payload.pseudocolor_preset is not None
+        or payload.pet_unit is not None
+        or payload.pet_window_min is not None
+        or payload.pet_window_max is not None
+    )
+
+
+def _apply_pet_config_embedded_in_reset(
+    service: ViewerService,
+    view: ViewRecord,
+    series: SeriesRecord,
+    payload: ViewOperationRequest,
+) -> None:
+    if not _reset_payload_has_pet_config(payload):
+        return
+    if not service._is_pet_view_type(view.view_type) and not service._is_pet_series(series):
+        return
+    service._handle_pet_config(view, payload)
+
+
 def _handle_reset_operation(
     service: ViewerService,
     view: ViewRecord,
@@ -600,7 +634,6 @@ def _handle_reset_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series
     reset_target = str(payload.sub_op_type or "view").strip().lower()
 
     if reset_target == "measurements":
@@ -621,10 +654,20 @@ def _handle_reset_operation(
     if reset_target in {"rotate3d", "rotate-3d", "3drotation"}:
         if not service._reset_rotate_3d_state(view):
             return _render_none()
+        return _render_broadcast(emit_mpr_state_update=True) if is_mpr_view else _render_single()
+
+    if reset_target in {"zoom", "transformzoom", "transform-zoom", "transform:zoom"}:
+        if not service._reset_view_zoom_state(view, series):
+            return _render_none()
         return _render_broadcast() if is_mpr_view else _render_single()
 
     if service._is_fusion_view_type(view.view_type):
-        service._reset_view(view)
+        if reset_target == "all":
+            service._clear_measurements(view)
+            service._clear_annotations(view)
+            service._reset_view(view)
+        else:
+            service._reset_active_fusion_pane(view)
         return _render_broadcast()
 
     if reset_target in {"mtf"}:
@@ -634,9 +677,11 @@ def _handle_reset_operation(
         service._clear_measurements(view)
         service._clear_annotations(view)
         service._reset_view(view)
+        _apply_pet_config_embedded_in_reset(service, view, series, payload)
         return _render_broadcast() if is_mpr_view else _render_single()
 
     service._reset_view(view)
+    _apply_pet_config_embedded_in_reset(service, view, series, payload)
     return _render_broadcast() if is_mpr_view else _render_single()
 
 
@@ -797,7 +842,7 @@ def _handle_mpr_segmentation_operation(
         return _render_none()
     if payload.action_type == DRAG_ACTION_MOVE:
         return _render_full_resolution_preview_single(defer=True, metadata_mode="mpr-segmentation-preview")
-    return _render_broadcast()
+    return _render_broadcast(emit_mpr_state_update=True)
 
 
 def _handle_mpr_oblique_operation(
@@ -905,12 +950,11 @@ def _handle_pet_config_operation(
     payload: ViewOperationRequest,
     is_mpr_view: bool,
 ) -> RenderDecision:
-    del series, is_mpr_view
-    if not service._is_pet_view_type(view.view_type):
+    if not service._is_pet_view_type(view.view_type) and not service._is_pet_series(series):
         return _render_none()
     if not service._handle_pet_config(view, payload):
         return _render_none()
-    return _render_single()
+    return _render_broadcast() if is_mpr_view else _render_single()
 
 
 def _handle_generic_operation(

@@ -116,6 +116,7 @@ class ViewportTransformer:
         *,
         pixel_aspect_x: float = 1.0,
         pixel_aspect_y: float = 1.0,
+        clamp_to_interaction_range: bool = True,
     ) -> float:
         if image_width <= 0 or image_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
             return 1.0
@@ -125,7 +126,7 @@ class ViewportTransformer:
             canvas_width / (image_width * resolved_aspect_x),
             canvas_height / (image_height * resolved_aspect_y),
         )
-        return self.clamp_zoom(contain_zoom)
+        return self.clamp_zoom(contain_zoom) if clamp_to_interaction_range else contain_zoom
 
     def apply_affine_array(
         self,
@@ -135,7 +136,7 @@ class ViewportTransformer:
         transform: AffineTransform,
         *,
         order: int = 1,
-        cval: float = 0.0,
+        cval: float | tuple[int, ...] = 0.0,
     ) -> np.ndarray:
         affine_matrix, offset = transform.inverse_components()
         affine_transform = _get_affine_transform()
@@ -144,6 +145,17 @@ class ViewportTransformer:
         array_matrix = affine_matrix[[1, 0]][:, [1, 0]]
         array_offset = offset[[1, 0]]
         if image_array.ndim == 3:
+            channel_cvals = (
+                (float(cval),) * image_array.shape[-1]
+                if np.isscalar(cval)
+                else tuple(float(value) for value in cval)
+            )
+            if len(channel_cvals) == 3 and image_array.shape[-1] == 4:
+                # PET registration overlays are RGBA. Keep padding transparent
+                # while preserving the active LUT colour in RGB channels.
+                channel_cvals = (*channel_cvals, 0.0)
+            if len(channel_cvals) != image_array.shape[-1]:
+                raise ValueError("Colour affine padding must provide one value per channel")
             transformed = np.stack(
                 [
                     affine_transform(
@@ -153,7 +165,7 @@ class ViewportTransformer:
                         output_shape=(canvas_height, canvas_width),
                         order=order,
                         mode="constant",
-                        cval=cval,
+                        cval=channel_cvals[channel_index],
                     )
                     for channel_index in range(image_array.shape[-1])
                 ],
@@ -169,8 +181,8 @@ class ViewportTransformer:
                 mode="constant",
                 cval=cval,
             )
-        if transformed.dtype != np.uint8:
-            transformed = np.clip(transformed, 0, 255).astype(np.uint8)
+        # Keep floating-point quantitative arrays intact. Windowing and LUT
+        # application happen after geometry resampling.
         return transformed
 
     def apply_affine(

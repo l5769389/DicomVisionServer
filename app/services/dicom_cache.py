@@ -103,8 +103,16 @@ class DicomCache:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to decode pixel data: {exc}") from exc
 
-        # The viewer currently treats enhanced/multi-frame files as a single 2D frame.
-        # Keep this choice explicit so adding true multi-frame support has one obvious branch.
+        modality = str(getattr(dataset, "Modality", "") or "").upper()
+        number_of_frames = int(getattr(dataset, "NumberOfFrames", 1) or 1)
+        if modality == "PT" and number_of_frames > 1:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Enhanced or multi-frame PET is not supported yet. "
+                    "Shared and per-frame functional groups must be decoded before display."
+                ),
+            )
         if pixels.ndim == 4:
             pixels = pixels[0]
 
@@ -121,6 +129,11 @@ class DicomCache:
             return pixels
 
         if pixels.ndim == 3:
+            if modality == "PT":
+                raise HTTPException(
+                    status_code=422,
+                    detail="Multi-frame PET is not supported yet; the first frame will not be displayed silently.",
+                )
             pixels = pixels[0]
 
         pixels = pixels.astype(np.float32)
@@ -129,10 +142,8 @@ class DicomCache:
         intercept = float(getattr(dataset, "RescaleIntercept", 0.0))
         pixels = pixels * slope + intercept
 
-        # MONOCHROME1 stores lower values as visually brighter. Negating keeps the
-        # downstream windowing path using the same "larger value is brighter" model.
-        if getattr(dataset, "PhotometricInterpretation", "") == "MONOCHROME1":
-            pixels = -pixels
+        # Photometric Interpretation is presentation metadata. Never invert
+        # quantitative scalar values here.
         logger.debug(
             "source pixels extracted rows=%s cols=%s slope=%s intercept=%s min=%.3f max=%.3f",
             pixels.shape[0],

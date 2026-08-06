@@ -38,6 +38,8 @@ def build_measurement_metrics(
     points: tuple[MeasurementPoint, ...],
     source_pixels: np.ndarray,
     spacing_xy: tuple[float, float] | None,
+    *,
+    intensity_unit: str | None = None,
 ) -> tuple[MeasurementMetrics, tuple[str, ...]]:
     if tool_type == "line":
         return _build_line_metrics(points[:2], spacing_xy)
@@ -46,15 +48,15 @@ def build_measurement_metrics(
     if tool_type == "alignment-vertical":
         return _build_alignment_angle_metrics(points[:2], spacing_xy, reference_axis="vertical")
     if tool_type == "rect":
-        return _build_rect_metrics(points[:2], source_pixels, spacing_xy)
+        return _build_rect_metrics(points[:2], source_pixels, spacing_xy, intensity_unit=intensity_unit)
     if tool_type == "ellipse":
-        return _build_ellipse_metrics(points[:2], source_pixels, spacing_xy)
+        return _build_ellipse_metrics(points[:2], source_pixels, spacing_xy, intensity_unit=intensity_unit)
     if tool_type == "angle":
         return _build_angle_metrics(points[:3], spacing_xy)
     if tool_type == "curve":
         return _build_curve_metrics(points, spacing_xy)
     if tool_type == "freeform":
-        return _build_freeform_metrics(points, source_pixels, spacing_xy)
+        return _build_freeform_metrics(points, source_pixels, spacing_xy, intensity_unit=intensity_unit)
     raise ValueError(f"Unsupported measurement tool type: {tool_type}")
 
 
@@ -141,6 +143,8 @@ def _build_rect_metrics(
     points: tuple[MeasurementPoint, ...],
     source_pixels: np.ndarray,
     spacing_xy: tuple[float, float] | None,
+    *,
+    intensity_unit: str | None = None,
 ) -> tuple[MeasurementMetrics, tuple[str, ...]]:
     left, top, right, bottom = _resolve_bounds(points)
     clipped_left, clipped_top, clipped_right, clipped_bottom = _clip_bounds_to_image(left, top, right, bottom, source_pixels)
@@ -175,6 +179,7 @@ def _build_rect_metrics(
                 minimum=stats.minimum,
                 maximum=stats.maximum,
                 standard_deviation=stats.standard_deviation,
+                intensity_unit=intensity_unit,
             ),
         )
 
@@ -202,6 +207,7 @@ def _build_rect_metrics(
             minimum=stats.minimum,
             maximum=stats.maximum,
             standard_deviation=stats.standard_deviation,
+            intensity_unit=intensity_unit,
         ),
     )
 
@@ -210,6 +216,8 @@ def _build_ellipse_metrics(
     points: tuple[MeasurementPoint, ...],
     source_pixels: np.ndarray,
     spacing_xy: tuple[float, float] | None,
+    *,
+    intensity_unit: str | None = None,
 ) -> tuple[MeasurementMetrics, tuple[str, ...]]:
     left, top, right, bottom = _resolve_bounds(points)
     clipped_left, clipped_top, clipped_right, clipped_bottom = _clip_bounds_to_image(left, top, right, bottom, source_pixels)
@@ -257,6 +265,7 @@ def _build_ellipse_metrics(
                 minimum=stats.minimum,
                 maximum=stats.maximum,
                 standard_deviation=stats.standard_deviation,
+                intensity_unit=intensity_unit,
             ),
         )
 
@@ -284,6 +293,7 @@ def _build_ellipse_metrics(
             minimum=stats.minimum,
             maximum=stats.maximum,
             standard_deviation=stats.standard_deviation,
+            intensity_unit=intensity_unit,
         ),
     )
 
@@ -334,6 +344,8 @@ def _build_freeform_metrics(
     points: tuple[MeasurementPoint, ...],
     source_pixels: np.ndarray,
     spacing_xy: tuple[float, float] | None,
+    *,
+    intensity_unit: str | None = None,
 ) -> tuple[MeasurementMetrics, tuple[str, ...]]:
     left, top, right, bottom = _resolve_bounds_for_points(points)
     clipped_left, clipped_top, clipped_right, clipped_bottom = _clip_bounds_to_image(left, top, right, bottom, source_pixels)
@@ -373,6 +385,7 @@ def _build_freeform_metrics(
                 minimum=stats.minimum,
                 maximum=stats.maximum,
                 standard_deviation=stats.standard_deviation,
+                intensity_unit=intensity_unit,
             ),
         )
 
@@ -399,6 +412,7 @@ def _build_freeform_metrics(
             minimum=stats.minimum,
             maximum=stats.maximum,
             standard_deviation=stats.standard_deviation,
+            intensity_unit=intensity_unit,
         ),
     )
 
@@ -486,16 +500,18 @@ def _build_roi_label_lines(
     minimum: float | None,
     maximum: float | None,
     standard_deviation: float | None,
+    intensity_unit: str | None = None,
 ) -> tuple[str, ...]:
     return (
         f"Size {width:.1f} * {height:.1f} {length_unit}",
         f"Area {area:.1f} {area_unit}",
-        _format_stat_label("Mean", mean),
-        _format_stat_label("Min", minimum),
-        _format_stat_label("Max", maximum),
-        _format_stat_label("SD", standard_deviation),
+        _format_stat_label("Mean", mean, intensity_unit),
+        _format_stat_label("Min", minimum, intensity_unit),
+        _format_stat_label("Max", maximum, intensity_unit),
+        _format_stat_label("SD", standard_deviation, intensity_unit),
     )
 
 
-def _format_stat_label(name: str, value: float | None) -> str:
-    return f"{name} {value:.1f}" if value is not None else f"{name} -"
+def _format_stat_label(name: str, value: float | None, unit: str | None = None) -> str:
+    suffix = f" {unit}" if unit else ""
+    return f"{name} {value:.3g}{suffix}" if value is not None else f"{name} -"

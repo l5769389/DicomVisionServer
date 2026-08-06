@@ -27,9 +27,6 @@ class ViewerStackMixin:
             self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_pet_viewport(view)
             view.is_initialized = True
-        if view.pseudocolor_preset != PET_STANDALONE_PSEUDOCOLOR_PRESET:
-            view.pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
-
         pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
         view.pet_unit = pet_display.unit
         view.pet_unit_label = pet_display.unit_label
@@ -37,6 +34,12 @@ class ViewerStackMixin:
         instance, cached = self._get_indexed_instance_and_cache(series, view.current_index)
         if instance is None or cached is None:
             raise HTTPException(status_code=400, detail="PET series does not contain renderable DICOM instances")
+
+        # Keep the renderer's transform in the same physical coordinate system
+        # as PET auto-fit.  Initial PET fit already uses PixelSpacing; omitting
+        # it here doubled the apparent size for common 0.5 mm PET pixels.
+        spacing_xy = self._get_stack_spacing_xy(cached.dataset)
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
 
         source_pixels = self._prepare_pet_standalone_source_pixels(
             np.asarray(pet_display.volume[view.current_index], dtype=np.float32),
@@ -51,18 +54,25 @@ class ViewerStackMixin:
             pixel_max = pixel_min + 1.0
 
         metadata_started_at = perf_counter()
-        render_plan = self._build_render_plan_for_shape(view, *source_pixels.shape[:2])
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            *source_pixels.shape[:2],
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
         image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=source_pixels.shape[1],
             image_height=source_pixels.shape[0],
             canvas_width=render_plan.render_view.width or 0,
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         scale_bar = self._build_scale_bar_info(
             render_plan.render_view,
             image_transform,
-            self._get_stack_spacing_xy(cached.dataset),
+            spacing_xy,
         )
         slice_corner_info = self._build_slice_corner_info_overlay(
             view,
@@ -95,7 +105,9 @@ class ViewerStackMixin:
             measurements=visible_measurements,
             corner_info=None,
             orientation=None,
-            background_cval=FUSION_PET_STANDALONE_BACKGROUND_CVAL,
+            # The unused canvas is conceptually display value zero. It uses
+            # the active LUT's low-end colour for CT, PET and other 2D stacks.
+            background_cval=pseudocolor_background_color(view.pseudocolor_preset),
         )
         visible_presentation_measurements = (
             self._build_visible_presentation_measurements(series, instance)
@@ -147,13 +159,13 @@ class ViewerStackMixin:
                 imageFormat=image_format,
                 viewId=view.view_id,
                 color=ViewColorInfo(pseudocolorPreset=view.pseudocolor_preset),
-                petInfo=PetInfo(
-                    seriesId=series.series_id,
-                    petUnit=pet_display.unit,
-                    petUnitLabel=pet_display.unit_label,
-                    petWindowMin=self._resolve_window_min(view.window_width, view.window_center),
-                    petWindowMax=self._resolve_window_max(view.window_width, view.window_center),
-                    pseudocolorPreset=view.pseudocolor_preset,
+                petInfo=self._build_pet_info(
+                    series,
+                    pet_display,
+                    window_width=view.window_width,
+                    window_center=view.window_center,
+                    pseudocolor_preset=view.pseudocolor_preset,
+                    control_window_max=view.pet_control_window_max,
                 ),
                 scaleBar=scale_bar,
                 cornerInfo=self._serialize_corner_info_overlay(slice_corner_info),
@@ -235,6 +247,9 @@ class ViewerStackMixin:
             measurements=visible_measurements,
             corner_info=None,
             orientation=None,
+            # Keep the external canvas consistent with the active LUT. The
+            # normal CT BW preset consequently remains black.
+            background_cval=pseudocolor_background_color(view.pseudocolor_preset),
         )
         visible_presentation_measurements = (
             self._build_visible_presentation_measurements(series, instance)

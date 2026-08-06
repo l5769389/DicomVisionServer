@@ -1,6 +1,8 @@
 import math
 
 import numpy as np
+import pytest
+from fastapi import HTTPException
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.multival import MultiValue
 from pydicom.uid import ExplicitVRLittleEndian, RLELossless
@@ -120,7 +122,7 @@ def test_extract_source_pixels_uses_first_multiframe_grayscale_frame_explicitly(
     np.testing.assert_array_equal(source_pixels, first_frame.astype(np.float32) * 2.0 - 1024.0)
 
 
-def test_extract_source_pixels_normalizes_monochrome1_visual_polarity_after_rescale() -> None:
+def test_extract_source_pixels_preserves_quantitative_values_for_monochrome1() -> None:
     pixels = np.asarray([[0, 100], [200, 300]], dtype=np.int16)
     dataset = _build_grayscale_dataset(pixels, slope=2.0, intercept=-1000.0)
     dataset.PhotometricInterpretation = "MONOCHROME1"
@@ -128,8 +130,26 @@ def test_extract_source_pixels_normalizes_monochrome1_visual_polarity_after_resc
     source_pixels = DicomCache()._extract_source_pixels(dataset)
 
     rescaled = pixels.astype(np.float32) * 2.0 - 1000.0
-    np.testing.assert_array_equal(source_pixels, -rescaled)
-    assert source_pixels[0, 0] > source_pixels[-1, -1]
+    np.testing.assert_array_equal(source_pixels, rescaled)
+    assert source_pixels[0, 0] < source_pixels[-1, -1]
+
+
+def test_extract_source_pixels_rejects_multiframe_pet_instead_of_using_first_frame() -> None:
+    dataset = _build_multiframe_grayscale_dataset(
+        np.stack(
+            [
+                np.asarray([[0, 100], [200, 300]], dtype=np.int16),
+                np.asarray([[1000, 1100], [1200, 1300]], dtype=np.int16),
+            ]
+        )
+    )
+    dataset.Modality = "PT"
+
+    with pytest.raises(HTTPException) as error:
+        DicomCache()._extract_source_pixels(dataset)
+
+    assert error.value.status_code == 422
+    assert "multi-frame PET" in str(error.value.detail)
 
 
 def test_extract_source_pixels_preserves_rgb_secondary_capture_pixels() -> None:
