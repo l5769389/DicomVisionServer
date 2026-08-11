@@ -115,11 +115,12 @@ class ViewerFusionMixin:
             bool(view.hor_flip),
             bool(view.ver_flip),
             str(group.fusion_pet_unit),
+            str(group.fusion_ct_pseudocolor_preset),
             str(group.fusion_pet_pseudocolor_preset),
             str(group.fusion_pet_pane_pseudocolor_preset),
+            str(group.fusion_mip_pseudocolor_preset),
             None if group.fusion_pet_window.window_width is None else float(group.fusion_pet_window.window_width),
             None if group.fusion_pet_window.window_center is None else float(group.fusion_pet_window.window_center),
-            float(group.fusion_alpha),
             self._fusion_registration_visual_key(registration),
         )
 
@@ -543,7 +544,9 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    ctPseudocolorPreset=group.fusion_ct_pseudocolor_preset,
                     petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
+                    mipPseudocolorPreset=group.fusion_mip_pseudocolor_preset,
                     petUnit=group.fusion_pet_unit,
                     petUnitLabel=pet_unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -555,6 +558,7 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_center,
                     ),
                     fusionWindowTarget=group.fusion_window_target,
+                    frameOfReferenceMatched=group.fusion_frame_of_reference_matched,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
@@ -617,6 +621,10 @@ class ViewerFusionMixin:
                     pseudocolorPreset=(
                         group.fusion_pet_pane_pseudocolor_preset
                         if role == FUSION_PANE_PET_AXIAL
+                        else group.fusion_mip_pseudocolor_preset
+                        if role == FUSION_PANE_PET_CORONAL_MIP
+                        else group.fusion_ct_pseudocolor_preset
+                        if role == FUSION_PANE_CT_AXIAL
                         else group.fusion_pet_pseudocolor_preset
                     )
                 ),
@@ -625,7 +633,9 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    ctPseudocolorPreset=group.fusion_ct_pseudocolor_preset,
                     petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
+                    mipPseudocolorPreset=group.fusion_mip_pseudocolor_preset,
                     petUnit=group.fusion_pet_unit,
                     petUnitLabel=pet_unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -637,6 +647,7 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_center,
                     ),
                     fusionWindowTarget=group.fusion_window_target,
+                    frameOfReferenceMatched=group.fusion_frame_of_reference_matched,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
@@ -821,8 +832,10 @@ class ViewerFusionMixin:
             ct_window_center=group.window.window_center,
             pet_window_width=group.fusion_pet_window.window_width,
             pet_window_center=group.fusion_pet_window.window_center,
+            ct_pseudocolor_preset=group.fusion_ct_pseudocolor_preset,
             pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
             pet_standalone_pseudocolor_preset=group.fusion_pet_pane_pseudocolor_preset,
+            pet_mip_pseudocolor_preset=group.fusion_mip_pseudocolor_preset,
             registration=render_registration,
             alpha=group.fusion_alpha,
             ct_has_patient_geometry=(
@@ -891,15 +904,10 @@ class ViewerFusionMixin:
                 transformed_pet_uint8,
                 group.fusion_pet_pseudocolor_preset,
             )
-            pet_alpha = np.clip(float(group.fusion_alpha), 0.0, 1.0)
             transformed_pet = np.concatenate(
                 (
                     transformed_pet_rgb,
-                    np.clip(
-                        transformed_pet_uint8.astype(np.float32) * pet_alpha,
-                        0.0,
-                        255.0,
-                    ).astype(np.uint8)[..., None],
+                    transformed_pet_uint8[..., None],
                 ),
                 axis=-1,
             )
@@ -1000,7 +1008,7 @@ class ViewerFusionMixin:
                 image = image_from_pixels(
                     apply_pseudocolor(
                         transformed_pet_uint8,
-                        group.fusion_pet_pane_pseudocolor_preset,
+                        fusion_result.pseudocolor_preset,
                     )
                 )
             elif fusion_result.ct_scalar_pixels is not None:
@@ -1016,10 +1024,13 @@ class ViewerFusionMixin:
                     cval=ct_low,
                 )
                 image = image_from_pixels(
-                    window_to_uint8(
-                        transformed_ct_scalar,
-                        fusion_result.ct_window_width,
-                        fusion_result.ct_window_center,
+                    apply_pseudocolor(
+                        window_to_uint8(
+                            transformed_ct_scalar,
+                            fusion_result.ct_window_width,
+                            fusion_result.ct_window_center,
+                        ),
+                        fusion_result.pseudocolor_preset,
                     )
                 )
             else:
@@ -1189,7 +1200,9 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    ctPseudocolorPreset=group.fusion_ct_pseudocolor_preset,
                     petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
+                    mipPseudocolorPreset=group.fusion_mip_pseudocolor_preset,
                     petUnit=pet_display.unit,
                     petUnitLabel=pet_display.unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -1201,6 +1214,7 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_center,
                     ),
                     fusionWindowTarget=group.fusion_window_target,
+                    frameOfReferenceMatched=group.fusion_frame_of_reference_matched,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
@@ -1213,7 +1227,9 @@ class ViewerFusionMixin:
                     control_window_max=group.fusion_pet_control_window_max,
                     pseudocolor_preset=(
                         group.fusion_pet_pane_pseudocolor_preset
-                        if self._is_fusion_pet_display_role(role)
+                        if role == FUSION_PANE_PET_AXIAL
+                        else group.fusion_mip_pseudocolor_preset
+                        if role == FUSION_PANE_PET_CORONAL_MIP
                         else group.fusion_pet_pseudocolor_preset
                     ),
                     pet_pane_pseudocolor_preset=group.fusion_pet_pane_pseudocolor_preset,

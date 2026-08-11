@@ -201,12 +201,14 @@ def test_pet_view_resizes_from_initial_auto_fit_and_hover_maps_inside_image(monk
     assert "SUVbw" in hover.display_text
 
 
-def test_initial_pet_config_before_size_does_not_leave_standalone_view_at_one_x(monkeypatch) -> None:
+def test_initial_pet_config_before_size_keeps_first_fit_and_auto_pet_window(monkeypatch) -> None:
     service = ViewerService()
     series = _series()
-    volume = np.zeros((3, 70, 140), dtype=np.float32)
+    volume = np.arange(3 * 70 * 140, dtype=np.float32).reshape((3, 70, 140))
     _patch_pet_render_dependencies(monkeypatch, service, series, volume)
     view = ViewRecord(view_id="pet-view", series_id=series.series_id, view_type="PET")
+    pet_display = service._build_fusion_pet_display_volume(series, volume, None)
+    expected_ww, expected_wl = service._derive_default_pet_window_for_display_volume(pet_display)
 
     assert service._handle_pet_config(
         view,
@@ -231,6 +233,38 @@ def test_initial_pet_config_before_size_does_not_leave_standalone_view_at_one_x(
 
     assert view.is_initialized is True
     assert view.zoom == pytest.approx(9.8)
+    assert view.window_width == pytest.approx(expected_ww)
+    assert view.window_center == pytest.approx(expected_wl)
+
+
+@pytest.mark.parametrize("preset", ["rainbow", "bw"])
+def test_initial_pet_config_preserves_preferred_pseudocolor_during_first_fit(monkeypatch, preset: str) -> None:
+    service = ViewerService()
+    series = _series()
+    volume = np.zeros((3, 70, 140), dtype=np.float32)
+    _patch_pet_render_dependencies(monkeypatch, service, series, volume)
+    view = ViewRecord(
+        view_id="pet-view",
+        series_id=series.series_id,
+        view_type="PET",
+        width=1400,
+        height=700,
+    )
+
+    assert service._handle_pet_config(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="petConfig",
+            pseudocolorPreset=preset,
+        ),
+    )
+    assert view.is_initialized is False
+
+    service._initialize_pet_viewport(view)
+
+    assert view.pseudocolor_preset == preset
+    assert view.pending_pet_pseudocolor_preset is None
 
 
 def test_pet_auto_fit_keeps_a_safe_margin_for_standalone_and_mpr_views(monkeypatch) -> None:

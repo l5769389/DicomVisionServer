@@ -213,6 +213,8 @@ from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
 from app.services.viewer_render_dispatch import render_by_view_type
 from app.services.viewer_fusion import (
+    FUSION_PET_AXIAL_PSEUDOCOLOR_PRESET,
+    FUSION_PET_MIP_PSEUDOCOLOR_PRESET,
     FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET,
     FUSION_VIEW_TYPES,
     FUSION_VIEW_TYPE_TO_PANE_ROLE,

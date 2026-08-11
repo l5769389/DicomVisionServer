@@ -665,7 +665,7 @@ class ViewerOperationsMixin:
             delta_x = float(payload.x or 0.0)
             delta_y = float(payload.y or 0.0)
             sensitivity = self._resolve_window_drag_sensitivity(base_ww)
-            view.window_width = base_ww + delta_x * sensitivity
+            view.window_width = max(float(WINDOW_WIDTH_MIN), base_ww + delta_x * sensitivity)
             view.window_center = base_wl - delta_y * sensitivity
             view.is_initialized = True
             if payload.action_type == DRAG_ACTION_MOVE:
@@ -856,8 +856,17 @@ class ViewerOperationsMixin:
                 return False
         changed = False
         group = view.view_group if self._is_mpr_view_type(view.view_type) else None
+        is_fresh_standalone_pet = (
+            group is None
+            and self._is_pet_view_type(view.view_type)
+            and not view.is_initialized
+        )
         if payload.pseudocolor_preset is not None:
             next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+            if is_fresh_standalone_pet:
+                if view.pending_pet_pseudocolor_preset != next_preset:
+                    view.pending_pet_pseudocolor_preset = next_preset
+                    changed = True
             current_preset = group.pet_pseudocolor_preset if group is not None else view.pseudocolor_preset
             if current_preset != next_preset:
                 if group is not None:
@@ -1551,15 +1560,23 @@ class ViewerOperationsMixin:
         if group is None or payload.pseudocolor_preset is None:
             return False
         next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
-        role = self._resolve_fusion_pane_role(view)
-        if self._is_fusion_pet_display_role(role):
-            if group.fusion_pet_pane_pseudocolor_preset == next_preset:
-                return False
-            group.fusion_pet_pane_pseudocolor_preset = next_preset
-        elif group.fusion_pet_pseudocolor_preset == next_preset:
+        roles = payload.fusion_pseudocolor_targets or [self._resolve_fusion_pane_role(view)]
+        changed = False
+        for role in roles:
+            if role == FUSION_PANE_CT_AXIAL and group.fusion_ct_pseudocolor_preset != next_preset:
+                group.fusion_ct_pseudocolor_preset = next_preset
+                changed = True
+            elif role == FUSION_PANE_PET_AXIAL and group.fusion_pet_pane_pseudocolor_preset != next_preset:
+                group.fusion_pet_pane_pseudocolor_preset = next_preset
+                changed = True
+            elif role == FUSION_PANE_PET_CORONAL_MIP and group.fusion_mip_pseudocolor_preset != next_preset:
+                group.fusion_mip_pseudocolor_preset = next_preset
+                changed = True
+            elif role == FUSION_PANE_OVERLAY_AXIAL and group.fusion_pet_pseudocolor_preset != next_preset:
+                group.fusion_pet_pseudocolor_preset = next_preset
+                changed = True
+        if not changed:
             return False
-        else:
-            group.fusion_pet_pseudocolor_preset = next_preset
         self._clear_fusion_registration_overlay_frame_locks(group)
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):

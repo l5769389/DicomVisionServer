@@ -56,6 +56,7 @@ MPR_CROSSHAIR_STATE_OPERATION_TYPES = {
 }
 MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS = 0.05
 MPR_VIEW_TYPES = {"MPR", "AX", "COR", "SAG"}
+STACK_WINDOW_QUEUE_VIEW_TYPES = {"Stack", "PET"}
 FUSION_VIEW_TYPES = {
     "FusionCTAxial",
     "FusionPETAxial",
@@ -77,6 +78,7 @@ PAN_ZOOM_FINAL_RENDER_TARGET_SPACING_SECONDS = 0.035
 PAN_ZOOM_FINAL_RENDER_MIN_DELAY_SECONDS = 0.005
 MPR_END_REQUIRES_PENDING_MOVE_TYPES = {
     VIEW_OP_TYPE_PAN,
+    VIEW_OP_TYPE_WINDOW,
     VIEW_OP_TYPE_ZOOM,
 }
 
@@ -244,12 +246,14 @@ def _should_queue_mpr_operation(view_type: str, payload: ViewOperationRequest) -
         allowed_operation_types = MPR_LOW_LATENCY_OPERATION_TYPES
     elif view_type in FUSION_VIEW_TYPES:
         allowed_operation_types = FUSION_LOW_LATENCY_OPERATION_TYPES
+    elif view_type in STACK_WINDOW_QUEUE_VIEW_TYPES:
+        allowed_operation_types = {VIEW_OP_TYPE_WINDOW}
     else:
         return False
     if payload.op_type not in allowed_operation_types:
         return False
-    # High-frequency MPR drags are lossy: start/end are preserved, while move
-    # events are coalesced to the latest payload by the group operation queue.
+    # High-frequency drags preserve start/end while coalescing move events to
+    # the latest payload for the view or shared MPR/fusion group.
     return payload.action_type in {DRAG_ACTION_START, DRAG_ACTION_MOVE, DRAG_ACTION_END}
 
 
@@ -581,7 +585,7 @@ async def _dispatch_operation_result(
 async def _process_queued_mpr_operation(operation: _QueuedMprOperation) -> None:
     try:
         view = view_registry.get(operation.payload.view_id, workspace_id=operation.workspace_id)
-        if view.view_type in FUSION_VIEW_TYPES:
+        if view.view_type in FUSION_VIEW_TYPES or view.view_type in STACK_WINDOW_QUEUE_VIEW_TYPES:
             result = await asyncio.to_thread(viewer_service.handle_view_operation, operation.payload, operation.workspace_id)
         else:
             result = viewer_service.handle_view_operation(operation.payload, operation.workspace_id)

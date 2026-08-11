@@ -152,16 +152,33 @@ def test_view_operation_payload_normalizes_image_format(monkeypatch) -> None:
             "sid-1",
             {"viewId": "v-stack", "opType": "window", "actionType": "start", "imageFormat": "webp"},
         )
+        await _wait_for(lambda: len(seen_formats) == 1)
         await handlers._handle_operation(
             server,  # type: ignore[arg-type]
             "sid-1",
             {"viewId": "v-stack", "opType": "window", "actionType": "start", "imageFormat": "avif"},
         )
+        await _wait_for(lambda: len(seen_formats) == 2)
         return seen_formats, [event for event, _payload, _to in server.events]
 
     seen_formats, events = asyncio.run(run())
     assert seen_formats == ["webp", "webp"]
     assert events == []
+
+
+def test_stack_window_reuses_the_latest_move_operation_queue() -> None:
+    assert handlers._should_queue_mpr_operation(
+        "Stack",
+        handlers.ViewOperationRequest(viewId="stack", opType="window", actionType="move", x=10, y=-4),
+    ) is True
+    assert handlers._should_queue_mpr_operation(
+        "PET",
+        handlers.ViewOperationRequest(viewId="pet", opType="window", actionType="move", x=10, y=-4),
+    ) is True
+    assert handlers._should_queue_mpr_operation(
+        "Stack",
+        handlers.ViewOperationRequest(viewId="stack", opType="zoom", actionType="move", x=0, y=-4),
+    ) is False
 
 
 def test_3d_rotate_start_marks_latest_interaction(monkeypatch) -> None:
@@ -594,6 +611,52 @@ def test_legacy_mpr_pan_queue_applies_pending_move_before_end(monkeypatch) -> No
         return calls
 
     assert asyncio.run(run()) == [("start", 0.0), ("move", 42.0), ("end", 42.0)]
+
+
+def test_legacy_mpr_window_queue_applies_pending_move_before_end(monkeypatch) -> None:
+    async def run() -> list[tuple[str, float | None]]:
+        handlers._mpr_operation_queues.clear()
+        server = _SocketServerStub()
+        calls: list[tuple[str, float | None]] = []
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async def fake_process(operation):
+            calls.append((str(operation.payload.action_type), operation.payload.x))
+            if operation.payload.action_type == "start":
+                start_entered.set()
+                await release_start.wait()
+
+        monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
+        monkeypatch.setattr(handlers, "_process_queued_mpr_operation", fake_process)
+
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "window", "actionType": "start", "x": 0.0, "y": 0.0},
+        ) == {"ok": True}
+        await _wait_for(start_entered.is_set)
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "window", "actionType": "move", "x": 36.0, "y": -20.0},
+        ) == {"ok": True}
+        assert await handlers._handle_operation(
+            server,  # type: ignore[arg-type]
+            "sid-1",
+            {"viewId": "v-ax", "opType": "window", "actionType": "end", "x": 36.0, "y": -20.0},
+        ) == {"ok": True}
+        release_start.set()
+        await _wait_for(lambda: calls == [("start", 0.0), ("move", 36.0), ("end", 36.0)])
+        return calls
+
+    assert asyncio.run(run()) == [("start", 0.0), ("move", 36.0), ("end", 36.0)]
 
 
 def test_mpr_pan_queue_uses_authoritative_end_without_replaying_pending_move(monkeypatch) -> None:

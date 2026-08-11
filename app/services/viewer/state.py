@@ -154,7 +154,10 @@ class ViewerStateMixin:
         view.rotation_degrees = 0
         view.hor_flip = False
         view.ver_flip = False
-        view.pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        view.pseudocolor_preset = normalize_pseudocolor_preset(
+            view.pending_pet_pseudocolor_preset or PET_STANDALONE_PSEUDOCOLOR_PRESET
+        )
+        view.pending_pet_pseudocolor_preset = None
         auto_low, auto_high = derive_pet_auto_range(pet_display.volume, pet_display.unit)
         view.window_width = auto_high - auto_low
         view.window_center = (auto_high + auto_low) / 2.0
@@ -998,21 +1001,16 @@ class ViewerStateMixin:
         _, pet_cached = self._get_reference_instance_and_cache(pet_series)
         ct_frame_uid = str(getattr(ct_cached.dataset, "FrameOfReferenceUID", "") or "") if ct_cached else ""
         pet_frame_uid = str(getattr(pet_cached.dataset, "FrameOfReferenceUID", "") or "") if pet_cached else ""
-        has_manual_registration = any(
-            abs(float(value)) > 1e-6
-            for value in (
-                group.fusion_registration.translate_row_mm,
-                group.fusion_registration.translate_col_mm,
-                group.fusion_registration.rotation_degrees,
-            )
+        group.fusion_frame_of_reference_matched = not (
+            ct_frame_uid and pet_frame_uid and ct_frame_uid != pet_frame_uid
         )
-        if ct_frame_uid and pet_frame_uid and ct_frame_uid != pet_frame_uid and not has_manual_registration:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "PET/CT Frame of Reference does not match. "
-                    "Automatic fusion is blocked until a valid registration is provided."
-                ),
+        if not group.fusion_frame_of_reference_matched:
+            logger.warning(
+                "PET/CT Frame of Reference mismatch; rendering fusion for manual registration "
+                "group_id=%s ct_frame_uid=%s pet_frame_uid=%s",
+                group.group_id,
+                ct_frame_uid,
+                pet_frame_uid,
             )
         ct_volume = self._get_series_volume(ct_series)
         pet_volume = self._get_series_volume(pet_series)
@@ -1035,8 +1033,14 @@ class ViewerStateMixin:
             group.fusion_pet_pseudocolor_preset = normalize_pseudocolor_preset(
                 group.fusion_pet_pseudocolor_preset or PET_STANDALONE_PSEUDOCOLOR_PRESET
             )
+            group.fusion_ct_pseudocolor_preset = normalize_pseudocolor_preset(
+                group.fusion_ct_pseudocolor_preset or DEFAULT_PSEUDOCOLOR_PRESET
+            )
             group.fusion_pet_pane_pseudocolor_preset = normalize_pseudocolor_preset(
-                group.fusion_pet_pane_pseudocolor_preset or PET_STANDALONE_PSEUDOCOLOR_PRESET
+                group.fusion_pet_pane_pseudocolor_preset or FUSION_PET_AXIAL_PSEUDOCOLOR_PRESET
+            )
+            group.fusion_mip_pseudocolor_preset = normalize_pseudocolor_preset(
+                group.fusion_mip_pseudocolor_preset or FUSION_PET_MIP_PSEUDOCOLOR_PRESET
             )
             group.fusion_initialized = True
         self._fit_fusion_view_to_source(
@@ -1055,10 +1059,14 @@ class ViewerStateMixin:
             return
         role = self._resolve_fusion_pane_role(view)
         view.current_index = int(group.fusion_axial_index)
-        if role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
+        if role == FUSION_PANE_PET_AXIAL:
             view.window_width = group.fusion_pet_window.window_width
             view.window_center = group.fusion_pet_window.window_center
             view.pseudocolor_preset = group.fusion_pet_pane_pseudocolor_preset
+        elif role == FUSION_PANE_PET_CORONAL_MIP:
+            view.window_width = group.fusion_pet_window.window_width
+            view.window_center = group.fusion_pet_window.window_center
+            view.pseudocolor_preset = group.fusion_mip_pseudocolor_preset
         elif role == FUSION_PANE_OVERLAY_AXIAL:
             view.window_width = group.window.window_width
             view.window_center = group.window.window_center
@@ -1066,7 +1074,7 @@ class ViewerStateMixin:
         else:
             view.window_width = group.window.window_width
             view.window_center = group.window.window_center
-            view.pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
+            view.pseudocolor_preset = group.fusion_ct_pseudocolor_preset
 
     def _reset_fusion_view_group(self, view: ViewRecord) -> None:
         group = view.view_group
@@ -1077,7 +1085,9 @@ class ViewerStateMixin:
         self._fusion_registration_preview_drags.pop(group.group_id, None)
         group.fusion_initialized = False
         group.fusion_pet_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
-        group.fusion_pet_pane_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+        group.fusion_ct_pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
+        group.fusion_pet_pane_pseudocolor_preset = FUSION_PET_AXIAL_PSEUDOCOLOR_PRESET
+        group.fusion_mip_pseudocolor_preset = FUSION_PET_MIP_PSEUDOCOLOR_PRESET
         # The next initialization resolves the preferred available PET unit.
         # Keep this empty meanwhile instead of publishing a transient Source
         # state that can race the SUV response in the client.
@@ -1113,6 +1123,7 @@ class ViewerStateMixin:
             ct_ww, ct_wl = self._derive_default_window_for_volume(ct_series, ct_volume)
             group.window.window_width = ct_ww
             group.window.window_center = ct_wl
+            group.fusion_ct_pseudocolor_preset = DEFAULT_PSEUDOCOLOR_PRESET
         elif role in {FUSION_PANE_PET_AXIAL, FUSION_PANE_PET_CORONAL_MIP}:
             pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, None)
             pet_ww, pet_wl = self._derive_default_pet_window_for_display_volume(pet_display)
@@ -1123,7 +1134,10 @@ class ViewerStateMixin:
                 derive_pet_auto_range(pet_display.volume, pet_display.unit)[1],
                 pet_display.unit,
             )
-            group.fusion_pet_pane_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
+            if role == FUSION_PANE_PET_AXIAL:
+                group.fusion_pet_pane_pseudocolor_preset = FUSION_PET_AXIAL_PSEUDOCOLOR_PRESET
+            else:
+                group.fusion_mip_pseudocolor_preset = FUSION_PET_MIP_PSEUDOCOLOR_PRESET
         else:
             group.fusion_pet_pseudocolor_preset = PET_STANDALONE_PSEUDOCOLOR_PRESET
             group.fusion_window_target = "ct"

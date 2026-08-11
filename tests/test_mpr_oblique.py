@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from PIL import Image
+from pydicom.dataset import Dataset
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL, ZOOM_MAX, ZOOM_MIN
 from app.models.viewer import MprMipViewportState, MprRotationDragRecord, ViewGroupRecord, ViewRecord
@@ -17,6 +18,29 @@ from app.services import viewer_service as viewer_service_module
 from app.services.view_registry import view_registry
 from app.services.viewer_service import ViewerService
 from app.services.viewport_transformer import viewport_transformer
+
+
+def test_series_corner_info_keeps_patient_summary_on_separate_rows() -> None:
+    service = ViewerService()
+    dataset = Dataset()
+    dataset.PatientName = "ZHANG^SAN"
+    dataset.PatientID = "P000123"
+    dataset.PatientSex = "M"
+    dataset.PatientAge = "058Y"
+    series = SimpleNamespace(
+        series_description="CT CHEST",
+        patient_id="P000123",
+        modality="CT",
+        accession_number="",
+        study_date="",
+        study_instance_uid="",
+        series_instance_uid="",
+    )
+
+    overlay = service._build_series_corner_info_overlay(series, dataset)
+
+    assert overlay.top_right == ("ZHANG^SAN", "P000123", "M / 058Y")
+    assert overlay.tags["patientSummary"] == ("P000123", "M / 058Y")
 
 
 def _build_service_with_stubbed_series(monkeypatch):
@@ -1454,19 +1478,26 @@ def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) ->
     assert group.mpr_revision == 1
 
 
-def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
+def test_stack_window_moves_and_end_render_matching_full_webp_frames_while_zoom_remains_deferred(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
     view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
     view.window_width = 400.0
     view.window_center = 40.0
     view.zoom = 1.0
+    rendered_result = SimpleNamespace(image_bytes=b"preview", meta=SimpleNamespace())
+    render_calls: list[dict[str, object]] = []
+
+    def render_by_view_type(*_args, **kwargs):
+        render_calls.append(kwargs)
+        return rendered_result
 
     previous_views = dict(view_registry._view_by_id)
     try:
         view_registry._view_by_id.clear()
         view_registry._view_by_id[view.view_id] = view
         monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+        monkeypatch.setattr(service, "_render_by_view_type", render_by_view_type)
 
         service.handle_view_operation(
             ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
@@ -1491,17 +1522,32 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert window_move.primary_result is None
-    assert window_move.deferred_view_ids == (view.view_id,)
-    assert window_move.deferred_image_format == "webp"
-    assert window_move.deferred_fast_preview is True
-    assert window_move.deferred_metadata_mode == "stack-pixel-preview"
+    assert window_move.primary_result is rendered_result
+    assert window_move.primary_image_format == "webp"
+    assert window_move.primary_fast_preview is False
+    assert window_move.primary_metadata_mode == "full"
+    assert window_move.deferred_view_ids == ()
     assert view.window_width == pytest.approx(412.0)
     assert view.window_center == pytest.approx(48.0)
-    assert window_end.primary_result is None
-    assert window_end.deferred_view_ids == (view.view_id,)
-    assert window_end.deferred_image_format == "webp"
-    assert window_end.deferred_fast_preview is False
+    assert window_end.primary_result is rendered_result
+    assert window_end.primary_image_format == "webp"
+    assert window_end.primary_fast_preview is False
+    assert window_end.primary_metadata_mode == "full"
+    assert window_end.deferred_view_ids == ()
+    assert render_calls == [
+        {
+            "image_format": "webp",
+            "fast_preview": False,
+            "fast_preview_full_resolution": False,
+            "metadata_mode": "full",
+        },
+        {
+            "image_format": "webp",
+            "fast_preview": False,
+            "fast_preview_full_resolution": False,
+            "metadata_mode": "full",
+        },
+    ]
     assert zoom_move.primary_result is None
     assert zoom_move.deferred_view_ids == (view.view_id,)
     assert zoom_move.deferred_image_format == "webp"
@@ -1571,6 +1617,11 @@ def test_window_drag_sensitivity_scales_with_current_width(monkeypatch) -> None:
         view_registry._view_by_id.clear()
         view_registry._view_by_id[view.view_id] = view
         monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+        monkeypatch.setattr(
+            service,
+            "_render_by_view_type",
+            lambda *args, **kwargs: SimpleNamespace(image_bytes=b"preview", meta=SimpleNamespace()),
+        )
 
         service.handle_view_operation(
             ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
@@ -1584,6 +1635,37 @@ def test_window_drag_sensitivity_scales_with_current_width(monkeypatch) -> None:
 
     assert view.window_width == pytest.approx(10.0)
     assert view.window_center == pytest.approx(5.0)
+
+
+def test_window_drag_clamps_ct_width_to_positive_minimum(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
+    view.window_width = 400.0
+    view.window_center = 40.0
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+        monkeypatch.setattr(
+            service,
+            "_render_by_view_type",
+            lambda *args, **kwargs: SimpleNamespace(image_bytes=b"preview", meta=SimpleNamespace()),
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
+        )
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="move", x=-1000, y=0)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert view.window_width == pytest.approx(1.0)
 
 
 def test_stack_pan_move_uses_default_webp_transport(monkeypatch) -> None:

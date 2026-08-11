@@ -462,9 +462,8 @@ def _handle_window_operation(
             return _render_broadcast()
         return _render_single(
             "webp",
-            fast_preview=payload.action_type == DRAG_ACTION_MOVE,
-            defer=payload.action_type == DRAG_ACTION_MOVE,
-            metadata_mode="stack-pixel-preview" if payload.action_type == DRAG_ACTION_MOVE else "full",
+            fast_preview=False,
+            metadata_mode="full",
         )
 
     if payload.action_type is None and (payload.ww is not None or payload.wl is not None):
@@ -482,15 +481,12 @@ def _handle_window_operation(
         if payload.action_type == DRAG_ACTION_MOVE:
             return _render_full_resolution_preview_broadcast(metadata_mode="mpr-pixel-preview")
         return _render_broadcast()
-    return _resolve_drag_single_render_decision(
-        service,
-        view,
-        payload,
-        move_image_format="webp",
-        fast_preview_on_move=True,
-        defer_on_move=True,
-        defer_on_end=True,
-        move_metadata_mode="stack-pixel-preview",
+    if payload.action_type == DRAG_ACTION_START:
+        return _render_none()
+    return _render_single(
+        "webp",
+        fast_preview=False,
+        metadata_mode="full",
     )
 
 
