@@ -115,11 +115,12 @@ class ViewerFusionMixin:
             bool(view.hor_flip),
             bool(view.ver_flip),
             str(group.fusion_pet_unit),
+            str(group.fusion_ct_pseudocolor_preset),
             str(group.fusion_pet_pseudocolor_preset),
             str(group.fusion_pet_pane_pseudocolor_preset),
+            str(group.fusion_mip_pseudocolor_preset),
             None if group.fusion_pet_window.window_width is None else float(group.fusion_pet_window.window_width),
             None if group.fusion_pet_window.window_center is None else float(group.fusion_pet_window.window_center),
-            float(group.fusion_alpha),
             self._fusion_registration_visual_key(registration),
         )
 
@@ -477,254 +478,6 @@ class ViewerFusionMixin:
             fillcolor=fillcolor,
         )
 
-    def _build_fusion_registration_layer_preview_result(
-        self,
-        view: ViewRecord,
-        group: ViewGroupRecord,
-        ct_series: SeriesRecord,
-        pet_series: SeriesRecord,
-        *,
-        pet_image: Image.Image,
-        image_format: ImageFormat,
-        slice_index: int,
-        slice_total: int,
-        pet_unit_label: str,
-        render_started_at: float,
-        cache_hit: bool,
-        transform_ms: float | None = None,
-    ) -> RenderedImageResult:
-        canvas_width, canvas_height = pet_image.size
-        registration_info = FusionRegistrationInfo(
-            translateRowMm=float(group.fusion_registration.translate_row_mm),
-            translateColMm=float(group.fusion_registration.translate_col_mm),
-            rotationDegrees=float(group.fusion_registration.rotation_degrees),
-            saved=bool(group.fusion_registration.saved),
-        )
-        fusion_composite = FusionCompositeInfo(
-            revision=int(group.fusion_revision),
-            alpha=float(group.fusion_alpha),
-            registration=registration_info,
-            width=int(canvas_width),
-            height=int(canvas_height),
-            layers=[FusionCompositeLayerInfo(key="pet", role="pet", imageFormat="png")],
-            primary_image_unchanged=True,
-        )
-        pet_encode_started_at = perf_counter()
-        pet_bytes = self._encode_image(pet_image, "png", fast_preview=False)
-        pet_encode_ms = (perf_counter() - pet_encode_started_at) * 1000.0
-        extra_image_bytes = {
-            "pet": pet_bytes
-        }
-        logger.info(
-            (
-                "fusion registration preview layer view_id=%s role=%s cache_hit=%s "
-                "render=%sx%s transform_ms=%s pet_encode_ms=%.1f total_ms=%.1f pet_bytes=%s"
-            ),
-            view.view_id,
-            FUSION_PANE_OVERLAY_AXIAL,
-            cache_hit,
-            canvas_width,
-            canvas_height,
-            None if transform_ms is None else round(float(transform_ms), 1),
-            pet_encode_ms,
-            (perf_counter() - render_started_at) * 1000.0,
-            len(pet_bytes),
-        )
-        return RenderedImageResult(
-            meta=ViewImageResponse(
-                slice_info=SliceInfo(current=int(slice_index) + 1, total=max(1, int(slice_total))),
-                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
-                imageFormat=image_format,
-                viewId=view.view_id,
-                transform=self._build_view_transform_payload(view),
-                color=ViewColorInfo(pseudocolorPreset=group.fusion_pet_pseudocolor_preset),
-                fusionInfo=FusionInfo(
-                    paneRole=FUSION_PANE_OVERLAY_AXIAL,
-                    ctSeriesId=ct_series.series_id,
-                    petSeriesId=pet_series.series_id,
-                    petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
-                    petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
-                    petUnit=group.fusion_pet_unit,
-                    petUnitLabel=pet_unit_label,
-                    petWindowMin=self._resolve_window_min(
-                        group.fusion_pet_window.window_width,
-                        group.fusion_pet_window.window_center,
-                    ),
-                    petWindowMax=self._resolve_window_max(
-                        group.fusion_pet_window.window_width,
-                        group.fusion_pet_window.window_center,
-                    ),
-                    fusionWindowTarget=group.fusion_window_target,
-                    alpha=float(group.fusion_alpha),
-                    revision=int(group.fusion_revision),
-                    registration=registration_info,
-                ),
-                fusionComposite=fusion_composite,
-            ),
-            image_bytes=self._fusion_registration_transparent_primary_png,
-            extra_image_bytes=extra_image_bytes,
-        )
-
-    def _build_fusion_registration_primary_preview_result(
-        self,
-        view: ViewRecord,
-        group: ViewGroupRecord,
-        ct_series: SeriesRecord,
-        pet_series: SeriesRecord,
-        *,
-        role: str,
-        image: Image.Image,
-        image_format: ImageFormat,
-        slice_index: int,
-        slice_total: int,
-        pet_unit_label: str,
-        render_started_at: float,
-        cache_hit: bool,
-        transform_ms: float | None = None,
-    ) -> RenderedImageResult:
-        registration_info = FusionRegistrationInfo(
-            translateRowMm=float(group.fusion_registration.translate_row_mm),
-            translateColMm=float(group.fusion_registration.translate_col_mm),
-            rotationDegrees=float(group.fusion_registration.rotation_degrees),
-            saved=bool(group.fusion_registration.saved),
-        )
-        encode_started_at = perf_counter()
-        image_bytes = self._encode_image(image, image_format, fast_preview=False)
-        encode_ms = (perf_counter() - encode_started_at) * 1000.0
-        logger.info(
-            (
-                "fusion registration preview primary view_id=%s role=%s cache_hit=%s "
-                "render=%sx%s transform_ms=%s encode_ms=%.1f total_ms=%.1f bytes=%s"
-            ),
-            view.view_id,
-            role,
-            cache_hit,
-            image.width,
-            image.height,
-            None if transform_ms is None else round(float(transform_ms), 1),
-            encode_ms,
-            (perf_counter() - render_started_at) * 1000.0,
-            len(image_bytes),
-        )
-        return RenderedImageResult(
-            meta=ViewImageResponse(
-                slice_info=SliceInfo(current=int(slice_index) + 1, total=max(1, int(slice_total))),
-                window_info=WindowInfo(ww=view.window_width, wl=view.window_center),
-                imageFormat=image_format,
-                viewId=view.view_id,
-                transform=self._build_view_transform_payload(view),
-                color=ViewColorInfo(
-                    pseudocolorPreset=(
-                        group.fusion_pet_pane_pseudocolor_preset
-                        if role == FUSION_PANE_PET_AXIAL
-                        else group.fusion_pet_pseudocolor_preset
-                    )
-                ),
-                fusionInfo=FusionInfo(
-                    paneRole=role,
-                    ctSeriesId=ct_series.series_id,
-                    petSeriesId=pet_series.series_id,
-                    petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
-                    petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
-                    petUnit=group.fusion_pet_unit,
-                    petUnitLabel=pet_unit_label,
-                    petWindowMin=self._resolve_window_min(
-                        group.fusion_pet_window.window_width,
-                        group.fusion_pet_window.window_center,
-                    ),
-                    petWindowMax=self._resolve_window_max(
-                        group.fusion_pet_window.window_width,
-                        group.fusion_pet_window.window_center,
-                    ),
-                    fusionWindowTarget=group.fusion_window_target,
-                    alpha=float(group.fusion_alpha),
-                    revision=int(group.fusion_revision),
-                    registration=registration_info,
-                ),
-            ),
-            image_bytes=image_bytes,
-        )
-
-    def _try_render_cached_fusion_registration_layer_preview(
-        self,
-        view: ViewRecord,
-        group: ViewGroupRecord,
-        ct_series: SeriesRecord,
-        pet_series: SeriesRecord,
-        *,
-        image_format: ImageFormat,
-        render_started_at: float,
-    ) -> RenderedImageResult | None:
-        drag = self._fusion_registration_preview_drags.get(group.group_id)
-        if drag is None:
-            return None
-        role = self._resolve_fusion_pane_role(view)
-        if role not in {FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL}:
-            return None
-        cache_key = self._build_fusion_registration_pet_layer_cache_key(
-            view,
-            group,
-            ct_series,
-            pet_series,
-            drag.origin_registration,
-        )
-        cached = self._get_fusion_registration_pet_layer_cache(cache_key)
-        if cached is None:
-            logger.info(
-                "fusion registration preview cache miss view_id=%s group_id=%s role=%s",
-                view.view_id,
-                group.group_id,
-                role,
-            )
-            return None
-        self._lock_fusion_registration_overlay_frame(view, group, cached.overlay_frame)
-        transform_started_at = perf_counter()
-        preview_drag = self._with_fusion_registration_preview_rotation_center(
-            drag,
-            cached.pet_center_canvas,
-        )
-        preview_fillcolor = (
-            self._fusion_pet_standalone_fill_color(cached.image)
-            if role == FUSION_PANE_PET_AXIAL
-            else None
-        )
-        transformed_pet = self._apply_fusion_registration_preview_transform(
-            cached.image,
-            preview_drag,
-            fillcolor=preview_fillcolor,
-        )
-        transform_ms = (perf_counter() - transform_started_at) * 1000.0
-        if role == FUSION_PANE_PET_AXIAL:
-            return self._build_fusion_registration_primary_preview_result(
-                view,
-                group,
-                ct_series,
-                pet_series,
-                role=role,
-                image=transformed_pet,
-                image_format=image_format,
-                slice_index=cached.slice_index,
-                slice_total=cached.slice_total,
-                pet_unit_label=cached.pet_unit_label,
-                render_started_at=render_started_at,
-                cache_hit=True,
-                transform_ms=transform_ms,
-            )
-        return self._build_fusion_registration_layer_preview_result(
-            view,
-            group,
-            ct_series,
-            pet_series,
-            pet_image=transformed_pet,
-            image_format=image_format,
-            slice_index=cached.slice_index,
-            slice_total=cached.slice_total,
-            pet_unit_label=cached.pet_unit_label,
-            render_started_at=render_started_at,
-            cache_hit=True,
-            transform_ms=transform_ms,
-        )
-
     def _render_fusion_view(
         self,
         view: ViewRecord,
@@ -747,27 +500,7 @@ class ViewerFusionMixin:
             and metadata_mode == "fusion-registration-layer-preview"
             and role in {FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL}
         )
-        primary_image_unchanged = registration_preview and role == FUSION_PANE_OVERLAY_AXIAL
         self._sync_fusion_view_state_from_group(view)
-        if registration_preview:
-            cached_preview = self._try_render_cached_fusion_registration_layer_preview(
-                view,
-                group,
-                ct_series,
-                pet_series,
-                image_format=image_format,
-                render_started_at=render_started_at,
-            )
-            if cached_preview is not None:
-                return cached_preview
-
-        preview_volume_ms: float | None = None
-        preview_fusion_ms: float | None = None
-        preview_pet_canvas_ms: float | None = None
-        preview_transform_ms: float | None = None
-        preview_pet_encode_ms: float | None = None
-        preview_pet_bytes: int | None = None
-        preview_volume_started_at = perf_counter() if primary_image_unchanged else None
         ct_volume = self._get_series_volume(ct_series, progress_callback=progress_callback)
         pet_volume = self._get_series_volume(pet_series, progress_callback=progress_callback)
         pet_display = self._build_fusion_pet_display_volume(pet_series, pet_volume, group.fusion_pet_unit)
@@ -775,41 +508,9 @@ class ViewerFusionMixin:
         pet_transform = self._get_series_patient_transform(pet_series)
         ct_geometry = self._get_series_volume_geometry(ct_series, ct_volume.shape)
         pet_geometry = self._get_series_volume_geometry(pet_series, pet_volume.shape)
-        if preview_volume_started_at is not None:
-            preview_volume_ms = (perf_counter() - preview_volume_started_at) * 1000.0
-        registration_drag = self._fusion_registration_preview_drags.get(group.group_id)
-        preview_drag = registration_drag if registration_preview else None
-        render_registration = preview_drag.origin_registration if preview_drag is not None else group.fusion_registration
-        locked_overlay_frame = (
-            self._resolve_fusion_registration_overlay_render_frame(
-                view,
-                group,
-                ct_series,
-                pet_series,
-                registration_drag.origin_registration,
-            )
-            if role == FUSION_PANE_OVERLAY_AXIAL and registration_drag is not None
-            else None
-        )
-        overlay_plane_override = (
-            locked_overlay_frame.plane
-            if primary_image_unchanged and locked_overlay_frame is not None
-            else None
-        )
-        if (
-            role == FUSION_PANE_OVERLAY_AXIAL
-            and registration_drag is not None
-            and locked_overlay_frame is None
-            and primary_image_unchanged
-        ):
-            logger.warning(
-                "fusion registration locked overlay frame missing view_id=%s group_id=%s; using current overlay plane",
-                view.view_id,
-                group.group_id,
-            )
+        render_registration = group.fusion_registration
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
 
-        preview_fusion_started_at = perf_counter() if primary_image_unchanged else None
         fusion_result = render_fusion_pixels(
             pane_role=role,
             ct_volume=ct_volume,
@@ -821,8 +522,10 @@ class ViewerFusionMixin:
             ct_window_center=group.window.window_center,
             pet_window_width=group.fusion_pet_window.window_width,
             pet_window_center=group.fusion_pet_window.window_center,
+            ct_pseudocolor_preset=group.fusion_ct_pseudocolor_preset,
             pet_pseudocolor_preset=group.fusion_pet_pseudocolor_preset,
             pet_standalone_pseudocolor_preset=group.fusion_pet_pane_pseudocolor_preset,
+            pet_mip_pseudocolor_preset=group.fusion_mip_pseudocolor_preset,
             registration=render_registration,
             alpha=group.fusion_alpha,
             ct_has_patient_geometry=(
@@ -836,11 +539,9 @@ class ViewerFusionMixin:
                 == tuple(int(value) for value in pet_volume.shape)
             ),
             interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
-            overlay_pet_layer_only=primary_image_unchanged,
-            overlay_plane_override=overlay_plane_override,
+            overlay_pet_layer_only=False,
+            overlay_plane_override=None,
         )
-        if preview_fusion_started_at is not None:
-            preview_fusion_ms = (perf_counter() - preview_fusion_started_at) * 1000.0
         source_image = image_from_pixels(fusion_result.pixels)
         pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(fusion_result.spacing_xy)
         render_plan = self._build_render_plan_for_shape(
@@ -868,9 +569,8 @@ class ViewerFusionMixin:
         if (
             role == FUSION_PANE_OVERLAY_AXIAL
             and fusion_result.pet_scalar_pixels is not None
-            and (primary_image_unchanged or fusion_result.ct_layer_pixels is not None)
+            and fusion_result.ct_layer_pixels is not None
         ):
-            preview_pet_canvas_started_at = perf_counter() if primary_image_unchanged else None
             pet_low = float(fusion_result.pet_window_center or 0.0) - float(
                 fusion_result.pet_window_width or 1.0
             ) / 2.0
@@ -891,20 +591,13 @@ class ViewerFusionMixin:
                 transformed_pet_uint8,
                 group.fusion_pet_pseudocolor_preset,
             )
-            pet_alpha = np.clip(float(group.fusion_alpha), 0.0, 1.0)
             transformed_pet = np.concatenate(
                 (
                     transformed_pet_rgb,
-                    np.clip(
-                        transformed_pet_uint8.astype(np.float32) * pet_alpha,
-                        0.0,
-                        255.0,
-                    ).astype(np.uint8)[..., None],
+                    transformed_pet_uint8[..., None],
                 ),
                 axis=-1,
             )
-            if preview_pet_canvas_started_at is not None:
-                preview_pet_canvas_ms = (perf_counter() - preview_pet_canvas_started_at) * 1000.0
             transformed_pet_image = image_from_pixels(transformed_pet)
             cache_key = self._build_fusion_registration_pet_layer_cache_key(
                 view,
@@ -936,49 +629,40 @@ class ViewerFusionMixin:
                 pet_center_canvas=pet_center_canvas,
             )
             self._lock_fusion_registration_overlay_frame(view, group, cached_entry.overlay_frame)
-            if primary_image_unchanged and preview_drag is not None:
-                preview_transform_started_at = perf_counter()
-                preview_drag_for_transform = self._with_fusion_registration_preview_rotation_center(
-                    preview_drag,
-                    cached_entry.pet_center_canvas,
-                )
-                transformed_pet_image = self._apply_fusion_registration_preview_transform(
-                    transformed_pet_image,
-                    preview_drag_for_transform,
-                )
-                preview_transform_ms = (perf_counter() - preview_transform_started_at) * 1000.0
-            elif not primary_image_unchanged:
+            if not registration_preview:
                 self._fusion_registration_preview_drags.pop(group.group_id, None)
-            preview_pet_encode_started_at = perf_counter() if primary_image_unchanged else None
-            extra_image_bytes["pet"] = self._encode_image(transformed_pet_image, "png", fast_preview=False)
-            if preview_pet_encode_started_at is not None:
-                preview_pet_encode_ms = (perf_counter() - preview_pet_encode_started_at) * 1000.0
-                preview_pet_bytes = len(extra_image_bytes["pet"])
-            if primary_image_unchanged:
-                image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-            else:
-                ct_scalar = (
-                    fusion_result.ct_scalar_pixels
-                    if fusion_result.ct_scalar_pixels is not None
-                    else fusion_result.ct_layer_pixels
-                )
-                ct_low = float(fusion_result.ct_window_center or 0.0) - float(
-                    fusion_result.ct_window_width or 1.0
-                ) / 2.0
-                transformed_ct_scalar = compat.viewport_transformer.apply_affine_array(
-                    ct_scalar,
-                    canvas_width,
-                    canvas_height,
-                    image_transform,
-                    order=interpolation_order,
-                    cval=ct_low,
-                )
-                transformed_ct = window_to_uint8(
-                    transformed_ct_scalar,
-                    fusion_result.ct_window_width,
-                    fusion_result.ct_window_center,
-                )
-                image = image_from_pixels(transformed_ct)
+            ct_scalar = (
+                fusion_result.ct_scalar_pixels
+                if fusion_result.ct_scalar_pixels is not None
+                else fusion_result.ct_layer_pixels
+            )
+            ct_low = float(fusion_result.ct_window_center or 0.0) - float(
+                fusion_result.ct_window_width or 1.0
+            ) / 2.0
+            transformed_ct_scalar = compat.viewport_transformer.apply_affine_array(
+                ct_scalar,
+                canvas_width,
+                canvas_height,
+                image_transform,
+                order=interpolation_order,
+                cval=ct_low,
+            )
+            transformed_ct_uint8 = window_to_uint8(
+                transformed_ct_scalar,
+                fusion_result.ct_window_width,
+                fusion_result.ct_window_center,
+            )
+            transformed_ct_rgb = apply_pseudocolor(
+                transformed_ct_uint8,
+                group.fusion_ct_pseudocolor_preset,
+            )
+            pet_mask = transformed_pet_uint8.astype(np.float32)[..., None] / 255.0
+            blend_alpha = np.clip(float(group.fusion_alpha), 0.0, 1.0) * pet_mask
+            fused_pixels = (
+                transformed_ct_rgb.astype(np.float32) * (1.0 - blend_alpha)
+                + transformed_pet_rgb.astype(np.float32) * blend_alpha
+            )
+            image = image_from_pixels(np.clip(fused_pixels, 0.0, 255.0).astype(np.uint8))
         else:
             if pet_standalone_primary and fusion_result.pet_scalar_pixels is not None:
                 pet_low = float(fusion_result.pet_window_center or 0.0) - float(
@@ -1000,7 +684,7 @@ class ViewerFusionMixin:
                 image = image_from_pixels(
                     apply_pseudocolor(
                         transformed_pet_uint8,
-                        group.fusion_pet_pane_pseudocolor_preset,
+                        fusion_result.pseudocolor_preset,
                     )
                 )
             elif fusion_result.ct_scalar_pixels is not None:
@@ -1016,10 +700,13 @@ class ViewerFusionMixin:
                     cval=ct_low,
                 )
                 image = image_from_pixels(
-                    window_to_uint8(
-                        transformed_ct_scalar,
-                        fusion_result.ct_window_width,
-                        fusion_result.ct_window_center,
+                    apply_pseudocolor(
+                        window_to_uint8(
+                            transformed_ct_scalar,
+                            fusion_result.ct_window_width,
+                            fusion_result.ct_window_center,
+                        ),
+                        fusion_result.pseudocolor_preset,
                     )
                 )
             else:
@@ -1057,18 +744,6 @@ class ViewerFusionMixin:
                     pet_center_canvas=pet_center_canvas,
                 )
                 self._lock_fusion_registration_overlay_frame(view, group, cached_entry.overlay_frame)
-                if registration_preview and preview_drag is not None:
-                    preview_transform_started_at = perf_counter()
-                    preview_drag_for_transform = self._with_fusion_registration_preview_rotation_center(
-                        preview_drag,
-                        cached_entry.pet_center_canvas,
-                    )
-                    image = self._apply_fusion_registration_preview_transform(
-                        image,
-                        preview_drag_for_transform,
-                        fillcolor=self._fusion_pet_standalone_fill_color(image),
-                    )
-                    preview_transform_ms = (perf_counter() - preview_transform_started_at) * 1000.0
         fusion_projection = self._build_fusion_projection_info(
             pane_role=role,
             source_projection=fusion_result.source_projection,
@@ -1117,25 +792,8 @@ class ViewerFusionMixin:
             rotationDegrees=float(group.fusion_registration.rotation_degrees),
             saved=bool(group.fusion_registration.saved),
         )
-        if extra_image_bytes:
-            fusion_composite = FusionCompositeInfo(
-                revision=int(group.fusion_revision),
-                alpha=float(group.fusion_alpha),
-                registration=registration_info,
-                width=int(canvas_width if primary_image_unchanged else image.width),
-                height=int(canvas_height if primary_image_unchanged else image.height),
-                layers=[
-                    *([] if primary_image_unchanged else [FusionCompositeLayerInfo(key="primary", role="ct", imageFormat=image_format)]),
-                    FusionCompositeLayerInfo(key="pet", role="pet", imageFormat="png"),
-                ],
-                primary_image_unchanged=primary_image_unchanged,
-            )
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
-        image_bytes = (
-            self._fusion_registration_transparent_primary_png
-            if primary_image_unchanged
-            else self._encode_image(image, image_format, fast_preview=fast_preview)
-        )
+        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
         logger.debug(
             "fusion render timing view_id=%s role=%s fast_preview=%s image_format=%s source_shape=%s render=%sx%s total_ms=%.1f",
             view.view_id,
@@ -1147,25 +805,6 @@ class ViewerFusionMixin:
             render_plan.render_view.height,
             (perf_counter() - render_started_at) * 1000.0,
         )
-        if primary_image_unchanged:
-            logger.info(
-                (
-                    "fusion registration preview fallback view_id=%s role=%s cache_hit=False "
-                    "render=%sx%s volume_ms=%s fusion_ms=%s pet_canvas_ms=%s "
-                    "preview_transform_ms=%s pet_encode_ms=%s total_ms=%.1f pet_bytes=%s"
-                ),
-                view.view_id,
-                role,
-                canvas_width,
-                canvas_height,
-                None if preview_volume_ms is None else round(preview_volume_ms, 1),
-                None if preview_fusion_ms is None else round(preview_fusion_ms, 1),
-                None if preview_pet_canvas_ms is None else round(preview_pet_canvas_ms, 1),
-                None if preview_transform_ms is None else round(preview_transform_ms, 1),
-                None if preview_pet_encode_ms is None else round(preview_pet_encode_ms, 1),
-                (perf_counter() - render_started_at) * 1000.0,
-                preview_pet_bytes,
-            )
         return RenderedImageResult(
             meta=ViewImageResponse(
                 slice_info=SliceInfo(current=fusion_result.slice_index + 1, total=max(1, fusion_result.slice_total)),
@@ -1189,7 +828,9 @@ class ViewerFusionMixin:
                     ctSeriesId=ct_series.series_id,
                     petSeriesId=pet_series.series_id,
                     petPseudocolorPreset=group.fusion_pet_pseudocolor_preset,
+                    ctPseudocolorPreset=group.fusion_ct_pseudocolor_preset,
                     petPanePseudocolorPreset=group.fusion_pet_pane_pseudocolor_preset,
+                    mipPseudocolorPreset=group.fusion_mip_pseudocolor_preset,
                     petUnit=pet_display.unit,
                     petUnitLabel=pet_display.unit_label,
                     petWindowMin=self._resolve_window_min(
@@ -1201,6 +842,7 @@ class ViewerFusionMixin:
                         group.fusion_pet_window.window_center,
                     ),
                     fusionWindowTarget=group.fusion_window_target,
+                    frameOfReferenceMatched=group.fusion_frame_of_reference_matched,
                     alpha=float(group.fusion_alpha),
                     revision=int(group.fusion_revision),
                     registration=registration_info,
@@ -1213,7 +855,9 @@ class ViewerFusionMixin:
                     control_window_max=group.fusion_pet_control_window_max,
                     pseudocolor_preset=(
                         group.fusion_pet_pane_pseudocolor_preset
-                        if self._is_fusion_pet_display_role(role)
+                        if role == FUSION_PANE_PET_AXIAL
+                        else group.fusion_mip_pseudocolor_preset
+                        if role == FUSION_PANE_PET_CORONAL_MIP
                         else group.fusion_pet_pseudocolor_preset
                     ),
                     pet_pane_pseudocolor_preset=group.fusion_pet_pane_pseudocolor_preset,

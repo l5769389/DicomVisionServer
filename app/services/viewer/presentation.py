@@ -519,7 +519,8 @@ class ViewerPresentationMixin:
         exposure_time = self._format_number(getattr(dataset, "ExposureTime", None), precision=1, suffix="ms")
 
         vendor_line = self._join_non_empty(" / ", manufacturer, manufacturer_model)
-        patient_meta = self._join_non_empty(" ", patient_id, self._join_non_empty(" / ", patient_sex, patient_age))
+        patient_demographics = self._join_non_empty(" / ", patient_sex, patient_age)
+        patient_meta = tuple(line for line in (patient_id, patient_demographics) if line)
         technique_parts = [part for part in (kv, ma) if part]
         acquisition_datetime = self._join_non_empty(" ", acquisition_date, acquisition_time)
         tags = self._build_corner_info_tags(
@@ -530,7 +531,7 @@ class ViewerPresentationMixin:
                 "examDescription": self._corner_info_tag(exam_text),
                 "seriesNumber": self._corner_info_tag(f"Se: {series_number}" if series_number else None),
                 "patientName": self._corner_info_tag(patient_name),
-                "patientSummary": self._corner_info_tag(patient_meta),
+                "patientSummary": patient_meta,
                 "technique": self._corner_info_tag(" ".join(technique_parts) if technique_parts else None),
                 "sliceThickness": self._corner_info_tag(thickness),
                 "acquisitionDateTime": self._corner_info_tag(acquisition_datetime),
@@ -576,7 +577,7 @@ class ViewerPresentationMixin:
             line
             for line in (
                 patient_name,
-                patient_meta,
+                *patient_meta,
             )
             if line
         )

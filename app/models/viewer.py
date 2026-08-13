@@ -25,6 +25,8 @@ class InstanceRecord:
     samples_per_pixel: int | None = None
     pixel_spacing: tuple[float, float] | None = None
     imager_pixel_spacing: tuple[float, float] | None = None
+    image_orientation_patient: tuple[float, float, float, float, float, float] | None = None
+    image_position_patient: tuple[float, float, float] | None = None
     has_image_orientation_patient: bool = False
     has_image_position_patient: bool = False
     has_rescale_slope: bool = False
@@ -463,8 +465,10 @@ class ViewGroupRecord:
     fusion_view_group_key: str | None = None
     fusion_initialized: bool = False
     fusion_axial_index: int = 0
+    fusion_ct_pseudocolor_preset: str = "bw"
     fusion_pet_pseudocolor_preset: str = "hotiron"
-    fusion_pet_pane_pseudocolor_preset: str = "hotiron"
+    fusion_pet_pane_pseudocolor_preset: str = "bwinverse"
+    fusion_mip_pseudocolor_preset: str = "bwinverse"
     fusion_pet_unit: str = "source"
     fusion_window_target: str = "ct"
     fusion_alpha: float = 0.52
@@ -472,6 +476,7 @@ class ViewGroupRecord:
     fusion_pet_control_window_max: float | None = None
     fusion_revision: int = 0
     fusion_registration: FusionRegistrationState = field(default_factory=FusionRegistrationState)
+    fusion_frame_of_reference_matched: bool = True
     active_viewport: str = "mpr-ax"
     pet_unit: str = "source"
     pet_unit_label: str = "Source"
@@ -517,6 +522,11 @@ class ViewRecord:
     pet_unit: str = "source"
     pet_unit_label: str = "Source"
     pet_control_window_max: float | None = None
+    pending_pet_pseudocolor_preset: str | None = None
+    pending_pet_unit: str | None = None
+    pending_pet_window_min: float | None = None
+    pending_pet_window_max: float | None = None
+    pending_pet_control_window_max: float | None = None
     width: int | None = None
     height: int | None = None
     current_index: int = 0

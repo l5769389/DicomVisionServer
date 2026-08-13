@@ -27,9 +27,10 @@ from app.core.workspace import DEFAULT_WORKSPACE_ID, WORKSPACE_QUERY_PARAM, norm
 from app.models.viewer import InstanceRecord, SeriesRecord
 from app.schemas.dicom import DicomCompatibilityIssue, LoadFolderRequest, LoadFolderResponse, SeriesSummary
 from app.services.dicom_cache import dicom_cache
-from app.services.dicom_compatibility import build_dicom_compatibility_issues
+from app.services.dicom_compatibility import build_dicom_compatibility_issues, build_series_view_capabilities
 from app.services.dicom_gsps_import_service import is_gsps_dataset, parse_gsps_dataset
 from app.services.four_d_service import four_d_service
+from app.services.pet_quantification import derive_pet_auto_range
 from app.services.pseudocolor import (
     DEFAULT_PSEUDOCOLOR_PRESET,
     apply_pseudocolor,
@@ -44,6 +45,9 @@ MONTAGE_TILE_DEFAULT_SIZE = 256
 MONTAGE_TILE_MIN_SIZE = 96
 MONTAGE_TILE_MAX_SIZE = 512
 MONTAGE_TILE_CACHE_LIMIT = 512
+MONTAGE_TILE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+MONTAGE_SCALAR_TILE_CACHE_LIMIT = 512
+MONTAGE_SCALAR_TILE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 DICOM_SR_SOP_CLASS_UIDS = {
     str(BasicTextSRStorage),
     str(EnhancedSRStorage),
@@ -121,6 +125,9 @@ class SeriesRegistry:
         self._series_id_by_key: dict[str, str] = {}
         self._series_id_by_instance_path: dict[str, str] = {}
         self._montage_tile_cache: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
+        self._montage_tile_cache_bytes = 0
+        self._montage_scalar_tile_cache: OrderedDict[tuple[object, ...], np.ndarray] = OrderedDict()
+        self._montage_scalar_tile_cache_bytes = 0
         self._lock = RLock()
 
     @staticmethod
@@ -271,6 +278,11 @@ class SeriesRegistry:
 
     @staticmethod
     def _safe_numeric_pair(value) -> tuple[float, float] | None:
+        resolved = SeriesRegistry._safe_numeric_tuple(value, 2)
+        return (resolved[0], resolved[1]) if resolved is not None else None
+
+    @staticmethod
+    def _safe_numeric_tuple(value, length: int) -> tuple[float, ...] | None:
         if value is None:
             return None
         if isinstance(value, str):
@@ -280,12 +292,56 @@ class SeriesRegistry:
                 parts = list(value)
             except TypeError:
                 return None
-        if len(parts) < 2:
+        if len(parts) < length:
             return None
         try:
-            return (float(parts[0]), float(parts[1]))
+            resolved = tuple(float(item) for item in parts[:length])
         except (TypeError, ValueError):
             return None
+        return resolved if all(np.isfinite(item) for item in resolved) else None
+
+    @staticmethod
+    def _sort_instances(instances: Iterable[InstanceRecord]) -> list[InstanceRecord]:
+        resolved = list(instances)
+        if not resolved:
+            return resolved
+
+        first_orientation = next(
+            (instance.image_orientation_patient for instance in resolved if instance.image_orientation_patient),
+            None,
+        )
+        if first_orientation is not None and all(instance.image_position_patient is not None for instance in resolved):
+            row = np.asarray(first_orientation[:3], dtype=np.float64)
+            column = np.asarray(first_orientation[3:], dtype=np.float64)
+            normal = np.cross(row, column)
+            normal_norm = float(np.linalg.norm(normal))
+            if normal_norm > 1e-6:
+                normal /= normal_norm
+                aligned = True
+                for instance in resolved:
+                    orientation = instance.image_orientation_patient
+                    if orientation is None:
+                        aligned = False
+                        break
+                    current_normal = np.cross(
+                        np.asarray(orientation[:3], dtype=np.float64),
+                        np.asarray(orientation[3:], dtype=np.float64),
+                    )
+                    current_norm = float(np.linalg.norm(current_normal))
+                    if current_norm <= 1e-6 or abs(float(np.dot(current_normal / current_norm, normal))) < 0.999:
+                        aligned = False
+                        break
+                if aligned:
+                    return sorted(
+                        resolved,
+                        key=lambda instance: (
+                            float(np.dot(np.asarray(instance.image_position_patient, dtype=np.float64), normal)),
+                            instance.instance_number,
+                            instance.path.as_posix(),
+                        ),
+                    )
+
+        return sorted(resolved, key=lambda instance: (instance.instance_number, instance.path.as_posix()))
 
     @staticmethod
     def _get_transfer_syntax_info(dataset) -> tuple[str | None, str | None, bool]:
@@ -443,6 +499,14 @@ class SeriesRegistry:
             samples_per_pixel=SeriesRegistry._safe_positive_int(getattr(dataset, "SamplesPerPixel", None)),
             pixel_spacing=SeriesRegistry._safe_numeric_pair(getattr(dataset, "PixelSpacing", None)),
             imager_pixel_spacing=SeriesRegistry._safe_numeric_pair(getattr(dataset, "ImagerPixelSpacing", None)),
+            image_orientation_patient=SeriesRegistry._safe_numeric_tuple(
+                getattr(dataset, "ImageOrientationPatient", None),
+                6,
+            ),
+            image_position_patient=SeriesRegistry._safe_numeric_tuple(
+                getattr(dataset, "ImagePositionPatient", None),
+                3,
+            ),
             has_image_orientation_patient=SeriesRegistry._has_header_value(dataset, "ImageOrientationPatient"),
             has_image_position_patient=SeriesRegistry._has_header_value(dataset, "ImagePositionPatient"),
             has_rescale_slope=SeriesRegistry._has_header_value(dataset, "RescaleSlope"),
@@ -599,7 +663,7 @@ class SeriesRegistry:
             ] = series.series_id
 
     def _build_series_summary(self, series_key: str, series: SeriesRecord) -> SeriesSummary:
-        series.instances.sort(key=lambda item: item.instance_number)
+        series.instances[:] = self._sort_instances(series.instances)
         self._series_by_id[series.series_id] = series
         self._series_id_by_key[self._build_workspace_scoped_key(series.workspace_id, series_key)] = series.series_id
         self._index_series_instances(series)
@@ -630,6 +694,7 @@ class SeriesRegistry:
             standardObjectType=series.standard_object_type,
             preferredViewType=series.preferred_view_type,
             compatibilityIssues=[],
+            viewCapabilities=build_series_view_capabilities(series),
         )
 
     @staticmethod
@@ -657,6 +722,13 @@ class SeriesRegistry:
         window_center: float | None = None,
         pseudocolor_preset: str | None = None,
         pet_unit: str | None = None,
+        zoom: float = 1.0,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+        rotation_degrees: float = 0.0,
+        hor_flip: bool = False,
+        ver_flip: bool = False,
+        render_intent: str = "final",
         workspace_id: str | None = None,
     ) -> bytes:
         """Render one isolated stack slice for the virtualized montage viewer."""
@@ -674,8 +746,14 @@ class SeriesRegistry:
         cache_key = instance.sop_instance_uid or self._build_instance_path_key(instance.path)
         preset = normalize_pseudocolor_preset(pseudocolor_preset)
         normalized_pet_unit = str(pet_unit or "").strip() or None
+        normalized_zoom = max(0.25, min(float(zoom), 10.0))
+        max_offset = max(0.5, (normalized_zoom - 1.0) / 2.0)
+        normalized_offset_x = max(-max_offset, min(float(offset_x), max_offset))
+        normalized_offset_y = max(-max_offset, min(float(offset_y), max_offset))
+        normalized_rotation = float(rotation_degrees) % 360.0
         resolved_window_width = float(window_width) if window_width is not None else None
         resolved_window_center = float(window_center) if window_center is not None else None
+        normalized_render_intent = "preview" if str(render_intent).strip().lower() == "preview" else "final"
         tile_cache_key = (
             normalize_workspace_id(series.workspace_id),
             series.series_id,
@@ -689,54 +767,115 @@ class SeriesRegistry:
             round(resolved_window_center, 4) if resolved_window_center is not None else None,
             preset,
             normalized_pet_unit,
+            round(normalized_zoom, 4),
+            round(normalized_offset_x, 4),
+            round(normalized_offset_y, 4),
+            round(normalized_rotation, 4),
+            bool(hor_flip),
+            bool(ver_flip),
         )
-        with self._lock:
-            cached_tile = self._montage_tile_cache.get(tile_cache_key)
-            if cached_tile is not None:
-                self._montage_tile_cache.move_to_end(tile_cache_key)
-                return cached_tile
+        if normalized_render_intent == "final":
+            with self._lock:
+                cached_tile = self._montage_tile_cache.get(tile_cache_key)
+                if cached_tile is not None:
+                    self._montage_tile_cache.move_to_end(tile_cache_key)
+                    return cached_tile
 
         try:
             cached = dicom_cache.get(cache_key, instance.path)
             source_pixels = np.asarray(cached.source_pixels)
             is_pet_series = str(series.modality or "").strip().upper() in {"PT", "PET"}
+            actual_pet_unit: str | None = None
+            pet_mapping = None
+            pet_window_width = resolved_window_width
+            pet_window_center = resolved_window_center
             if is_pet_series:
                 # Import lazily to avoid a module cycle while retaining exactly
                 # the same PET unit/SUV conversion used by the standalone view.
                 from app.services.viewer_service import viewer_service
 
-                pet_volume = viewer_service._get_series_volume(series)
-                pet_display = viewer_service._build_fusion_pet_display_volume(
+                pet_mapping, actual_unit, _actual_label, _context = viewer_service._resolve_pet_display_mapping(
                     series,
-                    pet_volume,
                     normalized_pet_unit,
+                    cached=cached,
                 )
-                default_pet_width, default_pet_center = (
-                    viewer_service._derive_default_pet_window_for_display_volume(pet_display)
+                actual_pet_unit = actual_unit
+            scalar_pixels: np.ndarray | None = None
+            scalar_cache_key: tuple[object, ...] | None = None
+            if source_pixels.ndim == 2:
+                scalar_cache_key = (
+                    normalize_workspace_id(series.workspace_id),
+                    series.series_id,
+                    dicom_cache.build_instance_content_key(
+                        reference_instance.sop_instance_uid,
+                        reference_instance.path,
+                    ),
+                    dicom_cache.build_instance_content_key(instance.sop_instance_uid, instance.path),
+                    normalized_size,
+                    actual_pet_unit,
                 )
-                pet_window_width = (
-                    resolved_window_width
-                    if resolved_window_width is not None and resolved_window_width > 0
-                    else default_pet_width
-                )
-                pet_window_center = (
-                    resolved_window_center
-                    if resolved_window_center is not None
-                    else default_pet_center
-                )
-                source_pixels = viewer_service._prepare_pet_standalone_source_pixels(
-                    np.asarray(pet_display.volume[slice_index], dtype=np.float32),
-                    pet_window_width,
-                    pet_window_center,
-                )
+                with self._lock:
+                    scalar_pixels = self._montage_scalar_tile_cache.get(scalar_cache_key)
+                    if scalar_pixels is not None:
+                        self._montage_scalar_tile_cache.move_to_end(scalar_cache_key)
+            if is_pet_series:
+                mapped_pixels: np.ndarray | None = None
+                if scalar_pixels is None or pet_window_width is None or pet_window_center is None:
+                    mapped_pixels = (
+                        np.asarray(cached.source_pixels, dtype=np.float32) * np.float32(pet_mapping.scale)
+                        + np.float32(pet_mapping.offset)
+                    )
+                if pet_window_width is None or pet_window_width <= 0 or pet_window_center is None:
+                    auto_low, auto_high = derive_pet_auto_range(mapped_pixels, actual_pet_unit)
+                    if pet_window_width is None or pet_window_width <= 0:
+                        pet_window_width = max(1e-6, auto_high - auto_low)
+                    if pet_window_center is None:
+                        pet_window_center = (auto_high + auto_low) / 2.0
+                if scalar_pixels is None:
+                    source_pixels = viewer_service._prepare_pet_standalone_source_pixels(
+                        mapped_pixels,
+                        pet_window_width,
+                        pet_window_center,
+                    )
             if source_pixels.ndim == 3 and source_pixels.shape[-1] in (3, 4):
                 image = Image.fromarray(np.asarray(source_pixels[..., :3], dtype=np.uint8))
-                image = ImageOps.contain(image, (normalized_size, normalized_size), Image.Resampling.BILINEAR)
+                image = self._contain_montage_image(image, normalized_size, instance, Image.Resampling.BILINEAR)
                 canvas = Image.new("RGB", (normalized_size, normalized_size), (0, 0, 0))
             elif source_pixels.ndim == 2:
-                pixels = np.asarray(source_pixels, dtype=np.float32)
+                if scalar_pixels is None:
+                    pixels = np.asarray(source_pixels, dtype=np.float32)
+                    scalar_image = Image.fromarray(pixels, mode="F")
+                    scalar_image = self._contain_montage_image(
+                        scalar_image,
+                        normalized_size,
+                        instance,
+                        Image.Resampling.BILINEAR,
+                    )
+                    scalar_canvas = Image.new("F", (normalized_size, normalized_size), 0.0)
+                    scalar_canvas.paste(
+                        scalar_image,
+                        ((normalized_size - scalar_image.width) // 2, (normalized_size - scalar_image.height) // 2),
+                    )
+                    scalar_pixels = np.asarray(scalar_canvas, dtype=np.float32).copy()
+                    scalar_bytes = int(scalar_pixels.nbytes)
+                    if scalar_cache_key is not None and scalar_bytes <= MONTAGE_SCALAR_TILE_CACHE_MAX_BYTES:
+                        with self._lock:
+                            replaced = self._montage_scalar_tile_cache.pop(scalar_cache_key, None)
+                            if replaced is not None:
+                                self._montage_scalar_tile_cache_bytes -= int(replaced.nbytes)
+                            self._montage_scalar_tile_cache[scalar_cache_key] = scalar_pixels
+                            self._montage_scalar_tile_cache_bytes += scalar_bytes
+                            while (
+                                len(self._montage_scalar_tile_cache) > MONTAGE_SCALAR_TILE_CACHE_LIMIT
+                                or self._montage_scalar_tile_cache_bytes > MONTAGE_SCALAR_TILE_CACHE_MAX_BYTES
+                            ):
+                                _, evicted = self._montage_scalar_tile_cache.popitem(last=False)
+                                self._montage_scalar_tile_cache_bytes = max(
+                                    0,
+                                    self._montage_scalar_tile_cache_bytes - int(evicted.nbytes),
+                                )
                 low, high = self._resolve_thumbnail_window(
-                    pixels,
+                    scalar_pixels,
                     (
                         pet_window_width
                         if is_pet_series
@@ -755,39 +894,70 @@ class SeriesRegistry:
                 scale = high - low
                 if scale <= 0:
                     raise HTTPException(status_code=422, detail="Montage slice has no displayable pixel range")
-                # Geometry is applied to quantitative scalar samples first.
-                # Resizing an already colorized tile blends LUT colors and makes
-                # Montage disagree with Stack/MPR at identical physical points.
-                scalar_image = Image.fromarray(pixels, mode="F")
-                scalar_image = ImageOps.contain(
-                    scalar_image,
-                    (normalized_size, normalized_size),
-                    Image.Resampling.BILINEAR,
-                )
-                resized_pixels = np.asarray(scalar_image, dtype=np.float32)
                 clipped = np.nan_to_num(
-                    np.clip(resized_pixels, low, high),
+                    np.clip(scalar_pixels, low, high),
                     nan=low,
                     posinf=high,
                     neginf=low,
                 )
                 grayscale = ((clipped - low) * (255.0 / scale)).astype(np.uint8)
                 if preset == DEFAULT_PSEUDOCOLOR_PRESET:
-                    image = Image.fromarray(grayscale)
-                    canvas = Image.new("L", (normalized_size, normalized_size), 0)
+                    canvas = Image.fromarray(grayscale)
                 else:
-                    image = Image.fromarray(apply_pseudocolor(grayscale, preset))
-                    canvas = Image.new(
-                        "RGB",
-                        (normalized_size, normalized_size),
-                        pseudocolor_background_color(preset),
-                    )
+                    canvas = Image.fromarray(apply_pseudocolor(grayscale, preset))
             else:
                 raise HTTPException(status_code=422, detail="Montage slice pixel format is not supported")
 
-            canvas.paste(image, ((normalized_size - image.width) // 2, (normalized_size - image.height) // 2))
+            if source_pixels.ndim == 3 and source_pixels.shape[-1] in (3, 4):
+                canvas.paste(image, ((normalized_size - image.width) // 2, (normalized_size - image.height) // 2))
+            if hor_flip:
+                canvas = ImageOps.mirror(canvas)
+            if ver_flip:
+                canvas = ImageOps.flip(canvas)
+            if abs(normalized_rotation) > 1e-6:
+                canvas = canvas.rotate(
+                    -normalized_rotation,
+                    resample=Image.Resampling.BILINEAR,
+                    fillcolor=(
+                        pseudocolor_background_color(preset)
+                        if canvas.mode == "RGB"
+                        else 0
+                    ),
+                )
+            if (
+                abs(normalized_zoom - 1.0) > 1e-6
+                or abs(normalized_offset_x) > 1e-6
+                or abs(normalized_offset_y) > 1e-6
+            ):
+                center = float(normalized_size) / 2.0
+                inverse_zoom = 1.0 / normalized_zoom
+                translate_x = normalized_offset_x * float(normalized_size)
+                translate_y = normalized_offset_y * float(normalized_size)
+                canvas = canvas.transform(
+                    (normalized_size, normalized_size),
+                    Image.Transform.AFFINE,
+                    (
+                        inverse_zoom,
+                        0.0,
+                        center - (center + translate_x) * inverse_zoom,
+                        0.0,
+                        inverse_zoom,
+                        center - (center + translate_y) * inverse_zoom,
+                    ),
+                    resample=Image.Resampling.BILINEAR,
+                    fillcolor=(
+                        pseudocolor_background_color(preset)
+                        if canvas.mode == "RGB"
+                        else 0
+                    ),
+                )
             buffer = io.BytesIO()
-            canvas.save(buffer, format="WEBP", quality=82, method=4)
+            canvas.save(
+                buffer,
+                format="WEBP",
+                quality=60 if normalized_render_intent == "preview" else 88,
+                method=0 if normalized_render_intent == "preview" else 4,
+            )
             payload = buffer.getvalue()
         except HTTPException:
             raise
@@ -800,12 +970,41 @@ class SeriesRegistry:
             )
             raise HTTPException(status_code=422, detail="Montage slice could not be decoded") from exc
 
-        with self._lock:
-            self._montage_tile_cache[tile_cache_key] = payload
-            self._montage_tile_cache.move_to_end(tile_cache_key)
-            while len(self._montage_tile_cache) > MONTAGE_TILE_CACHE_LIMIT:
-                self._montage_tile_cache.popitem(last=False)
+        if normalized_render_intent == "final":
+            with self._lock:
+                payload_bytes = len(payload)
+                if payload_bytes <= MONTAGE_TILE_CACHE_MAX_BYTES:
+                    replaced = self._montage_tile_cache.pop(tile_cache_key, None)
+                    if replaced is not None:
+                        self._montage_tile_cache_bytes -= len(replaced)
+                    self._montage_tile_cache[tile_cache_key] = payload
+                    self._montage_tile_cache_bytes += payload_bytes
+                    while (
+                        len(self._montage_tile_cache) > MONTAGE_TILE_CACHE_LIMIT
+                        or self._montage_tile_cache_bytes > MONTAGE_TILE_CACHE_MAX_BYTES
+                    ):
+                        _, evicted = self._montage_tile_cache.popitem(last=False)
+                        self._montage_tile_cache_bytes = max(0, self._montage_tile_cache_bytes - len(evicted))
         return payload
+
+    @staticmethod
+    def _contain_montage_image(
+        image: Image.Image,
+        size: int,
+        instance: InstanceRecord,
+        resample: Image.Resampling,
+    ) -> Image.Image:
+        spacing = instance.pixel_spacing or instance.imager_pixel_spacing or (1.0, 1.0)
+        row_spacing = max(abs(float(spacing[0])), 1e-6)
+        column_spacing = max(abs(float(spacing[1])), 1e-6)
+        physical_width = max(float(image.width) * column_spacing, 1e-6)
+        physical_height = max(float(image.height) * row_spacing, 1e-6)
+        scale = min(float(size) / physical_width, float(size) / physical_height)
+        target_size = (
+            max(1, min(size, int(round(physical_width * scale)))),
+            max(1, min(size, int(round(physical_height * scale)))),
+        )
+        return image.resize(target_size, resample=resample)
 
     def _build_series_thumbnail_png(self, series: SeriesRecord) -> bytes | None:
         if not series.is_image_series or not series.instances:
@@ -908,7 +1107,7 @@ class SeriesRegistry:
                     four_d_phase_sort_value=phase.sort_value,
                     four_d_phase_label_value=phase.label_value,
                     four_d_phase_source=phase.source,
-                    instances=sorted(instances, key=lambda item: item.instance_number),
+                    instances=self._sort_instances(instances),
                 )
                 self._series_by_id[virtual_series.series_id] = virtual_series
                 virtual_series_records.append(virtual_series)
@@ -1007,11 +1206,23 @@ class SeriesRegistry:
                     for key, value in self._montage_tile_cache.items()
                     if key[0] != normalized_workspace_id
                 )
+                self._montage_tile_cache_bytes = sum(len(value) for value in self._montage_tile_cache.values())
+                self._montage_scalar_tile_cache = OrderedDict(
+                    (key, value)
+                    for key, value in self._montage_scalar_tile_cache.items()
+                    if key[0] != normalized_workspace_id
+                )
+                self._montage_scalar_tile_cache_bytes = sum(
+                    int(value.nbytes) for value in self._montage_scalar_tile_cache.values()
+                )
                 return
             self._series_by_id.clear()
             self._series_id_by_key.clear()
             self._series_id_by_instance_path.clear()
             self._montage_tile_cache.clear()
+            self._montage_tile_cache_bytes = 0
+            self._montage_scalar_tile_cache.clear()
+            self._montage_scalar_tile_cache_bytes = 0
 
 
 series_registry = SeriesRegistry()

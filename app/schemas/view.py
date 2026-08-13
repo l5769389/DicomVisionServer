@@ -215,6 +215,7 @@ class ViewExportAnnotationOverlayPayload(BaseModel):
 class ViewExportOverlaysPayload(BaseModel):
     annotations: list[ViewExportAnnotationOverlayPayload] = Field(default_factory=list)
     measurements: list[ViewExportMeasurementOverlayPayload] = Field(default_factory=list)
+    corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
 
     model_config = {"populate_by_name": True}
 
@@ -577,12 +578,15 @@ class FusionInfo(BaseModel):
     ct_series_id: str = Field(alias="ctSeriesId")
     pet_series_id: str = Field(alias="petSeriesId")
     pet_pseudocolor_preset: str = Field(alias="petPseudocolorPreset")
-    pet_pane_pseudocolor_preset: str = Field(default="hotiron", alias="petPanePseudocolorPreset")
+    ct_pseudocolor_preset: str = Field(default="bw", alias="ctPseudocolorPreset")
+    pet_pane_pseudocolor_preset: str = Field(default="bwinverse", alias="petPanePseudocolorPreset")
+    mip_pseudocolor_preset: str = Field(default="bwinverse", alias="mipPseudocolorPreset")
     pet_unit: str = Field(default="source", alias="petUnit")
     pet_unit_label: str = Field(default="Source", alias="petUnitLabel")
     pet_window_min: float | None = Field(default=None, alias="petWindowMin")
     pet_window_max: float | None = Field(default=None, alias="petWindowMax")
     fusion_window_target: Literal["ct", "pet"] = Field(default="ct", alias="fusionWindowTarget")
+    frame_of_reference_matched: bool = Field(default=True, alias="frameOfReferenceMatched")
     alpha: float
     revision: int
     registration: FusionRegistrationInfo
@@ -669,6 +673,15 @@ class PetInfo(BaseModel):
     fusion_overlay_pseudocolor_preset: str | None = Field(default=None, alias="fusionOverlayPseudocolorPreset")
     tracer_name: str | None = Field(default=None, alias="tracerName")
     is_fdg: bool = Field(default=False, alias="isFdg")
+
+    model_config = {"populate_by_name": True}
+
+
+class MontageDisplayConfigResponse(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    modality: str
+    window_info: WindowInfo = Field(alias="windowInfo")
+    pet_info: PetInfo | None = Field(default=None, alias="petInfo")
 
     model_config = {"populate_by_name": True}
 
@@ -805,6 +818,9 @@ class ViewOperationRequest(BaseModel):
     ww: float | None = None
     wl: float | None = None
     pseudocolor_preset: str | None = Field(default=None, alias="pseudocolorPreset")
+    fusion_pseudocolor_targets: list[
+        Literal["fusion-ct-ax", "fusion-pet-ax", "fusion-overlay-ax", "fusion-pet-cor-mip"]
+    ] | None = Field(default=None, alias="fusionPseudocolorTargets")
     fusion_alpha: float | None = Field(default=None, alias="fusionAlpha")
     fusion_manual_registration: bool | None = Field(default=None, alias="fusionManualRegistration")
     fusion_pet_unit: str | None = Field(default=None, alias="fusionPetUnit")

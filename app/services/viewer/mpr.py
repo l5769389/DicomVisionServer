@@ -47,6 +47,11 @@ class ViewerMprMixin:
         volume_ms = (perf_counter() - volume_started_at) * 1000.0
 
         target_viewport = self._resolve_mpr_viewport(view)
+        is_crosshair_preview = fast_preview and metadata_mode == "mpr-crosshair-preview"
+        # Crosshair batches may be throttled, but every presented image must
+        # use the final pixel pipeline. Mixing the lightweight preview renderer
+        # with the final renderer makes mouse-up visibly change the image.
+        use_fast_pixel_path = fast_preview and not is_crosshair_preview
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
         preview_plane_shape = (
             self._get_mpr_fast_preview_plane_shape(
@@ -54,7 +59,7 @@ class ViewerMprMixin:
                 target_viewport,
                 viewport_size=(view.height or 0, view.width or 0),
             )
-            if fast_preview and not fast_preview_full_resolution
+            if use_fast_pixel_path and not fast_preview_full_resolution
             else None
         )
         reslice_started_at = perf_counter()
@@ -63,7 +68,7 @@ class ViewerMprMixin:
             volume,
             target_viewport,
             output_shape=preview_plane_shape,
-            interpolation_order=0 if fast_preview and not fast_preview_full_resolution else 1,
+            interpolation_order=0 if use_fast_pixel_path and not fast_preview_full_resolution else 1,
         )
         reslice_ms = (perf_counter() - reslice_started_at) * 1000.0
         metadata_started_at = perf_counter()
@@ -94,21 +99,21 @@ class ViewerMprMixin:
         metadata_image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=full_plane_width,
             image_height=full_plane_height,
-            canvas_width=render_plan.render_view.width or 0,
-            canvas_height=render_plan.render_view.height or 0,
-            view=render_plan.render_view,
+            canvas_width=view.width or 0,
+            canvas_height=view.height or 0,
+            view=view,
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
         scale_bar = self._build_scale_bar_info(
-            render_plan.render_view,
+            view,
             metadata_image_transform,
             self._get_mpr_spacing_xy_from_pose(target_plane_pose),
         )
         plane_min = float(np.min(plane_pixels))
         plane_max = float(np.max(plane_pixels))
         mpr_crosshair_overlay = self._build_mpr_crosshair_overlay(
-            render_plan.render_view,
+            view,
             volume.shape,
             target_plane_pose.output_shape,
             metadata_image_transform,
@@ -125,7 +130,7 @@ class ViewerMprMixin:
         )
         reference_instance, reference_cached = (
             (None, None)
-            if fast_preview
+            if use_fast_pixel_path
             else self._get_reference_instance_and_cache(series)
         )
         slice_corner_info = (
@@ -150,7 +155,7 @@ class ViewerMprMixin:
                 view.window_width,
                 view.window_center,
             )
-        include_mpr_measurement_payloads = not fast_preview or metadata_mode in {
+        include_mpr_measurement_payloads = not use_fast_pixel_path or metadata_mode in {
             "mpr-pan-zoom-preview",
             "mpr-zoom-preview",
             "mpr-model-rotate-preview",
@@ -173,7 +178,7 @@ class ViewerMprMixin:
         )
         metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
         image_started_at = perf_counter()
-        if fast_preview:
+        if use_fast_pixel_path:
             image = self._render_fast_mpr_preview(
                 context,
                 order=1 if fast_preview_full_resolution else 0,
@@ -182,7 +187,7 @@ class ViewerMprMixin:
             image = compat.layered_renderer.render(context)
         is_mpr_model_rotate_preview = fast_preview and metadata_mode == "mpr-model-rotate-preview"
         include_mpr_segmentation_overlay = (
-            not fast_preview
+            not use_fast_pixel_path
             or metadata_mode in {"mpr-segmentation-preview", "mpr-model-rotate-preview"}
         )
         model_rotation_world = np.eye(3, dtype=np.float64)
@@ -204,12 +209,12 @@ class ViewerMprMixin:
                 target_viewport,
                 segmentation_plane_pose,
                 display_shape=target_plane_pose.output_shape,
-                include_samples=not fast_preview
+                include_samples=not use_fast_pixel_path
                 or metadata_mode
                 in {"mpr-segmentation-preview", "mpr-model-rotate-preview"},
                 sample_limit=(
                     MPR_SEGMENTATION_OVERLAY_PREVIEW_SAMPLE_LIMIT
-                    if fast_preview
+                    if use_fast_pixel_path
                     and metadata_mode
                     in {"mpr-segmentation-preview", "mpr-model-rotate-preview"}
                     else MPR_SEGMENTATION_OVERLAY_SAMPLE_LIMIT
@@ -253,7 +258,7 @@ class ViewerMprMixin:
         image_bytes = self._encode_image(
             image,
             image_format,
-            fast_preview=fast_preview and not fast_preview_full_resolution,
+            fast_preview=use_fast_pixel_path,
         )
         encode_ms = (perf_counter() - encode_started_at) * 1000.0
         logger.debug(
@@ -314,19 +319,19 @@ class ViewerMprMixin:
                 measurements=[] if not include_mpr_measurement_payloads else self._serialize_measurements(
                     visible_measurements,
                     image_transform=metadata_image_transform,
-                    canvas_width=render_plan.render_view.width or 0,
-                    canvas_height=render_plan.render_view.height or 0,
+                    canvas_width=view.width or 0,
+                    canvas_height=view.height or 0,
                 ),
                 annotations=[] if not include_mpr_measurement_payloads else self._serialize_annotations(
                     tuple(visible_annotations),
                     image_transform=metadata_image_transform,
-                    canvas_width=render_plan.render_view.width or 0,
-                    canvas_height=render_plan.render_view.height or 0,
+                    canvas_width=view.width or 0,
+                    canvas_height=view.height or 0,
                 ),
                 transform=self._build_view_transform_payload(view),
                 orientation=None if not include_static_preview_metadata else self._serialize_orientation_overlay(
                     self._build_mpr_orientation_overlay(
-                        render_plan.render_view,
+                        view,
                         target_viewport,
                         plane_state,
                         plane_pose=target_plane_pose,
@@ -346,40 +351,77 @@ class ViewerMprMixin:
         return compat.layered_renderer.composite_overlays(image.convert("RGBA"), context)
 
     def _render_cached_fast_base_image(self, context: RenderContext, *, order: int = 1) -> Image.Image:
-        base_pixels = self._get_cached_fast_base_pixels(context)
-        if context.view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
-            transformed_color = compat.viewport_transformer.apply_affine_array(
-                apply_pseudocolor(base_pixels, context.view.pseudocolor_preset),
+        source_pixels = context.source_pixels
+        if source_pixels.ndim == 3 and source_pixels.shape[-1] in (3, 4):
+            base_pixels = self._window_array(
+                source_pixels,
+                context.view.window_width,
+                context.view.window_center,
+                pixel_min=context.pixel_min,
+                pixel_max=context.pixel_max,
+            )
+            transformed = compat.viewport_transformer.apply_affine_array(
+                base_pixels,
                 context.view.width or 0,
                 context.view.height or 0,
                 context.image_transform,
                 order=order,
                 cval=context.background_cval,
             )
-            return Image.fromarray(transformed_color)
-        transformed = compat.viewport_transformer.apply_affine_array(
-            base_pixels,
-            context.view.width or 0,
-            context.view.height or 0,
-            context.image_transform,
-            order=order,
-            cval=context.background_cval,
-        )
-        return Image.fromarray(transformed)
+            return Image.fromarray(transformed)
 
-    def _get_cached_fast_base_pixels(self, context: RenderContext) -> np.ndarray:
-        cache_key = self._build_fast_base_pixels_cache_key(context)
+        window_width = context.view.window_width
+        window_center = context.view.window_center
+        if window_width is not None and window_width > 0 and window_center is not None:
+            lower = float(window_center) - float(window_width) / 2.0
+            upper = float(window_center) + float(window_width) / 2.0
+        else:
+            lower = float(context.pixel_min)
+            upper = float(context.pixel_max)
+        dataset = context.cached.dataset if context.cached is not None else None
+        is_monochrome1 = str(getattr(dataset, "PhotometricInterpretation", "") or "").upper() == "MONOCHROME1"
+        transformed_scalar = self._get_cached_fast_base_pixels(
+            context,
+            order=order,
+            scalar_padding=upper if is_monochrome1 else lower,
+        )
+        base_pixels = self._window_array(
+            transformed_scalar,
+            window_width,
+            window_center,
+            pixel_min=context.pixel_min,
+            pixel_max=context.pixel_max,
+        )
+        if is_monochrome1:
+            base_pixels = np.subtract(255, base_pixels, dtype=np.uint8)
+        if context.view.pseudocolor_preset != DEFAULT_PSEUDOCOLOR_PRESET:
+            base_pixels = apply_pseudocolor(base_pixels, context.view.pseudocolor_preset)
+        return Image.fromarray(base_pixels)
+
+    def _get_cached_fast_base_pixels(
+        self,
+        context: RenderContext,
+        *,
+        order: int,
+        scalar_padding: float,
+    ) -> np.ndarray:
+        cache_key = self._build_fast_base_pixels_cache_key(
+            context,
+            order=order,
+            scalar_padding=scalar_padding,
+        )
         cached = self._fast_base_pixels_cache.get(cache_key)
         if cached is not None:
             self._fast_base_pixels_cache.move_to_end(cache_key)
             return cached
 
-        base_pixels = self._window_array(
-            context.source_pixels,
-            context.view.window_width,
-            context.view.window_center,
-            pixel_min=context.pixel_min,
-            pixel_max=context.pixel_max,
+        base_pixels = compat.viewport_transformer.apply_affine_array(
+            np.asarray(context.source_pixels, dtype=np.float32),
+            context.view.width or 0,
+            context.view.height or 0,
+            context.image_transform,
+            order=order,
+            cval=scalar_padding,
         )
         self._fast_base_pixels_cache[cache_key] = base_pixels
         self._fast_base_pixels_cache.move_to_end(cache_key)
@@ -388,15 +430,21 @@ class ViewerMprMixin:
         return base_pixels
 
     @staticmethod
-    def _build_fast_base_pixels_cache_key(context: RenderContext) -> tuple[object, ...]:
+    def _build_fast_base_pixels_cache_key(
+        context: RenderContext,
+        *,
+        order: int,
+        scalar_padding: float,
+    ) -> tuple[object, ...]:
         return (
             id(context.source_pixels),
             tuple(context.source_pixels.shape),
             str(context.source_pixels.dtype),
-            float(context.pixel_min),
-            float(context.pixel_max),
-            None if context.view.window_width is None else float(context.view.window_width),
-            None if context.view.window_center is None else float(context.view.window_center),
+            int(context.view.width or 0),
+            int(context.view.height or 0),
+            int(order),
+            float(scalar_padding),
+            tuple(float(value) for value in np.asarray(context.image_transform.matrix).reshape(-1)),
         )
 
     @staticmethod

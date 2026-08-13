@@ -603,6 +603,7 @@ class ViewerVolumeMixin:
         image_format: ImageFormat = "webp",
         *,
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         progress_callback: ViewRenderProgressCallback | None = None,
         raw_output: bool = False,
     ) -> RenderedImageResult:
@@ -690,6 +691,7 @@ class ViewerVolumeMixin:
                 volume=render_volume,
                 spacing_xyz=spacing_xyz,
                 fast_preview=fast_preview,
+                scale_fast_preview_canvas=not fast_preview_full_resolution,
                 volume_token=render_volume_token,
             )
             image = compat._get_vtk_volume_renderer().render(volume_request)

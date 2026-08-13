@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+from io import BytesIO
 from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PIL import Image
+from pydicom.dataset import Dataset
 
 from app.core import MPR_VIEWPORT_AXIAL, MPR_VIEWPORT_CORONAL, MPR_VIEWPORT_SAGITTAL, ZOOM_MAX, ZOOM_MIN
 from app.models.viewer import MprMipViewportState, MprRotationDragRecord, ViewGroupRecord, ViewRecord
@@ -17,6 +19,29 @@ from app.services import viewer_service as viewer_service_module
 from app.services.view_registry import view_registry
 from app.services.viewer_service import ViewerService
 from app.services.viewport_transformer import viewport_transformer
+
+
+def test_series_corner_info_keeps_patient_summary_on_separate_rows() -> None:
+    service = ViewerService()
+    dataset = Dataset()
+    dataset.PatientName = "ZHANG^SAN"
+    dataset.PatientID = "P000123"
+    dataset.PatientSex = "M"
+    dataset.PatientAge = "058Y"
+    series = SimpleNamespace(
+        series_description="CT CHEST",
+        patient_id="P000123",
+        modality="CT",
+        accession_number="",
+        study_date="",
+        study_instance_uid="",
+        series_instance_uid="",
+    )
+
+    overlay = service._build_series_corner_info_overlay(series, dataset)
+
+    assert overlay.top_right == ("ZHANG^SAN", "P000123", "M / 058Y")
+    assert overlay.tags["patientSummary"] == ("P000123", "M / 058Y")
 
 
 def _build_service_with_stubbed_series(monkeypatch):
@@ -1454,19 +1479,26 @@ def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) ->
     assert group.mpr_revision == 1
 
 
-def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
+def test_stack_window_move_uses_full_resolution_webp_preview_and_end_uses_lossless_frame(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
     view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
     view.window_width = 400.0
     view.window_center = 40.0
     view.zoom = 1.0
+    rendered_result = SimpleNamespace(image_bytes=b"preview", meta=SimpleNamespace())
+    render_calls: list[dict[str, object]] = []
+
+    def render_by_view_type(*_args, **kwargs):
+        render_calls.append(kwargs)
+        return rendered_result
 
     previous_views = dict(view_registry._view_by_id)
     try:
         view_registry._view_by_id.clear()
         view_registry._view_by_id[view.view_id] = view
         monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+        monkeypatch.setattr(service, "_render_by_view_type", render_by_view_type)
 
         service.handle_view_operation(
             ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
@@ -1491,17 +1523,33 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
         view_registry._view_by_id.clear()
         view_registry._view_by_id.update(previous_views)
 
-    assert window_move.primary_result is None
-    assert window_move.deferred_view_ids == (view.view_id,)
-    assert window_move.deferred_image_format == "webp"
-    assert window_move.deferred_fast_preview is True
-    assert window_move.deferred_metadata_mode == "stack-pixel-preview"
+    assert window_move.primary_result is rendered_result
+    assert window_move.primary_image_format == "webp"
+    assert window_move.primary_fast_preview is True
+    assert window_move.primary_fast_preview_full_resolution is True
+    assert window_move.primary_metadata_mode == "stack-pixel-preview"
+    assert window_move.deferred_view_ids == ()
     assert view.window_width == pytest.approx(412.0)
     assert view.window_center == pytest.approx(48.0)
-    assert window_end.primary_result is None
-    assert window_end.deferred_view_ids == (view.view_id,)
-    assert window_end.deferred_image_format == "webp"
-    assert window_end.deferred_fast_preview is False
+    assert window_end.primary_result is rendered_result
+    assert window_end.primary_image_format == "webp"
+    assert window_end.primary_fast_preview is False
+    assert window_end.primary_metadata_mode == "full"
+    assert window_end.deferred_view_ids == ()
+    assert render_calls == [
+        {
+            "image_format": "webp",
+            "fast_preview": True,
+            "fast_preview_full_resolution": True,
+            "metadata_mode": "stack-pixel-preview",
+        },
+        {
+            "image_format": "webp",
+            "fast_preview": False,
+            "fast_preview_full_resolution": False,
+            "metadata_mode": "full",
+        },
+    ]
     assert zoom_move.primary_result is None
     assert zoom_move.deferred_view_ids == (view.view_id,)
     assert zoom_move.deferred_image_format == "webp"
@@ -1514,7 +1562,7 @@ def test_stack_window_and_zoom_moves_use_png_render(monkeypatch) -> None:
     assert zoom_end.deferred_fast_preview is False
 
 
-def test_volume_zoom_move_uses_transport_format_without_full_resolution_preview(monkeypatch) -> None:
+def test_volume_zoom_move_uses_full_resolution_webp_preview(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
     view = ViewRecord(view_id="volume-view", series_id=series.series_id, view_type="3D")
@@ -1555,7 +1603,7 @@ def test_volume_zoom_move_uses_transport_format_without_full_resolution_preview(
     assert zoom_move.deferred_view_ids == (view.view_id,)
     assert zoom_move.deferred_image_format == "webp"
     assert zoom_move.deferred_fast_preview is True
-    assert zoom_move.deferred_fast_preview_full_resolution is False
+    assert zoom_move.deferred_fast_preview_full_resolution is True
     assert zoom_move.deferred_metadata_mode == "stack-zoom-preview"
 
 
@@ -1571,6 +1619,11 @@ def test_window_drag_sensitivity_scales_with_current_width(monkeypatch) -> None:
         view_registry._view_by_id.clear()
         view_registry._view_by_id[view.view_id] = view
         monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+        monkeypatch.setattr(
+            service,
+            "_render_by_view_type",
+            lambda *args, **kwargs: SimpleNamespace(image_bytes=b"preview", meta=SimpleNamespace()),
+        )
 
         service.handle_view_operation(
             ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
@@ -1584,6 +1637,37 @@ def test_window_drag_sensitivity_scales_with_current_width(monkeypatch) -> None:
 
     assert view.window_width == pytest.approx(10.0)
     assert view.window_center == pytest.approx(5.0)
+
+
+def test_window_drag_clamps_ct_width_to_positive_minimum(monkeypatch) -> None:
+    service = ViewerService()
+    series = SimpleNamespace(series_id="s", instances=[])
+    view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
+    view.window_width = 400.0
+    view.window_center = 40.0
+
+    previous_views = dict(view_registry._view_by_id)
+    try:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id[view.view_id] = view
+        monkeypatch.setattr(viewer_service_module.series_registry, "get", lambda series_id: series)
+        monkeypatch.setattr(
+            service,
+            "_render_by_view_type",
+            lambda *args, **kwargs: SimpleNamespace(image_bytes=b"preview", meta=SimpleNamespace()),
+        )
+
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="start")
+        )
+        service.handle_view_operation(
+            ViewOperationRequest(viewId=view.view_id, opType="window", actionType="move", x=-1000, y=0)
+        )
+    finally:
+        view_registry._view_by_id.clear()
+        view_registry._view_by_id.update(previous_views)
+
+    assert view.window_width == pytest.approx(1.0)
 
 
 def test_stack_pan_move_uses_default_webp_transport(monkeypatch) -> None:
@@ -1970,6 +2054,35 @@ def test_mpr_fast_preview_includes_backend_corner_state(monkeypatch) -> None:
     assert "Zoom:1.5x" in result.meta.corner_info.bottom_right
     assert all(not line.startswith("X:") for line in result.meta.corner_info.bottom_right)
     assert "coordinates" not in result.meta.corner_info.tags
+
+
+def test_mpr_crosshair_preview_uses_the_final_pixel_pipeline(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    _, axial_view = _build_axial_view(service, series, volume)
+    axial_view.is_initialized = True
+    axial_view.window_width = 512.0
+    axial_view.window_center = 42.0
+
+    preview = service._render_mpr_view(
+        axial_view,
+        image_format="webp",
+        fast_preview=True,
+        fast_preview_full_resolution=True,
+        metadata_mode="mpr-crosshair-preview",
+    )
+    final = service._render_mpr_view(
+        axial_view,
+        image_format="webp",
+        fast_preview=False,
+        metadata_mode="full",
+    )
+
+    with Image.open(BytesIO(preview.image_bytes)) as preview_image:
+        preview_pixels = np.asarray(preview_image.convert("RGB"))
+    with Image.open(BytesIO(final.image_bytes)) as final_image:
+        final_pixels = np.asarray(final_image.convert("RGB"))
+
+    assert np.array_equal(preview_pixels, final_pixels)
 
 
 def test_mpr_crosshair_end_broadcasts_full_quality_to_all_mpr_views(monkeypatch) -> None:

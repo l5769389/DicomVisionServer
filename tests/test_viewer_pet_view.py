@@ -76,6 +76,7 @@ def _patch_pet_render_dependencies(
     cached = SimpleNamespace(dataset=dataset, source_pixels=volume[0])
     monkeypatch.setattr("app.services.viewer_service.series_registry.get", lambda *_args, **_kwargs: series)
     monkeypatch.setattr(service, "_get_series_volume", lambda *_args, **_kwargs: volume)
+    monkeypatch.setattr(service, "_get_series_native_slice_volume", lambda *_args, **_kwargs: volume)
     monkeypatch.setattr(service, "_resolve_representative_stack_index", lambda _series: 1)
     monkeypatch.setattr(service, "_get_reference_instance_and_cache", lambda _series: (series.instances[0], cached))
     monkeypatch.setattr(service, "_get_indexed_instance_and_cache", lambda _series, index: (series.instances[index], cached))
@@ -201,12 +202,14 @@ def test_pet_view_resizes_from_initial_auto_fit_and_hover_maps_inside_image(monk
     assert "SUVbw" in hover.display_text
 
 
-def test_initial_pet_config_before_size_does_not_leave_standalone_view_at_one_x(monkeypatch) -> None:
+def test_initial_pet_config_before_size_keeps_first_fit_and_auto_pet_window(monkeypatch) -> None:
     service = ViewerService()
     series = _series()
-    volume = np.zeros((3, 70, 140), dtype=np.float32)
+    volume = np.arange(3 * 70 * 140, dtype=np.float32).reshape((3, 70, 140))
     _patch_pet_render_dependencies(monkeypatch, service, series, volume)
     view = ViewRecord(view_id="pet-view", series_id=series.series_id, view_type="PET")
+    pet_display = service._build_fusion_pet_display_volume(series, volume, None)
+    expected_ww, expected_wl = service._derive_default_pet_window_for_display_volume(pet_display)
 
     assert service._handle_pet_config(
         view,
@@ -231,6 +234,38 @@ def test_initial_pet_config_before_size_does_not_leave_standalone_view_at_one_x(
 
     assert view.is_initialized is True
     assert view.zoom == pytest.approx(9.8)
+    assert view.window_width == pytest.approx(expected_ww)
+    assert view.window_center == pytest.approx(expected_wl)
+
+
+@pytest.mark.parametrize("preset", ["rainbow", "bw"])
+def test_initial_pet_config_preserves_preferred_pseudocolor_during_first_fit(monkeypatch, preset: str) -> None:
+    service = ViewerService()
+    series = _series()
+    volume = np.zeros((3, 70, 140), dtype=np.float32)
+    _patch_pet_render_dependencies(monkeypatch, service, series, volume)
+    view = ViewRecord(
+        view_id="pet-view",
+        series_id=series.series_id,
+        view_type="PET",
+        width=1400,
+        height=700,
+    )
+
+    assert service._handle_pet_config(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="petConfig",
+            pseudocolorPreset=preset,
+        ),
+    )
+    assert view.is_initialized is False
+
+    service._initialize_pet_viewport(view)
+
+    assert view.pseudocolor_preset == preset
+    assert view.pending_pet_pseudocolor_preset is None
 
 
 def test_pet_auto_fit_keeps_a_safe_margin_for_standalone_and_mpr_views(monkeypatch) -> None:
@@ -742,6 +777,7 @@ def test_pet_config_unit_resets_default_window(monkeypatch) -> None:
     volume = np.ones((3, 4, 5), dtype=np.float32)
     monkeypatch.setattr("app.services.viewer_service.series_registry.get", lambda *_args, **_kwargs: series)
     monkeypatch.setattr(service, "_get_series_volume", lambda *_args, **_kwargs: volume)
+    monkeypatch.setattr(service, "_get_series_native_slice_volume", lambda *_args, **_kwargs: volume)
     monkeypatch.setattr(
         service,
         "_build_fusion_pet_display_volume",
@@ -831,3 +867,31 @@ def test_pet_display_range_update_does_not_change_control_ceiling() -> None:
     assert view.window_width == pytest.approx(8.0)
     assert view.window_center == pytest.approx(4.0)
     assert view.pet_control_window_max == pytest.approx(30.0)
+
+
+def test_pet_control_ceiling_clamps_current_display_range() -> None:
+    service = ViewerService()
+    view = ViewRecord(
+        view_id="pet-view",
+        series_id="pet",
+        view_type="PET",
+        width=128,
+        height=96,
+        pet_control_window_max=65_535.0,
+    )
+    view.window_width = 65_535.0
+    view.window_center = 32_767.5
+
+    changed = service._handle_pet_config(
+        view,
+        ViewOperationRequest(
+            viewId=view.view_id,
+            opType="petConfig",
+            petControlWindowMax=20.0,
+        ),
+    )
+
+    assert changed is True
+    assert view.pet_control_window_max == pytest.approx(20.0)
+    assert view.window_width == pytest.approx(20.0)
+    assert view.window_center == pytest.approx(10.0)

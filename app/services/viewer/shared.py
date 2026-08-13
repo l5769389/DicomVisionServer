@@ -112,6 +112,7 @@ from app.schemas.view import (
     MprVoiSphereStats,
     MprSegmentationVoiBox,
     MeasurementOverlayPayload,
+    MontageDisplayConfigResponse,
     OperationAcceptedResponse,
     OrientationInfo,
     ScaleBarInfo,
@@ -186,6 +187,7 @@ from app.services.pet_quantification import (
     PET_UNIT_SUL,
     PET_UNIT_SUV_BSA,
     PET_UNIT_SUV_BW,
+    PetLinearMapping,
     PetQuantificationContext,
     apply_pet_mapping,
     build_pet_quantification_context,
@@ -213,6 +215,8 @@ from app.services.view_registry import view_registry
 from app.services.viewer_operation_handlers import OperationRenderOutcome, handle_view_operation
 from app.services.viewer_render_dispatch import render_by_view_type
 from app.services.viewer_fusion import (
+    FUSION_PET_AXIAL_PSEUDOCOLOR_PRESET,
+    FUSION_PET_MIP_PSEUDOCOLOR_PRESET,
     FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET,
     FUSION_VIEW_TYPES,
     FUSION_VIEW_TYPE_TO_PANE_ROLE,
@@ -326,6 +330,7 @@ MEASUREMENT_TOOL_TYPES = {
     "alignment-vertical",
 }
 VOLUME_CACHE_MAX_BYTES = 1024 * 1024 * 1024
+PET_DISPLAY_VOLUME_CACHE_MAX_BYTES = 512 * 1024 * 1024
 FAST_PREVIEW_JPEG_QUALITY = 20
 WEBP_PREVIEW_QUALITY = 80
 WEBP_PREVIEW_METHOD = 0

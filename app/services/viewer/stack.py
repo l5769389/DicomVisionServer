@@ -22,15 +22,20 @@ class ViewerStackMixin:
         if not self._is_pet_series(series):
             raise HTTPException(status_code=400, detail="PET view requires a PT/PET series")
         self._emit_render_progress(progress_callback, "volume", progress_percent=8)
-        pet_volume = self._get_series_volume(series, progress_callback=progress_callback)
+        pet_volume = self._get_series_native_slice_volume(series, progress_callback=progress_callback)
         if not view.is_initialized:
             self._emit_render_progress(progress_callback, "initialize", progress_percent=72)
             self._initialize_pet_viewport(view)
             view.is_initialized = True
-        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        pet_display = self._build_fusion_pet_display_volume(
+            series,
+            pet_volume,
+            view.pet_unit,
+            source_kind="native",
+        )
         view.pet_unit = pet_display.unit
         view.pet_unit_label = pet_display.unit_label
-        view.current_index = max(0, min(int(view.current_index), pet_display.volume.shape[0] - 1))
+        view.current_index = max(0, min(int(view.current_index), len(series.instances) - 1))
         instance, cached = self._get_indexed_instance_and_cache(series, view.current_index)
         if instance is None or cached is None:
             raise HTTPException(status_code=400, detail="PET series does not contain renderable DICOM instances")
@@ -41,8 +46,11 @@ class ViewerStackMixin:
         spacing_xy = self._get_stack_spacing_xy(cached.dataset)
         pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
 
+        native_pet_slice = np.asarray(cached.source_pixels, dtype=np.float32)
+        if abs(pet_display.scale - 1.0) > 1e-12 or abs(pet_display.offset) > 1e-12:
+            native_pet_slice = native_pet_slice * np.float32(pet_display.scale) + np.float32(pet_display.offset)
         source_pixels = self._prepare_pet_standalone_source_pixels(
-            np.asarray(pet_display.volume[view.current_index], dtype=np.float32),
+            native_pet_slice,
             view.window_width,
             view.window_center,
         )
@@ -209,18 +217,27 @@ class ViewerStackMixin:
         cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
         cache_ms = (perf_counter() - cache_started_at) * 1000.0
         metadata_started_at = perf_counter()
-        render_plan = self._build_render_plan_for_shape(view, *cached.source_pixels.shape[:2])
+        spacing_xy = self._get_stack_spacing_xy(cached.dataset)
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
+        render_plan = self._build_render_plan_for_shape(
+            view,
+            *cached.source_pixels.shape[:2],
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
         image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=cached.source_pixels.shape[1],
             image_height=cached.source_pixels.shape[0],
             canvas_width=render_plan.render_view.width or 0,
             canvas_height=render_plan.render_view.height or 0,
             view=render_plan.render_view,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         scale_bar = self._build_scale_bar_info(
             render_plan.render_view,
             image_transform,
-            self._get_stack_spacing_xy(cached.dataset),
+            spacing_xy,
         )
         slice_corner_info = self._build_slice_corner_info_overlay(
             view,

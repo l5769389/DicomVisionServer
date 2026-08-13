@@ -2,10 +2,15 @@ from __future__ import annotations
 
 """Volume caching and interactive operation handlers."""
 
+from threading import RLock
+
 from app.services.viewer.shared import *  # noqa: F403
+from app.services.dicom_compatibility import get_series_volume_block_reason
 
 
 class ViewerOperationsMixin:
+    _series_content_key_lock = RLock()
+
     @staticmethod
     def _normalize_render_3d_mode(value: object) -> str:
         return "surface" if str(value or "").strip().lower() == "surface" else "volume"
@@ -87,6 +92,7 @@ class ViewerOperationsMixin:
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> np.ndarray:
         volume_cache_key = self._build_series_volume_cache_key(series)
+        self._remember_series_volume_cache_key(series.series_id, volume_cache_key)
         cached_volume = self._get_cached_series_volume(volume_cache_key)
         if cached_volume is not None:
             self._emit_render_progress(
@@ -134,24 +140,81 @@ class ViewerOperationsMixin:
             )
             return stored_volume
 
+    def _get_series_native_slice_volume(
+        self,
+        series: SeriesRecord,
+        *,
+        progress_callback: ViewRenderProgressCallback | None = None,
+    ) -> np.ndarray:
+        """Return the physically ordered native slice stack without 3D normalization."""
+
+        content_key = self._build_series_volume_cache_key(series)
+        native_cache_key = f"native-stack::{content_key}"
+        self._remember_series_volume_cache_key(series.series_id, native_cache_key)
+        cached_volume = self._get_cached_series_volume(native_cache_key)
+        if cached_volume is not None:
+            return cached_volume
+
+        build_lock = self._get_series_volume_build_lock(native_cache_key)
+        with build_lock:
+            cached_volume = self._get_cached_series_volume(native_cache_key)
+            if cached_volume is not None:
+                return cached_volume
+
+            slices: list[np.ndarray] = []
+            readable_total = sum(1 for instance in series.instances if instance.sop_instance_uid)
+            for loaded_count, instance in enumerate(
+                (item for item in series.instances if item.sop_instance_uid),
+                start=1,
+            ):
+                cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
+                pixels = np.asarray(cached.source_pixels)
+                if pixels.ndim != 2:
+                    raise HTTPException(status_code=422, detail="Native PET stack requires single-frame scalar slices")
+                if slices and pixels.shape != slices[0].shape:
+                    raise HTTPException(status_code=422, detail="Native PET stack requires consistent slice dimensions")
+                slices.append(pixels)
+                self._emit_render_progress(
+                    progress_callback,
+                    "volume",
+                    progress_percent=10 + int((loaded_count / max(readable_total, 1)) * 55),
+                    loaded_count=loaded_count,
+                    total_count=readable_total,
+                )
+
+            if not slices:
+                raise HTTPException(status_code=400, detail="Series does not contain readable pixel data")
+            return self._store_series_volume(native_cache_key, np.stack(slices, axis=0))
+
     @staticmethod
     def _build_series_volume_cache_key(series: SeriesRecord) -> str:
-        cached_key = getattr(series, "volume_cache_key", None)
-        if cached_key:
-            return str(cached_key)
+        with ViewerOperationsMixin._series_content_key_lock:
+            cached_key = getattr(series, "volume_cache_key", None)
+            if cached_key:
+                return str(cached_key)
 
-        content_keys = [
-            compat.dicom_cache.build_instance_content_key(instance.sop_instance_uid, instance.path)
-            for instance in series.instances
-            if instance.sop_instance_uid
-        ]
-        digest = hashlib.sha256("\n".join(content_keys).encode("utf-8")).hexdigest()
-        volume_cache_key = f"volume::{digest}"
-        try:
-            series.volume_cache_key = volume_cache_key
-        except Exception:
-            pass
-        return volume_cache_key
+            content_keys: list[str] = []
+            for instance in series.instances:
+                if not instance.sop_instance_uid:
+                    continue
+                try:
+                    content_key = compat.dicom_cache.build_instance_content_key(
+                        instance.sop_instance_uid,
+                        instance.path,
+                    )
+                except OSError:
+                    # Registry entries can outlive a moved file long enough for a
+                    # deterministic cache lookup; the actual decoder still reports
+                    # the missing file when rendering is attempted.
+                    content_key = f"{instance.sop_instance_uid}::{instance.path.resolve()}"
+                content_keys.append(content_key)
+            digest = hashlib.sha256("\n".join(content_keys).encode("utf-8")).hexdigest()
+            volume_cache_key = f"volume::{digest}"
+            try:
+                series.volume_cache_key = volume_cache_key
+            except Exception:
+                pass
+            return volume_cache_key
 
     def _build_series_volume(
         self,
@@ -159,6 +222,10 @@ class ViewerOperationsMixin:
         *,
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> np.ndarray:
+        blocked_reason = get_series_volume_block_reason(series)
+        if blocked_reason is not None:
+            raise HTTPException(status_code=422, detail=blocked_reason)
+
         slice_entries: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
         readable_total = sum(1 for instance in series.instances if instance.sop_instance_uid)
         loaded_count = 0
@@ -211,12 +278,48 @@ class ViewerOperationsMixin:
     def _store_series_volume(self, series_id: str, volume: np.ndarray) -> np.ndarray:
         return self._series_volume_cache.store(series_id, volume)
 
-    def _handle_series_volume_cache_evict(self, series_id: str, volume: np.ndarray) -> None:
-        self._series_volume_geometry_cache.pop(series_id, None)
-        self._series_patient_transform_cache.pop(series_id, None)
-        self._series_representative_slice_cache.pop(series_id, None)
+    def _remember_series_volume_cache_key(self, series_id: str, volume_cache_key: str) -> None:
+        with self._cache_index_lock:
+            self._volume_cache_keys_by_series_id.setdefault(series_id, set()).add(volume_cache_key)
+            self._series_ids_by_volume_cache_key.setdefault(volume_cache_key, set()).add(series_id)
+
+    def _handle_series_volume_cache_evict(self, volume_cache_key: str, volume: np.ndarray) -> None:
+        with self._cache_index_lock:
+            series_ids = self._series_ids_by_volume_cache_key.pop(volume_cache_key, set())
+            for series_id in series_ids:
+                series_keys = self._volume_cache_keys_by_series_id.get(series_id)
+                if series_keys is not None:
+                    series_keys.discard(volume_cache_key)
+                    if not series_keys:
+                        self._volume_cache_keys_by_series_id.pop(series_id, None)
+            content_key = (
+                volume_cache_key.removeprefix("native-stack::")
+                if volume_cache_key.startswith("native-stack::")
+                else volume_cache_key
+            )
+            self._pet_quantification_context_cache.pop(content_key, None)
+            stale_pet_keys = [
+                cache_key
+                for cache_key in self._pet_display_volume_cache
+                if cache_key and cache_key[0] == content_key
+            ]
+            for cache_key in stale_pet_keys:
+                evicted_pet_volume = self._pet_display_volume_cache.pop(cache_key)
+                self._pet_display_volume_cache_bytes = max(
+                    0,
+                    self._pet_display_volume_cache_bytes - int(evicted_pet_volume.nbytes),
+                )
+        for series_id in series_ids:
+            self._series_volume_geometry_cache.pop(series_id, None)
+            self._series_patient_transform_cache.pop(series_id, None)
+            self._series_representative_slice_cache.pop(series_id, None)
         self._volume_render_preprocess_cache.clear()
-        logger.debug("volume cache evict series_id=%s bytes=%s", series_id, int(volume.nbytes))
+        logger.debug(
+            "volume cache evict cache_key=%s series_ids=%s bytes=%s",
+            volume_cache_key,
+            sorted(series_ids),
+            int(volume.nbytes),
+        )
 
     def get_volume_cache_stats(self) -> dict[str, int]:
         return self._series_volume_cache.stats()
@@ -665,7 +768,7 @@ class ViewerOperationsMixin:
             delta_x = float(payload.x or 0.0)
             delta_y = float(payload.y or 0.0)
             sensitivity = self._resolve_window_drag_sensitivity(base_ww)
-            view.window_width = base_ww + delta_x * sensitivity
+            view.window_width = max(float(WINDOW_WIDTH_MIN), base_ww + delta_x * sensitivity)
             view.window_center = base_wl - delta_y * sensitivity
             view.is_initialized = True
             if payload.action_type == DRAG_ACTION_MOVE:
@@ -856,8 +959,26 @@ class ViewerOperationsMixin:
                 return False
         changed = False
         group = view.view_group if self._is_mpr_view_type(view.view_type) else None
+        is_fresh_standalone_pet = (
+            group is None
+            and self._is_pet_view_type(view.view_type)
+            and not view.is_initialized
+        )
+        if is_fresh_standalone_pet:
+            if payload.pet_unit is not None:
+                view.pending_pet_unit = self._normalize_fusion_pet_unit(payload.pet_unit)
+                if payload.pet_window_min is not None:
+                    view.pending_pet_window_min = float(payload.pet_window_min)
+                if payload.pet_window_max is not None:
+                    view.pending_pet_window_max = float(payload.pet_window_max)
+                if payload.pet_control_window_max is not None:
+                    view.pending_pet_control_window_max = float(payload.pet_control_window_max)
         if payload.pseudocolor_preset is not None:
             next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
+            if is_fresh_standalone_pet:
+                if view.pending_pet_pseudocolor_preset != next_preset:
+                    view.pending_pet_pseudocolor_preset = next_preset
+                    changed = True
             current_preset = group.pet_pseudocolor_preset if group is not None else view.pseudocolor_preset
             if current_preset != next_preset:
                 if group is not None:
@@ -870,9 +991,25 @@ class ViewerOperationsMixin:
             if current_unit != next_unit:
                 if series is None:
                     series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
-                pet_volume = self._get_series_volume(series)
-                previous_display = self._build_fusion_pet_display_volume(series, pet_volume, current_unit)
-                pet_display = self._build_fusion_pet_display_volume(series, pet_volume, next_unit)
+                is_native_stack = group is None and self._is_pet_view_type(view.view_type)
+                pet_volume = (
+                    self._get_series_native_slice_volume(series)
+                    if is_native_stack
+                    else self._get_series_volume(series)
+                )
+                display_kwargs = {"source_kind": "native"} if is_native_stack else {}
+                previous_display = self._build_fusion_pet_display_volume(
+                    series,
+                    pet_volume,
+                    current_unit,
+                    **display_kwargs,
+                )
+                pet_display = self._build_fusion_pet_display_volume(
+                    series,
+                    pet_volume,
+                    next_unit,
+                    **display_kwargs,
+                )
                 view.pet_unit = pet_display.unit
                 view.pet_unit_label = pet_display.unit_label
                 if group is not None:
@@ -1551,15 +1688,23 @@ class ViewerOperationsMixin:
         if group is None or payload.pseudocolor_preset is None:
             return False
         next_preset = normalize_pseudocolor_preset(payload.pseudocolor_preset)
-        role = self._resolve_fusion_pane_role(view)
-        if self._is_fusion_pet_display_role(role):
-            if group.fusion_pet_pane_pseudocolor_preset == next_preset:
-                return False
-            group.fusion_pet_pane_pseudocolor_preset = next_preset
-        elif group.fusion_pet_pseudocolor_preset == next_preset:
+        roles = payload.fusion_pseudocolor_targets or [self._resolve_fusion_pane_role(view)]
+        changed = False
+        for role in roles:
+            if role == FUSION_PANE_CT_AXIAL and group.fusion_ct_pseudocolor_preset != next_preset:
+                group.fusion_ct_pseudocolor_preset = next_preset
+                changed = True
+            elif role == FUSION_PANE_PET_AXIAL and group.fusion_pet_pane_pseudocolor_preset != next_preset:
+                group.fusion_pet_pane_pseudocolor_preset = next_preset
+                changed = True
+            elif role == FUSION_PANE_PET_CORONAL_MIP and group.fusion_mip_pseudocolor_preset != next_preset:
+                group.fusion_mip_pseudocolor_preset = next_preset
+                changed = True
+            elif role == FUSION_PANE_OVERLAY_AXIAL and group.fusion_pet_pseudocolor_preset != next_preset:
+                group.fusion_pet_pseudocolor_preset = next_preset
+                changed = True
+        if not changed:
             return False
-        else:
-            group.fusion_pet_pseudocolor_preset = next_preset
         self._clear_fusion_registration_overlay_frame_locks(group)
         group.fusion_revision += 1
         for group_view in self._get_group_views(view):
@@ -1930,9 +2075,28 @@ class ViewerOperationsMixin:
             pixel_aspect_y=pixel_aspect_y,
         )
 
+        def payload_to_normalized_canvas_point() -> tuple[float, float]:
+            if (
+                payload.canvas_x is not None
+                and payload.canvas_y is not None
+                and payload.canvas_width is not None
+                and payload.canvas_height is not None
+                and float(payload.canvas_width) > 0.0
+                and float(payload.canvas_height) > 0.0
+            ):
+                return (
+                    min(max(float(payload.canvas_x) / float(payload.canvas_width), 0.0), 1.0),
+                    min(max(float(payload.canvas_y) / float(payload.canvas_height), 0.0), 1.0),
+                )
+            return (
+                min(max(float(payload.x or 0.0), 0.0), 1.0),
+                min(max(float(payload.y or 0.0), 0.0), 1.0),
+            )
+
         def payload_to_plane_image_point() -> tuple[float, float]:
-            canvas_x = min(max(float(payload.x or 0.0), 0.0), 1.0) * canvas_width
-            canvas_y = min(max(float(payload.y or 0.0), 0.0), 1.0) * canvas_height
+            normalized_x, normalized_y = payload_to_normalized_canvas_point()
+            canvas_x = normalized_x * canvas_width
+            canvas_y = normalized_y * canvas_height
             return self._canvas_to_image_coordinates(image_transform, canvas_x, canvas_y)
 
         if payload.action_type == DRAG_ACTION_START:
@@ -2065,12 +2229,24 @@ class ViewerOperationsMixin:
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
+        normalized_x = float(payload.x)
+        normalized_y = float(payload.y)
+        if (
+            payload.canvas_x is not None
+            and payload.canvas_y is not None
+            and payload.canvas_width is not None
+            and payload.canvas_height is not None
+            and float(payload.canvas_width) > 0.0
+            and float(payload.canvas_height) > 0.0
+        ):
+            normalized_x = float(payload.canvas_x) / float(payload.canvas_width)
+            normalized_y = float(payload.canvas_y) / float(payload.canvas_height)
         pointer_angle_rad = self._resolve_mpr_rotation_pointer_angle(
             view,
             active_plane,
             image_transform,
-            float(payload.x),
-            float(payload.y),
+            normalized_x,
+            normalized_y,
         )
         if pointer_angle_rad is None:
             if payload.action_type == DRAG_ACTION_END:

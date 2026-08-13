@@ -74,7 +74,7 @@ def test_build_compatibility_issues_flags_decoding_and_geometry_risks() -> None:
 
     assert issue_by_code["compressed-transfer-syntax"].affected_instances == 1
     assert issue_by_code["unsupported-photometric"].affected_instances == 1
-    assert issue_by_code["multiframe-first-frame"].affected_instances == 1
+    assert issue_by_code["multiframe-unsupported"].affected_instances == 1
     assert issue_by_code["missing-pixel-spacing"].affected_instances == 2
     assert issue_by_code["missing-spatial-geometry"].affected_instances == 2
     assert issue_by_code["missing-rescale"].affected_instances == 1

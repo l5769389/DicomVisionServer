@@ -65,6 +65,30 @@ def _alpha_centroid(image: Image.Image) -> tuple[float, float]:
     return float((x_grid * alpha).sum() / total), float((y_grid * alpha).sum() / total)
 
 
+def _visual_change_centroid(image: Image.Image) -> tuple[float, float]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.float64)
+    border = np.concatenate(
+        (
+            pixels[0],
+            pixels[-1],
+            pixels[:, 0],
+            pixels[:, -1],
+        ),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    weights = np.maximum(np.max(np.abs(pixels - background), axis=-1) - 8.0, 0.0)
+    margin = max(1, min(weights.shape) // 20)
+    weights[:margin] = 0.0
+    weights[-margin:] = 0.0
+    weights[:, :margin] = 0.0
+    weights[:, -margin:] = 0.0
+    total = float(weights.sum())
+    assert total > 0.0
+    y_grid, x_grid = np.indices(weights.shape, dtype=np.float64)
+    return float((x_grid * weights).sum() / total), float((y_grid * weights).sum() / total)
+
+
 def _assert_near_white(region: np.ndarray) -> None:
     assert int(np.min(region)) >= 250
 
@@ -261,15 +285,36 @@ def test_fusion_overlay_returns_ct_base_and_transparent_pet_layer() -> None:
     assert np.any(result.pet_layer_pixels[..., 3] == 0)
     assert np.any(result.pet_layer_pixels[..., 3] > 0)
 
-    alpha = result.pet_layer_pixels[..., 3:4].astype(np.float32) / 255.0
+    intrinsic_alpha = result.pet_layer_pixels[..., 3:4].astype(np.float32) / 255.0
+    alpha = intrinsic_alpha * 0.52
     composite = (
         result.ct_layer_pixels.astype(np.float32) * (1.0 - alpha)
         + result.pet_layer_pixels[..., :3].astype(np.float32) * alpha
     )
     assert np.max(np.abs(composite - result.pixels.astype(np.float32))) <= 1.5
 
+    stronger = render_fusion_pixels(
+        pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        ct_volume=ct_volume,
+        ct_geometry=geometry,
+        pet_volume=pet_volume,
+        pet_geometry=geometry,
+        axial_index=2,
+        ct_window_width=400,
+        ct_window_center=40,
+        pet_window_width=8,
+        pet_window_center=4,
+        pet_pseudocolor_preset="petct-rainbow",
+        registration=FusionRegistrationState(),
+        alpha=0.9,
+        ct_has_patient_geometry=True,
+        pet_has_patient_geometry=True,
+    )
+    assert np.array_equal(stronger.pet_layer_pixels, result.pet_layer_pixels)
+    assert not np.array_equal(stronger.pixels, result.pixels)
 
-def test_fusion_overlay_registration_preview_only_returns_pet_layer(monkeypatch) -> None:
+
+def test_fusion_overlay_registration_preview_returns_complete_backend_composite(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -336,22 +381,15 @@ def test_fusion_overlay_registration_preview_only_returns_pet_layer(monkeypatch)
         metadata_mode="fusion-registration-layer-preview",
     )
 
-    assert result.meta.fusion_composite is not None
-    assert result.meta.fusion_composite.primary_image_unchanged is True
-    assert result.meta.fusion_composite.width > 0
-    assert result.meta.fusion_composite.height > 0
-    assert [layer.key for layer in result.meta.fusion_composite.layers] == ["pet"]
-    assert set(result.extra_image_bytes) == {"pet"}
-    primary = Image.open(io.BytesIO(result.image_bytes)).convert("RGBA")
-    assert primary.size == (1, 1)
-    assert primary.getpixel((0, 0)) == (0, 0, 0, 0)
-    assert Image.open(io.BytesIO(result.extra_image_bytes["pet"])).size == (
-        result.meta.fusion_composite.width,
-        result.meta.fusion_composite.height,
-    )
+    assert result.meta.fusion_composite is None
+    assert result.extra_image_bytes == {}
+    primary = Image.open(io.BytesIO(result.image_bytes)).convert("RGB")
+    assert primary.width > 1
+    assert primary.height > 1
+    assert np.ptp(np.asarray(primary)) > 0
 
 
-def test_fusion_registration_preview_reuses_cached_pet_layer_without_volume_load(monkeypatch) -> None:
+def test_fusion_registration_preview_rerenders_complete_backend_composite(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -445,9 +483,8 @@ def test_fusion_registration_preview_reuses_cached_pet_layer_without_volume_load
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
-    assert first.meta.fusion_composite is not None
-    assert first.meta.fusion_composite.primary_image_unchanged is True
-    assert set(first.extra_image_bytes) == {"pet"}
+    assert first.meta.fusion_composite is None
+    assert first.extra_image_bytes == {}
 
     service._handle_fusion_registration(
         view,
@@ -461,30 +498,19 @@ def test_fusion_registration_preview_reuses_cached_pet_layer_without_volume_load
         ),
     )
 
-    def fail_volume_load(*args, **kwargs):
-        raise AssertionError("cached registration preview should not load CT/PET volumes")
-
-    def fail_array_affine(*args, **kwargs):
-        raise AssertionError("cached integer translate preview should not use the generic array affine path")
-
-    monkeypatch.setattr(service, "_get_series_volume", fail_volume_load)
-    monkeypatch.setattr("app.services.viewer_service.viewport_transformer.apply_affine_array", fail_array_affine)
     second = service._render_fusion_view(
         view,
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
 
-    assert second.meta.fusion_composite is not None
-    assert second.meta.fusion_composite.primary_image_unchanged is True
-    assert Image.open(io.BytesIO(second.image_bytes)).size == (1, 1)
-    assert Image.open(io.BytesIO(second.extra_image_bytes["pet"])).size == (
-        second.meta.fusion_composite.width,
-        second.meta.fusion_composite.height,
-    )
+    assert second.meta.fusion_composite is None
+    assert second.extra_image_bytes == {}
+    assert Image.open(io.BytesIO(second.image_bytes)).size == (64, 64)
+    assert second.image_bytes != first.image_bytes
 
 
-def test_fusion_registration_pet_axial_preview_reuses_cached_bitmap_without_volume_load(monkeypatch) -> None:
+def test_fusion_registration_pet_axial_preview_returns_complete_backend_frame(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -574,10 +600,6 @@ def test_fusion_registration_pet_axial_preview_reuses_cached_bitmap_without_volu
         ),
     )
 
-    def fail_volume_load(*args, **kwargs):
-        raise AssertionError("cached PET axial registration preview should not load CT/PET volumes")
-
-    monkeypatch.setattr(service, "_get_series_volume", fail_volume_load)
     result = service._render_fusion_view(
         view,
         fast_preview=True,
@@ -695,9 +717,10 @@ def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monke
     assert origin_frame.pet_center_canvas is not None
     assert origin_frame.pet_center_canvas[0] == pytest.approx(50.0, abs=1.0)
     assert origin_frame.pet_center_canvas[1] == pytest.approx(50.0, abs=1.0)
-    origin_pet = Image.open(io.BytesIO(origin.extra_image_bytes["pet"])).convert("RGBA")
-    origin_alpha_centroid = _alpha_centroid(origin_pet)
-    assert abs(origin_alpha_centroid[0] - origin_frame.pet_center_canvas[0]) > 10.0
+    assert origin.meta.fusion_composite is None
+    assert origin.extra_image_bytes == {}
+    origin_centroid = _visual_change_centroid(Image.open(io.BytesIO(origin.image_bytes)))
+    assert abs(origin_centroid[0] - origin_frame.pet_center_canvas[0]) > 10.0
     service._handle_fusion_registration(
         view,
         ViewOperationRequest(
@@ -727,6 +750,11 @@ def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monke
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
+    preview_registration = (
+        group.fusion_registration.translate_row_mm,
+        group.fusion_registration.translate_col_mm,
+        group.fusion_registration.rotation_degrees,
+    )
 
     service._handle_fusion_registration(
         view,
@@ -741,12 +769,22 @@ def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monke
         ),
     )
     final = service._render_fusion_view(view)
+    final_registration = (
+        group.fusion_registration.translate_row_mm,
+        group.fusion_registration.translate_col_mm,
+        group.fusion_registration.rotation_degrees,
+    )
+    assert final_registration == pytest.approx(preview_registration)
 
-    preview_pet = Image.open(io.BytesIO(preview.extra_image_bytes["pet"])).convert("RGBA")
-    final_pet = Image.open(io.BytesIO(final.extra_image_bytes["pet"])).convert("RGBA")
-    assert preview_pet.size == final_pet.size
-    preview_centroid = _alpha_centroid(preview_pet)
-    final_centroid = _alpha_centroid(final_pet)
+    assert preview.meta.fusion_composite is None
+    assert final.meta.fusion_composite is None
+    assert preview.extra_image_bytes == {}
+    assert final.extra_image_bytes == {}
+    preview_image = Image.open(io.BytesIO(preview.image_bytes))
+    final_image = Image.open(io.BytesIO(final.image_bytes))
+    assert preview_image.size == final_image.size
+    preview_centroid = _visual_change_centroid(preview_image)
+    final_centroid = _visual_change_centroid(final_image)
     assert final_centroid[0] == pytest.approx(preview_centroid[0], abs=2.0)
     assert final_centroid[1] == pytest.approx(preview_centroid[1], abs=2.0)
 
@@ -849,8 +887,9 @@ def test_fusion_registration_end_expands_overlay_frame_after_large_translate(mon
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
-    assert preview.meta.fusion_composite is not None
-    assert preview.meta.fusion_composite.primary_image_unchanged is True
+    assert preview.meta.fusion_composite is None
+    assert preview.extra_image_bytes == {}
+    assert Image.open(io.BytesIO(preview.image_bytes)).size == (101, 101)
 
     service._handle_fusion_registration(
         view,
@@ -868,7 +907,9 @@ def test_fusion_registration_end_expands_overlay_frame_after_large_translate(mon
 
     assert final_frame is not None
     assert final_frame.plane.output_shape[1] > origin_frame.plane.output_shape[1]
-    assert set(final.extra_image_bytes) == {"pet"}
+    assert final.meta.fusion_composite is None
+    assert final.extra_image_bytes == {}
+    assert Image.open(io.BytesIO(final.image_bytes)).size == (101, 101)
 
 
 def test_pet_axial_registration_expands_canvas_and_keeps_background() -> None:
@@ -971,7 +1012,7 @@ def test_fusion_overlay_positive_registration_rotation_is_screen_clockwise() -> 
         (FUSION_PANE_CT_AXIAL, "bw"),
         (FUSION_PANE_PET_AXIAL, "hotiron"),
         (FUSION_PANE_OVERLAY_AXIAL, "hotmetal"),
-        (FUSION_PANE_PET_CORONAL_MIP, "hotiron"),
+        (FUSION_PANE_PET_CORONAL_MIP, "bwinverse"),
     ],
 )
 def test_fusion_result_reports_actual_rendered_pseudocolor(role: str, expected_preset: str) -> None:
@@ -1072,7 +1113,10 @@ def test_pet_only_rendered_canvas_padding_follows_active_lut(
     group.window.window_center = 40.0
     group.fusion_pet_window.window_width = 12.0
     group.fusion_pet_window.window_center = 6.0
-    group.fusion_pet_pane_pseudocolor_preset = preset
+    if role == FUSION_PANE_PET_CORONAL_MIP:
+        group.fusion_mip_pseudocolor_preset = preset
+    else:
+        group.fusion_pet_pane_pseudocolor_preset = preset
     group.fusion_axial_index = 10
     ct_series = SeriesRecord(
         series_id="ct",
@@ -1577,7 +1621,81 @@ def test_fusion_set_size_initializes_shared_fusion_group(monkeypatch) -> None:
     assert group.fusion_axial_index == 3
     assert view.current_index == 3
     assert view.is_initialized is True
-    assert view.pseudocolor_preset == "hotiron"
+    assert view.pseudocolor_preset == "bwinverse"
+
+
+def test_fusion_pseudocolor_updates_selected_panes_independently(monkeypatch) -> None:
+    service = ViewerService()
+    group, views = _build_fusion_geometry_test_views()
+    monkeypatch.setattr(service, "_get_group_views", lambda _view: list(views.values()))
+    monkeypatch.setattr(service, "_clear_fusion_registration_overlay_frame_locks", lambda _group: None)
+
+    changed = service._handle_fusion_pseudocolor(
+        views[FUSION_PANE_CT_AXIAL],
+        ViewOperationRequest(
+            viewId=views[FUSION_PANE_CT_AXIAL].view_id,
+            opType="pseudocolor",
+            pseudocolorPreset="rainbow",
+            fusionPseudocolorTargets=[FUSION_PANE_CT_AXIAL, FUSION_PANE_PET_CORONAL_MIP],
+        ),
+    )
+
+    assert changed is True
+    assert group.fusion_ct_pseudocolor_preset == "rainbow"
+    assert group.fusion_mip_pseudocolor_preset == "rainbow"
+    assert group.fusion_pet_pane_pseudocolor_preset == "bwinverse"
+    assert group.fusion_pet_pseudocolor_preset == "hotiron"
+    assert views[FUSION_PANE_CT_AXIAL].pseudocolor_preset == "rainbow"
+    assert views[FUSION_PANE_PET_CORONAL_MIP].pseudocolor_preset == "rainbow"
+
+
+def test_fusion_initialization_allows_frame_of_reference_mismatch_for_manual_registration(monkeypatch) -> None:
+    service = ViewerService()
+    group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
+    group.fusion_ct_series_id = "ct"
+    group.fusion_pet_series_id = "pet"
+    ct_series = SeriesRecord("ct", "", "ct-uid", "study", None, None, None, None, None, "CT", "CT")
+    pet_series = SeriesRecord("pet", "", "pet-uid", "study", None, None, None, None, None, "PT", "PET")
+    view = ViewRecord(
+        view_id="fusion-overlay",
+        series_id="ct",
+        secondary_series_id="pet",
+        view_type="FusionOverlayAxial",
+        fusion_pane_role=FUSION_PANE_OVERLAY_AXIAL,
+        view_group=group,
+        width=512,
+        height=512,
+    )
+    ct_dataset = Dataset()
+    ct_dataset.FrameOfReferenceUID = "1.2.3"
+    pet_dataset = Dataset()
+    pet_dataset.FrameOfReferenceUID = "4.5.6"
+    volume = np.arange(5 * 6 * 7, dtype=np.float32).reshape(5, 6, 7)
+    geometry = build_identity_geometry(volume.shape)
+
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda _view: (group, ct_series, pet_series))
+    monkeypatch.setattr(
+        service,
+        "_get_reference_instance_and_cache",
+        lambda series: (None, SimpleNamespace(dataset=ct_dataset if series.series_id == "ct" else pet_dataset)),
+    )
+    monkeypatch.setattr(service, "_get_series_volume", lambda _series, **_: volume)
+    monkeypatch.setattr(service, "_get_series_volume_geometry", lambda _series, _shape: geometry)
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda _series, source, _unit: FusionPetDisplayVolume(
+            volume=np.asarray(source, dtype=np.float32),
+            unit="source",
+            unit_label="Bq/ml",
+        ),
+    )
+
+    service._initialize_fusion_viewport(view)
+
+    assert group.fusion_initialized is True
+    assert group.fusion_frame_of_reference_matched is False
+    assert view.is_initialized is True
 
 
 def test_fusion_view_windows_are_scoped_by_pane_role() -> None:
@@ -1645,6 +1763,45 @@ def _build_fusion_geometry_test_views() -> tuple[ViewGroupRecord, dict[str, View
         )
     }
     return group, views
+
+
+def test_fusion_group_defaults_pet_and_mip_to_bwinverse() -> None:
+    group, _ = _build_fusion_geometry_test_views()
+
+    assert group.fusion_ct_pseudocolor_preset == "bw"
+    assert group.fusion_pet_pane_pseudocolor_preset == "bwinverse"
+    assert group.fusion_pet_pseudocolor_preset == "hotiron"
+    assert group.fusion_mip_pseudocolor_preset == "bwinverse"
+
+
+def test_reset_active_fusion_mip_restores_bwinverse(monkeypatch) -> None:
+    service = ViewerService()
+    group, views = _build_fusion_geometry_test_views()
+    group.fusion_mip_pseudocolor_preset = "rainbow"
+    ct_series = SeriesRecord("ct", "", None, None, None, None, None, None, None, "CT", "CT")
+    pet_series = SeriesRecord("pet", "", None, None, None, None, None, None, None, "PT", "PET")
+    volume = np.zeros((2, 2, 2), dtype=np.float32)
+    monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda _view: (group, ct_series, pet_series))
+    monkeypatch.setattr(service, "_get_series_volume", lambda _series: volume)
+    monkeypatch.setattr(
+        service,
+        "_build_fusion_pet_display_volume",
+        lambda _series, source, _unit: FusionPetDisplayVolume(
+            volume=np.asarray(source, dtype=np.float32),
+            unit="SUVbw",
+            unit_label="g/ml (SUVbw)",
+        ),
+    )
+    monkeypatch.setattr(service, "_get_group_views", lambda _view: list(views.values()))
+    monkeypatch.setattr(service, "_clear_fusion_registration_overlay_frame_locks", lambda _group: None)
+    monkeypatch.setattr(service, "_initialize_fusion_viewport", lambda _view: None)
+    monkeypatch.setattr(service, "_sync_fusion_view_state_from_group", lambda _view: None)
+
+    service._reset_active_fusion_pane(views[FUSION_PANE_PET_CORONAL_MIP])
+
+    assert group.fusion_mip_pseudocolor_preset == "bwinverse"
+    assert group.fusion_pet_pane_pseudocolor_preset == "bwinverse"
+    assert group.fusion_pet_pseudocolor_preset == "hotiron"
 
 
 def test_fusion_axial_pan_links_ct_pet_and_overlay_but_not_coronal_mip(monkeypatch) -> None:
@@ -1784,8 +1941,17 @@ def test_fusion_info_reports_pet_window_for_overlay_pane(monkeypatch) -> None:
     ct_volume = np.arange(64, dtype=np.float32).reshape(4, 4, 4)
     pet_volume = np.arange(64, dtype=np.float32).reshape(4, 4, 4)
     geometry = build_identity_geometry((4, 4, 4))
+    ct_dataset = Dataset()
+    ct_dataset.FrameOfReferenceUID = "1.2.3"
+    pet_dataset = Dataset()
+    pet_dataset.FrameOfReferenceUID = "4.5.6"
 
     monkeypatch.setattr(service, "_resolve_fusion_group_series", lambda view: (group, ct_series, pet_series))
+    monkeypatch.setattr(
+        service,
+        "_get_reference_instance_and_cache",
+        lambda series: (None, SimpleNamespace(dataset=ct_dataset if series.series_id == "ct" else pet_dataset)),
+    )
     monkeypatch.setattr(
         service,
         "_get_series_volume",
@@ -1816,6 +1982,7 @@ def test_fusion_info_reports_pet_window_for_overlay_pane(monkeypatch) -> None:
     result = service._render_fusion_view(view)
 
     assert result.meta.fusion_info is not None
+    assert result.meta.fusion_info.frame_of_reference_matched is False
     assert result.meta.fusion_info.pet_window_min == pytest.approx(0.0)
     assert result.meta.fusion_info.pet_window_max == pytest.approx(np.percentile(pet_volume, 99.5), abs=0.01)
 
@@ -1923,8 +2090,8 @@ def test_fusion_registration_move_broadcasts_overlay_and_pet_axial_backend_previ
     assert move.metadata_mode == "fusion-registration-layer-preview"
     assert move.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
     assert end.mode == "broadcast"
-    assert end.fast_preview is True
-    assert end.metadata_mode == "fusion-registration-layer-preview"
+    assert end.fast_preview is False
+    assert end.metadata_mode == "full"
     assert end.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
 
 
@@ -2371,6 +2538,14 @@ def test_fusion_registration_rotate_uses_frontend_pivot_not_pet_layer_center(mon
         pet_series,
         origin_registration,
     )
+    group.fusion_alpha = 0.9
+    assert service._build_fusion_registration_pet_layer_cache_key(
+        view,
+        group,
+        ct_series,
+        pet_series,
+        origin_registration,
+    ) == cache_key
     service._store_fusion_registration_pet_layer_cache(
         cache_key,
         image=Image.new("RGBA", (200, 200), (0, 0, 0, 0)),

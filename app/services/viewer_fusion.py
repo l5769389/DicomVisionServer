@@ -37,6 +37,8 @@ FUSION_VIEW_TYPE_TO_PANE_ROLE = {
 }
 
 FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET = "hotiron"
+FUSION_PET_AXIAL_PSEUDOCOLOR_PRESET = "bwinverse"
+FUSION_PET_MIP_PSEUDOCOLOR_PRESET = "bwinverse"
 
 
 @dataclass(frozen=True)
@@ -427,7 +429,9 @@ def render_fusion_pixels(
     alpha: float,
     ct_has_patient_geometry: bool,
     pet_has_patient_geometry: bool,
+    ct_pseudocolor_preset: str = DEFAULT_PSEUDOCOLOR_PRESET,
     pet_standalone_pseudocolor_preset: str = FUSION_PET_STANDALONE_PSEUDOCOLOR_PRESET,
+    pet_mip_pseudocolor_preset: str = FUSION_PET_MIP_PSEUDOCOLOR_PRESET,
     interpolation_order: int = 1,
     overlay_pet_layer_only: bool = False,
     overlay_plane_override: PlanePose | None = None,
@@ -455,7 +459,7 @@ def render_fusion_pixels(
         pet_mip = np.max(np.asarray(pet_volume, dtype=np.float32), axis=1)
         pet_mip = np.flipud(pet_mip)
         pet_uint8 = window_to_uint8(pet_mip, pet_window_width, pet_window_center)
-        pet_display_preset = normalize_pseudocolor_preset(pet_standalone_pseudocolor_preset)
+        pet_display_preset = normalize_pseudocolor_preset(pet_mip_pseudocolor_preset)
         pet_rgb = apply_pseudocolor(pet_uint8, pet_display_preset)
         row_world, row_spacing = _axis_direction_and_spacing(pet_geometry, 0)
         col_world, col_spacing = _axis_direction_and_spacing(pet_geometry, 2)
@@ -514,14 +518,15 @@ def render_fusion_pixels(
     )
     if pane_role == FUSION_PANE_CT_AXIAL:
         ct_uint8 = window_to_uint8(ct_slice, ct_window_width, ct_window_center)
+        ct_display_preset = normalize_pseudocolor_preset(ct_pseudocolor_preset)
         return FusionRenderResult(
-            pixels=ct_uint8,
+            pixels=apply_pseudocolor(ct_uint8, ct_display_preset),
             spacing_xy=(plane.pixel_spacing_col_mm, plane.pixel_spacing_row_mm),
             slice_index=axial_index,
             slice_total=ct_shape[0],
             row_world=plane.row_world if ct_has_patient_geometry else None,
             col_world=plane.col_world if ct_has_patient_geometry else None,
-            pseudocolor_preset=DEFAULT_PSEUDOCOLOR_PRESET,
+            pseudocolor_preset=ct_display_preset,
             source_projection=_plane_source_projection(
                 plane,
                 has_patient_geometry=ct_has_patient_geometry,
@@ -561,12 +566,11 @@ def render_fusion_pixels(
     overlay_preset = normalize_pseudocolor_preset(pet_pseudocolor_preset)
     pet_rgb = apply_pseudocolor(pet_uint8, overlay_preset)
     if overlay_pet_layer_only:
-        pet_alpha = np.clip(float(alpha), 0.0, 1.0)
         pet_mask = (pet_uint8.astype(np.float32) / 255.0)
         pet_rgba = np.concatenate(
             [
                 pet_rgb.astype(np.uint8, copy=False),
-                np.clip(pet_alpha * pet_mask * 255.0, 0.0, 255.0).astype(np.uint8)[..., None],
+                np.clip(pet_mask * 255.0, 0.0, 255.0).astype(np.uint8)[..., None],
             ],
             axis=-1,
         )
@@ -594,7 +598,7 @@ def render_fusion_pixels(
     if ct_slice is None:
         ct_slice = np.asarray(ct_volume[axial_index, :, :], dtype=np.float32)
     ct_uint8 = window_to_uint8(ct_slice, ct_window_width, ct_window_center)
-    ct_rgb = np.repeat(ct_uint8[..., None], 3, axis=-1)
+    ct_rgb = apply_pseudocolor(ct_uint8, ct_pseudocolor_preset)
     pet_alpha = np.clip(float(alpha), 0.0, 1.0)
     pet_mask = (pet_uint8.astype(np.float32) / 255.0)[..., None]
     blend_alpha = pet_alpha * pet_mask
@@ -602,7 +606,7 @@ def render_fusion_pixels(
     pet_rgba = np.concatenate(
         [
             pet_rgb.astype(np.uint8, copy=False),
-            np.clip(blend_alpha[..., 0] * 255.0, 0.0, 255.0).astype(np.uint8)[..., None],
+            np.clip(pet_mask[..., 0] * 255.0, 0.0, 255.0).astype(np.uint8)[..., None],
         ],
         axis=-1,
     )
