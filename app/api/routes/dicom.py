@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
@@ -31,6 +32,7 @@ from app.services.dicom_upload_service import dicom_upload_service
 from app.services.four_d_service import four_d_service
 from app.services.series_registry import series_registry
 from app.services.viewer_service import viewer_service
+from app.schemas.view import MontageDisplayConfigResponse
 
 router = APIRouter(prefix="/dicom", tags=["dicom"])
 settings = get_settings()
@@ -250,6 +252,23 @@ def get_montage_corner_info(
 
 
 @router.get(
+    "/montage/display-config",
+    response_model=MontageDisplayConfigResponse,
+    summary="Resolve montage display configuration",
+)
+def get_montage_display_config(
+    seriesId: str,
+    petUnit: str | None = None,
+    workspace_id: str = Depends(get_request_workspace_id),
+) -> MontageDisplayConfigResponse:
+    return viewer_service.get_montage_display_config(
+        seriesId,
+        pet_unit=petUnit,
+        workspace_id=workspace_id,
+    )
+
+
+@router.get(
     "/montage/tile",
     summary="Render a montage slice tile",
     description="Returns one WebP stack slice without changing the current index of an open viewer.",
@@ -262,6 +281,13 @@ def get_montage_tile(
     wl: float | None = None,
     pseudocolorPreset: str | None = None,
     petUnit: str | None = None,
+    zoom: float = 1.0,
+    offsetX: float = 0.0,
+    offsetY: float = 0.0,
+    rotationDegrees: float = 0.0,
+    horFlip: bool = False,
+    verFlip: bool = False,
+    renderIntent: Literal["preview", "final"] = "final",
     workspace_id: str = Depends(get_request_workspace_id),
 ) -> Response:
     return Response(
@@ -273,10 +299,19 @@ def get_montage_tile(
             window_center=wl,
             pseudocolor_preset=pseudocolorPreset,
             pet_unit=petUnit,
+            zoom=zoom,
+            offset_x=offsetX,
+            offset_y=offsetY,
+            rotation_degrees=rotationDegrees,
+            hor_flip=horFlip,
+            ver_flip=verFlip,
+            render_intent=renderIntent,
             workspace_id=workspace_id,
         ),
         media_type="image/webp",
-        headers={"Cache-Control": "private, max-age=300"},
+        headers={
+            "Cache-Control": "no-store" if renderIntent == "preview" else "private, max-age=300"
+        },
     )
 
 

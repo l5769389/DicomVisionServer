@@ -103,13 +103,12 @@ class DicomCache:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to decode pixel data: {exc}") from exc
 
-        modality = str(getattr(dataset, "Modality", "") or "").upper()
         number_of_frames = int(getattr(dataset, "NumberOfFrames", 1) or 1)
-        if modality == "PT" and number_of_frames > 1:
+        if number_of_frames > 1:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "Enhanced or multi-frame PET is not supported yet. "
+                    "Enhanced or multi-frame DICOM is not supported yet. "
                     "Shared and per-frame functional groups must be decoded before display."
                 ),
             )
@@ -127,14 +126,6 @@ class DicomCache:
                 float(np.max(pixels)),
             )
             return pixels
-
-        if pixels.ndim == 3:
-            if modality == "PT":
-                raise HTTPException(
-                    status_code=422,
-                    detail="Multi-frame PET is not supported yet; the first frame will not be displayed silently.",
-                )
-            pixels = pixels[0]
 
         pixels = pixels.astype(np.float32)
 

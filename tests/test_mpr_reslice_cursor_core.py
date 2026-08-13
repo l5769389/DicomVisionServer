@@ -390,7 +390,7 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     service._render_mpr_view(view, image_format="webp", fast_preview=True, fast_preview_full_resolution=True)
 
     assert reslice_calls == 1
-    assert encode_calls == [("webp", False), ("webp", False)]
+    assert encode_calls == [("webp", False), ("webp", True)]
 
 
 def test_fast_preview_resamples_scalar_pixels_before_windowing(monkeypatch) -> None:

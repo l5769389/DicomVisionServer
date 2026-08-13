@@ -378,7 +378,10 @@ def test_handle_operation_schedules_mpr_broadcast_batch_without_waiting(monkeypa
         monkeypatch.setattr(
             handlers.view_registry,
             "get",
-            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+            lambda view_id, workspace_id=None: SimpleNamespace(
+                view_id=view_id,
+                view_type={"v-cor": "COR", "v-sag": "SAG"}.get(view_id, "AX"),
+            ),
         )
         monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
         monkeypatch.setattr(
@@ -443,7 +446,11 @@ def test_mpr_drag_operations_bypass_default_threadpool(monkeypatch) -> None:
         monkeypatch.setattr(
             handlers.view_registry,
             "get",
-            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+            lambda view_id, workspace_id=None: SimpleNamespace(
+                view_id=view_id,
+                view_type={"v-cor": "COR", "v-sag": "SAG"}.get(view_id, "AX"),
+                view_group=None,
+            ),
         )
         monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
         monkeypatch.setattr(handlers.viewer_service, "handle_view_operation", fake_handle_view_operation)
@@ -903,21 +910,22 @@ def test_handle_operation_returns_revision_and_schedules_preview_options(monkeyp
 def test_mpr_crosshair_state_move_emits_state_and_queues_preview(monkeypatch) -> None:
     async def run() -> tuple[
         dict[str, object],
-        list[tuple[tuple[str, ...], str, bool, str, int | None]],
-        list[tuple[tuple[str, ...], str, bool, str, int | None]],
+        list[tuple[tuple[str, ...], str, bool, str, int | None, str | None, str | None, bool]],
         list[tuple[str, object, str | None]],
     ]:
         handlers._mpr_crosshair_state_queues.clear()
-        handlers._mpr_crosshair_preview_states.clear()
         server = _SocketServerStub()
-        scheduled_batches: list[tuple[tuple[str, ...], str, bool, str, int | None]] = []
-        queued_previews: list[tuple[tuple[str, ...], str, bool, str, int | None]] = []
+        scheduled_batches: list[tuple[tuple[str, ...], str, bool, str, int | None, str | None, str | None, bool]] = []
 
         monkeypatch.setattr(handlers.view_socket_hub, "get_sid_workspace", lambda sid: "workspace-a")
         monkeypatch.setattr(
             handlers.view_registry,
             "get",
-            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+            lambda view_id, workspace_id=None: SimpleNamespace(
+                view_id=view_id,
+                view_type={"v-cor": "COR", "v-sag": "SAG"}.get(view_id, "AX"),
+                view_group=None,
+            ),
         )
         monkeypatch.setattr(handlers.view_socket_hub, "bind_view", lambda sid, view_id: None)
         monkeypatch.setattr(
@@ -956,43 +964,125 @@ def test_mpr_crosshair_state_move_emits_state_and_queues_preview(monkeypatch) ->
             target_sids: tuple[str, ...] | None = None,
             mpr_revision: int | None = None,
             interaction_id: str | None = None,
+            mpr_batch_id: str | None = None,
+            mpr_batch_final: bool = False,
         ) -> bool:
             del fast_preview_full_resolution, target_sids
-            scheduled_batches.append((view_ids, image_format, fast_preview, metadata_mode, mpr_revision))
+            scheduled_batches.append(
+                (
+                    view_ids,
+                    image_format,
+                    fast_preview,
+                    metadata_mode,
+                    mpr_revision,
+                    interaction_id,
+                    mpr_batch_id,
+                    mpr_batch_final,
+                )
+            )
             return False
 
         monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", fake_schedule_render_batch)
 
-        def fake_schedule_mpr_crosshair_preview(queue_key, request) -> None:
-            del queue_key
-            queued_previews.append(
-                (
-                    request.view_ids,
-                    request.image_format,
-                    request.fast_preview_full_resolution,
-                    request.metadata_mode,
-                    request.mpr_revision,
-                )
-            )
-
-        monkeypatch.setattr(handlers, "_schedule_mpr_crosshair_preview", fake_schedule_mpr_crosshair_preview)
-
         response = await handlers._handle_mpr_crosshair_state(
             server,  # type: ignore[arg-type]
             "sid-1",
-            {"viewId": "v-ax", "opType": "crosshair", "actionType": "move", "x": 0.5, "y": 0.5},
+            {
+                "viewId": "v-ax",
+                "opType": "crosshair",
+                "actionType": "move",
+                "interactionId": "crosshair-1",
+                "x": 0.5,
+                "y": 0.5,
+            },
         )
-        await _wait_for(lambda: len(server.events) == 2)
-        return response, scheduled_batches, queued_previews, server.events
+        await _wait_for(lambda: len(server.events) == 2 and len(scheduled_batches) == 1)
+        return response, scheduled_batches, server.events
 
-    response, scheduled_batches, queued_previews, events = asyncio.run(run())
+    response, scheduled_batches, events = asyncio.run(run())
     assert response == {"ok": True}
-    assert scheduled_batches == []
-    assert queued_previews == [(("v-cor", "v-sag"), "webp", False, "mpr-crosshair-preview", 12)]
-    assert events == [
-        ("mpr_state_update", {"viewId": "v-cor", "mprRevision": 12}, "sid-v-cor"),
-        ("mpr_state_update", {"viewId": "v-sag", "mprRevision": 12}, "sid-v-sag"),
+    assert scheduled_batches == [
+        (
+            ("v-cor", "v-sag"),
+            "webp",
+            True,
+            "mpr-crosshair-preview",
+            12,
+            "crosshair-1",
+            "crosshair-1:12:preview",
+            False,
+        )
     ]
+    assert events == [
+        (
+            "mpr_state_update",
+            {
+                "viewId": "v-cor",
+                "mprRevision": 12,
+                "interactionId": "crosshair-1",
+                "mprBatchId": "crosshair-1:12:preview",
+                "mprBatchViewportKeys": ["mpr-cor", "mpr-sag"],
+                "mprBatchFinal": False,
+            },
+            "sid-v-cor",
+        ),
+        (
+            "mpr_state_update",
+            {
+                "viewId": "v-sag",
+                "mprRevision": 12,
+                "interactionId": "crosshair-1",
+                "mprBatchId": "crosshair-1:12:preview",
+                "mprBatchViewportKeys": ["mpr-cor", "mpr-sag"],
+                "mprBatchFinal": False,
+            },
+            "sid-v-sag",
+        ),
+    ]
+
+
+def test_mpr_crosshair_state_error_keeps_interaction_context(monkeypatch) -> None:
+    async def run() -> list[tuple[str, object, str | None]]:
+        server = _SocketServerStub()
+        payload = handlers.ViewOperationRequest.model_validate(
+            {
+                "viewId": "v-ax",
+                "opType": "crosshair",
+                "actionType": "end",
+                "interactionId": "crosshair-error-1",
+                "x": 0.5,
+                "y": 0.5,
+            }
+        )
+        operation = handlers._QueuedMprOperation(
+            payload=payload,
+            server=server,  # type: ignore[arg-type]
+            sid="sid-1",
+            workspace_id="workspace-a",
+        )
+        monkeypatch.setattr(
+            handlers.view_registry,
+            "get",
+            lambda view_id, workspace_id=None: SimpleNamespace(view_id=view_id, view_type="AX"),
+        )
+        monkeypatch.setattr(
+            handlers.viewer_service,
+            "handle_view_operation",
+            lambda payload, workspace_id=None: (_ for _ in ()).throw(RuntimeError("render failed")),
+        )
+
+        await handlers._process_queued_mpr_crosshair_state_operation("mpr-op:workspace-a:group-1", operation)
+        return server.events
+
+    events = asyncio.run(run())
+    expected_error = {
+        "message": "render failed",
+        "viewId": "v-ax",
+        "interactionId": "crosshair-error-1",
+        "mprBatchFinal": True,
+    }
+    assert ("image_error", expected_error, "sid-1") in events
+    assert ("render_error", expected_error, "sid-1") in events
 
 
 def test_mpr_crosshair_state_queue_keeps_latest_move(monkeypatch) -> None:
@@ -1040,70 +1130,6 @@ def test_mpr_crosshair_state_queue_keeps_latest_move(monkeypatch) -> None:
         return calls
 
     assert asyncio.run(run()) == [("start", 0.1), ("move", 0.8)]
-
-
-def test_mpr_crosshair_preview_generation_skips_replaced_request(monkeypatch) -> None:
-    async def run() -> list[tuple[tuple[str, ...], int | None, str | None]]:
-        handlers._mpr_crosshair_preview_states.clear()
-        server = _SocketServerStub()
-        scheduled_batches: list[tuple[tuple[str, ...], int | None, str | None]] = []
-        queue_key = "mpr-op:workspace-a:g"
-        loop = asyncio.get_running_loop()
-        handlers._mpr_crosshair_preview_states[queue_key] = handlers._MprCrosshairPreviewState(
-            last_dispatch_at=loop.time(),
-        )
-
-        async def fake_schedule_render_batch(
-            view_ids: tuple[str, ...],
-            *,
-            image_format: str = "png",
-            fast_preview: bool = False,
-            fast_preview_full_resolution: bool = False,
-            metadata_mode: str = "full",
-            target_sids: tuple[str, ...] | None = None,
-            mpr_revision: int | None = None,
-            interaction_id: str | None = None,
-        ) -> bool:
-            del image_format, fast_preview, fast_preview_full_resolution, metadata_mode, target_sids
-            scheduled_batches.append((view_ids, mpr_revision, interaction_id))
-            return False
-
-        monkeypatch.setattr(handlers, "MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS", 0.02)
-        monkeypatch.setattr(handlers.view_socket_hub, "schedule_render_batch", fake_schedule_render_batch)
-
-        handlers._schedule_mpr_crosshair_preview(
-            queue_key,
-            handlers._MprCrosshairPreviewRequest(
-                server=server,  # type: ignore[arg-type]
-                sid="sid-1",
-                view_ids=("v-old",),
-                image_format="png",
-                fast_preview=True,
-                fast_preview_full_resolution=False,
-                metadata_mode="mpr-crosshair-preview",
-                mpr_revision=1,
-                interaction_id="interaction-old",
-            ),
-        )
-        await asyncio.sleep(0)
-        handlers._schedule_mpr_crosshair_preview(
-            queue_key,
-            handlers._MprCrosshairPreviewRequest(
-                server=server,  # type: ignore[arg-type]
-                sid="sid-1",
-                view_ids=("v-new",),
-                image_format="png",
-                fast_preview=True,
-                fast_preview_full_resolution=False,
-                metadata_mode="mpr-crosshair-preview",
-                mpr_revision=2,
-                interaction_id="interaction-new",
-            ),
-        )
-        await _wait_for(lambda: len(scheduled_batches) == 1)
-        return scheduled_batches
-
-    assert asyncio.run(run()) == [(("v-new",), 2, "interaction-new")]
 
 
 def test_handle_operation_routes_mpr_deferred_preview_through_batch_scheduler(monkeypatch) -> None:

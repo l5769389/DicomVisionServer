@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from io import BytesIO
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1478,7 +1479,7 @@ def test_mpr_window_keeps_geometry_revision_after_crosshair_move(monkeypatch) ->
     assert group.mpr_revision == 1
 
 
-def test_stack_window_moves_and_end_render_matching_full_webp_frames_while_zoom_remains_deferred(monkeypatch) -> None:
+def test_stack_window_move_uses_full_resolution_webp_preview_and_end_uses_lossless_frame(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
     view = ViewRecord(view_id="stack-view", series_id=series.series_id, view_type="Stack")
@@ -1524,8 +1525,9 @@ def test_stack_window_moves_and_end_render_matching_full_webp_frames_while_zoom_
 
     assert window_move.primary_result is rendered_result
     assert window_move.primary_image_format == "webp"
-    assert window_move.primary_fast_preview is False
-    assert window_move.primary_metadata_mode == "full"
+    assert window_move.primary_fast_preview is True
+    assert window_move.primary_fast_preview_full_resolution is True
+    assert window_move.primary_metadata_mode == "stack-pixel-preview"
     assert window_move.deferred_view_ids == ()
     assert view.window_width == pytest.approx(412.0)
     assert view.window_center == pytest.approx(48.0)
@@ -1537,9 +1539,9 @@ def test_stack_window_moves_and_end_render_matching_full_webp_frames_while_zoom_
     assert render_calls == [
         {
             "image_format": "webp",
-            "fast_preview": False,
-            "fast_preview_full_resolution": False,
-            "metadata_mode": "full",
+            "fast_preview": True,
+            "fast_preview_full_resolution": True,
+            "metadata_mode": "stack-pixel-preview",
         },
         {
             "image_format": "webp",
@@ -1560,7 +1562,7 @@ def test_stack_window_moves_and_end_render_matching_full_webp_frames_while_zoom_
     assert zoom_end.deferred_fast_preview is False
 
 
-def test_volume_zoom_move_uses_transport_format_without_full_resolution_preview(monkeypatch) -> None:
+def test_volume_zoom_move_uses_full_resolution_webp_preview(monkeypatch) -> None:
     service = ViewerService()
     series = SimpleNamespace(series_id="s", instances=[])
     view = ViewRecord(view_id="volume-view", series_id=series.series_id, view_type="3D")
@@ -1601,7 +1603,7 @@ def test_volume_zoom_move_uses_transport_format_without_full_resolution_preview(
     assert zoom_move.deferred_view_ids == (view.view_id,)
     assert zoom_move.deferred_image_format == "webp"
     assert zoom_move.deferred_fast_preview is True
-    assert zoom_move.deferred_fast_preview_full_resolution is False
+    assert zoom_move.deferred_fast_preview_full_resolution is True
     assert zoom_move.deferred_metadata_mode == "stack-zoom-preview"
 
 
@@ -2052,6 +2054,35 @@ def test_mpr_fast_preview_includes_backend_corner_state(monkeypatch) -> None:
     assert "Zoom:1.5x" in result.meta.corner_info.bottom_right
     assert all(not line.startswith("X:") for line in result.meta.corner_info.bottom_right)
     assert "coordinates" not in result.meta.corner_info.tags
+
+
+def test_mpr_crosshair_preview_uses_the_final_pixel_pipeline(monkeypatch) -> None:
+    service, series, volume = _build_service_with_stubbed_series(monkeypatch)
+    _, axial_view = _build_axial_view(service, series, volume)
+    axial_view.is_initialized = True
+    axial_view.window_width = 512.0
+    axial_view.window_center = 42.0
+
+    preview = service._render_mpr_view(
+        axial_view,
+        image_format="webp",
+        fast_preview=True,
+        fast_preview_full_resolution=True,
+        metadata_mode="mpr-crosshair-preview",
+    )
+    final = service._render_mpr_view(
+        axial_view,
+        image_format="webp",
+        fast_preview=False,
+        metadata_mode="full",
+    )
+
+    with Image.open(BytesIO(preview.image_bytes)) as preview_image:
+        preview_pixels = np.asarray(preview_image.convert("RGB"))
+    with Image.open(BytesIO(final.image_bytes)) as final_image:
+        final_pixels = np.asarray(final_image.convert("RGB"))
+
+    assert np.array_equal(preview_pixels, final_pixels)
 
 
 def test_mpr_crosshair_end_broadcasts_full_quality_to_all_mpr_views(monkeypatch) -> None:

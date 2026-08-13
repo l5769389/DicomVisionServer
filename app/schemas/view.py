@@ -215,6 +215,7 @@ class ViewExportAnnotationOverlayPayload(BaseModel):
 class ViewExportOverlaysPayload(BaseModel):
     annotations: list[ViewExportAnnotationOverlayPayload] = Field(default_factory=list)
     measurements: list[ViewExportMeasurementOverlayPayload] = Field(default_factory=list)
+    corner_info: CornerInfoPayload | None = Field(default=None, alias="cornerInfo")
 
     model_config = {"populate_by_name": True}
 
@@ -672,6 +673,15 @@ class PetInfo(BaseModel):
     fusion_overlay_pseudocolor_preset: str | None = Field(default=None, alias="fusionOverlayPseudocolorPreset")
     tracer_name: str | None = Field(default=None, alias="tracerName")
     is_fdg: bool = Field(default=False, alias="isFdg")
+
+    model_config = {"populate_by_name": True}
+
+
+class MontageDisplayConfigResponse(BaseModel):
+    series_id: str = Field(alias="seriesId")
+    modality: str
+    window_info: WindowInfo = Field(alias="windowInfo")
+    pet_info: PetInfo | None = Field(default=None, alias="petInfo")
 
     model_config = {"populate_by_name": True}
 

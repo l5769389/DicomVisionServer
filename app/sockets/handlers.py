@@ -54,7 +54,6 @@ MPR_CROSSHAIR_STATE_OPERATION_TYPES = {
     VIEW_OP_TYPE_CROSSHAIR,
     VIEW_OP_TYPE_MPR_OBLIQUE,
 }
-MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS = 0.05
 MPR_VIEW_TYPES = {"MPR", "AX", "COR", "SAG"}
 STACK_WINDOW_QUEUE_VIEW_TYPES = {"Stack", "PET"}
 FUSION_VIEW_TYPES = {
@@ -99,33 +98,10 @@ class _MprOperationQueueState:
     task: asyncio.Task[None] | None = None
 
 
-@dataclass
-class _MprCrosshairPreviewRequest:
-    server: socketio.AsyncServer
-    sid: str
-    view_ids: tuple[str, ...]
-    image_format: str
-    fast_preview: bool
-    fast_preview_full_resolution: bool
-    metadata_mode: str
-    mpr_revision: int | None
-    interaction_id: str | None = None
-    generation: int = 0
-
-
-@dataclass
-class _MprCrosshairPreviewState:
-    pending: _MprCrosshairPreviewRequest | None = None
-    task: asyncio.Task[None] | None = None
-    last_dispatch_at: float = 0.0
-    generation: int = 0
-
-
 _mpr_operation_queues: dict[str, _MprOperationQueueState] = {}
 _mpr_crosshair_state_queues: dict[str, _MprOperationQueueState] = {}
-_mpr_crosshair_preview_states: dict[str, _MprCrosshairPreviewState] = {}
 
-def _build_error_payload(exc: Exception) -> dict[str, str]:
+def _build_error_payload(exc: Exception) -> dict[str, object]:
     return {"message": getattr(exc, "detail", str(exc))}
 
 
@@ -135,8 +111,11 @@ async def _emit_errors(
     *,
     events: tuple[str, ...],
     exc: Exception,
+    context: dict[str, object] | None = None,
 ) -> None:
     error = _build_error_payload(exc)
+    if context:
+        error.update(context)
     for event_name in events:
         await server.emit(event_name, error, to=sid)
 
@@ -207,6 +186,8 @@ def _schedule_render_batch_for_views(
     target_sids: tuple[str, ...] | None = None,
     mpr_revision: int | None = None,
     interaction_id: str | None = None,
+    mpr_batch_id: str | None = None,
+    mpr_batch_final: bool = False,
 ) -> asyncio.Task[None]:
     async def run_render_batch() -> None:
         try:
@@ -226,6 +207,8 @@ def _schedule_render_batch_for_views(
                 target_sids=target_sids,
                 mpr_revision=mpr_revision,
                 interaction_id=interaction_id,
+                mpr_batch_id=mpr_batch_id,
+                mpr_batch_final=mpr_batch_final,
             )
             logger.debug(
                 "socket background render batch completed sid=%s view_ids=%s image_format=%s fast_preview=%s",
@@ -355,6 +338,9 @@ async def _emit_mpr_state_updates(
     *,
     mpr_revision: int | None = None,
     interaction_id: str | None = None,
+    batch_id: str | None = None,
+    batch_viewport_keys: tuple[str, ...] = (),
+    batch_final: bool = False,
 ) -> None:
     if not view_ids:
         return
@@ -371,68 +357,12 @@ async def _emit_mpr_state_updates(
             continue
         if interaction_id is not None:
             state_payload["interactionId"] = interaction_id
+        if batch_id is not None:
+            state_payload["mprBatchId"] = batch_id
+            state_payload["mprBatchViewportKeys"] = list(batch_viewport_keys)
+            state_payload["mprBatchFinal"] = batch_final
         for target_sid in view_socket_hub.get_view_sids(state_view_id):
             await server.emit("mpr_state_update", state_payload, to=target_sid)
-
-
-def _schedule_mpr_crosshair_preview(
-    queue_key: str,
-    request: _MprCrosshairPreviewRequest,
-) -> None:
-    if not request.view_ids:
-        return
-    state = _mpr_crosshair_preview_states.setdefault(queue_key, _MprCrosshairPreviewState())
-    state.generation += 1
-    request.generation = state.generation
-    state.pending = request
-    if state.task is None or state.task.done():
-        state.task = asyncio.create_task(_run_mpr_crosshair_preview_queue(queue_key, state))
-
-
-def _cancel_mpr_crosshair_preview(queue_key: str) -> None:
-    state = _mpr_crosshair_preview_states.pop(queue_key, None)
-    if state and state.task is not None and not state.task.done():
-        state.task.cancel()
-
-
-async def _run_mpr_crosshair_preview_queue(queue_key: str, state: _MprCrosshairPreviewState) -> None:
-    current_task = asyncio.current_task()
-    try:
-        while True:
-            request = state.pending
-            if request is None:
-                return
-            state.pending = None
-            loop = asyncio.get_running_loop()
-            delay_seconds = MPR_CROSSHAIR_PREVIEW_INTERVAL_SECONDS - (loop.time() - state.last_dispatch_at)
-            if delay_seconds > 0:
-                await asyncio.sleep(delay_seconds)
-            if request.generation != state.generation and state.pending is not None:
-                continue
-            try:
-                await view_socket_hub.schedule_render_batch(
-                    request.view_ids,
-                    image_format=request.image_format,
-                    fast_preview=request.fast_preview,
-                    fast_preview_full_resolution=request.fast_preview_full_resolution,
-                    metadata_mode=request.metadata_mode,
-                    mpr_revision=request.mpr_revision,
-                    interaction_id=request.interaction_id,
-                )
-                state.last_dispatch_at = asyncio.get_running_loop().time()
-            except Exception as exc:
-                logger.exception("socket MPR crosshair preview failed sid=%s view_ids=%s", request.sid, request.view_ids)
-                await _emit_errors(request.server, request.sid, events=("image_error", "render_error"), exc=exc)
-            if state.pending is None:
-                return
-    except asyncio.CancelledError:
-        raise
-    finally:
-        if state.task is current_task:
-            if state.pending is None:
-                _mpr_crosshair_preview_states.pop(queue_key, None)
-            else:
-                state.task = asyncio.create_task(_run_mpr_crosshair_preview_queue(queue_key, state))
 
 
 async def _dispatch_operation_result(
@@ -612,37 +542,49 @@ async def _run_mpr_operation_queue(queue_key: str, state: _MprOperationQueueStat
 
 
 async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operation: _QueuedMprOperation) -> None:
+    batch_id: str | None = None
+    batch_viewport_keys: tuple[str, ...] = ()
+    batch_final = operation.payload.action_type == DRAG_ACTION_END
+    mpr_revision: int | None = None
     try:
         view = view_registry.get(operation.payload.view_id, workspace_id=operation.workspace_id)
         result = viewer_service.handle_view_operation(operation.payload, operation.workspace_id)
+        mpr_revision = result.mpr_revision
+        batch_kind = "final" if batch_final else "preview"
+        batch_id = (
+            f"{operation.payload.interaction_id}:{result.mpr_revision}:{batch_kind}"
+            if operation.payload.interaction_id is not None and result.mpr_revision is not None
+            else None
+        )
+        batch_viewport_keys = tuple(
+            str(viewer_service._resolve_mpr_viewport(view_registry.get(view_id, workspace_id=operation.workspace_id)))
+            for view_id in result.broadcast_view_ids
+        )
         await _emit_mpr_state_updates(
             operation.server,
             operation.sid,
             result.mpr_state_view_ids,
             mpr_revision=result.mpr_revision,
             interaction_id=operation.payload.interaction_id,
+            batch_id=batch_id,
+            batch_viewport_keys=batch_viewport_keys,
+            batch_final=batch_final,
         )
         if operation.payload.action_type == DRAG_ACTION_MOVE and result.broadcast_view_ids:
-            _schedule_mpr_crosshair_preview(
-                queue_key,
-                _MprCrosshairPreviewRequest(
-                    server=operation.server,
-                    sid=operation.sid,
-                    view_ids=result.broadcast_view_ids,
-                    image_format=result.broadcast_image_format,
-                    fast_preview=result.broadcast_fast_preview,
-                    fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
-                    metadata_mode=result.broadcast_metadata_mode,
-                    mpr_revision=result.mpr_revision,
-                    interaction_id=operation.payload.interaction_id,
-                ),
+            await view_socket_hub.schedule_render_batch(
+                result.broadcast_view_ids,
+                image_format=result.broadcast_image_format,
+                fast_preview=result.broadcast_fast_preview,
+                fast_preview_full_resolution=result.broadcast_fast_preview_full_resolution,
+                metadata_mode=result.broadcast_metadata_mode,
+                mpr_revision=result.mpr_revision,
+                interaction_id=operation.payload.interaction_id,
+                mpr_batch_id=batch_id,
+                mpr_batch_final=False,
             )
         if operation.payload.action_type == DRAG_ACTION_END:
-            _cancel_mpr_crosshair_preview(queue_key)
             if result.broadcast_view_ids:
-                _schedule_render_batch_for_views(
-                    operation.server,
-                    operation.sid,
+                await view_socket_hub.schedule_render_batch(
                     result.broadcast_view_ids,
                     image_format=result.broadcast_image_format,
                     fast_preview=result.broadcast_fast_preview,
@@ -650,6 +592,8 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
                     metadata_mode=result.broadcast_metadata_mode,
                     mpr_revision=result.mpr_revision,
                     interaction_id=operation.payload.interaction_id,
+                    mpr_batch_id=batch_id,
+                    mpr_batch_final=True,
                 )
         logger.debug(
             "socket mpr_crosshair_state sid=%s view_id=%s action=%s",
@@ -663,7 +607,23 @@ async def _process_queued_mpr_crosshair_state_operation(queue_key: str, operatio
             operation.sid,
             operation.payload.view_id,
         )
-        await _emit_errors(operation.server, operation.sid, events=("image_error", "render_error"), exc=exc)
+        error_context: dict[str, object] = {
+            "viewId": operation.payload.view_id,
+            "interactionId": operation.payload.interaction_id,
+            "mprBatchFinal": batch_final,
+        }
+        if batch_id is not None:
+            error_context["mprBatchId"] = batch_id
+            error_context["mprBatchViewportKeys"] = list(batch_viewport_keys)
+        if mpr_revision is not None:
+            error_context["mprRevision"] = mpr_revision
+        await _emit_errors(
+            operation.server,
+            operation.sid,
+            events=("image_error", "render_error"),
+            exc=exc,
+            context=error_context,
+        )
 
 
 async def _run_mpr_crosshair_state_queue(queue_key: str, state: _MprOperationQueueState) -> None:
@@ -724,6 +684,10 @@ async def _handle_mpr_crosshair_state(server: socketio.AsyncServer, sid: str, da
         workspace_id = view_socket_hub.get_sid_workspace(sid)
         view = view_registry.get(payload.view_id, workspace_id=workspace_id)
         view_socket_hub.bind_view(sid, payload.view_id)
+        if payload.action_type == DRAG_ACTION_END:
+            view_socket_hub.mark_mpr_interaction_final(payload.view_id, payload.interaction_id)
+        else:
+            view_socket_hub.mark_view_interaction(payload.view_id, payload.interaction_id)
         if not _should_queue_mpr_crosshair_state_operation(view.view_type, payload):
             message = "mpr_crosshair_state requires an MPR crosshair or mprOblique start/move/end payload"
             await server.emit("render_error", {"message": message}, to=sid)

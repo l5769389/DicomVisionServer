@@ -103,11 +103,16 @@ class ViewerStateMixin:
 
         cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
         image_height, image_width = cached.source_pixels.shape[:2]
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(
+            self._get_stack_spacing_xy(cached.dataset)
+        )
         view.zoom = compat.viewport_transformer.calculate_contain_zoom(
             image_width=image_width,
             image_height=image_height,
             canvas_width=view.width,
             canvas_height=view.height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
         )
         view.offset_x = 0.0
         view.offset_y = 0.0
@@ -134,6 +139,65 @@ class ViewerStateMixin:
             else False
         )
 
+    def get_montage_display_config(
+        self,
+        series_id: str,
+        *,
+        pet_unit: str | None = None,
+        workspace_id: str | None = None,
+    ) -> MontageDisplayConfigResponse:
+        """Return authoritative display state without creating a mutable viewer view."""
+
+        series = compat.series_registry.get(series_id, workspace_id=workspace_id)
+        if not series.is_image_series or not series.instances:
+            raise HTTPException(status_code=400, detail="Series does not contain renderable image instances")
+
+        if self._is_pet_series(series):
+            native_volume = self._get_series_native_slice_volume(series)
+            display = self._build_fusion_pet_display_volume(
+                series,
+                native_volume,
+                pet_unit,
+                source_kind="native",
+            )
+            window_width, window_center = self._derive_default_pet_window_for_display_volume(display)
+            _auto_low, auto_high = derive_pet_auto_range(display.volume, display.unit)
+            control_window_max = derive_pet_control_range_max(auto_high, display.unit)
+            pet_info = self._build_pet_info(
+                series,
+                display,
+                window_width=window_width,
+                window_center=window_center,
+                pseudocolor_preset=PET_STANDALONE_PSEUDOCOLOR_PRESET,
+                control_window_max=control_window_max,
+            )
+            return MontageDisplayConfigResponse(
+                seriesId=series.series_id,
+                modality=str(series.modality or "PT"),
+                windowInfo=WindowInfo(ww=window_width, wl=window_center),
+                petInfo=pet_info,
+            )
+
+        _instance, cached = self._get_reference_instance_and_cache(series)
+        if cached is None:
+            raise HTTPException(status_code=422, detail="Series display metadata could not be decoded")
+        window_width = cached.window_width
+        window_center = cached.window_center
+        if window_width is None or window_center is None:
+            pixels = np.asarray(cached.source_pixels)
+            if pixels.ndim == 2:
+                low, high = compat.series_registry._resolve_thumbnail_window(pixels, window_width, window_center)
+                window_width = max(1e-6, high - low)
+                window_center = (high + low) / 2.0
+            else:
+                window_width = 255.0
+                window_center = 127.5
+        return MontageDisplayConfigResponse(
+            seriesId=series.series_id,
+            modality=str(series.modality or ""),
+            windowInfo=WindowInfo(ww=window_width, wl=window_center),
+        )
+
     def _initialize_pet_viewport(self, view: ViewRecord) -> None:
         ensure_view_size(view)
 
@@ -143,8 +207,13 @@ class ViewerStateMixin:
         if not series.instances:
             raise HTTPException(status_code=400, detail="PET series does not contain image instances")
 
-        pet_volume = self._get_series_volume(series)
-        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, None)
+        pet_volume = self._get_series_native_slice_volume(series)
+        pet_display = self._build_fusion_pet_display_volume(
+            series,
+            pet_volume,
+            view.pending_pet_unit,
+            source_kind="native",
+        )
         view.pet_unit = pet_display.unit
         view.pet_unit_label = pet_display.unit_label
         view.current_index = max(0, min(self._resolve_representative_stack_index(series), pet_display.volume.shape[0] - 1))
@@ -162,6 +231,18 @@ class ViewerStateMixin:
         view.window_width = auto_high - auto_low
         view.window_center = (auto_high + auto_low) / 2.0
         view.pet_control_window_max = derive_pet_control_range_max(auto_high, pet_display.unit)
+        if view.pending_pet_window_min is not None or view.pending_pet_window_max is not None:
+            requested_low = float(view.pending_pet_window_min if view.pending_pet_window_min is not None else auto_low)
+            requested_high = float(view.pending_pet_window_max if view.pending_pet_window_max is not None else auto_high)
+            if requested_high > requested_low:
+                view.window_width = requested_high - requested_low
+                view.window_center = (requested_high + requested_low) / 2.0
+        if view.pending_pet_control_window_max is not None:
+            view.pet_control_window_max = max(1e-6, float(view.pending_pet_control_window_max))
+        view.pending_pet_unit = None
+        view.pending_pet_window_min = None
+        view.pending_pet_window_max = None
+        view.pending_pet_control_window_max = None
         self._reset_drag_state(view)
         logger.info(
             "PET viewport initialized view_id=%s volume=%s unit=%s zoom=%.4f ww=%s wl=%s",
@@ -179,9 +260,12 @@ class ViewerStateMixin:
         pet_display: FusionPetDisplayVolume,
         current_index: int,
     ) -> tuple[int, int, float, float]:
-        image_height = int(pet_display.volume.shape[1]) if pet_display.volume.ndim >= 2 else 1
-        image_width = int(pet_display.volume.shape[2]) if pet_display.volume.ndim >= 3 else 1
         _, cached = self._get_indexed_instance_and_cache(series, current_index)
+        if cached is not None:
+            image_height, image_width = cached.source_pixels.shape[:2]
+        else:
+            image_height = int(pet_display.volume.shape[1]) if pet_display.volume.ndim >= 2 else 1
+            image_width = int(pet_display.volume.shape[2]) if pet_display.volume.ndim >= 3 else 1
         spacing_xy = self._get_stack_spacing_xy(cached.dataset) if cached is not None else None
         pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(spacing_xy)
         return image_height, image_width, pixel_aspect_x, pixel_aspect_y
@@ -195,7 +279,7 @@ class ViewerStateMixin:
         canvas_width: int | None = None,
         canvas_height: int | None = None,
     ) -> float:
-        current_index = max(0, min(int(view.current_index or 0), pet_display.volume.shape[0] - 1))
+        current_index = max(0, min(int(view.current_index or 0), len(series.instances) - 1))
         image_height, image_width, pixel_aspect_x, pixel_aspect_y = self._get_pet_display_shape_and_aspect(
             series,
             pet_display,
@@ -533,10 +617,70 @@ class ViewerStateMixin:
         pet_series: SeriesRecord,
         pet_volume: np.ndarray,
         requested_unit: str | None,
+        *,
+        source_kind: str = "standardized",
     ) -> FusionPetDisplayVolume:
         _, cached = self._get_reference_instance_and_cache(pet_series)
+        mapping, actual_unit, actual_label, context = self._resolve_pet_display_mapping(
+            pet_series,
+            requested_unit,
+            cached=cached,
+        )
+        volume_cache_key = self._build_series_volume_cache_key(pet_series)
+
+        display_cache_key = (
+            volume_cache_key,
+            source_kind,
+            actual_unit,
+            round(float(mapping.scale), 12),
+            round(float(mapping.offset), 12),
+        )
+        with self._cache_index_lock:
+            display_volume = self._pet_display_volume_cache.get(display_cache_key)
+            if display_volume is not None:
+                self._pet_display_volume_cache.move_to_end(display_cache_key)
+            else:
+                display_volume = apply_pet_mapping(pet_volume, mapping)
+                display_bytes = int(display_volume.nbytes)
+                if display_bytes <= PET_DISPLAY_VOLUME_CACHE_MAX_BYTES:
+                    self._pet_display_volume_cache[display_cache_key] = display_volume
+                    self._pet_display_volume_cache_bytes += display_bytes
+                    while (
+                        self._pet_display_volume_cache_bytes > PET_DISPLAY_VOLUME_CACHE_MAX_BYTES
+                        and self._pet_display_volume_cache
+                    ):
+                        _, evicted = self._pet_display_volume_cache.popitem(last=False)
+                        self._pet_display_volume_cache_bytes = max(
+                            0,
+                            self._pet_display_volume_cache_bytes - int(evicted.nbytes),
+                        )
+        source_units = str(getattr(cached.dataset, "Units", "") or "").strip() if cached is not None else None
+        return FusionPetDisplayVolume(
+            volume=display_volume,
+            unit=actual_unit,
+            unit_label=actual_label,
+            source_units=source_units or None,
+            scale=float(mapping.scale),
+            offset=float(mapping.offset),
+            context=context,
+        )
+
+    def _resolve_pet_display_mapping(
+        self,
+        pet_series: SeriesRecord,
+        requested_unit: str | None,
+        *,
+        cached: CachedDicom | None = None,
+    ) -> tuple[PetLinearMapping, str, str, PetQuantificationContext]:
+        if cached is None:
+            _, cached = self._get_reference_instance_and_cache(pet_series)
         dataset = cached.dataset if cached is not None else None
-        context = build_pet_quantification_context(dataset)
+        volume_cache_key = self._build_series_volume_cache_key(pet_series)
+        with self._cache_index_lock:
+            context = self._pet_quantification_context_cache.get(volume_cache_key)
+            if context is None:
+                context = build_pet_quantification_context(dataset)
+                self._pet_quantification_context_cache[volume_cache_key] = context
         if context.support_status == "unsupported":
             raise HTTPException(
                 status_code=422,
@@ -554,18 +698,8 @@ class ViewerStateMixin:
                 status_code=422,
                 detail=f"PET unit {option.label} is unavailable: {option.reason or 'required metadata is missing'}",
             )
-        display_volume = apply_pet_mapping(pet_volume, mapping)
         actual_label = context.option_for(actual_unit).label
-        source_units = str(getattr(cached.dataset, "Units", "") or "").strip() if cached is not None else None
-        return FusionPetDisplayVolume(
-            volume=display_volume,
-            unit=actual_unit,
-            unit_label=actual_label,
-            source_units=source_units or None,
-            scale=float(mapping.scale),
-            offset=float(mapping.offset),
-            context=context,
-        )
+        return mapping, actual_unit, actual_label, context
 
     def _derive_default_pet_window_for_display_volume(
         self,
@@ -904,8 +1038,13 @@ class ViewerStateMixin:
         series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
         if not self._is_pet_series(series):
             return False
-        pet_volume = self._get_series_volume(series)
-        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        pet_volume = self._get_series_native_slice_volume(series)
+        pet_display = self._build_fusion_pet_display_volume(
+            series,
+            pet_volume,
+            view.pet_unit,
+            source_kind="native",
+        )
         expected_zoom = self._calculate_pet_fit_zoom_for_size(
             view,
             series,
@@ -920,8 +1059,13 @@ class ViewerStateMixin:
         series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
         if not self._is_pet_series(series):
             return
-        pet_volume = self._get_series_volume(series)
-        pet_display = self._build_fusion_pet_display_volume(series, pet_volume, view.pet_unit)
+        pet_volume = self._get_series_native_slice_volume(series)
+        pet_display = self._build_fusion_pet_display_volume(
+            series,
+            pet_volume,
+            view.pet_unit,
+            source_kind="native",
+        )
         view.pet_unit = pet_display.unit
         view.pet_unit_label = pet_display.unit_label
         view.current_index = max(0, min(int(view.current_index or 0), pet_display.volume.shape[0] - 1))

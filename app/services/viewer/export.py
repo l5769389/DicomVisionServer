@@ -37,7 +37,7 @@ class ViewerExportMixin:
 
         if export_format == "png":
             rendered = self._render_by_view_type(view, image_format="png", fast_preview=False)
-            if overlays and (overlays.annotations or overlays.measurements):
+            if overlays and (overlays.annotations or overlays.measurements or overlays.corner_info):
                 try:
                     image = Image.open(io.BytesIO(rendered.image_bytes)).convert("RGB")
                     image = self._apply_export_overlays(image, overlays)
@@ -60,7 +60,7 @@ class ViewerExportMixin:
         except Exception as exc:  # pragma: no cover - defensive
             raise HTTPException(status_code=500, detail="Failed to decode rendered image for DICOM export") from exc
 
-        if overlays and (overlays.annotations or overlays.measurements):
+        if overlays and (overlays.annotations or overlays.measurements or overlays.corner_info):
             image = self._apply_export_overlays(image, overlays)
 
         reference_dataset = self._get_export_reference_dataset(view)
@@ -650,6 +650,9 @@ class ViewerExportMixin:
         font = ImageFont.load_default()
         width, height = canvas.size
 
+        if overlays.corner_info is not None:
+            self._draw_export_corner_info(draw, font, overlays.corner_info, width, height)
+
         for measurement in overlays.measurements:
             points = tuple((point.x * width, point.y * height) for point in measurement.points)
             self._draw_export_measurement(draw, font, measurement.tool_type, points, measurement.label_lines, width, height)
@@ -659,6 +662,43 @@ class ViewerExportMixin:
             self._draw_export_annotation(draw, font, points, annotation.text, annotation.color, annotation.size, width, height)
 
         return canvas.convert("RGB")
+
+    @staticmethod
+    def _draw_export_corner_info(
+        draw: ImageDraw.ImageDraw,
+        font: ImageFont.ImageFont,
+        corner_info: CornerInfoPayload,
+        width: int,
+        height: int,
+    ) -> None:
+        padding = max(10, int(round(min(width, height) * 0.018)))
+        line_gap = 4
+        blocks = (
+            (corner_info.top_left, "left", "top"),
+            (corner_info.top_right, "right", "top"),
+            (corner_info.bottom_left, "left", "bottom"),
+            (corner_info.bottom_right, "right", "bottom"),
+        )
+        for lines, horizontal, vertical in blocks:
+            visible_lines = [line.strip() for line in lines if line.strip()]
+            if not visible_lines:
+                continue
+            line_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=2) for line in visible_lines]
+            line_heights = [max(1, box[3] - box[1]) for box in line_boxes]
+            total_height = sum(line_heights) + line_gap * max(0, len(visible_lines) - 1)
+            cursor_y = padding if vertical == "top" else height - padding - total_height
+            for line, box, line_height in zip(visible_lines, line_boxes, line_heights, strict=True):
+                line_width = max(1, box[2] - box[0])
+                x = padding if horizontal == "left" else width - padding - line_width
+                draw.text(
+                    (x, cursor_y),
+                    line,
+                    font=font,
+                    fill=(234, 243, 251, 255),
+                    stroke_width=2,
+                    stroke_fill=(3, 15, 24, 235),
+                )
+                cursor_y += line_height + line_gap
 
     def _draw_export_measurement(
         self,

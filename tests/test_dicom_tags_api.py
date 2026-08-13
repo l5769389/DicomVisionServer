@@ -6,6 +6,7 @@ from zipfile import ZipFile
 
 import numpy as np
 import pydicom
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
@@ -170,6 +171,79 @@ def test_montage_tile_renders_requested_stack_slice_without_mutating_order(tmp_p
 
     series = series_registry.get(series_id)
     assert [instance.instance_number for instance in series.instances] == [1, 2]
+
+
+def test_montage_display_config_returns_authoritative_pet_range_without_a_view(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    series_instance_uid = generate_uid()
+    _create_test_dicom(
+        tmp_path / "pet-slice-1.dcm",
+        series_instance_uid=series_instance_uid,
+        instance_number=1,
+        modality="PT",
+    )
+    second_path = tmp_path / "pet-slice-2.dcm"
+    _create_test_dicom(
+        second_path,
+        series_instance_uid=series_instance_uid,
+        instance_number=2,
+        modality="PT",
+    )
+    second = pydicom.dcmread(second_path)
+    second.PixelData = np.array([[10, 20], [30, 40]], dtype=np.uint16).tobytes()
+    second.save_as(second_path, write_like_original=False)
+
+    client = TestClient(fastapi_app)
+    load_response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+    response = client.get(
+        "/api/v1/dicom/montage/display-config",
+        params={"seriesId": series_id, "petUnit": "source"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["seriesId"] == series_id
+    assert payload["modality"] == "PT"
+    assert payload["petInfo"]["petUnit"] == "source"
+    assert payload["petInfo"]["unitOptions"]
+    assert payload["petInfo"]["petWindowMax"] == payload["petInfo"]["autoWindowMax"]
+    assert payload["windowInfo"]["ww"] == pytest.approx(
+        payload["petInfo"]["petWindowMax"] - payload["petInfo"]["petWindowMin"]
+    )
+
+
+def test_montage_preview_uses_no_store_and_does_not_fill_final_cache(tmp_path: Path) -> None:
+    series_registry.clear()
+    dicom_cache.clear()
+    _create_test_dicom(tmp_path / "preview-slice.dcm")
+    client = TestClient(fastapi_app)
+    load_response = client.post("/api/v1/dicom/loadFolder", json={"folderPath": str(tmp_path)})
+    series_id = load_response.json()["seriesList"][0]["seriesId"]
+
+    preview = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={
+            "seriesId": series_id,
+            "sliceIndex": 0,
+            "ww": 4,
+            "wl": 2,
+            "renderIntent": "preview",
+        },
+    )
+    assert preview.status_code == 200
+    assert preview.headers["cache-control"] == "no-store"
+    assert len(series_registry._montage_tile_cache) == 0
+    assert len(series_registry._montage_scalar_tile_cache) == 1
+
+    final = client.get(
+        "/api/v1/dicom/montage/tile",
+        params={"seriesId": series_id, "sliceIndex": 0, "ww": 4, "wl": 2},
+    )
+    assert final.status_code == 200
+    assert len(series_registry._montage_tile_cache) == 1
+    assert len(series_registry._montage_scalar_tile_cache) == 1
 
 
 def test_montage_tile_rejects_invalid_series_and_slice(tmp_path: Path) -> None:

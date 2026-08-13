@@ -426,6 +426,17 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
         meta,
         RenderRequest(image_format="jpeg", fast_preview=True, interaction_id="drag-1"),
     )
+    batch_payload = ViewSocketHub._build_image_update_payload(
+        meta,
+        RenderRequest(
+            image_format="webp",
+            mpr_revision=9,
+            interaction_id="crosshair-1",
+            mpr_batch_id="crosshair-1:9:final",
+            mpr_batch_viewport_keys=("mpr-ax", "mpr-cor"),
+            mpr_batch_final=True,
+        ),
+    )
 
     assert "measurements" not in stack_pixel_payload
     assert "annotations" not in stack_pixel_payload
@@ -469,6 +480,9 @@ def test_preview_metadata_modes_drop_heavy_fields() -> None:
     assert "annotations" not in mpr_crosshair_payload
     assert "mprSegmentationOverlay" not in mpr_crosshair_payload
     assert interaction_payload["interactionId"] == "drag-1"
+    assert batch_payload["mprBatchId"] == "crosshair-1:9:final"
+    assert batch_payload["mprBatchViewportKeys"] == ["mpr-ax", "mpr-cor"]
+    assert batch_payload["mprBatchFinal"] is True
 
 
 def test_render_request_revision_is_assigned_at_schedule_time() -> None:
@@ -797,7 +811,7 @@ def test_mpr_group_queue_drains_latest_pending_requests(monkeypatch) -> None:
         await first_render_started.wait()
 
         assert await hub.emit_render_for_view("v-cor", image_format="jpeg", fast_preview=True) is False
-        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is True
+        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is False
         assert await hub.emit_render_for_view("v-sag", image_format="jpeg", fast_preview=True) is False
 
         release_first_render.set()
@@ -861,7 +875,7 @@ def test_mpr_group_queue_renders_pending_batch_in_parallel(monkeypatch) -> None:
 
 
 def test_mpr_group_final_request_discards_pending_previews(monkeypatch) -> None:
-    async def run() -> dict[str, RenderRequest]:
+    async def run() -> tuple[dict[str, RenderRequest], dict[str, RenderRequest]]:
         hub = ViewSocketHub()
         server = _SocketServerStub()
         hub.attach_server(server)  # type: ignore[arg-type]
@@ -885,15 +899,18 @@ def test_mpr_group_final_request_discards_pending_previews(monkeypatch) -> None:
 
         assert await hub.emit_render_for_view("v-cor", image_format="jpeg", fast_preview=True) is False
         assert await hub.emit_render_for_view("v-sag", image_format="jpeg", fast_preview=True) is False
-        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is True
+        assert await hub.emit_render_for_view("v-cor", image_format="png", fast_preview=False) is False
 
-        pending = dict(hub._pending_render_requests.get("mpr-group:g", {}))
+        pending_before_release = dict(hub._pending_render_requests.get("mpr-group:g", {}))
         release_first_render.set()
         await first_task
-        return pending
+        pending_after_release = dict(hub._pending_render_requests.get("mpr-group:g", {}))
+        return pending_before_release, pending_after_release
 
-    pending = asyncio.run(run())
-    assert pending == {}
+    pending_before_release, pending_after_release = asyncio.run(run())
+    assert set(pending_before_release) == {"v-cor"}
+    assert pending_before_release["v-cor"].fast_preview is False
+    assert pending_after_release == {}
 
 
 def test_mpr_preview_older_than_current_revision_is_emitted_during_drag(monkeypatch) -> None:
@@ -977,6 +994,23 @@ def test_mpr_preview_is_not_emitted_when_final_is_waiting(monkeypatch) -> None:
     assert image_updates == []
 
 
+def test_mpr_end_barrier_suppresses_running_preview_before_final_is_scheduled(monkeypatch) -> None:
+    hub = ViewSocketHub()
+    monkeypatch.setattr(hub, "_resolve_render_queue_key", lambda view_id: "mpr-group:g")
+    request = RenderRequest(
+        image_format="webp",
+        fast_preview=True,
+        interaction_id="crosshair-1",
+        mpr_revision=5,
+    )
+    preemption_token = hub._mpr_final_preemption_tokens.get("mpr-group:g", 0)
+
+    hub.mark_mpr_interaction_final("v-cor", "crosshair-1")
+
+    assert hub._should_suppress_preview_emit("v-cor", request, preemption_token) is True
+    assert hub._mpr_group_final_interaction_ids["mpr-group:g"] == "crosshair-1"
+
+
 def test_mpr_final_preempts_locked_preview_and_suppresses_preview_emit(monkeypatch) -> None:
     async def run() -> tuple[list[tuple[str, str]], list[tuple[str, object, str | None]]]:
         hub = ViewSocketHub()
@@ -1034,8 +1068,8 @@ def test_mpr_final_preempts_locked_preview_and_suppresses_preview_emit(monkeypat
         release_preview.set()
         preview_result = await preview_task
 
-        assert final_result is True
-        assert preview_result is False
+        assert final_result is False
+        assert preview_result is True
         return render_calls, server.events
 
     render_calls, events = asyncio.run(run())
@@ -1121,7 +1155,7 @@ def test_mpr_low_resolution_preview_below_final_revision_is_dropped_before_rende
     assert render_calls == [("v-cor", "png")]
 
 
-def test_schedule_mpr_preview_at_final_revision_is_rendered(monkeypatch) -> None:
+def test_schedule_mpr_preview_at_final_revision_is_suppressed(monkeypatch) -> None:
     async def run() -> list[tuple[str, str, int | None, bool]]:
         hub = ViewSocketHub()
         server = _SocketServerStub()
@@ -1157,10 +1191,7 @@ def test_schedule_mpr_preview_at_final_revision_is_rendered(monkeypatch) -> None
         assert preview_result is False
         return render_calls
 
-    assert asyncio.run(run()) == [
-        ("v-cor", "png", 8, False),
-        ("v-cor", "jpeg", 8, False),
-    ]
+    assert asyncio.run(run()) == [("v-cor", "png", 8, False)]
 
 
 def test_mpr_preview_after_final_revision_starts_new_interaction(monkeypatch) -> None:

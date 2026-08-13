@@ -61,10 +61,11 @@ class _RenderServiceSpy:
         *,
         image_format: str,
         fast_preview: bool,
+        fast_preview_full_resolution: bool = False,
         progress_callback=None,
         raw_output: bool = False,
     ) -> str:
-        self.calls.append(("3d", view.view_id, image_format, fast_preview, None, "full"))
+        self.calls.append(("3d", view.view_id, image_format, fast_preview, fast_preview_full_resolution, "full"))
         return "3d-result"
 
     def _render_pet_view(
@@ -127,7 +128,7 @@ def test_render_by_view_type_dispatches_to_matching_renderer() -> None:
 
     assert service.calls == [
         ("mpr", "ax-view", "jpeg", True, True, "mpr-pan-zoom-preview"),
-        ("3d", "3d-view", "png", False, None, "full"),
+        ("3d", "3d-view", "png", False, False, "full"),
         ("fusion", "fusionoverlayaxial-view", "png", True, True, "full"),
         ("pet", "pet-view", "png", False, None, "full"),
         ("stack", "stack-view", "webp", True, None, "full"),

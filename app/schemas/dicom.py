@@ -40,6 +40,13 @@ class DicomCompatibilityResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SeriesViewCapability(BaseModel):
+    supported: bool = True
+    blocked_reason: str | None = Field(default=None, alias="blockedReason")
+
+    model_config = {"populate_by_name": True}
+
+
 class SeriesSummary(BaseModel):
     series_id: str = Field(alias="seriesId")
     series_instance_uid: str | None = Field(default=None, alias="seriesInstanceUid")
@@ -64,6 +71,7 @@ class SeriesSummary(BaseModel):
     four_d_phase_count: int | None = Field(default=None, alias="fourDPhaseCount")
     four_d_phases: list[FourDPhaseItem] | None = Field(default=None, alias="fourDPhases")
     compatibility_issues: list[DicomCompatibilityIssue] = Field(default_factory=list, alias="compatibilityIssues")
+    view_capabilities: dict[str, SeriesViewCapability] = Field(default_factory=dict, alias="viewCapabilities")
 
     model_config = {"populate_by_name": True}
 

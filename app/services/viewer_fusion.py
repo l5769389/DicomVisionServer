@@ -598,7 +598,7 @@ def render_fusion_pixels(
     if ct_slice is None:
         ct_slice = np.asarray(ct_volume[axial_index, :, :], dtype=np.float32)
     ct_uint8 = window_to_uint8(ct_slice, ct_window_width, ct_window_center)
-    ct_rgb = np.repeat(ct_uint8[..., None], 3, axis=-1)
+    ct_rgb = apply_pseudocolor(ct_uint8, ct_pseudocolor_preset)
     pet_alpha = np.clip(float(alpha), 0.0, 1.0)
     pet_mask = (pet_uint8.astype(np.float32) / 255.0)[..., None]
     blend_alpha = pet_alpha * pet_mask

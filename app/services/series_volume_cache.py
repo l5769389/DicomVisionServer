@@ -55,6 +55,8 @@ class SeriesVolumeCache:
         # Integral CT/CBCT values remain 16-bit in the shared series cache.
         # MPR reslicing explicitly promotes interpolated output to float32.
         normalized = prepare_vtk_volume(volume)
+        if int(normalized.nbytes) > self._max_bytes:
+            return normalized
         with self._lock:
             existing = self._cache.get(series_id)
             if existing is not None:
@@ -68,9 +70,13 @@ class SeriesVolumeCache:
 
     def clear(self) -> None:
         with self._lock:
+            evicted = tuple(self._cache.items())
             self._cache.clear()
             self._bytes = 0
             self._build_locks.clear()
+        if self._on_evict is not None:
+            for series_id, volume in evicted:
+                self._on_evict(series_id, volume)
 
     def _evict_if_needed(self) -> None:
         while self._bytes > self._max_bytes and len(self._cache) > 1:

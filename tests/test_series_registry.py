@@ -54,7 +54,41 @@ def test_build_instance_record_collects_compatibility_metadata() -> None:
     assert record.samples_per_pixel == 3
     assert record.pixel_spacing == (0.7, 0.8)
     assert record.has_image_orientation_patient is True
+    assert record.image_orientation_patient == (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    assert record.image_position_patient == (0.0, 0.0, 0.0)
     assert record.number_of_frames == 12
+
+
+def test_sort_instances_prefers_patient_position_over_instance_number() -> None:
+    orientation = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    records = [
+        SeriesRegistry._build_instance_record(
+            Path("z4.dcm"),
+            SimpleNamespace(
+                SOPInstanceUID="4",
+                InstanceNumber=1,
+                Rows=2,
+                Columns=2,
+                ImageOrientationPatient=orientation,
+                ImagePositionPatient=(0.0, 0.0, 4.0),
+            ),
+            1,
+        ),
+        SeriesRegistry._build_instance_record(
+            Path("z0.dcm"),
+            SimpleNamespace(
+                SOPInstanceUID="0",
+                InstanceNumber=2,
+                Rows=2,
+                Columns=2,
+                ImageOrientationPatient=orientation,
+                ImagePositionPatient=(0.0, 0.0, 0.0),
+            ),
+            2,
+        ),
+    ]
+
+    assert [record.sop_instance_uid for record in SeriesRegistry._sort_instances(records)] == ["0", "4"]
 
 
 def test_resolve_scan_target_skips_archives_and_metadata_but_keeps_extensionless_dicom_candidates(tmp_path: Path) -> None:

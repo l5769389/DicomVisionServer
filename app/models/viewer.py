@@ -25,6 +25,8 @@ class InstanceRecord:
     samples_per_pixel: int | None = None
     pixel_spacing: tuple[float, float] | None = None
     imager_pixel_spacing: tuple[float, float] | None = None
+    image_orientation_patient: tuple[float, float, float, float, float, float] | None = None
+    image_position_patient: tuple[float, float, float] | None = None
     has_image_orientation_patient: bool = False
     has_image_position_patient: bool = False
     has_rescale_slope: bool = False
@@ -521,6 +523,10 @@ class ViewRecord:
     pet_unit_label: str = "Source"
     pet_control_window_max: float | None = None
     pending_pet_pseudocolor_preset: str | None = None
+    pending_pet_unit: str | None = None
+    pending_pet_window_min: float | None = None
+    pending_pet_window_max: float | None = None
+    pending_pet_control_window_max: float | None = None
     width: int | None = None
     height: int | None = None
     current_index: int = 0

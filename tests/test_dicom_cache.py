@@ -107,7 +107,7 @@ def test_extract_source_pixels_decodes_rle_lossless_before_applying_ct_rescale()
     np.testing.assert_array_equal(source_pixels, pixels.astype(np.float32) * 1.5 - 1000.0)
 
 
-def test_extract_source_pixels_uses_first_multiframe_grayscale_frame_explicitly() -> None:
+def test_extract_source_pixels_rejects_multiframe_grayscale() -> None:
     first_frame = np.asarray([[0, 100], [200, 300]], dtype=np.int16)
     second_frame = np.asarray([[1000, 1100], [1200, 1300]], dtype=np.int16)
     dataset = _build_multiframe_grayscale_dataset(
@@ -116,10 +116,11 @@ def test_extract_source_pixels_uses_first_multiframe_grayscale_frame_explicitly(
         intercept=-1024.0,
     )
 
-    source_pixels = DicomCache()._extract_source_pixels(dataset)
+    with pytest.raises(HTTPException) as error:
+        DicomCache()._extract_source_pixels(dataset)
 
-    assert source_pixels.shape == first_frame.shape
-    np.testing.assert_array_equal(source_pixels, first_frame.astype(np.float32) * 2.0 - 1024.0)
+    assert error.value.status_code == 422
+    assert "multi-frame DICOM" in str(error.value.detail)
 
 
 def test_extract_source_pixels_preserves_quantitative_values_for_monochrome1() -> None:
@@ -149,7 +150,7 @@ def test_extract_source_pixels_rejects_multiframe_pet_instead_of_using_first_fra
         DicomCache()._extract_source_pixels(dataset)
 
     assert error.value.status_code == 422
-    assert "multi-frame PET" in str(error.value.detail)
+    assert "multi-frame DICOM" in str(error.value.detail)
 
 
 def test_extract_source_pixels_preserves_rgb_secondary_capture_pixels() -> None:
@@ -168,12 +169,13 @@ def test_extract_source_pixels_preserves_rgb_secondary_capture_pixels() -> None:
     np.testing.assert_array_equal(source_pixels, pixels)
 
 
-def test_extract_source_pixels_uses_first_rgb_frame_without_collapsing_channels() -> None:
+def test_extract_source_pixels_rejects_multiframe_rgb() -> None:
     first_frame = np.full((2, 2, 3), [20, 40, 80], dtype=np.uint8)
     second_frame = np.full((2, 2, 3), [200, 180, 120], dtype=np.uint8)
     pixels = np.stack([first_frame, second_frame], axis=0)
 
-    source_pixels = DicomCache()._extract_source_pixels(_build_rgb_dataset(pixels))
+    with pytest.raises(HTTPException) as error:
+        DicomCache()._extract_source_pixels(_build_rgb_dataset(pixels))
 
-    assert source_pixels.shape == (2, 2, 3)
-    np.testing.assert_array_equal(source_pixels, first_frame)
+    assert error.value.status_code == 422
+    assert "multi-frame DICOM" in str(error.value.detail)

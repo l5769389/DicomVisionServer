@@ -386,7 +386,12 @@ class ViewerInteractionMixin:
             if pet_display is not None:
                 return source_pixels, dataset, modality, "PET", pet_display.unit_label
         elif self._is_pet_series(series):
-            pet_display = self._build_fusion_pet_display_volume(series, self._get_series_volume(series), view.pet_unit)
+            pet_display = self._build_fusion_pet_display_volume(
+                series,
+                self._get_series_native_slice_volume(series),
+                view.pet_unit,
+                source_kind="native",
+            )
             index = max(0, min(int(view.current_index), pet_display.volume.shape[0] - 1))
             source_pixels = np.asarray(pet_display.volume[index], dtype=np.float32)
             return source_pixels, dataset, modality, "PET", pet_display.unit_label
@@ -513,8 +518,9 @@ class ViewerInteractionMixin:
         if self._is_pet_series(series):
             pet_display = self._build_fusion_pet_display_volume(
                 series,
-                self._get_series_volume(series),
+                self._get_series_native_slice_volume(series),
                 view.pet_unit,
+                source_kind="native",
             )
             index = max(0, min(int(view.current_index), pet_display.volume.shape[0] - 1))
             source_pixels = np.asarray(pet_display.volume[index], dtype=np.float32)
@@ -539,10 +545,16 @@ class ViewerInteractionMixin:
                 if self._is_mpr_view_type(view.view_type) and view.view_group is not None
                 else view.pet_unit
             )
+            is_native_stack = not self._is_mpr_view_type(view.view_type)
             return self._build_fusion_pet_display_volume(
                 series,
-                self._get_series_volume(series),
+                (
+                    self._get_series_native_slice_volume(series)
+                    if is_native_stack
+                    else self._get_series_volume(series)
+                ),
                 requested_unit,
+                **({"source_kind": "native"} if is_native_stack else {}),
             ).unit_label
         return "HU" if str(getattr(series, "modality", "") or "").strip().upper() == "CT" else None
 

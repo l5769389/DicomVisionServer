@@ -65,6 +65,30 @@ def _alpha_centroid(image: Image.Image) -> tuple[float, float]:
     return float((x_grid * alpha).sum() / total), float((y_grid * alpha).sum() / total)
 
 
+def _visual_change_centroid(image: Image.Image) -> tuple[float, float]:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.float64)
+    border = np.concatenate(
+        (
+            pixels[0],
+            pixels[-1],
+            pixels[:, 0],
+            pixels[:, -1],
+        ),
+        axis=0,
+    )
+    background = np.median(border, axis=0)
+    weights = np.maximum(np.max(np.abs(pixels - background), axis=-1) - 8.0, 0.0)
+    margin = max(1, min(weights.shape) // 20)
+    weights[:margin] = 0.0
+    weights[-margin:] = 0.0
+    weights[:, :margin] = 0.0
+    weights[:, -margin:] = 0.0
+    total = float(weights.sum())
+    assert total > 0.0
+    y_grid, x_grid = np.indices(weights.shape, dtype=np.float64)
+    return float((x_grid * weights).sum() / total), float((y_grid * weights).sum() / total)
+
+
 def _assert_near_white(region: np.ndarray) -> None:
     assert int(np.min(region)) >= 250
 
@@ -290,7 +314,7 @@ def test_fusion_overlay_returns_ct_base_and_transparent_pet_layer() -> None:
     assert not np.array_equal(stronger.pixels, result.pixels)
 
 
-def test_fusion_overlay_registration_preview_only_returns_pet_layer(monkeypatch) -> None:
+def test_fusion_overlay_registration_preview_returns_complete_backend_composite(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -357,22 +381,15 @@ def test_fusion_overlay_registration_preview_only_returns_pet_layer(monkeypatch)
         metadata_mode="fusion-registration-layer-preview",
     )
 
-    assert result.meta.fusion_composite is not None
-    assert result.meta.fusion_composite.primary_image_unchanged is True
-    assert result.meta.fusion_composite.width > 0
-    assert result.meta.fusion_composite.height > 0
-    assert [layer.key for layer in result.meta.fusion_composite.layers] == ["pet"]
-    assert set(result.extra_image_bytes) == {"pet"}
-    primary = Image.open(io.BytesIO(result.image_bytes)).convert("RGBA")
-    assert primary.size == (1, 1)
-    assert primary.getpixel((0, 0)) == (0, 0, 0, 0)
-    assert Image.open(io.BytesIO(result.extra_image_bytes["pet"])).size == (
-        result.meta.fusion_composite.width,
-        result.meta.fusion_composite.height,
-    )
+    assert result.meta.fusion_composite is None
+    assert result.extra_image_bytes == {}
+    primary = Image.open(io.BytesIO(result.image_bytes)).convert("RGB")
+    assert primary.width > 1
+    assert primary.height > 1
+    assert np.ptp(np.asarray(primary)) > 0
 
 
-def test_fusion_registration_preview_reuses_cached_pet_layer_without_volume_load(monkeypatch) -> None:
+def test_fusion_registration_preview_rerenders_complete_backend_composite(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -466,9 +483,8 @@ def test_fusion_registration_preview_reuses_cached_pet_layer_without_volume_load
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
-    assert first.meta.fusion_composite is not None
-    assert first.meta.fusion_composite.primary_image_unchanged is True
-    assert set(first.extra_image_bytes) == {"pet"}
+    assert first.meta.fusion_composite is None
+    assert first.extra_image_bytes == {}
 
     service._handle_fusion_registration(
         view,
@@ -482,30 +498,19 @@ def test_fusion_registration_preview_reuses_cached_pet_layer_without_volume_load
         ),
     )
 
-    def fail_volume_load(*args, **kwargs):
-        raise AssertionError("cached registration preview should not load CT/PET volumes")
-
-    def fail_array_affine(*args, **kwargs):
-        raise AssertionError("cached integer translate preview should not use the generic array affine path")
-
-    monkeypatch.setattr(service, "_get_series_volume", fail_volume_load)
-    monkeypatch.setattr("app.services.viewer_service.viewport_transformer.apply_affine_array", fail_array_affine)
     second = service._render_fusion_view(
         view,
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
 
-    assert second.meta.fusion_composite is not None
-    assert second.meta.fusion_composite.primary_image_unchanged is True
-    assert Image.open(io.BytesIO(second.image_bytes)).size == (1, 1)
-    assert Image.open(io.BytesIO(second.extra_image_bytes["pet"])).size == (
-        second.meta.fusion_composite.width,
-        second.meta.fusion_composite.height,
-    )
+    assert second.meta.fusion_composite is None
+    assert second.extra_image_bytes == {}
+    assert Image.open(io.BytesIO(second.image_bytes)).size == (64, 64)
+    assert second.image_bytes != first.image_bytes
 
 
-def test_fusion_registration_pet_axial_preview_reuses_cached_bitmap_without_volume_load(monkeypatch) -> None:
+def test_fusion_registration_pet_axial_preview_returns_complete_backend_frame(monkeypatch) -> None:
     service = ViewerService()
     group = ViewGroupRecord(group_id="fusion-group", group_type="fusion", series_id="ct")
     group.fusion_ct_series_id = "ct"
@@ -595,10 +600,6 @@ def test_fusion_registration_pet_axial_preview_reuses_cached_bitmap_without_volu
         ),
     )
 
-    def fail_volume_load(*args, **kwargs):
-        raise AssertionError("cached PET axial registration preview should not load CT/PET volumes")
-
-    monkeypatch.setattr(service, "_get_series_volume", fail_volume_load)
     result = service._render_fusion_view(
         view,
         fast_preview=True,
@@ -716,9 +717,10 @@ def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monke
     assert origin_frame.pet_center_canvas is not None
     assert origin_frame.pet_center_canvas[0] == pytest.approx(50.0, abs=1.0)
     assert origin_frame.pet_center_canvas[1] == pytest.approx(50.0, abs=1.0)
-    origin_pet = Image.open(io.BytesIO(origin.extra_image_bytes["pet"])).convert("RGBA")
-    origin_alpha_centroid = _alpha_centroid(origin_pet)
-    assert abs(origin_alpha_centroid[0] - origin_frame.pet_center_canvas[0]) > 10.0
+    assert origin.meta.fusion_composite is None
+    assert origin.extra_image_bytes == {}
+    origin_centroid = _visual_change_centroid(Image.open(io.BytesIO(origin.image_bytes)))
+    assert abs(origin_centroid[0] - origin_frame.pet_center_canvas[0]) > 10.0
     service._handle_fusion_registration(
         view,
         ViewOperationRequest(
@@ -748,6 +750,11 @@ def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monke
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
+    preview_registration = (
+        group.fusion_registration.translate_row_mm,
+        group.fusion_registration.translate_col_mm,
+        group.fusion_registration.rotation_degrees,
+    )
 
     service._handle_fusion_registration(
         view,
@@ -762,12 +769,22 @@ def test_fusion_registration_rotation_preview_and_end_use_pet_layer_center(monke
         ),
     )
     final = service._render_fusion_view(view)
+    final_registration = (
+        group.fusion_registration.translate_row_mm,
+        group.fusion_registration.translate_col_mm,
+        group.fusion_registration.rotation_degrees,
+    )
+    assert final_registration == pytest.approx(preview_registration)
 
-    preview_pet = Image.open(io.BytesIO(preview.extra_image_bytes["pet"])).convert("RGBA")
-    final_pet = Image.open(io.BytesIO(final.extra_image_bytes["pet"])).convert("RGBA")
-    assert preview_pet.size == final_pet.size
-    preview_centroid = _alpha_centroid(preview_pet)
-    final_centroid = _alpha_centroid(final_pet)
+    assert preview.meta.fusion_composite is None
+    assert final.meta.fusion_composite is None
+    assert preview.extra_image_bytes == {}
+    assert final.extra_image_bytes == {}
+    preview_image = Image.open(io.BytesIO(preview.image_bytes))
+    final_image = Image.open(io.BytesIO(final.image_bytes))
+    assert preview_image.size == final_image.size
+    preview_centroid = _visual_change_centroid(preview_image)
+    final_centroid = _visual_change_centroid(final_image)
     assert final_centroid[0] == pytest.approx(preview_centroid[0], abs=2.0)
     assert final_centroid[1] == pytest.approx(preview_centroid[1], abs=2.0)
 
@@ -870,8 +887,9 @@ def test_fusion_registration_end_expands_overlay_frame_after_large_translate(mon
         fast_preview=True,
         metadata_mode="fusion-registration-layer-preview",
     )
-    assert preview.meta.fusion_composite is not None
-    assert preview.meta.fusion_composite.primary_image_unchanged is True
+    assert preview.meta.fusion_composite is None
+    assert preview.extra_image_bytes == {}
+    assert Image.open(io.BytesIO(preview.image_bytes)).size == (101, 101)
 
     service._handle_fusion_registration(
         view,
@@ -889,7 +907,9 @@ def test_fusion_registration_end_expands_overlay_frame_after_large_translate(mon
 
     assert final_frame is not None
     assert final_frame.plane.output_shape[1] > origin_frame.plane.output_shape[1]
-    assert set(final.extra_image_bytes) == {"pet"}
+    assert final.meta.fusion_composite is None
+    assert final.extra_image_bytes == {}
+    assert Image.open(io.BytesIO(final.image_bytes)).size == (101, 101)
 
 
 def test_pet_axial_registration_expands_canvas_and_keeps_background() -> None:
@@ -2070,8 +2090,8 @@ def test_fusion_registration_move_broadcasts_overlay_and_pet_axial_backend_previ
     assert move.metadata_mode == "fusion-registration-layer-preview"
     assert move.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
     assert end.mode == "broadcast"
-    assert end.fast_preview is True
-    assert end.metadata_mode == "fusion-registration-layer-preview"
+    assert end.fast_preview is False
+    assert end.metadata_mode == "full"
     assert end.broadcast_viewports == (FUSION_PANE_OVERLAY_AXIAL, FUSION_PANE_PET_AXIAL)
 
 
