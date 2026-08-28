@@ -164,6 +164,44 @@ def test_render_pet_view_returns_pet_info(monkeypatch) -> None:
     assert suv_option.control_window_max is not None
 
 
+def test_pet_window_preview_uses_viewport_size_and_lossless_webp(monkeypatch) -> None:
+    service = ViewerService()
+    series = _series()
+    volume = np.arange(3 * 4 * 5, dtype=np.float32).reshape((3, 4, 5))
+    _patch_pet_render_dependencies(monkeypatch, service, series, volume)
+    rendered_sizes: list[tuple[int, int]] = []
+    encode_modes: list[tuple[str, bool]] = []
+
+    def render_preview(context):
+        rendered_sizes.append((context.view.width or 0, context.view.height or 0))
+        return Image.new("RGB", (context.view.width or 1, context.view.height or 1))
+
+    def encode_image(_image, image_format, *, fast_preview=False):
+        encode_modes.append((image_format, fast_preview))
+        return b"lossless-window-preview"
+
+    monkeypatch.setattr("app.services.viewer.stack.compat.layered_renderer.render", render_preview)
+    monkeypatch.setattr(
+        service,
+        "_render_fast_preview",
+        lambda _context: pytest.fail("Window pixel previews must use the settled backend pixel renderer"),
+    )
+    monkeypatch.setattr(service, "_encode_image", encode_image)
+
+    view = ViewRecord(view_id="pet-preview", series_id=series.series_id, view_type="PET", width=320, height=240)
+    result = service._render_pet_view(
+        view,
+        image_format="webp",
+        fast_preview=True,
+        fast_preview_full_resolution=True,
+        metadata_mode="stack-pixel-preview",
+    )
+
+    assert result.image_bytes == b"lossless-window-preview"
+    assert rendered_sizes == [(320, 240)]
+    assert encode_modes == [("webp", False)]
+
+
 def test_pet_view_resizes_from_initial_auto_fit_and_hover_maps_inside_image(monkeypatch) -> None:
     service = ViewerService()
     series = _series()
@@ -352,6 +390,8 @@ def test_pet_render_uses_pixel_spacing_for_the_same_fit_geometry(monkeypatch) ->
     service._render_pet_view(view)
 
     assert captured_context is not None
+    assert captured_context.view.width == 1400
+    assert captured_context.view.height == 700
     matrix = captured_context.image_transform.matrix
     # The 70 × 140 pixels are 35 × 70 mm.  With the physical contain fit,
     # their mapped height stays inside the 700 px canvas instead of being
@@ -360,6 +400,52 @@ def test_pet_render_uses_pixel_spacing_for_the_same_fit_geometry(monkeypatch) ->
     bottom = top + 140 * float(matrix[1, 1])
     assert top >= 0.0
     assert bottom <= 700.0
+
+
+def test_settled_stack_render_keeps_the_full_viewport_canvas(monkeypatch) -> None:
+    service = ViewerService()
+    series = _series("ct", "CT")
+    source_pixels = np.arange(4 * 5, dtype=np.float32).reshape((4, 5))
+    dataset = _dataset("HU")
+    cached = SimpleNamespace(
+        dataset=dataset,
+        source_pixels=source_pixels,
+        pixel_min=float(np.min(source_pixels)),
+        pixel_max=float(np.max(source_pixels)),
+    )
+    monkeypatch.setattr("app.services.viewer_service.series_registry.get", lambda *_args, **_kwargs: series)
+    monkeypatch.setattr("app.services.viewer_service.dicom_cache.get", lambda *_args, **_kwargs: cached)
+    monkeypatch.setattr(service, "_build_scale_bar_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_build_visible_measurements", lambda _view: ())
+    monkeypatch.setattr(service, "_build_visible_annotations", lambda _view: ())
+    monkeypatch.setattr(service, "_build_visible_presentation_measurements", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(service, "_build_visible_presentation_annotations", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(service, "_build_stack_orientation_overlay", lambda *_args, **_kwargs: None)
+
+    captured_context: RenderContext | None = None
+
+    def capture_context(context: RenderContext) -> Image.Image:
+        nonlocal captured_context
+        captured_context = context
+        return Image.new("RGB", (context.view.width or 1, context.view.height or 1))
+
+    monkeypatch.setattr("app.services.viewer_service.layered_renderer.render", capture_context)
+    view = ViewRecord(
+        view_id="stack-view",
+        series_id=series.series_id,
+        view_type="Stack",
+        width=960,
+        height=640,
+        is_initialized=True,
+    )
+    view.window_width = 400.0
+    view.window_center = 40.0
+
+    service._render_view(view)
+
+    assert captured_context is not None
+    assert captured_context.view.width == 960
+    assert captured_context.view.height == 640
 
 
 def test_each_pet_mpr_plane_uses_its_own_physical_contain_fit(monkeypatch) -> None:

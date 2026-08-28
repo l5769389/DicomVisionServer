@@ -66,6 +66,10 @@ class ViewerService(
         return view_type == "PET"
 
     @staticmethod
+    def _is_stack_view_type(view_type: str) -> bool:
+        return view_type == "Stack"
+
+    @staticmethod
     def _is_fusion_view_type(view_type: str) -> bool:
         return view_type in FUSION_VIEW_TYPES
 
@@ -111,6 +115,16 @@ class ViewerService(
                 canvas_height=previous_height,
             )
         )
+        should_refit_stack = (
+            self._is_stack_view_type(view.view_type)
+            and view.is_initialized
+            and size_changed
+            and self._is_stack_view_at_auto_fit_size(
+                view,
+                canvas_width=previous_width,
+                canvas_height=previous_height,
+            )
+        )
         view.width = payload.size.width
         view.height = payload.size.height
         if (
@@ -144,6 +158,8 @@ class ViewerService(
             self._fit_initialized_pet_view_to_source(view)
         elif should_refit_mpr:
             self._fit_initialized_mpr_view_to_source(view)
+        elif should_refit_stack:
+            self._fit_initialized_stack_view_to_source(view)
 
         return OperationAcceptedResponse(message="View size updated", viewId=view.view_id)
 

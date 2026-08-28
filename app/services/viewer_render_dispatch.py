@@ -61,6 +61,7 @@ def render_by_view_type(
             view,
             image_format=image_format,
             fast_preview=fast_preview,
+            fast_preview_full_resolution=fast_preview_full_resolution,
             metadata_mode=metadata_mode,
             progress_callback=progress_callback,
         )
@@ -68,5 +69,6 @@ def render_by_view_type(
         view,
         image_format=image_format,
         fast_preview=fast_preview,
+        fast_preview_full_resolution=fast_preview_full_resolution,
         metadata_mode=metadata_mode,
     )

@@ -1,11 +1,12 @@
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import fastapi_app
-from app.models.viewer import SeriesRecord, ViewRecord
+from app.models.viewer import InstanceRecord, SeriesRecord, ViewRecord
 from app.schemas.view import ViewOperationRequest
 from app.sockets.runtime import RenderRequest
 from app.sockets.runtime import view_socket_hub
@@ -73,6 +74,22 @@ def _register_series(series_id: str = "series-1") -> str:
         accession_number=None,
         modality="CT",
         series_description="Lifecycle test",
+        instances=[
+            InstanceRecord(
+                path=Path(f"{series_id}-{index}.dcm"),
+                sop_instance_uid=f"{series_id}.{index}",
+                instance_number=index + 1,
+                rows=16,
+                columns=16,
+                pixel_spacing=(1.0, 1.0),
+                image_orientation_patient=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                image_position_patient=(0.0, 0.0, float(index)),
+                has_image_orientation_patient=True,
+                has_image_position_patient=True,
+                number_of_frames=1,
+            )
+            for index in range(2)
+        ],
     )
     return series_id
 
@@ -240,6 +257,35 @@ def test_mpr_view_group_key_isolates_same_series_groups() -> None:
     assert four_d_group_id != default_group_id
     assert view_registry.get(four_d_coronal_view_id).view_group.group_id == four_d_group_id
     assert view_registry.get(other_phase_view_id).view_group.group_id not in {default_group_id, four_d_group_id}
+
+
+@pytest.mark.parametrize("view_type", ["MPR", "AX", "COR", "SAG", "3D"])
+def test_create_volume_view_rejects_incompatible_geometry_before_allocating_state(view_type: str) -> None:
+    client = TestClient(fastapi_app)
+    series_id = _register_series("irregular-series")
+    series = series_registry.get(series_id)
+    series.instances.append(
+        InstanceRecord(
+            path=Path("irregular-series-2.dcm"),
+            sop_instance_uid="irregular-series.2",
+            instance_number=3,
+            rows=16,
+            columns=16,
+            pixel_spacing=(1.0, 1.0),
+            image_orientation_patient=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+            image_position_patient=(0.0, 0.0, 3.0),
+            has_image_orientation_patient=True,
+            has_image_position_patient=True,
+            number_of_frames=1,
+        )
+    )
+
+    response = client.post("/api/v1/view/create", json={"seriesId": series_id, "viewType": view_type})
+
+    assert response.status_code == 422
+    assert "irregular slice spacing" in response.json()["detail"]
+    assert view_registry._view_by_id == {}
+    assert view_group_registry._view_groups_by_id == {}
 
 
 def test_mpr_state_sync_operation_accepts_source_view_alias() -> None:

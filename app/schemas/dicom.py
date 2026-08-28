@@ -42,6 +42,7 @@ class DicomCompatibilityResponse(BaseModel):
 
 class SeriesViewCapability(BaseModel):
     supported: bool = True
+    blocked_code: str | None = Field(default=None, alias="blockedCode")
     blocked_reason: str | None = Field(default=None, alias="blockedReason")
 
     model_config = {"populate_by_name": True}
@@ -116,6 +117,14 @@ class FourDPhasesResponse(BaseModel):
     is_four_d_series: bool = Field(default=False, alias="isFourDSeries")
     four_d_phase_count: int = Field(default=0, alias="fourDPhaseCount")
     four_d_phases: list[FourDPhaseItem] = Field(default_factory=list, alias="fourDPhases")
+    view_capability: SeriesViewCapability = Field(
+        default_factory=lambda: SeriesViewCapability(
+            supported=False,
+            blockedCode="not-four-d-series",
+            blockedReason="The series does not contain at least two detectable 4D phases.",
+        ),
+        alias="viewCapability",
+    )
 
     model_config = {"populate_by_name": True}
 

@@ -867,11 +867,19 @@ class ViewOperationRequest(BaseModel):
 class MtfMetricsPayload(BaseModel):
     mtf50: float | None = None
     mtf10: float | None = None
+    mtf50_w: float | None = Field(default=None, alias="mtf50W")
+    mtf10_w: float | None = Field(default=None, alias="mtf10W")
+    mtf50_h: float | None = Field(default=None, alias="mtf50H")
+    mtf10_h: float | None = Field(default=None, alias="mtf10H")
+    nyquist_w: float | None = Field(default=None, alias="nyquistW")
+    nyquist_h: float | None = Field(default=None, alias="nyquistH")
+    radial_nyquist: float | None = Field(default=None, alias="radialNyquist")
     fwhm_w: float | None = Field(default=None, alias="fwhmW")
     fwhm_h: float | None = Field(default=None, alias="fwhmH")
     peak_value: float | None = Field(default=None, alias="peakValue")
     sample_count: int | None = Field(default=None, alias="sampleCount")
     unit: str | None = None
+    source_size_corrected: bool = Field(default=False, alias="sourceSizeCorrected")
 
     model_config = {"populate_by_name": True}
 
@@ -881,10 +889,21 @@ class MtfCurvePointPayload(BaseModel):
     value: float
 
 
+class MtfQualityWarningPayload(BaseModel):
+    code: str
+    message: str
+
+
 class ViewMtfAnalyzeRequest(BaseModel):
     view_id: str = Field(alias="viewId", description="2D view ID to analyze.")
     viewport_key: str = Field(alias="viewportKey", description="Frontend viewport key used to route analysis results.")
     points: list[MeasurementPointPayload] = Field(description="Normalized ROI points from the frontend MTF overlay.")
+    source_slice_index: int | None = Field(
+        default=None,
+        alias="sourceSliceIndex",
+        ge=0,
+        description="Zero-based source slice shown when the ROI was committed.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -895,6 +914,7 @@ class ViewMtfAnalyzeResponse(BaseModel):
     points: list[MeasurementPointPayload]
     metrics: MtfMetricsPayload
     curve: list[MtfCurvePointPayload]
+    quality_warnings: list[MtfQualityWarningPayload] = Field(default_factory=list, alias="qualityWarnings")
     is_placeholder: bool = Field(default=True, alias="isPlaceholder")
 
     model_config = {"populate_by_name": True}

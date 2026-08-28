@@ -374,8 +374,19 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
             center_y=150.0,
         ),
     )
-    monkeypatch.setattr(viewer_service_module.layered_renderer, "render", lambda context: Image.new("L", (300, 300)))
-    monkeypatch.setattr(service, "_render_fast_mpr_preview", lambda context, **kwargs: Image.new("L", (300, 300)))
+    settled_render_calls = 0
+
+    def render_settled(context):
+        nonlocal settled_render_calls
+        settled_render_calls += 1
+        return Image.new("L", (300, 300))
+
+    monkeypatch.setattr(viewer_service_module.layered_renderer, "render", render_settled)
+    monkeypatch.setattr(
+        service,
+        "_render_fast_mpr_preview",
+        lambda context, **kwargs: pytest.fail("Window pixel previews must use the settled backend pixel renderer"),
+    )
     def fake_encode(image, image_format, **kwargs):
         del image
         encode_calls.append((image_format, bool(kwargs.get("fast_preview"))))
@@ -387,10 +398,17 @@ def test_mpr_full_resolution_preview_reuses_settled_plane_cache(monkeypatch) -> 
     view.offset_x = 18.0
     view.offset_y = -7.0
     view.zoom = 1.2
-    service._render_mpr_view(view, image_format="webp", fast_preview=True, fast_preview_full_resolution=True)
+    service._render_mpr_view(
+        view,
+        image_format="webp",
+        fast_preview=True,
+        fast_preview_full_resolution=True,
+        metadata_mode="mpr-pixel-preview",
+    )
 
     assert reslice_calls == 1
-    assert encode_calls == [("webp", False), ("webp", True)]
+    assert settled_render_calls == 2
+    assert encode_calls == [("webp", False), ("webp", False)]
 
 
 def test_fast_preview_resamples_scalar_pixels_before_windowing(monkeypatch) -> None:

@@ -34,6 +34,7 @@ def _create_test_dicom(
     slice_index: int,
     pixel_value: int,
     temporal_position_identifier: int | None = None,
+    slice_position: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +67,7 @@ def _create_test_dicom(
     dataset.PixelSpacing = [1.0, 1.0]
     dataset.SliceThickness = 1.0
     dataset.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-    dataset.ImagePositionPatient = [0.0, 0.0, float(slice_index)]
+    dataset.ImagePositionPatient = [0.0, 0.0, float(slice_index if slice_position is None else slice_position)]
     if temporal_position_identifier is not None:
         dataset.TemporalPositionIdentifier = temporal_position_identifier
         dataset.NumberOfTemporalPositions = 2
@@ -105,6 +106,7 @@ def test_load_folder_marks_related_phase_series_as_four_d(tmp_path: Path) -> Non
         assert all(phase.status == "pending" for phase in summary.four_d_phases)
         assert all(phase.image_src == "" for phase in summary.four_d_phases)
         assert all(phase.viewport_images == {} for phase in summary.four_d_phases)
+        assert summary.view_capabilities["4d"].supported is True
 
 
 def test_incremental_phase_load_uses_existing_series_for_four_d_manifest(tmp_path: Path) -> None:
@@ -419,6 +421,7 @@ def test_four_d_phases_api_returns_phase_manifest_for_selected_series(tmp_path: 
     assert all(phase["status"] == "pending" for phase in data["fourDPhases"])
     assert all(phase["imageSrc"] == "" for phase in data["fourDPhases"])
     assert all(phase["viewportImages"] == {} for phase in data["fourDPhases"])
+    assert data["viewCapability"] == {"supported": True, "blockedCode": None, "blockedReason": None}
 
     preview_response = client.post(
         "/api/v1/dicom/fourD/phases",
@@ -477,6 +480,47 @@ def test_four_d_phases_api_returns_virtual_series_ids_for_single_series_phases(t
         phase_series = series_registry.get(str(phase_series_id))
         assert phase_series.is_virtual is True
         assert phase_series.source_series_id == selected_series_id
+
+
+def test_four_d_is_blocked_when_any_phase_cannot_build_mpr(tmp_path: Path) -> None:
+    study_uid = generate_uid()
+
+    for phase_percent, positions in ((0, (0.0, 1.0, 2.0)), (50, (0.0, 1.0, 3.0))):
+        series_uid = generate_uid()
+        for slice_index, slice_position in enumerate(positions):
+            _create_test_dicom(
+                tmp_path / f"phase-{phase_percent}" / f"slice-{slice_index}.dcm",
+                study_uid=study_uid,
+                series_uid=series_uid,
+                series_description=f"4D Lung {phase_percent}%",
+                instance_number=slice_index + 1,
+                slice_index=slice_index,
+                slice_position=slice_position,
+                pixel_value=100 + phase_percent,
+            )
+
+    load_response = series_registry.load_folder(LoadFolderRequest(folderPath=str(tmp_path)))
+
+    assert len(load_response.series_list) == 2
+    for summary in load_response.series_list:
+        assert summary.is_four_d_series is True
+        assert summary.four_d_phase_count == 2
+        capability = summary.view_capabilities["4d"]
+        assert capability.supported is False
+        assert capability.blocked_code == "phase-mpr-unavailable"
+        assert "Phase 50%" in str(capability.blocked_reason)
+        assert "irregular slice spacing" in str(capability.blocked_reason)
+
+    client = TestClient(fastapi_app)
+    response = client.post(
+        "/api/v1/dicom/fourD/phases",
+        json={"seriesId": load_response.series_list[0].series_id},
+    )
+
+    assert response.status_code == 200
+    capability = response.json()["viewCapability"]
+    assert capability["supported"] is False
+    assert capability["blockedCode"] == "phase-mpr-unavailable"
 
 
 def test_load_folder_keeps_same_path_series_separate_by_workspace(tmp_path: Path) -> None:

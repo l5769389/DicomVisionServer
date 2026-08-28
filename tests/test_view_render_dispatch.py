@@ -74,10 +74,11 @@ class _RenderServiceSpy:
         *,
         image_format: str,
         fast_preview: bool,
+        fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
         progress_callback=None,
     ) -> str:
-        self.calls.append(("pet", view.view_id, image_format, fast_preview, None, metadata_mode))
+        self.calls.append(("pet", view.view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode))
         return "pet-result"
 
     def _render_fusion_view(
@@ -93,8 +94,16 @@ class _RenderServiceSpy:
         self.calls.append(("fusion", view.view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode))
         return "fusion-result"
 
-    def _render_view(self, view: ViewRecord, *, image_format: str, fast_preview: bool, metadata_mode: str = "full") -> str:
-        self.calls.append(("stack", view.view_id, image_format, fast_preview, None, metadata_mode))
+    def _render_view(
+        self,
+        view: ViewRecord,
+        *,
+        image_format: str,
+        fast_preview: bool,
+        fast_preview_full_resolution: bool = False,
+        metadata_mode: str = "full",
+    ) -> str:
+        self.calls.append(("stack", view.view_id, image_format, fast_preview, fast_preview_full_resolution, metadata_mode))
         return "stack-result"
 
 
@@ -123,13 +132,31 @@ def test_render_by_view_type_dispatches_to_matching_renderer() -> None:
         )
         == "fusion-result"
     )
-    assert render_by_view_type(service, _view("PET"), image_format="png", fast_preview=False) == "pet-result"
-    assert render_by_view_type(service, _view("Stack"), image_format="webp", fast_preview=True) == "stack-result"
+    assert (
+        render_by_view_type(
+            service,
+            _view("PET"),
+            image_format="webp",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+        )
+        == "pet-result"
+    )
+    assert (
+        render_by_view_type(
+            service,
+            _view("Stack"),
+            image_format="webp",
+            fast_preview=True,
+            fast_preview_full_resolution=True,
+        )
+        == "stack-result"
+    )
 
     assert service.calls == [
         ("mpr", "ax-view", "jpeg", True, True, "mpr-pan-zoom-preview"),
         ("3d", "3d-view", "png", False, False, "full"),
         ("fusion", "fusionoverlayaxial-view", "png", True, True, "full"),
-        ("pet", "pet-view", "png", False, None, "full"),
-        ("stack", "stack-view", "webp", True, None, "full"),
+        ("pet", "pet-view", "webp", True, True, "full"),
+        ("stack", "stack-view", "webp", True, True, "full"),
     ]

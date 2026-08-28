@@ -16,6 +16,7 @@ from app.core.logging import get_logger
 from app.core.workspace import DEFAULT_WORKSPACE_ID, normalize_workspace_id
 from app.models.viewer import ViewRecord
 from app.schemas.view import ViewCreateRequest, ViewCreateResponse
+from app.services.dicom_compatibility import get_series_volume_compatibility
 from app.services.series_registry import series_registry
 from app.services.view_group_registry import view_group_registry
 
@@ -36,6 +37,7 @@ FUSION_VIEW_TYPE_TO_PANE_ROLE = {
     "FusionOverlayAxial": FUSION_PANE_OVERLAY_AXIAL,
     "FusionPETCoronalMip": FUSION_PANE_PET_CORONAL_MIP,
 }
+VOLUME_VIEW_TYPES = {"MPR", "AX", "COR", "SAG", "3D"}
 
 
 def _is_ct_series(series) -> bool:
@@ -78,6 +80,13 @@ class ViewRegistry:
             series = series_registry.get(payload.series_id, workspace_id=normalized_workspace_id)
             if payload.view_type == "PET" and not _is_pet_series(series):
                 raise HTTPException(status_code=400, detail="PET view requires a PT/PET series")
+            if payload.view_type in VOLUME_VIEW_TYPES:
+                volume_compatibility = get_series_volume_compatibility(series)
+                if not volume_compatibility.supported:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=volume_compatibility.blocked_reason or "The series cannot be used for volume display.",
+                    )
             create_series_id = payload.series_id
             create_secondary_series_id = payload.secondary_series_id
 

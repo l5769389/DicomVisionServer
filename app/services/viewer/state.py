@@ -103,17 +103,7 @@ class ViewerStateMixin:
 
         cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
         image_height, image_width = cached.source_pixels.shape[:2]
-        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(
-            self._get_stack_spacing_xy(cached.dataset)
-        )
-        view.zoom = compat.viewport_transformer.calculate_contain_zoom(
-            image_width=image_width,
-            image_height=image_height,
-            canvas_width=view.width,
-            canvas_height=view.height,
-            pixel_aspect_x=pixel_aspect_x,
-            pixel_aspect_y=pixel_aspect_y,
-        )
+        view.zoom = self._calculate_stack_fit_zoom_for_size(view, series, cached=cached)
         view.offset_x = 0.0
         view.offset_y = 0.0
         view.rotation_degrees = 0
@@ -130,6 +120,73 @@ class ViewerStateMixin:
             view.window_width,
             view.window_center,
         )
+
+    def _calculate_stack_fit_zoom_for_size(
+        self,
+        view: ViewRecord,
+        series: SeriesRecord,
+        *,
+        cached: CachedDicom | None = None,
+        canvas_width: int | None = None,
+        canvas_height: int | None = None,
+    ) -> float:
+        if cached is None:
+            if not series.instances:
+                return 1.0
+            current_index = max(0, min(int(view.current_index or 0), len(series.instances) - 1))
+            instance = series.instances[current_index]
+            if not instance.sop_instance_uid:
+                return 1.0
+            cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
+
+        image_height, image_width = cached.source_pixels.shape[:2]
+        pixel_aspect_x, pixel_aspect_y = self._get_display_aspect_xy_from_spacing(
+            self._get_stack_spacing_xy(cached.dataset)
+        )
+        return compat.viewport_transformer.calculate_contain_zoom(
+            image_width=image_width,
+            image_height=image_height,
+            canvas_width=canvas_width or view.width or image_width,
+            canvas_height=canvas_height or view.height or image_height,
+            pixel_aspect_x=pixel_aspect_x,
+            pixel_aspect_y=pixel_aspect_y,
+        )
+
+    def _is_stack_view_at_auto_fit_size(
+        self,
+        view: ViewRecord,
+        *,
+        canvas_width: int | None,
+        canvas_height: int | None,
+    ) -> bool:
+        if not canvas_width or not canvas_height:
+            return False
+        if (
+            abs(float(view.offset_x)) > 1e-6
+            or abs(float(view.offset_y)) > 1e-6
+            or int(view.rotation_degrees) != 0
+            or bool(view.hor_flip)
+            or bool(view.ver_flip)
+        ):
+            return False
+
+        series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        expected_zoom = self._calculate_stack_fit_zoom_for_size(
+            view,
+            series,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
+        tolerance = max(1e-3, abs(float(expected_zoom)) * 1e-3)
+        return abs(float(view.zoom) - float(expected_zoom)) <= tolerance
+
+    def _fit_initialized_stack_view_to_source(self, view: ViewRecord) -> None:
+        series = compat.series_registry.get(view.series_id, workspace_id=view.workspace_id)
+        view.zoom = self._calculate_stack_fit_zoom_for_size(view, series)
+        view.offset_x = 0.0
+        view.offset_y = 0.0
+        self._reset_drag_state(view)
+        view.is_initialized = True
 
     @staticmethod
     def _is_pet_series(series: SeriesRecord | None) -> bool:
@@ -1370,13 +1427,7 @@ class ViewerStateMixin:
         if not instance.sop_instance_uid:
             return False
         cached = compat.dicom_cache.get(instance.sop_instance_uid, instance.path)
-        image_height, image_width = cached.source_pixels.shape[:2]
-        view.zoom = compat.viewport_transformer.calculate_contain_zoom(
-            image_width=image_width,
-            image_height=image_height,
-            canvas_width=view.width or image_width,
-            canvas_height=view.height or image_height,
-        )
+        view.zoom = self._calculate_stack_fit_zoom_for_size(view, series, cached=cached)
         self._reset_drag_state(view)
         view.is_initialized = True
         return True

@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app as fastapi_app
 from app.models.viewer import InstanceRecord, SeriesRecord
-from app.services.dicom_compatibility import build_dicom_compatibility_issues
+from app.services.dicom_compatibility import build_dicom_compatibility_issues, build_series_view_capabilities
 from app.services.series_registry import SeriesRegistry, series_registry
 
 
@@ -84,6 +84,32 @@ def test_build_compatibility_issues_accepts_complete_monochrome_series() -> None
     issues = build_dicom_compatibility_issues(_build_series([_build_complete_instance()]))
 
     assert issues == []
+
+
+def test_volume_capabilities_include_stable_block_code() -> None:
+    first = _build_complete_instance(
+        image_orientation_patient=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+        image_position_patient=(0.0, 0.0, 0.0),
+    )
+    second = _build_complete_instance(
+        instance_number=2,
+        sop_instance_uid="1.2.4",
+        image_orientation_patient=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+        image_position_patient=(0.0, 0.0, 1.0),
+    )
+    third = _build_complete_instance(
+        instance_number=3,
+        sop_instance_uid="1.2.5",
+        image_orientation_patient=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+        image_position_patient=(0.0, 0.0, 3.0),
+    )
+
+    capabilities = build_series_view_capabilities(_build_series([first, second, third]))
+
+    assert capabilities["mpr"].supported is False
+    assert capabilities["mpr"].blocked_code == "irregular-slice-spacing"
+    assert capabilities["3d"].blocked_code == "irregular-slice-spacing"
+    assert capabilities["4d"].blocked_code == "not-four-d-series"
 
 
 def test_series_summary_defers_compatibility_issues_until_explicit_check() -> None:

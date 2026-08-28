@@ -18,7 +18,8 @@ from pydicom.multival import MultiValue
 from app.core.logging import get_logger
 from app.core.workspace import DEFAULT_WORKSPACE_ID, WORKSPACE_QUERY_PARAM, normalize_workspace_id
 from app.models.viewer import InstanceRecord, SeriesRecord
-from app.schemas.dicom import FourDPhaseItem, FourDPhasesResponse, SeriesSummary
+from app.schemas.dicom import FourDPhaseItem, FourDPhasesResponse, SeriesSummary, SeriesViewCapability
+from app.services.dicom_compatibility import get_instances_volume_compatibility
 from app.services.dicom_cache import dicom_cache
 from app.services.dicom_geometry import build_standardized_volume, get_dataset_orientation, get_dataset_position
 
@@ -78,9 +79,16 @@ class FourDService:
             return FourDPhasesResponse(seriesId=series_id, isFourDSeries=False, fourDPhaseCount=0, fourDPhases=[])
 
         phase_entries = self._resolve_phase_entries(target_series, series_records)
+        view_capability = self._build_four_d_view_capability(phase_entries)
 
         if len(phase_entries) < 2:
-            return FourDPhasesResponse(seriesId=series_id, isFourDSeries=False, fourDPhaseCount=0, fourDPhases=[])
+            return FourDPhasesResponse(
+                seriesId=series_id,
+                isFourDSeries=False,
+                fourDPhaseCount=0,
+                fourDPhases=[],
+                viewCapability=view_capability,
+            )
 
         phase_items = self._build_phase_items(
             phase_entries,
@@ -99,6 +107,7 @@ class FourDService:
             isFourDSeries=True,
             fourDPhaseCount=len(phase_items),
             fourDPhases=phase_items,
+            viewCapability=view_capability,
         )
 
     def get_four_d_preview_png(
@@ -165,6 +174,9 @@ class FourDService:
             phase_items = self._build_phase_items(self._phase_entries_from_candidates(ordered_candidates))
             if len(phase_items) < 2:
                 continue
+            view_capability = self._build_four_d_view_capability(
+                self._phase_entries_from_candidates(ordered_candidates)
+            )
 
             for candidate in ordered_candidates:
                 summary = summaries_by_id.get(candidate.series.series_id)
@@ -173,6 +185,7 @@ class FourDService:
                 summary.is_four_d_series = True
                 summary.four_d_phase_count = len(phase_items)
                 summary.four_d_phases = phase_items
+                summary.view_capabilities["4d"] = view_capability.model_copy()
 
     def _apply_single_series_groups(
         self,
@@ -194,6 +207,36 @@ class FourDService:
             summary.is_four_d_series = True
             summary.four_d_phase_count = len(phase_items)
             summary.four_d_phases = phase_items
+            summary.view_capabilities["4d"] = self._build_four_d_view_capability(phase_entries)
+
+    def _build_four_d_view_capability(self, phase_entries: list[PhaseEntry]) -> SeriesViewCapability:
+        if len(phase_entries) < 2:
+            return SeriesViewCapability(
+                supported=False,
+                blockedCode="not-four-d-series",
+                blockedReason="The series does not contain at least two detectable 4D phases.",
+            )
+
+        blocked_phases_by_reason: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for entry in phase_entries:
+            compatibility = get_instances_volume_compatibility(entry.instances)
+            if compatibility.supported:
+                continue
+            blocked_code = compatibility.blocked_code or "phase-mpr-unavailable"
+            blocked_reason = compatibility.blocked_reason or "The phase cannot be used for MPR."
+            blocked_phases_by_reason[(blocked_code, blocked_reason)].append(self._format_phase_label(entry.phase))
+
+        if not blocked_phases_by_reason:
+            return SeriesViewCapability(supported=True)
+
+        details = []
+        for (_, blocked_reason), phase_labels in blocked_phases_by_reason.items():
+            details.append(f"{', '.join(phase_labels)}: {blocked_reason}")
+        return SeriesViewCapability(
+            supported=False,
+            blockedCode="phase-mpr-unavailable",
+            blockedReason="4D requires every phase to support MPR. " + "; ".join(details),
+        )
 
     def _resolve_multi_series_phase_entries(
         self,

@@ -48,10 +48,15 @@ class ViewerMprMixin:
 
         target_viewport = self._resolve_mpr_viewport(view)
         is_crosshair_preview = fast_preview and metadata_mode == "mpr-crosshair-preview"
+        is_window_pixel_preview = (
+            fast_preview
+            and fast_preview_full_resolution
+            and metadata_mode == "mpr-pixel-preview"
+        )
         # Crosshair batches may be throttled, but every presented image must
         # use the final pixel pipeline. Mixing the lightweight preview renderer
         # with the final renderer makes mouse-up visibly change the image.
-        use_fast_pixel_path = fast_preview and not is_crosshair_preview
+        use_fast_pixel_path = fast_preview and not is_crosshair_preview and not is_window_pixel_preview
         self._emit_render_progress(progress_callback, "render", progress_percent=82)
         preview_plane_shape = (
             self._get_mpr_fast_preview_plane_shape(
@@ -86,6 +91,7 @@ class ViewerMprMixin:
             *plane_pixels.shape[:2],
             pixel_aspect_x=render_pixel_aspect_x,
             pixel_aspect_y=render_pixel_aspect_y,
+            allow_downsample=False,
         )
         render_image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=plane_pixels.shape[1],
@@ -258,7 +264,7 @@ class ViewerMprMixin:
         image_bytes = self._encode_image(
             image,
             image_format,
-            fast_preview=use_fast_pixel_path,
+            fast_preview=use_fast_pixel_path and not fast_preview_full_resolution,
         )
         encode_ms = (perf_counter() - encode_started_at) * 1000.0
         logger.debug(
@@ -485,7 +491,11 @@ class ViewerMprMixin:
         *,
         pixel_aspect_x: float = 1.0,
         pixel_aspect_y: float = 1.0,
+        allow_downsample: bool = True,
     ) -> RenderPlan:
+        if not allow_downsample:
+            return RenderPlan(render_view=view, render_ratio=1.0)
+
         render_ratio = self._resolve_render_ratio_for_shape(
             view,
             image_height,

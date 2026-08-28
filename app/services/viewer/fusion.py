@@ -550,6 +550,7 @@ class ViewerFusionMixin:
             source_image.width,
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
+            allow_downsample=False,
         )
         image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=source_image.width,
@@ -560,7 +561,7 @@ class ViewerFusionMixin:
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
         )
-        interpolation_order = 0 if fast_preview else 1
+        interpolation_order = 0 if fast_preview and not fast_preview_full_resolution else 1
         canvas_width = render_plan.render_view.width or 0
         canvas_height = render_plan.render_view.height or 0
         fusion_composite: FusionCompositeInfo | None = None
@@ -793,7 +794,11 @@ class ViewerFusionMixin:
             saved=bool(group.fusion_registration.saved),
         )
         self._emit_render_progress(progress_callback, "encode", progress_percent=96)
-        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        image_bytes = self._encode_image(
+            image,
+            image_format,
+            fast_preview=fast_preview and not fast_preview_full_resolution,
+        )
         logger.debug(
             "fusion render timing view_id=%s role=%s fast_preview=%s image_format=%s source_shape=%s render=%sx%s total_ms=%.1f",
             view.view_id,

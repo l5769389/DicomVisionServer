@@ -12,6 +12,7 @@ class ViewerStackMixin:
         image_format: ImageFormat = "webp",
         *,
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
         progress_callback: ViewRenderProgressCallback | None = None,
     ) -> RenderedImageResult:
@@ -67,6 +68,10 @@ class ViewerStackMixin:
             *source_pixels.shape[:2],
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
+            # Settled 2D frames must match the viewport canvas. Returning a
+            # source-sized bitmap here makes the browser upscale it after a
+            # large resize, which leaves Stack/PET visibly soft.
+            allow_downsample=fast_preview and not fast_preview_full_resolution,
         )
         image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=source_pixels.shape[1],
@@ -130,14 +135,21 @@ class ViewerStackMixin:
         metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
 
         image_started_at = perf_counter()
-        if fast_preview:
+        use_fast_pixel_path = not (
+            fast_preview_full_resolution and metadata_mode == "stack-pixel-preview"
+        )
+        if fast_preview and use_fast_pixel_path:
             image = self._render_fast_preview(context)
         else:
             image = compat.layered_renderer.render(context)
         image_ms = (perf_counter() - image_started_at) * 1000.0
 
         encode_started_at = perf_counter()
-        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        image_bytes = self._encode_image(
+            image,
+            image_format,
+            fast_preview=fast_preview and not fast_preview_full_resolution,
+        )
         encode_ms = (perf_counter() - encode_started_at) * 1000.0
 
         logger.debug(
@@ -203,6 +215,7 @@ class ViewerStackMixin:
         image_format: ImageFormat = "webp",
         *,
         fast_preview: bool = False,
+        fast_preview_full_resolution: bool = False,
         metadata_mode: str = "full",
     ) -> RenderedImageResult:
         render_started_at = perf_counter()
@@ -224,6 +237,7 @@ class ViewerStackMixin:
             *cached.source_pixels.shape[:2],
             pixel_aspect_x=pixel_aspect_x,
             pixel_aspect_y=pixel_aspect_y,
+            allow_downsample=fast_preview and not fast_preview_full_resolution,
         )
         image_transform = compat.viewport_transformer.build_image_to_canvas_transform(
             image_width=cached.source_pixels.shape[1],
@@ -281,14 +295,21 @@ class ViewerStackMixin:
         metadata_ms = (perf_counter() - metadata_started_at) * 1000.0
 
         image_started_at = perf_counter()
-        if fast_preview:
+        use_fast_pixel_path = not (
+            fast_preview_full_resolution and metadata_mode == "stack-pixel-preview"
+        )
+        if fast_preview and use_fast_pixel_path:
             image = self._render_fast_preview(context)
         else:
             image = compat.layered_renderer.render(context)
         image_ms = (perf_counter() - image_started_at) * 1000.0
 
         encode_started_at = perf_counter()
-        image_bytes = self._encode_image(image, image_format, fast_preview=fast_preview)
+        image_bytes = self._encode_image(
+            image,
+            image_format,
+            fast_preview=fast_preview and not fast_preview_full_resolution,
+        )
         encode_ms = (perf_counter() - encode_started_at) * 1000.0
 
         logger.debug(
